@@ -91,11 +91,7 @@ def make_buffer(group, num_sms: int) -> DeepEPBuffer:
             cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes
         )
     return DeepEPBuffer(
-        group,
-        nvl_bytes,
-        rdma_bytes,
-        num_qps_per_rank=DeepEPBuffer.num_sms,
-        use_default_stream_as_comm_stream=False,
+        group, nvl_bytes, rdma_bytes, num_qps_per_rank=DeepEPBuffer.num_sms
     )
 
 
@@ -140,15 +136,22 @@ def build_expanded_metadata(
     valid = flat_expert >= 0
     expert = flat_expert[valid]
     token = flat_token[valid]
+    flat_pos = torch.arange(N * K, device=device, dtype=torch.int32)[valid]
     order = expert.argsort(stable=True)
     x_gather_idx = token[order].contiguous()
+    s_scatter_idx = flat_pos[order].contiguous()
     sorted_expert = expert[order]
     counts = torch.bincount(sorted_expert, minlength=local_num_experts)
     expert_frequency_offset = torch.zeros(
         local_num_experts + 1, dtype=torch.int32, device=device
     )
     expert_frequency_offset[1:] = counts.to(torch.int32).cumsum(0).to(torch.int32)
-    return x_gather_idx, expert_frequency_offset, int(x_gather_idx.numel())
+    return (
+        x_gather_idx,
+        s_scatter_idx,
+        expert_frequency_offset,
+        int(x_gather_idx.numel()),
+    )
 
 
 def run_sweep(
@@ -187,15 +190,19 @@ def run_sweep(
                 (SEQ_LEN_PER_RANK, topk), 1.0 / topk, dtype=torch.float32, device=device
             )
 
-            (
-                num_tokens_per_rank,
-                num_tokens_per_rdma_rank,
-                num_tokens_per_expert,
-                is_token_in_rank,
-                _layout_evt,
-            ) = buffer.get_dispatch_layout(topk_idx, NUM_EXPERTS, async_finish=False)
-
             def do_dispatch(buffer=buffer):
+                # Realistic: layout is per-iter unique work in production
+                # (topk_idx changes each layer/step), so it lives inside the
+                # timed lambda alongside the dispatch call itself.
+                (
+                    num_tokens_per_rank,
+                    num_tokens_per_rdma_rank,
+                    num_tokens_per_expert,
+                    is_token_in_rank,
+                    _layout_evt,
+                ) = buffer.get_dispatch_layout(
+                    topk_idx, NUM_EXPERTS, async_finish=False
+                )
                 return buffer.dispatch(
                     x,
                     topk_idx=topk_idx,
@@ -207,7 +214,6 @@ def run_sweep(
                     expert_alignment=1,
                     async_finish=False,
                     allocate_on_comm_stream=False,
-                    num_recv_tokens_per_expert_as_cuda=True,
                 )
 
             t_dispatch = time_fn(do_dispatch, n_warmup, n_iter)
@@ -230,13 +236,15 @@ def run_sweep(
                 results.append(TimingResult(num_sms, topk, t_dispatch, 0.0, 0.0))
                 continue
 
-            x_gather_idx, expert_frequency_offset, tk_total = build_expanded_metadata(
-                _recv_topk_idx, local_num_experts
-            )
-
-            identity_idx = torch.arange(tk_total, dtype=torch.int32, device=device)
-
             def do_compute():
+                # Realistic: routing metadata, identity index, and topk
+                # aggregation depend on _recv_topk_idx (layout output of
+                # the current dispatch) and so cannot be cached across
+                # layers — recompute inside the timed lambda.
+                (x_gather_idx, s_scatter_idx, expert_frequency_offset, tk_total) = (
+                    build_expanded_metadata(_recv_topk_idx, local_num_experts)
+                )
+                identity_idx = torch.arange(tk_total, dtype=torch.int32, device=device)
                 # Up + SwiGLU fused: gather recv_x[x_gather_idx] then grouped-GEMM
                 # returns (preact z [TK, 2*I], postact y1 [TK, I]).
                 _z, y1 = gemm_gated(
@@ -255,7 +263,17 @@ def run_sweep(
                     A_idx=identity_idx,
                     dynamic_scheduler=False,
                 )
-                return y2
+                # Topk aggregation: scatter [TK, H] expert outputs back to
+                # [N_recv, H], weighted by per-(token, k) topk weight. Mirrors
+                # streaming_moe.aggregate_topk so the comparison is apples-to-
+                # apples.
+                weights_flat = _recv_topk_weights.reshape(-1)
+                weights_per_slot = (
+                    weights_flat[s_scatter_idx.long()].to(y2.dtype).unsqueeze(-1)
+                )
+                o = torch.zeros(recv_x.size(0), D_MODEL, dtype=y2.dtype, device=device)
+                o.index_add_(0, x_gather_idx.long(), y2 * weights_per_slot)
+                return o
 
             t_compute = time_fn(do_compute, n_warmup, n_iter)
 
