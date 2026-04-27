@@ -98,6 +98,12 @@ private:
     // Workspace
     void* workspace = nullptr;
 
+    // Streaming-MoE count-exchange inbox: per-(channel, src_rank, local_expert) int32.
+    // Lives in the same IPC slab as buffer_ptrs / barrier_signal_ptrs. Sized for the
+    // worst case (max channels = num_device_sms / 2, max experts = NUM_MAX_LOCAL_EXPERTS).
+    int64_t streaming_section_offset = 0;
+    int64_t streaming_section_bytes = 0;
+
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
@@ -184,6 +190,42 @@ public:
                        std::optional<EventHandle>& previous_event,
                        bool async,
                        bool allocate_on_comm_stream);
+
+    // Streaming-MoE: per-(channel, src_rank, local_expert) count exchange over NVL.
+    // Returns recv_count[num_channels, num_ranks, num_local_experts] int32 — receiver's
+    // inbox of "how many tokens does src_rank send in channel c that route to my local
+    // expert e".
+    torch::Tensor streaming_count_exchange(const torch::Tensor& topk_idx, int num_experts, int num_sms);
+
+    // Streaming-MoE pre-compute. Reads recv_count and produces the prefix-sum metadata
+    // derived from the count exchange. All output shapes are known statically — no
+    // padding. total_tiles lands in a [1] device int32 tensor; the dispatch flow's
+    // existing host sync (the busy-wait that learns num_recv) picks it up.
+    // Returns (expert_frequency, expert_frequency_offset, base, cumulative_tiles_before_e,
+    //         per_source_rank_remaining, total_tiles_device).
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    streaming_metadata_init(const torch::Tensor& recv_count, int tile_m);
+
+    // Streaming-MoE post-dispatch slot assignment. Runs on comm_stream. Deterministic
+    // by construction (one warp per substream, lane-private SMEM counters, warp-shuffle
+    // prefix scan).
+    void streaming_slot_assign(const torch::Tensor& recv_topk_idx,
+                               const torch::Tensor& recv_channel_offset,
+                               const torch::Tensor& rank_prefix_matrix,
+                               const torch::Tensor& base_table,
+                               const torch::Tensor& expert_frequency_offset,
+                               const torch::Tensor& cumulative_tiles_before_e,
+                               const torch::Tensor& per_source_rank_remaining,
+                               torch::Tensor& tile_records_recv_x_rows,
+                               torch::Tensor& tile_records_k_slots,
+                               torch::Tensor& tile_records_expert_id,
+                               torch::Tensor& tile_remaining,
+                               torch::Tensor& tile_ready_queue,
+                               torch::Tensor& tile_ready_queue_seq,
+                               torch::Tensor& tile_ready_queue_head,
+                               int num_channels,
+                               int tile_m,
+                               int64_t dispatch_seq);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,

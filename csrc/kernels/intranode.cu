@@ -1,3 +1,4 @@
+#include "api.cuh"
 #include "buffer.cuh"
 #include "configs.cuh"
 #include "exception.cuh"
@@ -7,6 +8,7 @@
 namespace deep_ep {
 
 namespace intranode {
+
 
 template <int kNumRanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
@@ -192,6 +194,364 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
     SETUP_LAUNCH_CONFIG(1, 128, stream);
     SWITCH_RANKS(CACHED_NOTIFY_DISPATCH_LAUNCH_CASE);
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
+}
+
+// Streaming-MoE per-(channel, src_rank, local_expert) count exchange.
+//
+// Each rank R holds an inbox at `buffer_ptrs[R] + streaming_section_offset`, indexed
+// `[c, src, e_local]` (size: num_channels * kNumRanks * num_experts_per_rank ints).
+// Rank S writes its outbound counts into peer R's inbox at slot `[c, S, e_local]` via
+// NVL atomicAdd. After cross-rank barriers, each rank reads its inbox into the
+// `recv_count_out` tensor.
+//
+// Channel-of-token follows the existing `get_channel_task_range` partitioning:
+// channel_id = token_idx / ceil_div(num_tokens, num_channels).
+template <int kNumRanks>
+__global__ void streaming_count_exchange(const topk_idx_t* topk_idx,
+                                         int* recv_count_out,
+                                         int num_tokens,
+                                         int num_topk,
+                                         int num_experts_per_rank,
+                                         int num_channels,
+                                         int64_t streaming_section_offset,
+                                         void** buffer_ptrs,
+                                         int** barrier_signal_ptrs,
+                                         int rank) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+    auto num_threads = static_cast<int>(blockDim.x);
+
+    auto inbox_size = num_channels * kNumRanks * num_experts_per_rank;
+    auto* my_inbox =
+        reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[rank]) + streaming_section_offset);
+    auto inbox_stride_c = kNumRanks * num_experts_per_rank;
+    auto inbox_stride_src = num_experts_per_rank;
+
+    barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
+
+    for (int i = thread_id; i < inbox_size; i += num_threads)
+        my_inbox[i] = 0;
+    __syncthreads();
+    barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
+
+    int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
+    auto total_pairs = num_tokens * num_topk;
+    for (int idx = thread_id; idx < total_pairs; idx += num_threads) {
+        int t = idx / num_topk;
+        int k = idx - t * num_topk;
+        int e_global = static_cast<int>(topk_idx[t * num_topk + k]);
+        if (e_global < 0)
+            continue;
+        int dst_rank = e_global / num_experts_per_rank;
+        int e_local = e_global - dst_rank * num_experts_per_rank;
+        int channel_id = t / num_tokens_per_channel;
+        auto* peer_inbox = reinterpret_cast<int*>(
+            static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + streaming_section_offset);
+        int slot = channel_id * inbox_stride_c + rank * inbox_stride_src + e_local;
+        atomicAdd(&peer_inbox[slot], 1);
+    }
+    __syncthreads();
+    barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
+
+    for (int i = thread_id; i < inbox_size; i += num_threads)
+        recv_count_out[i] = my_inbox[i];
+}
+
+void streaming_count_exchange(const topk_idx_t* topk_idx,
+                              int* recv_count_out,
+                              int num_tokens,
+                              int num_topk,
+                              int num_experts_per_rank,
+                              int num_channels,
+                              int64_t streaming_section_offset,
+                              void** buffer_ptrs,
+                              int** barrier_signal_ptrs,
+                              int rank,
+                              int num_ranks,
+                              cudaStream_t stream) {
+#define STREAMING_COUNT_EXCHANGE_LAUNCH_CASE(ranks)                                          \
+    LAUNCH_KERNEL(&cfg,                                                                      \
+                  streaming_count_exchange<ranks>,                                           \
+                  topk_idx,                                                                  \
+                  recv_count_out,                                                            \
+                  num_tokens,                                                                \
+                  num_topk,                                                                  \
+                  num_experts_per_rank,                                                      \
+                  num_channels,                                                              \
+                  streaming_section_offset,                                                  \
+                  buffer_ptrs,                                                               \
+                  barrier_signal_ptrs,                                                       \
+                  rank);                                                                     \
+    break
+
+    SETUP_LAUNCH_CONFIG(1, 256, stream);
+    SWITCH_RANKS(STREAMING_COUNT_EXCHANGE_LAUNCH_CASE);
+#undef STREAMING_COUNT_EXCHANGE_LAUNCH_CASE
+}
+
+// Streaming-MoE pre-compute. Single block; reads recv_count[c, src, e_local] and
+// emits the prefix-sum-style metadata derived from the count exchange (see
+// new_design.md §"Pre-compute on receiver"). All output shapes are known
+// statically from (num_channels, num_ranks, num_experts_per_rank); no padding.
+// total_tiles lands in `total_tiles_out` (device int) so that the eventual host
+// sync (the existing dispatch one that learns num_recv) can also pick it up.
+__global__ void streaming_metadata_init_kernel(const int* __restrict__ recv_count,
+                                               int* expert_frequency,
+                                               int* expert_frequency_offset,
+                                               int* base,
+                                               int* cumulative_tiles_before_e,
+                                               int* per_source_rank_remaining,
+                                               int* total_tiles_out,
+                                               int num_channels,
+                                               int num_ranks,
+                                               int num_experts_per_rank,
+                                               int tile_m) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+    auto num_threads = static_cast<int>(blockDim.x);
+    int num_csrc = num_channels * num_ranks;
+    int E = num_experts_per_rank;
+
+    extern __shared__ int smem[];
+    int* s_freq = smem;                  // [E]
+    int* s_freq_off = s_freq + E;        // [E + 1]
+
+    // expert_frequency[e] = sum over (c, src) of recv_count[c, src, e]
+    for (int e = thread_id; e < E; e += num_threads) {
+        int sum = 0;
+        for (int cs = 0; cs < num_csrc; ++cs)
+            sum += recv_count[cs * E + e];
+        s_freq[e] = sum;
+        expert_frequency[e] = sum;
+    }
+    // per_source_rank_remaining[c, src] = sum over e of recv_count[c, src, e]
+    for (int cs = thread_id; cs < num_csrc; cs += num_threads) {
+        int sum = 0;
+        for (int e = 0; e < E; ++e)
+            sum += recv_count[cs * E + e];
+        per_source_rank_remaining[cs] = sum;
+    }
+    __syncthreads();
+
+    // Sequential scans (E ≤ NUM_MAX_LOCAL_EXPERTS, fits in one thread).
+    if (thread_id == 0) {
+        s_freq_off[0] = 0;
+        int cum_off = 0, cum_tiles = 0;
+        cumulative_tiles_before_e[0] = 0;
+        for (int e = 0; e < E; ++e) {
+            cum_off += s_freq[e];
+            s_freq_off[e + 1] = cum_off;
+            int tpe = (s_freq[e] + tile_m - 1) / tile_m;
+            cum_tiles += tpe;
+            cumulative_tiles_before_e[e + 1] = cum_tiles;
+        }
+        *total_tiles_out = cum_tiles;
+    }
+    __syncthreads();
+    for (int e = thread_id; e < E + 1; e += num_threads)
+        expert_frequency_offset[e] = s_freq_off[e];
+
+    // base[c, src, e] = expert_frequency_offset[e] + Σ over (c', src') < (c, src) lex of recv_count[c', src', e]
+    for (int e = thread_id; e < E; e += num_threads) {
+        int acc = s_freq_off[e];
+        for (int cs = 0; cs < num_csrc; ++cs) {
+            base[cs * E + e] = acc;
+            acc += recv_count[cs * E + e];
+        }
+    }
+}
+
+// Streaming-MoE post-dispatch slot assignment. One block per (channel, src_rank)
+// substream; one warp per block. Each lane handles a deterministic slice of the
+// substream's (chunk, k) pairs (idx = lane + 32, +64, ...). Pass 1 counts per-e
+// occurrences in lane-private SMEM slots; cross-lane exclusive prefix scan per e
+// gives `thread_offset[lane, e]`. Pass 2 walks the same slice in the same order
+// and assigns each (chunk, k) pair its slot via `slot = base[c, src, e] +
+// thread_offset[lane, e] + local_seen[lane, e]++`. Counters are SMEM-private to
+// each lane (single-writer, no atomics), so the slot for a given (chunk, k) is
+// the same on every run with the same input. Bit-deterministic by construction.
+template <int kNumRanks>
+__global__ void streaming_slot_assign_kernel(const topk_idx_t* __restrict__ recv_topk_idx,
+                                             const int* __restrict__ recv_channel_offset,
+                                             const int* __restrict__ rank_prefix_matrix,
+                                             const int* __restrict__ per_source_rank_remaining,
+                                             const int* __restrict__ base_table,
+                                             const int* __restrict__ expert_frequency_offset,
+                                             const int* __restrict__ cumulative_tiles_before_e,
+                                             int* tile_records_recv_x_rows,
+                                             int* tile_records_k_slots,
+                                             int* tile_records_expert_id,
+                                             int* tile_remaining,
+                                             int* tile_ready_queue,
+                                             int64_t* tile_ready_queue_seq,
+                                             int* tile_ready_queue_head,
+                                             int my_rank,
+                                             int num_channels,
+                                             int num_experts_per_rank,
+                                             int num_topk,
+                                             int tile_m,
+                                             int64_t dispatch_seq) {
+    const int c = blockIdx.x / kNumRanks;
+    const int src = blockIdx.x - c * kNumRanks;
+    const int lane = threadIdx.x;
+    const int E = num_experts_per_rank;
+
+    // per_source_rank_remaining[c, src] is a PAIR count (sum over e of recv_count) and
+    // gives a quick zero-substream early-out, but the actual iteration needs the TOKEN
+    // count of the substream — derived from the channel prefix.
+    if (per_source_rank_remaining[c * kNumRanks + src] == 0)
+        return;
+
+    int rank_offset = (src > 0) ? rank_prefix_matrix[(src - 1) * kNumRanks + my_rank] : 0;
+    int rank_end = rank_prefix_matrix[src * kNumRanks + my_rank];
+    int channel_offset = recv_channel_offset[src * num_channels + c];
+    int next_channel_offset = (c + 1 < num_channels)
+                                  ? recv_channel_offset[src * num_channels + c + 1]
+                                  : (rank_end - rank_offset);
+    int substream_token_count = next_channel_offset - channel_offset;
+    const int substream_start = rank_offset + channel_offset;
+    const int total_pairs = substream_token_count * num_topk;
+
+    extern __shared__ int s_streaming[];
+    int* s_count_or_offset = s_streaming;            // [32 * E] -- pass 1 count, then thread_offset
+    int* s_seen = s_streaming + 32 * E;              // [32 * E]
+
+    for (int e = 0; e < E; ++e) {
+        s_count_or_offset[lane * E + e] = 0;
+        s_seen[lane * E + e] = 0;
+    }
+    __syncwarp();
+
+    for (int idx = lane; idx < total_pairs; idx += 32) {
+        int chunk = idx / num_topk;
+        int k = idx - chunk * num_topk;
+        int row = substream_start + chunk;
+        int e = static_cast<int>(recv_topk_idx[row * num_topk + k]);
+        if (e >= 0 && e < E)
+            s_count_or_offset[lane * E + e]++;
+    }
+    __syncwarp();
+
+    for (int e = 0; e < E; ++e) {
+        int val = s_count_or_offset[lane * E + e];
+        int x = val;
+        #pragma unroll
+        for (int i = 1; i < 32; i *= 2) {
+            int y = __shfl_up_sync(0xffffffff, x, i);
+            if (lane >= i)
+                x += y;
+        }
+        s_count_or_offset[lane * E + e] = x - val;
+    }
+    __syncwarp();
+
+    const int csrc_idx = c * kNumRanks + src;
+    for (int idx = lane; idx < total_pairs; idx += 32) {
+        int chunk = idx / num_topk;
+        int k = idx - chunk * num_topk;
+        int row = substream_start + chunk;
+        int e = static_cast<int>(recv_topk_idx[row * num_topk + k]);
+        if (e >= 0 && e < E) {
+            int slot = base_table[csrc_idx * E + e] + s_count_or_offset[lane * E + e] + s_seen[lane * E + e];
+            s_seen[lane * E + e]++;
+            int rel = slot - expert_frequency_offset[e];
+            int local_tile_idx = rel / tile_m;
+            int row_in_tile = rel - local_tile_idx * tile_m;
+            int tile_id = cumulative_tiles_before_e[e] + local_tile_idx;
+            int row_idx = tile_id * tile_m + row_in_tile;
+
+            tile_records_recv_x_rows[row_idx] = row;
+            tile_records_k_slots[row_idx] = k;
+            tile_records_expert_id[tile_id] = e;
+
+            int rem = atomicSub(tile_remaining + tile_id, 1);
+            if (rem == 1) {
+                memory_fence();
+                int q_pos = atomicAdd(tile_ready_queue_head, 1);
+                tile_ready_queue[q_pos] = tile_id;
+                memory_fence();
+                st_release_sys_global(tile_ready_queue_seq + q_pos, dispatch_seq);
+            }
+        }
+    }
+}
+
+void streaming_slot_assign(const topk_idx_t* recv_topk_idx,
+                           const int* recv_channel_offset,
+                           const int* rank_prefix_matrix,
+                           const int* base_table,
+                           const int* expert_frequency_offset,
+                           const int* cumulative_tiles_before_e,
+                           int* tile_records_recv_x_rows,
+                           int* tile_records_k_slots,
+                           int* tile_records_expert_id,
+                           int* tile_remaining,
+                           int* tile_ready_queue,
+                           int64_t* tile_ready_queue_seq,
+                           int* tile_ready_queue_head,
+                           const int* per_source_rank_remaining,
+                           int rank,
+                           int num_ranks,
+                           int num_channels,
+                           int num_experts_per_rank,
+                           int num_topk,
+                           int tile_m,
+                           int64_t dispatch_seq,
+                           cudaStream_t stream) {
+    const int total_blocks = num_channels * num_ranks;
+    const int smem_bytes = 2 * 32 * num_experts_per_rank * static_cast<int>(sizeof(int));
+
+#define STREAMING_SLOT_ASSIGN_LAUNCH_CASE(ranks)                                              \
+    streaming_slot_assign_kernel<ranks><<<total_blocks, 32, smem_bytes, stream>>>(            \
+        recv_topk_idx, recv_channel_offset, rank_prefix_matrix, per_source_rank_remaining,    \
+        base_table, expert_frequency_offset, cumulative_tiles_before_e,                       \
+        tile_records_recv_x_rows, tile_records_k_slots, tile_records_expert_id,               \
+        tile_remaining, tile_ready_queue, tile_ready_queue_seq, tile_ready_queue_head,        \
+        rank, num_channels, num_experts_per_rank, num_topk, tile_m, dispatch_seq);            \
+    break
+
+    SWITCH_RANKS(STREAMING_SLOT_ASSIGN_LAUNCH_CASE);
+#undef STREAMING_SLOT_ASSIGN_LAUNCH_CASE
+
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        EPException ex("CUDA", __FILE__, __LINE__, cudaGetErrorString(e));
+        fprintf(stderr, "%s\n", ex.what());
+        throw ex;
+    }
+}
+
+void streaming_metadata_init(const int* recv_count,
+                             int* expert_frequency,
+                             int* expert_frequency_offset,
+                             int* base,
+                             int* cumulative_tiles_before_e,
+                             int* per_source_rank_remaining,
+                             int* total_tiles_out,
+                             int num_channels,
+                             int num_ranks,
+                             int num_experts_per_rank,
+                             int tile_m,
+                             cudaStream_t stream) {
+    int num_threads = 256;
+    int E = num_experts_per_rank;
+    int smem_bytes = (E + (E + 1)) * sizeof(int);
+    streaming_metadata_init_kernel<<<1, num_threads, smem_bytes, stream>>>(
+        recv_count,
+        expert_frequency,
+        expert_frequency_offset,
+        base,
+        cumulative_tiles_before_e,
+        per_source_rank_remaining,
+        total_tiles_out,
+        num_channels,
+        num_ranks,
+        num_experts_per_rank,
+        tile_m);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        EPException ex("CUDA", __FILE__, __LINE__, cudaGetErrorString(e));
+        fprintf(stderr, "%s\n", ex.what());
+        throw ex;
+    }
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
@@ -493,7 +853,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 auto recv_idx = static_cast<int64_t>(total_offset + chunk_idx) * num_topk + token_topk_idx;
                 auto buffer_idx = token_idx_in_buffer * num_topk + token_topk_idx;
-                recv_topk_idx[recv_idx] = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
+                auto e_val = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
+                recv_topk_idx[recv_idx] = e_val;
                 recv_topk_weights[recv_idx] = ld_nc_global(channel_topk_weights_buffers.buffer() + buffer_idx);
             }
 

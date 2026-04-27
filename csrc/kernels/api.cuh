@@ -75,6 +75,59 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
                             int num_ranks,
                             cudaStream_t stream);
 
+// Streaming-MoE: post-dispatch slot-assignment kernel. Reads recv_topk_idx +
+// metadata, writes tile_records and fires tiles onto tile_ready_queue
+// deterministically (one warp per (channel, src_rank) substream block).
+// See new_design.md §"Receiver slot assignment".
+void streaming_slot_assign(const topk_idx_t* recv_topk_idx,
+                           const int* recv_channel_offset,
+                           const int* rank_prefix_matrix,
+                           const int* base_table,
+                           const int* expert_frequency_offset,
+                           const int* cumulative_tiles_before_e,
+                           int* tile_records_recv_x_rows,
+                           int* tile_records_k_slots,
+                           int* tile_records_expert_id,
+                           int* tile_remaining,
+                           int* tile_ready_queue,
+                           int64_t* tile_ready_queue_seq,
+                           int* tile_ready_queue_head,
+                           const int* per_source_rank_remaining,
+                           int rank,
+                           int num_ranks,
+                           int num_channels,
+                           int num_experts_per_rank,
+                           int num_topk,
+                           int tile_m,
+                           int64_t dispatch_seq,
+                           cudaStream_t stream);
+
+void streaming_count_exchange(const topk_idx_t* topk_idx,
+                              int* recv_count_out,
+                              int num_tokens,
+                              int num_topk,
+                              int num_experts_per_rank,
+                              int num_channels,
+                              int64_t streaming_section_offset,
+                              void** buffer_ptrs,
+                              int** barrier_signal_ptrs,
+                              int rank,
+                              int num_ranks,
+                              cudaStream_t stream);
+
+void streaming_metadata_init(const int* recv_count,
+                             int* expert_frequency,
+                             int* expert_frequency_offset,
+                             int* base,
+                             int* cumulative_tiles_before_e,
+                             int* per_source_rank_remaining,
+                             int* total_tiles_out,
+                             int num_channels,
+                             int num_ranks,
+                             int num_experts_per_rank,
+                             int tile_m,
+                             cudaStream_t stream);
+
 void dispatch(void* recv_x,
               float* recv_x_scales,
               int* recv_src_idx,
