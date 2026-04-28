@@ -229,3 +229,125 @@ def test_streaming_moe_smoke_2gpu():
 @requires_gpus(2)
 def test_streaming_moe_numerics_2gpu():
     run_distributed_test(streaming_moe_numerics, world_size=2)
+
+
+def streaming_kernel_a_e2e(rank, world_size, master_port):
+    """End-to-end Phase B test: the StreamingHandle from Buffer.dispatch feeds
+    the QuACK streaming kernel A. Per-tile output of kernel A matches an eager
+    pytorch reference (gather recv_x rows + matmul W1[expert_id] + SwiGLU).
+    """
+    setup_distributed_for_test(rank, world_size, master_port)
+    from quack.moe_streaming_sm90 import streaming_moe_a
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    H, I, K = 128, 256, 2
+    num_experts = 8
+    local_E = num_experts // world_size
+    T = 64
+    tile_m, tile_n = 128, 256
+
+    torch.manual_seed(100 + rank)
+    x = (torch.randn(T, H, dtype=dtype, device=device) * 0.1).contiguous()
+
+    # Replicated W1 across ranks; each rank slices its local portion.
+    g = torch.Generator(device=device).manual_seed(42)
+    w1_full = (
+        torch.randn(num_experts, 2 * I, H, dtype=dtype, device=device, generator=g)
+        * 0.02
+    ).contiguous()
+    w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
+
+    topk_idx = _make_uniform_topk_idx(T, K, num_experts, rank, device)
+    topk_weights = torch.softmax(
+        torch.randn(T, K, dtype=torch.float32, device=device), dim=-1
+    ).contiguous()
+
+    rank_idx = topk_idx // local_E
+    is_token_in_rank = torch.zeros((T, world_size), dtype=torch.bool, device=device)
+    for r in range(world_size):
+        is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
+
+    assert torch_dist.group.WORLD is not None
+    buffer = _make_buffer(
+        torch_dist.group.WORLD, num_sms=16, hidden_size=H, dtype=dtype
+    )
+
+    recv_x, recv_topk_idx, recv_topk_weights, handle, _event = buffer.dispatch(
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        tile_m=tile_m,
+        dispatch_seq=1,
+    )
+    torch.cuda.synchronize()
+
+    total_tiles = handle.total_tiles
+    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Pre-warm producer JIT (irrelevant here since slot_assign already fired
+    # before we read the handle, but pre-warming kernel A's compile keeps the
+    # subsequent launch tight).
+    streaming_moe_a(
+        recv_x,
+        w1_local,
+        postact_a,
+        handle.tile_records_recv_x_rows,
+        handle.tile_records_expert_id,
+        handle.tile_ready,
+        consumer_head,
+        dispatch_seq=handle.dispatch_seq,
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+    torch.cuda.synchronize()
+
+    # Per-tile reference: gather recv_x rows + matmul W1[expert_id] + SwiGLU.
+    rows = handle.tile_records_recv_x_rows[:total_tiles]
+    eids = handle.tile_records_expert_id[:total_tiles]
+    max_diff = 0.0
+    for t in range(total_tiles):
+        e_local = int(eids[t].item())
+        gather_idx = rows[t]
+        valid_mask = gather_idx >= 0
+        # tile_records may have -1 sentinels for the partial tail of an expert's tiles.
+        # Compare only the valid rows.
+        valid_rows = gather_idx[valid_mask].long()
+        if valid_rows.numel() == 0:
+            continue
+        x_gathered = recv_x[valid_rows]  # (n_valid, H)
+        h = x_gathered.float() @ w1_local[e_local].float().t()  # (n_valid, 2I)
+        gate = h[..., 0::2]
+        up = h[..., 1::2]
+        a_ref = (F.silu(gate) * up).to(dtype)  # (n_valid, I)
+        a_kernel = (
+            postact_a[t][valid_mask.cpu()]
+            if valid_mask.device.type == "cpu"
+            else postact_a[t][valid_mask]
+        )
+        diff = (a_kernel.float() - a_ref.float()).abs().max().item()
+        max_diff = max(max_diff, diff)
+        rel = (a_kernel.float() - a_ref.float()).abs() / (a_ref.float().abs() + 1e-3)
+        assert rel.max().item() < 5e-2, (
+            f"rank {rank} tile {t} expert={e_local} n_valid={valid_rows.numel()}: "
+            f"max rel {rel.max().item():.4f}, max abs {diff:.4f}"
+        )
+
+    if rank == 0:
+        print(
+            f"PASS streaming_kernel_a_e2e: world={world_size} T_recv={recv_x.size(0)} "
+            f"total_tiles={total_tiles} max_abs_diff={max_diff:.4e}",
+            flush=True,
+        )
+
+    torch_dist.destroy_process_group()
+
+
+@pytest.mark.nightly
+@requires_gpus(2)
+def test_streaming_kernel_a_e2e_2gpu():
+    run_distributed_test(streaming_kernel_a_e2e, world_size=2)
