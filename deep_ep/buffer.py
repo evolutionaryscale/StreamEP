@@ -13,29 +13,34 @@ from .utils import EventOverlap, check_nvlink_connections
 
 @dataclass
 class StreamingMetadata:
-    """Prefix-sum metadata derived from ``recv_count`` (see ``new_design.md`` §"Pre-compute on receiver").
-
-    Output of ``Buffer.streaming_metadata_init``. Tile-keyed buffers (``tile_remaining``,
-    ``tile_records``, ``tile_ready_queue``) live in a different lifecycle and are
-    allocated by ``Buffer.streaming_dispatch_finalize`` once ``total_tiles`` is known.
-    """
+    """Prefix-sum metadata derived from ``recv_count`` (see ``new_design.md`` §"Pre-compute on receiver")."""
 
     expert_frequency: torch.Tensor             # [E_local] int32: count of tokens routing to each local expert
     expert_frequency_offset: torch.Tensor      # [E_local + 1] int32: exclusive prefix sum of expert_frequency
     base: torch.Tensor                         # [num_channels, num_ranks, E_local] int32: per-(c,src,e) starting slot
     cumulative_tiles_before_e: torch.Tensor    # [E_local + 1] int32: tile-id offset where each expert's tiles begin
     per_source_rank_remaining: torch.Tensor    # [num_channels, num_ranks] int32: combine-gating counter
-    total_tiles_device: torch.Tensor           # [1] int32: actual total_tiles, on device. Caller .item()s when ready to sync.
+    rank_prefix_matrix: torch.Tensor           # [num_ranks, num_ranks] int32: combine's per-source prefix (this rank's column)
+    total_tiles_device: torch.Tensor           # [1] int32: actual total_tiles, on device. Host-mapped sync slot also written.
     tile_m: int
 
 
 @dataclass
 class StreamingHandle:
     """All per-dispatch state for the streaming-MoE pipeline (see ``new_design.md``
-    §"Pipeline architecture"). Returned by ``Buffer.streaming_dispatch_finalize``;
-    consumed by the kernel A / Y / combine-gate stages.
+    §"Pipeline architecture"). Returned by ``Buffer.dispatch``; consumed by the
+    kernel A / Y / combine-gate stages and by ``Buffer.combine``.
     """
 
+    # Combine inputs (reused by Buffer.combine)
+    rank_prefix_matrix: torch.Tensor           # [num_ranks, num_ranks] int32 (this rank's column populated)
+    channel_prefix_matrix: torch.Tensor        # [num_ranks, num_channels] int32 (sender-side)
+    recv_channel_prefix_matrix: torch.Tensor   # [num_ranks, num_channels] int32 (receiver-side)
+    recv_src_idx: torch.Tensor                 # [T_recv] int32
+    is_token_in_rank: torch.Tensor             # [num_tokens, num_ranks] bool
+    send_head: torch.Tensor                    # [num_tokens, num_ranks] int32
+
+    # Streaming metadata
     recv_count: torch.Tensor                   # [num_channels, num_ranks, E_local] int32
     expert_frequency: torch.Tensor             # [E_local] int32
     expert_frequency_offset: torch.Tensor      # [E_local + 1] int32
@@ -43,17 +48,25 @@ class StreamingHandle:
     cumulative_tiles_before_e: torch.Tensor    # [E_local + 1] int32
     per_source_rank_remaining: torch.Tensor    # [num_channels, num_ranks] int32
 
+    # Tile-keyed buffers
     tile_records_recv_x_rows: torch.Tensor     # [total_tiles, tile_m] int32
     tile_records_k_slots: torch.Tensor         # [total_tiles, tile_m] int32
     tile_records_expert_id: torch.Tensor       # [total_tiles] int32
     tile_remaining: torch.Tensor               # [total_tiles] int32 (zero post-slot_assign)
-    tile_ready_queue: torch.Tensor             # [total_tiles] int32, firing-order queue
-    tile_ready_queue_seq: torch.Tensor         # [total_tiles] int64, release-store seq
-    tile_ready_queue_head: torch.Tensor        # [1] int32
+    # Per-tile ready signal (replaces the old per-expert sub-queue trio).
+    # slot_assign release-stores `dispatch_seq` into `tile_ready[tile_id]` once
+    # tile_remaining[tile_id] hits 0; consumer spins until value >= dispatch_seq.
+    # Pass 2 is expert-major so tile fires arrive in expert-monotonic order
+    # across blocks — gives wave-scheduled view to the consumer for free.
+    tile_ready: torch.Tensor                   # [total_tiles] int64, release-store seq
 
     total_tiles: int
     tile_m: int
     dispatch_seq: int
+
+    # Per-expert recv counts (aligned to expert_alignment), for interop with
+    # legacy MoE reference code paths.
+    num_recv_tokens_per_expert: List[int] = None
 
 
 class Buffer:
@@ -364,264 +377,167 @@ class Buffer:
                                              async_finish, allocate_on_comm_stream)
         return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
 
-    def streaming_count_exchange(self, topk_idx: torch.Tensor, num_experts: int) -> torch.Tensor:
-        """
-        Exchange per-(channel, src_rank, local_expert) token counts over NVL.
+    def streaming_count_exchange(
+        self, topk_idx: torch.Tensor, num_experts: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Exchange per-(channel, src_rank, local_expert) (token, k) counts and
+        per-(channel, src_rank) UNIQUE token counts over NVL.
 
-        Returns ``recv_count`` of shape ``[num_channels, num_ranks, num_local_experts]``,
-        int32. ``recv_count[c, src, e]`` is the number of tokens that ``src`` sends in
-        channel ``c`` that route to this rank's local expert ``e``. Intranode-only;
-        feeds the streaming-MoE pre-compute kernel (see ``new_design.md`` §"Pre-compute
-        on receiver").
+        Returns ``(recv_count, recv_unique_per_source)``:
+          - ``recv_count[num_channels, num_ranks, num_local_experts]`` int32 — the
+            (token, k) pair count routed to this rank's local experts.
+          - ``recv_unique_per_source[num_channels, num_ranks]`` int32 — the unique
+            token count per (channel, src) regardless of how many local experts each
+            token routes to. Sums to ``num_recv``.
         """
         return self.runtime.streaming_count_exchange(topk_idx, num_experts, Buffer.num_sms)
 
-    def streaming_dispatch_finalize(
+
+    def streaming_metadata_init(
         self,
-        topk_idx: torch.Tensor,
-        num_experts: int,
-        recv_topk_idx: torch.Tensor,
-        handle: tuple,
-        *,
-        tile_m: int = 128,
-        dispatch_seq: int = 1,
-    ) -> 'StreamingHandle':
-        """Run the post-dispatch streaming-MoE pipeline: count exchange, metadata
-        pre-compute, tile-buffer allocation, and slot assignment.
-
-        Issues one host sync to learn ``total_tiles`` (rides on the dispatch
-        flow's existing host sync once integrated; standalone for Phase A).
-
-        Arguments:
-            topk_idx: ``[num_tokens, num_topk]`` int64, the dispatch input routing.
-            num_experts: total expert count.
-            recv_topk_idx: dispatch output, ``[T_recv, num_topk]`` int64 with -1
-                sentinels for k-slots that don't route to this rank.
-            handle: dispatch handle tuple (rank_prefix_matrix, channel_prefix_matrix,
-                recv_channel_prefix_matrix, ...).
-            tile_m: tile size (default 128, matching the design's production target).
-            dispatch_seq: monotonic int64 to release-store on tile completion.
-
-        Returns:
-            StreamingHandle ready for kernel A / Y consumption.
-        """
-        rank_prefix_matrix, _channel_prefix_matrix, recv_channel_prefix_matrix, *_ = handle
-
-        recv_count = self.streaming_count_exchange(topk_idx, num_experts)
-        md = self.streaming_metadata_init(recv_count, tile_m=tile_m)
-        total_tiles = int(md.total_tiles_device.cpu().item())
-
-        device = recv_count.device
-        i32 = torch.int32
-
-        if total_tiles == 0:
-            empty_tile = torch.empty((0, tile_m), dtype=i32, device=device)
-            empty_1d_i32 = torch.empty((0,), dtype=i32, device=device)
-            empty_1d_i64 = torch.empty((0,), dtype=torch.int64, device=device)
-            return StreamingHandle(
-                recv_count=recv_count, expert_frequency=md.expert_frequency,
-                expert_frequency_offset=md.expert_frequency_offset, base=md.base,
-                cumulative_tiles_before_e=md.cumulative_tiles_before_e,
-                per_source_rank_remaining=md.per_source_rank_remaining,
-                tile_records_recv_x_rows=empty_tile, tile_records_k_slots=empty_tile,
-                tile_records_expert_id=empty_1d_i32, tile_remaining=empty_1d_i32,
-                tile_ready_queue=empty_1d_i32, tile_ready_queue_seq=empty_1d_i64,
-                tile_ready_queue_head=torch.zeros((1,), dtype=i32, device=device),
-                total_tiles=0, tile_m=tile_m, dispatch_seq=dispatch_seq,
-            )
-
-        tile_records_recv_x_rows = torch.full((total_tiles, tile_m), -1, dtype=i32, device=device)
-        tile_records_k_slots = torch.full((total_tiles, tile_m), -1, dtype=i32, device=device)
-        tile_records_expert_id = torch.full((total_tiles,), -1, dtype=i32, device=device)
-        tile_ready_queue = torch.full((total_tiles,), -1, dtype=i32, device=device)
-        tile_ready_queue_seq = torch.zeros((total_tiles,), dtype=torch.int64, device=device)
-        tile_ready_queue_head = torch.zeros((1,), dtype=i32, device=device)
-
-        tile_remaining = torch.full((total_tiles,), tile_m, dtype=i32, device=device)
-        freq = md.expert_frequency
-        cum = md.cumulative_tiles_before_e
-        tiles_per_expert = (freq + tile_m - 1) // tile_m
-        last_tile_count = freq - (tiles_per_expert - 1) * tile_m
-        last_tile_idx = (cum[1:] - 1).to(torch.int64)
-        valid = freq > 0
-        if valid.any():
-            tile_remaining[last_tile_idx[valid]] = last_tile_count[valid].to(i32)
-
-        num_channels = Buffer.num_sms // 2
-        self.runtime.streaming_slot_assign(
-            recv_topk_idx, recv_channel_prefix_matrix, rank_prefix_matrix,
-            md.base, md.expert_frequency_offset, md.cumulative_tiles_before_e,
-            md.per_source_rank_remaining,
-            tile_records_recv_x_rows, tile_records_k_slots, tile_records_expert_id,
-            tile_remaining, tile_ready_queue, tile_ready_queue_seq, tile_ready_queue_head,
-            num_channels, tile_m, dispatch_seq,
-        )
-
-        return StreamingHandle(
-            recv_count=recv_count, expert_frequency=md.expert_frequency,
-            expert_frequency_offset=md.expert_frequency_offset, base=md.base,
-            cumulative_tiles_before_e=md.cumulative_tiles_before_e,
-            per_source_rank_remaining=md.per_source_rank_remaining,
-            tile_records_recv_x_rows=tile_records_recv_x_rows,
-            tile_records_k_slots=tile_records_k_slots,
-            tile_records_expert_id=tile_records_expert_id,
-            tile_remaining=tile_remaining,
-            tile_ready_queue=tile_ready_queue,
-            tile_ready_queue_seq=tile_ready_queue_seq,
-            tile_ready_queue_head=tile_ready_queue_head,
-            total_tiles=total_tiles, tile_m=tile_m, dispatch_seq=dispatch_seq,
-        )
-
-    def streaming_metadata_init(self, recv_count: torch.Tensor, tile_m: int) -> 'StreamingMetadata':
+        recv_count: torch.Tensor,
+        recv_unique_per_source: torch.Tensor,
+        tile_m: int,
+        expert_alignment: int = 1,
+    ) -> 'StreamingMetadata':
         """Pre-compute the prefix-sum metadata derived from a ``recv_count`` table.
 
-        Single GPU kernel; no host sync. All output shapes are static functions of
-        ``(num_channels, num_ranks, num_local_experts)``. ``total_tiles`` lands in a
-        ``[1]`` device int32 tensor; tile-keyed buffers (``tile_remaining``,
-        ``tile_records``, ``tile_ready_queue``) are allocated separately once the
-        dispatch flow's existing host sync surfaces ``total_tiles``.
+        Single GPU kernel; subsumes notify_dispatch's receiver-side metadata. Writes
+        ``num_recv``, ``num_recv_per_expert`` (aligned), and ``total_tiles`` to the
+        Buffer's host-mapped sync slots (polled by the dispatch flow as a single sync
+        per layer). Returns the GPU-side derivatives plus this rank's column of
+        ``rank_prefix_matrix`` for combine.
         """
-        (freq, freq_off, base, cum_tiles, per_src, total_tiles_dev) = \
-            self.runtime.streaming_metadata_init(recv_count, tile_m)
+        (freq, freq_off, base, cum_tiles, per_src, rank_prefix, total_tiles_dev) = \
+            self.runtime.streaming_metadata_init(recv_count, recv_unique_per_source,
+                                                 tile_m, expert_alignment)
         return StreamingMetadata(
             expert_frequency=freq,
             expert_frequency_offset=freq_off,
             base=base,
             cumulative_tiles_before_e=cum_tiles,
             per_source_rank_remaining=per_src,
+            rank_prefix_matrix=rank_prefix,
             total_tiles_device=total_tiles_dev,
             tile_m=tile_m,
         )
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                 handle: Optional[Tuple] = None,
-                 num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
-                 is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
-                 topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None,
-                 expert_alignment: int = 1, num_worst_tokens: int = 0,
+                 topk_idx: torch.Tensor,
+                 topk_weights: torch.Tensor,
+                 is_token_in_rank: torch.Tensor,
+                 num_experts: int,
+                 *,
+                 expert_alignment: int = 1,
+                 tile_m: int = 128,
+                 dispatch_seq: int = 1,
                  config: Optional[Config] = None,
-                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                 previous_event: Optional[EventOverlap] = None,
+                 async_finish: bool = False,
                  allocate_on_comm_stream: bool = False) -> \
-            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
-                  Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
-        """
-        Dispatch tokens to different ranks, both intranode and internode settings are supported.
-        Intranode kernels require all the ranks should be visible via NVLink.
-        Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
-            index should be visible via RDMA.
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+                  torch.Tensor, torch.Tensor, 'StreamingHandle', EventOverlap]:
+        """Streaming-MoE consolidated dispatch.
+
+        Folds notify_dispatch (sender-side channel prefix), streaming_count_exchange,
+        streaming_metadata_init, the dispatch main kernel, and streaming_slot_assign
+        into one host call with a single host sync per layer (the combined poll on
+        ``{moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}``).
 
         Arguments:
-            x: `torch.Tensor` or tuple of `torch.Tensor`, for the first type, the shape must be `[num_tokens, hidden]`,
-                and type must be `torch.bfloat16`; for the second type, the first element of the tuple must be shaped as
-                `[num_tokens, hidden]` with type `torch.float8_e4m3fn`, the second must be `[num_tokens, hidden // 128]`
-                 (requiring divisible) with type `torch.float`.
-            handle: an optional communication handle, if set, the CPU will reuse the layout information to save some time.
-            num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
-            num_tokens_per_rdma_rank: `[num_rdma_ranks]` with `torch.int`, the number of tokens to be sent to each RDMA
-                rank (with the same GPU index), return `None` for intranode settings.
-            is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
-            num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
-            topk_idx: `[num_tokens, num_topk]` with `deep_ep.topk_idx_t` (typically `torch.int64`), the expert indices
-                selected by each token, `-1` means no selections.
-            topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token to dispatch.
-            expert_alignment: align the number of tokens received by each local expert to this variable.
-            num_worst_tokens: the worst number of tokens to receive, if specified, there will be no CPU sync, and it
-                will be CUDA-graph compatible. Please also notice that this flag is for intranode only.
-            config: the performance tuning config.
-            previous_event: the event to wait before actually executing the kernel.
-            async_finish: the current stream will not wait for the communication kernels to be finished if set.
-            allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            x: tokens to dispatch, ``[num_tokens, hidden]`` bf16 (or a tuple
+                ``(x_fp8, x_scales)`` for FP8).
+            topk_idx: ``[num_tokens, num_topk]`` int64 expert indices (-1 sentinel).
+            topk_weights: ``[num_tokens, num_topk]`` float32 expert weights.
+            is_token_in_rank: ``[num_tokens, num_ranks]`` bool routing bitmap.
+            num_experts: total expert count across all ranks.
+            expert_alignment: alignment for per-expert receive counts (default 1).
+            tile_m: tile size (default 128).
+            dispatch_seq: monotonic int64 release-stamp on tile_ready.
+            config: performance-tuning config.
+            previous_event / async_finish / allocate_on_comm_stream: standard DeepEP
+                stream-management options.
 
         Returns:
-            recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
-                received token count.
-            recv_topk_idx: received expert indices.
-            recv_topk_weights: received expert weights.
-            num_recv_tokens_per_expert_list: Python list shaped `[num_local_experts]`, the received token count by
-                each local expert, aligned to the input `expert_alignment`. If `num_worst_tokens` is specified, the list
-                will be empty.
-            handle: the returned communication handle.
-            event: the event after executing the kernel (valid only if `async_finish` is set).
+            recv_x: received tokens (Tensor or (recv_x_fp8, recv_x_scales) tuple).
+            recv_topk_idx: ``[T_recv, num_topk]`` int64.
+            recv_topk_weights: ``[T_recv, num_topk]`` float32.
+            handle: ``StreamingHandle`` with all metadata for downstream compute and combine.
+            event: completion event (valid only when ``async_finish``).
         """
-        # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
-        # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
-                                           num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
-                                           previous_event, async_finish, allocate_on_comm_stream)
+            raise NotImplementedError("Internode streaming dispatch lands in Phase E.")
 
-        # Launch the kernel with cached or non-cached mode
-        x, x_scales = x if isinstance(x, tuple) else (x, None)
-        if handle is not None:
-            assert topk_idx is None and topk_weights is None
-            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
-            num_recv_tokens = recv_src_idx.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
-                x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
-            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
-        else:
-            assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
-                self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
-                                                num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
-                                                expert_alignment, num_worst_tokens, config,
-                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
-            handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
-            return (
-                recv_x, recv_x_scales
-            ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(
-                event)
+        x_tensor, x_scales = x if isinstance(x, tuple) else (x, None)
+        prev_event_obj = getattr(previous_event, 'event', None)
+        outputs = self.runtime.intranode_dispatch(
+            x_tensor, x_scales, topk_idx, topk_weights, is_token_in_rank,
+            num_experts, expert_alignment, tile_m, dispatch_seq,
+            config, prev_event_obj, async_finish, allocate_on_comm_stream,
+        )
+        (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
+         num_recv_tokens_per_expert_list,
+         rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
+         recv_src_idx, send_head,
+         recv_count, expert_frequency, expert_frequency_offset, base_table,
+         cumulative_tiles_before_e, per_source_rank_remaining,
+         tile_records_recv_x_rows, tile_records_k_slots, tile_records_expert_id,
+         tile_remaining, tile_ready,
+         total_tiles, event) = outputs
+
+        handle = StreamingHandle(
+            rank_prefix_matrix=rank_prefix_matrix,
+            channel_prefix_matrix=channel_prefix_matrix,
+            recv_channel_prefix_matrix=recv_channel_prefix_matrix,
+            recv_src_idx=recv_src_idx,
+            is_token_in_rank=is_token_in_rank,
+            send_head=send_head,
+            recv_count=recv_count,
+            expert_frequency=expert_frequency,
+            expert_frequency_offset=expert_frequency_offset,
+            base=base_table,
+            cumulative_tiles_before_e=cumulative_tiles_before_e,
+            per_source_rank_remaining=per_source_rank_remaining,
+            tile_records_recv_x_rows=tile_records_recv_x_rows,
+            tile_records_k_slots=tile_records_k_slots,
+            tile_records_expert_id=tile_records_expert_id,
+            tile_remaining=tile_remaining,
+            tile_ready=tile_ready,
+            total_tiles=total_tiles,
+            tile_m=tile_m,
+            dispatch_seq=dispatch_seq,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert_list,
+        )
+
+        recv = (recv_x, recv_x_scales) if x_scales is not None else recv_x
+        return recv, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
 
     # noinspection PyTypeChecker
-    def combine(self, x: torch.Tensor, handle: Tuple,
+    def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
                 topk_weights: Optional[torch.Tensor] = None,
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 config: Optional[Config] = None,
                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                 allocate_on_comm_stream: bool = False) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
+        returned by ``Buffer.dispatch``. Intranode only for now (Phase E for internode).
         """
-        Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
-            settings are supported.
-        Intranode kernels require all the ranks should be visible via NVLink.
-        Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
-            index should be visible via RDMA.
-
-        Arguments:
-            x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its original ranks.
-            handle: a must-set communication handle, you can obtain this from the dispatch function.
-            topk_weights: `[num_tokens, num_topk]` with `torch.float`, the tokens' top-k weights for reducing to its original ranks.
-            bias: 0, 1 or 2 `[num_tokens, hidden]` with `torch.bfloat16` final bias to the output.
-            config: the performance tuning config.
-            previous_event: the event to wait before actually executing the kernel.
-            async_finish: the current stream will not wait for the communication kernels to be finished if set.
-            allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
-
-        Returns:
-            recv_x: the reduced token from its dispatched ranks.
-            recv_topk_weights: the reduced top-k weights from its dispatch ranks.
-            event: the event after executing the kernel (valid only if `async_finish` is set).
-        """
-        # Default config
         config = self.get_combine_config(self.group_size) if config is None else config
 
-        # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
+            raise NotImplementedError("Internode streaming combine lands in Phase E.")
 
-        # NOTES: the second `_` is for the sending side, so we should use the third one
-        rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
-
-        # Launch the kernel
-        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix,
-                                                                          channel_prefix_matrix, send_head, config,
-                                                                          getattr(previous_event, 'event',
-                                                                                  None), async_finish, allocate_on_comm_stream)
+        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
+            x, topk_weights, bias_0, bias_1,
+            handle.recv_src_idx, handle.rank_prefix_matrix,
+            handle.channel_prefix_matrix, handle.send_head,
+            config, getattr(previous_event, 'event', None),
+            async_finish, allocate_on_comm_stream)
         return recv_x, recv_topk_weights, EventOverlap(event)
 
     # noinspection PyTypeChecker

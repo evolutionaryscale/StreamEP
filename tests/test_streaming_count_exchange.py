@@ -72,7 +72,7 @@ def main():
     dist.all_gather(all_topk, topk_idx, group=group)
     all_topk_cpu = [t.cpu() for t in all_topk]
 
-    recv_count = buf.streaming_count_exchange(topk_idx, num_experts)
+    recv_count, recv_unique_per_source = buf.streaming_count_exchange(topk_idx, num_experts)
     torch.cuda.synchronize()
 
     expected = expected_recv_count(all_topk_cpu, num_channels, world_size, num_local_experts, rank)
@@ -93,7 +93,7 @@ def main():
         raise SystemExit(1)
 
     tile_m = 128
-    md = buf.streaming_metadata_init(recv_count, tile_m=tile_m)
+    md = buf.streaming_metadata_init(recv_count, recv_unique_per_source, tile_m=tile_m)
 
     expert_freq_expected = expected.sum(dim=(0, 1)).to(torch.int32)
     assert torch.equal(md.expert_frequency.cpu(), expert_freq_expected), \
@@ -118,12 +118,31 @@ def main():
     assert actual_total_tiles == expected_total_tiles, \
         f"total_tiles {actual_total_tiles} vs expected {expected_total_tiles}"
 
-    per_sr_expected = expected.sum(dim=2).to(torch.int32)
-    assert torch.equal(md.per_source_rank_remaining.cpu(), per_sr_expected)
-
     cum_expected = torch.zeros(num_local_experts + 1, dtype=torch.int32)
     cum_expected[1:] = tiles_per_expert.cumsum(0).to(torch.int32)
     assert torch.equal(md.cumulative_tiles_before_e.cpu(), cum_expected)
+
+    # per_source_rank_remaining and rank_prefix_matrix: unique-token semantics.
+    # Recompute expected from gathered topk_idx + per-token routing-to-this-rank check.
+    expert_lo = rank * num_local_experts
+    expert_hi = (rank + 1) * num_local_experts
+    expected_unique = torch.zeros(num_channels, world_size, dtype=torch.int32)
+    per_channel = (num_tokens + num_channels - 1) // num_channels
+    for src in range(world_size):
+        topk = all_topk_cpu[src]
+        for t in range(topk.shape[0]):
+            if ((topk[t] >= expert_lo) & (topk[t] < expert_hi)).any():
+                c = t // per_channel
+                expected_unique[c, src] += 1
+    assert torch.equal(recv_unique_per_source.cpu(), expected_unique), \
+        f"recv_unique_per_source mismatch"
+    assert torch.equal(md.per_source_rank_remaining.cpu(), expected_unique)
+
+    per_src_total = expected_unique.sum(dim=0).to(torch.int64)
+    column_expected = per_src_total.cumsum(0).to(torch.int32)
+    actual_column = md.rank_prefix_matrix.cpu()[:, rank]
+    assert torch.equal(actual_column, column_expected), \
+        f"rank_prefix_matrix column mismatch: actual={actual_column} expected={column_expected}"
 
     if rank == 0:
         print(f"PASS: rank={rank} world={world_size} sum={actual.sum().item()} "

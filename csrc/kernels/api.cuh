@@ -49,49 +49,33 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 // Intranode kernels
 namespace intranode {
 
-void notify_dispatch(const int* num_tokens_per_rank,
-                     int* moe_recv_counter_mapped,
-                     int num_ranks,
-                     const int* num_tokens_per_expert,
-                     int* moe_recv_expert_counter_mapped,
-                     int num_experts,
+// Sender-side per-(dst_rank, channel) cumulative token counts. No cross-rank
+// exchange — receiver-side metadata (num_recv, per-expert counts, rank_prefix_matrix)
+// is produced by `streaming_metadata_init` from `recv_count`.
+void notify_dispatch(int num_ranks,
                      int num_tokens,
                      const bool* is_token_in_rank,
                      int* channel_prefix_matrix,
-                     int* rank_prefix_matrix_copy,
-                     int num_memset_int,
-                     int expert_alignment,
-                     void** buffer_ptrs,
-                     int** barrier_signal_ptrs,
-                     int rank,
                      cudaStream_t stream,
-                     int num_sms);
-
-void cached_notify_dispatch(const int* rank_prefix_matrix,
-                            int num_memset_int,
-                            void** buffer_ptrs,
-                            int** barrier_signal_ptrs,
-                            int rank,
-                            int num_ranks,
-                            cudaStream_t stream);
+                     int num_channels);
 
 // Streaming-MoE: post-dispatch slot-assignment kernel. Reads recv_topk_idx +
-// metadata, writes tile_records and fires tiles onto tile_ready_queue
-// deterministically (one warp per (channel, src_rank) substream block).
-// See new_design.md §"Receiver slot assignment".
+// metadata, writes tile_records and fires tiles via per-tile `tile_ready[tile_id]`
+// release-store. Pass 2 walks experts in expert-major order so tiles fire onto
+// `tile_ready` in expert-monotonic order. One warp per (channel, src_rank)
+// substream block. See new_design.md §"Receiver slot assignment".
 void streaming_slot_assign(const topk_idx_t* recv_topk_idx,
                            const int* recv_channel_offset,
                            const int* rank_prefix_matrix,
                            const int* base_table,
                            const int* expert_frequency_offset,
                            const int* cumulative_tiles_before_e,
+                           const int* substream_ready,
                            int* tile_records_recv_x_rows,
                            int* tile_records_k_slots,
                            int* tile_records_expert_id,
                            int* tile_remaining,
-                           int* tile_ready_queue,
-                           int64_t* tile_ready_queue_seq,
-                           int* tile_ready_queue_head,
+                           int64_t* tile_ready,
                            const int* per_source_rank_remaining,
                            int rank,
                            int num_ranks,
@@ -104,6 +88,7 @@ void streaming_slot_assign(const topk_idx_t* recv_topk_idx,
 
 void streaming_count_exchange(const topk_idx_t* topk_idx,
                               int* recv_count_out,
+                              int* recv_unique_per_source_out,
                               int num_tokens,
                               int num_topk,
                               int num_experts_per_rank,
@@ -116,17 +101,32 @@ void streaming_count_exchange(const topk_idx_t* topk_idx,
                               cudaStream_t stream);
 
 void streaming_metadata_init(const int* recv_count,
+                             const int* recv_unique_per_source,
                              int* expert_frequency,
                              int* expert_frequency_offset,
                              int* base,
                              int* cumulative_tiles_before_e,
                              int* per_source_rank_remaining,
+                             int* rank_prefix_matrix,
                              int* total_tiles_out,
+                             int* num_recv_mapped,
+                             int* num_recv_per_expert_mapped,
+                             int* total_tiles_mapped,
                              int num_channels,
                              int num_ranks,
                              int num_experts_per_rank,
                              int tile_m,
+                             int expert_alignment,
+                             int my_rank,
                              cudaStream_t stream);
+
+void tile_remaining_init(const int* expert_frequency,
+                         const int* cumulative_tiles_before_e,
+                         int* tile_remaining,
+                         int num_experts_per_rank,
+                         int total_tiles,
+                         int tile_m,
+                         cudaStream_t stream);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -155,7 +155,8 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_sms,
               int num_max_send_tokens,
-              int num_recv_buffer_tokens);
+              int num_recv_buffer_tokens,
+              int* substream_ready);
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,

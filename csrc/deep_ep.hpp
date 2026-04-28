@@ -83,6 +83,18 @@ private:
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
 
+    // Stream for streaming_slot_assign — runs concurrently with the dispatch main
+    // kernel. slot_assign blocks acquire-spin on `substream_ready[c, s]` and start
+    // firing tile_ready_queue pushes as soon as each substream lands, instead of
+    // waiting for the entire dispatch to complete on comm_stream.
+    at::cuda::CUDAStream slot_assign_stream;
+
+    // Per-(channel, src_rank) "this substream's recv_topk_idx is fully written"
+    // signal. Released by the dispatch main kernel's receiver block at the end of
+    // each substream's processing; acquire-loaded by streaming_slot_assign at block
+    // entry. Reset to 0 at the start of every dispatch via cudaMemsetAsync.
+    int* substream_ready = nullptr;
+
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
 
@@ -115,6 +127,12 @@ private:
     // Host-side RDMA-level MoE info
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
+
+    // Streaming-MoE total_tiles host-mapped slot. Written by streaming_metadata_init,
+    // polled by the dispatch flow alongside moe_recv_counter / moe_recv_expert_counter
+    // as the single sync point per layer.
+    volatile int* streaming_total_tiles = nullptr;
+    int* streaming_total_tiles_mapped = nullptr;
 
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
@@ -163,69 +181,82 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+    // Streaming-MoE consolidated dispatch (intranode). Fuses notify_dispatch +
+    // streaming_count_exchange + streaming_metadata_init + dispatch main + slot_assign
+    // into a single host call with exactly one host sync (the combined poll on
+    // {moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}).
+    //
+    // Return tuple (in order):
+    //   0  recv_x, 1 recv_x_scales, 2 recv_topk_idx, 3 recv_topk_weights,
+    //   4  num_recv_tokens_per_expert_list,
+    //   5  rank_prefix_matrix, 6 channel_prefix_matrix, 7 recv_channel_prefix_matrix,
+    //   8  recv_src_idx, 9 send_head,
+    //   10 recv_count, 11 expert_frequency, 12 expert_frequency_offset, 13 base,
+    //   14 cumulative_tiles_before_e, 15 per_source_rank_remaining,
+    //   16 tile_records_recv_x_rows, 17 tile_records_k_slots, 18 tile_records_expert_id,
+    //   19 tile_remaining, 20 tile_ready,
+    //   21 total_tiles (int),
+    //   22 EventHandle.
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>,
+               torch::Tensor,
+               torch::Tensor,
                std::vector<int>,
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               int,
                std::optional<EventHandle>>
     intranode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
-                       const std::optional<torch::Tensor>& topk_idx,
-                       const std::optional<torch::Tensor>& topk_weights,
-                       const std::optional<torch::Tensor>& num_tokens_per_rank,
+                       const torch::Tensor& topk_idx,
+                       const torch::Tensor& topk_weights,
                        const torch::Tensor& is_token_in_rank,
-                       const std::optional<torch::Tensor>& num_tokens_per_expert,
-                       int cached_num_recv_tokens,
-                       const std::optional<torch::Tensor>& cached_rank_prefix_matrix,
-                       const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                       int num_experts,
                        int expert_alignment,
-                       int num_worst_tokens,
+                       int tile_m,
+                       int64_t dispatch_seq,
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
                        bool allocate_on_comm_stream);
 
-    // Streaming-MoE: per-(channel, src_rank, local_expert) count exchange over NVL.
-    // Returns recv_count[num_channels, num_ranks, num_local_experts] int32 — receiver's
-    // inbox of "how many tokens does src_rank send in channel c that route to my local
-    // expert e".
-    torch::Tensor streaming_count_exchange(const torch::Tensor& topk_idx, int num_experts, int num_sms);
+    // Streaming-MoE count exchange. Returns (recv_count, recv_unique_per_source):
+    //   recv_count[num_channels, num_ranks, num_local_experts] int32 — per-(token, k)
+    //     pair counts (one increment per (chunk, k) routed to a local expert).
+    //   recv_unique_per_source[num_channels, num_ranks] int32 — per-(channel, src)
+    //     UNIQUE token counts (one increment per token regardless of how many of
+    //     this rank's local experts it routes to). Subsumes notify_dispatch's
+    //     receiver-side sums; sums to num_recv.
+    std::tuple<torch::Tensor, torch::Tensor>
+    streaming_count_exchange(const torch::Tensor& topk_idx, int num_experts, int num_sms);
 
     // Streaming-MoE pre-compute. Reads recv_count and produces the prefix-sum metadata
     // derived from the count exchange. All output shapes are known statically — no
-    // padding. total_tiles lands in a [1] device int32 tensor; the dispatch flow's
-    // existing host sync (the busy-wait that learns num_recv) picks it up.
+    // padding. total_tiles lands in both a [1] device int32 tensor and the host-mapped
+    // streaming_total_tiles slot; num_recv and num_recv_per_expert are written to the
+    // existing moe_recv_counter / moe_recv_expert_counter host-mapped slots. The
+    // dispatch flow polls these as a single combined sync per layer.
     // Returns (expert_frequency, expert_frequency_offset, base, cumulative_tiles_before_e,
-    //         per_source_rank_remaining, total_tiles_device).
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-    streaming_metadata_init(const torch::Tensor& recv_count, int tile_m);
-
-    // Streaming-MoE post-dispatch slot assignment. Runs on comm_stream. Deterministic
-    // by construction (one warp per substream, lane-private SMEM counters, warp-shuffle
-    // prefix scan).
-    void streaming_slot_assign(const torch::Tensor& recv_topk_idx,
-                               const torch::Tensor& recv_channel_offset,
-                               const torch::Tensor& rank_prefix_matrix,
-                               const torch::Tensor& base_table,
-                               const torch::Tensor& expert_frequency_offset,
-                               const torch::Tensor& cumulative_tiles_before_e,
-                               const torch::Tensor& per_source_rank_remaining,
-                               torch::Tensor& tile_records_recv_x_rows,
-                               torch::Tensor& tile_records_k_slots,
-                               torch::Tensor& tile_records_expert_id,
-                               torch::Tensor& tile_remaining,
-                               torch::Tensor& tile_ready_queue,
-                               torch::Tensor& tile_ready_queue_seq,
-                               torch::Tensor& tile_ready_queue_head,
-                               int num_channels,
-                               int tile_m,
-                               int64_t dispatch_seq);
+    //         per_source_rank_remaining, rank_prefix_matrix, total_tiles_device).
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor>
+    streaming_metadata_init(const torch::Tensor& recv_count,
+                            const torch::Tensor& recv_unique_per_source,
+                            int tile_m, int expert_alignment);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
