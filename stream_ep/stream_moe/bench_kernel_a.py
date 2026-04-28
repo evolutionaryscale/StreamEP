@@ -69,7 +69,7 @@ def make_buffer(group, num_sms):
     )
 
 
-def time_kernel(fn, *, warmup=5, iters=20) -> float:
+def time_kernel(fn, *, warmup=10, iters=50) -> float:
     """Median wall-clock time of `fn` over `iters` runs (μs), warmup excluded."""
     torch.cuda.synchronize()
     for _ in range(warmup):
@@ -212,6 +212,8 @@ def main():
         )
         print(f"{'-'*22}  {'-'*6}  {'-'*6}  {'-'*10}  {'-'*10}")
 
+    se_streaming_us = None
+    se_gated_us = None
     for tile_n in (128, 256):
         consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
         postact_se = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=device)
@@ -232,41 +234,40 @@ def main():
             )
 
         try:
-            t = time_kernel(run_streaming_se, warmup=3, iters=10)
+            t = time_kernel(run_streaming_se)
             fmt_row("streaming_moe_a [SE]", TILE_M, tile_n, t)
+            if tile_n == 256:
+                se_streaming_us = t
         except Exception as e:
             if rank == 0:
                 print(
                     f"streaming_moe_a SE tile_n={tile_n}: FAILED — {type(e).__name__}: {e}"
                 )
 
-    for tile_M, tile_N in [(128, 256)]:
+    def run_gated_se():
+        gemm_act(
+            recv_x,
+            w1_local[:1].contiguous(),  # only expert 0's slab
+            preact_flat,
+            None,
+            postact_flat,
+            None,
+            "swiglu",
+            tile_M=128,
+            tile_N=256,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_m=cu_seqlens_m_single,
+            A_idx=A_idx_flat,
+        )
 
-        def run_gated_se():
-            gemm_act(
-                recv_x,
-                w1_local[:1].contiguous(),  # only expert 0's slab
-                preact_flat,
-                None,
-                postact_flat,
-                None,
-                "swiglu",
-                tile_M=tile_M,
-                tile_N=tile_N,
-                cluster_M=1,
-                cluster_N=1,
-                cu_seqlens_m=cu_seqlens_m_single,
-                A_idx=A_idx_flat,
-            )
-
-        try:
-            t = time_kernel(run_gated_se, warmup=3, iters=10)
-            fmt_row("gemm_gated [SE]", tile_M, tile_N, t)
-        except Exception as e:
-            if rank == 0:
-                print(
-                    f"gemm_gated SE tile_M={tile_M} tile_N={tile_N}: FAILED — {type(e).__name__}: {e}"
-                )
+    try:
+        t = time_kernel(run_gated_se)
+        fmt_row("gemm_gated [SE]", 128, 256, t)
+        se_gated_us = t
+    except Exception as e:
+        if rank == 0:
+            print(f"gemm_gated SE: FAILED — {type(e).__name__}: {e}")
 
     # Restore original expert ids for the cross-check below.
     handle.tile_records_expert_id[:total_tiles] = handle_expert_orig[:total_tiles]
@@ -278,8 +279,10 @@ def main():
         )
         print(f"{'-'*22}  {'-'*6}  {'-'*6}  {'-'*10}  {'-'*10}")
 
-    # ── Streaming kernel A across tile_n sweep.
-    for tile_n in (128, 256, 512):
+    # ── Streaming kernel A across tile_n sweep. tile_n=512 is unsupported by the
+    # MMA atom (8 ≤ N ≤ 256, N % 8 == 0); skipped.
+    streaming_us = None
+    for tile_n in (128, 256):
         consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
         postact_streaming = torch.empty(
             total_tiles, TILE_M, I, dtype=DTYPE, device=device
@@ -301,44 +304,62 @@ def main():
             )
 
         try:
-            t = time_kernel(run_streaming, warmup=3, iters=10)
+            t = time_kernel(run_streaming)
             fmt_row("streaming_moe_a", TILE_M, tile_n, t)
+            if tile_n == 256:
+                streaming_us = t
         except Exception as e:
             if rank == 0:
                 print(
                     f"streaming_moe_a tile_n={tile_n}: FAILED — {type(e).__name__}: {e}"
                 )
 
-    # ── Non-streaming gemm_gated across (tile_M, tile_N) sweep.
-    # gemm_gated is the reference: same total work, no streaming overhead, no
-    # gather-overhead beyond the standard varlen_m + gather_A path.
-    for tile_M, tile_N in [(128, 256), (128, 512), (256, 256), (256, 512)]:
+    # ── Non-streaming gemm_gated reference at production tile shape. tile_M=256
+    # is dramatically slower (~18 ms/iter) and never the right choice — skipped.
+    # tile_N=512 is unsupported (same MMA-atom bound).
+    gated_us = None
 
-        def run_gated():
-            gemm_act(
-                recv_x,  # A (T_recv, H), bf16, k-major
-                W1_for_gated,  # B (E_local, 2I, H)
-                preact_flat,  # D (TK, 2I)
-                None,  # C
-                postact_flat,  # PostAct (TK, I)
-                None,  # tile_count_semaphore
-                "swiglu",
-                tile_M=tile_M,
-                tile_N=tile_N,
-                cluster_M=1,
-                cluster_N=1,
-                cu_seqlens_m=cu_seqlens_m,
-                A_idx=A_idx_flat,
+    def run_gated():
+        gemm_act(
+            recv_x,  # A (T_recv, H), bf16, k-major
+            W1_for_gated,  # B (E_local, 2I, H)
+            preact_flat,  # D (TK, 2I)
+            None,  # C
+            postact_flat,  # PostAct (TK, I)
+            None,  # tile_count_semaphore
+            "swiglu",
+            tile_M=128,
+            tile_N=256,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx_flat,
+        )
+
+    try:
+        t = time_kernel(run_gated)
+        fmt_row("gemm_gated (varlen_m)", 128, 256, t)
+        gated_us = t
+    except Exception as e:
+        if rank == 0:
+            print(f"gemm_gated: FAILED — {type(e).__name__}: {e}")
+
+    if rank == 0:
+        print()
+        print("=== summary (multi-expert, tile_M=128, tile_N=256) ===")
+        if streaming_us is not None and gated_us is not None:
+            ratio = streaming_us / gated_us
+            verdict = "FASTER" if ratio < 1.0 else "slower"
+            print(f"  streaming_moe_a:       {streaming_us:7.1f} μs")
+            print(f"  gemm_gated (varlen_m): {gated_us:7.1f} μs")
+            print(
+                f"  streaming / gemm_gated: {ratio:.3f}x ({verdict} than non-streaming reference)"
             )
-
-        try:
-            t = time_kernel(run_gated, warmup=3, iters=10)
-            fmt_row("gemm_gated (varlen_m)", tile_M, tile_N, t)
-        except Exception as e:
-            if rank == 0:
-                print(
-                    f"gemm_gated tile_M={tile_M} tile_N={tile_N}: FAILED — {type(e).__name__}: {e}"
-                )
+        if se_streaming_us is not None and se_gated_us is not None:
+            print(
+                f"  [single-expert control] streaming {se_streaming_us:7.1f} μs vs "
+                f"gemm_gated {se_gated_us:7.1f} μs ({se_streaming_us/se_gated_us:.3f}x)"
+            )
 
     torch_dist.destroy_process_group()
 
