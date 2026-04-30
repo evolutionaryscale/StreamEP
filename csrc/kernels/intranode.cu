@@ -9,11 +9,26 @@ namespace deep_ep {
 
 namespace intranode {
 
+// Per-sub-batch chunk size in the dispatch receiver. Bounds the batch_slot SMEM
+// scratch independent of the channel queue depth — Pass A allocates pool slots
+// for at most kReceiverChunkSize (chunk, k) pairs at a time before Pass B drains
+// them. Used both in the kernel and at the launch site for SMEM sizing.
+constexpr int kReceiverChunkSize = 32;
 
-// Streaming-MoE consolidated dispatch metadata. Single-block kernel that fuses
-// what used to live in three separate kernels (count_exchange, metadata_init,
-// tile_remaining_init's pre-host-poll inputs) and emits the pool-shape outputs
-// the dispatch hot path consumes.
+// Receiver-state SMEM layout, used by the dispatch kernel's receiver block. Sits
+// after the per-warp TMA buffer slabs in dynamic SMEM:
+//   smem_per_substream_seen [num_ranks][E_local]                       — per-(c, src, e) cumulative count
+//   smem_batch_slot         [num_ranks][kReceiverChunkSize][num_topk]  — per-sub-batch slot map
+__host__ __device__ inline int receiver_state_smem_bytes(int num_ranks, int E_local, int num_topk) {
+    return (num_ranks * E_local +
+            num_ranks * kReceiverChunkSize * num_topk) * static_cast<int>(sizeof(int));
+}
+
+
+// Streaming-MoE consolidated dispatch metadata. Single-block kernel that does
+// the cross-rank (token, k) count exchange and emits the pool-shape outputs the
+// dispatch hot path consumes (everything sized by E_local + R + (c, src, e),
+// known before the host poll).
 //
 // IPC slab at `buffer_ptrs[R] + streaming_section_offset` carries two adjacent
 // inboxes (zeroed on Buffer construction; cross-rank stores via per-(c, src)
@@ -253,7 +268,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
 
 // Pool-layout per-tile arrays. Sized by `total_tiles` (known only after the host
 // poll on streaming_total_tiles), so this is a separate launch from the metadata
-// kernel. Replaces the gather-A `tile_remaining_init`. Outputs:
+// kernel. Outputs:
 //   - tile_id_to_expert[total_tiles]      int32 — which expert this tile belongs to.
 //   - pool_arrival_target[total_tiles]    int32 — write count needed for the tile
 //       to be considered "ready" (BLOCK_M for full tiles, leftover for the last
@@ -421,10 +436,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
-        // Compute the channel-prefix locally over `is_token_in_rank` (folded
-        // notify_dispatch). One warp per (channel, dst_rank) pair scans tokens
-        // [0, channel_end_of_c) and splits the count into start (i < channel_start)
-        // and end (full range) using lane-strided accumulation + warp_reduce.
+        // Compute the channel-prefix locally over `is_token_in_rank`. One warp
+        // per (channel, dst_rank) pair scans tokens [0, channel_end_of_c) and
+        // splits the count into start (i < channel_start) and end (full range)
+        // using lane-strided accumulation + warp_reduce.
         if (send_warp_id_in_rank == 0) {
             int channel_start, channel_end;
             get_channel_task_range(num_tokens, num_channels, responsible_channel, channel_start, channel_end);
@@ -545,11 +560,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         // so kernel A sees firings in tile_id-monotonic order (preserves W1[e] L2
         // caching).
         //
-        // Per-iter inner-loop processes at most kReceiverChunkSize chunks; if the
-        // sender pushed a larger backlog into the queue, we run multiple inner
-        // sub-iters before advancing the queue head. Bounds the batch_slot SMEM
-        // scratch independent of the queue depth.
-        constexpr int kReceiverChunkSize = 32;
+        // Per-iter inner-loop processes at most kReceiverChunkSize chunks (defined
+        // at namespace scope); if the sender pushed a larger backlog into the
+        // queue, we run multiple inner sub-iters before advancing the queue head.
         constexpr int num_recv_warps = kNumThreads / 32;
         constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
         const auto recv_thread_id = thread_id;
@@ -559,7 +572,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
-        // ── Receiver-state SMEM (after all warps' TMA buffer slabs).
+        // ── Receiver-state SMEM (sized by `receiver_state_smem_bytes` at the
+        // launch site; placed after the per-warp TMA buffer slabs in dynamic SMEM).
         //   smem_per_substream_seen [kNumRanks][E] — cumulative (chunk, k) pair
         //     count routed to each local expert across all batches so far. Plus
         //     base_pool[c, src, e], gives the next slot for that (c, src, e).
@@ -830,21 +844,13 @@ void dispatch(void* pool,
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
     constexpr int kNumWarps = kNumThreads / 32;
-    // Must match the kernel's `kReceiverChunkSize`. Bounds the per-substream
-    // batch_slot SMEM scratch independent of the queue depth.
-    constexpr int kReceiverChunkSize = 32;
 
-    // Receiver-state SMEM (placed after the per-warp TMA buffer slabs).
-    //   smem_per_substream_seen [R][E_local]                           — cumulative pair count
-    //   smem_batch_slot         [R][kReceiverChunkSize][num_topk]      — per-sub-batch slot map
     int E_local = num_experts / num_ranks;
-    int receiver_state_bytes_val =
-        (num_ranks * E_local +
-         num_ranks * kReceiverChunkSize * num_topk) * static_cast<int>(sizeof(int));
+    int receiver_state_bytes = receiver_state_smem_bytes(num_ranks, E_local, num_topk);
 #ifndef DISABLE_SM90_FEATURES
-    int smem_size = kNumTMABytesPerWarp * kNumWarps + receiver_state_bytes_val;
+    int smem_size = kNumTMABytesPerWarp * kNumWarps + receiver_state_bytes;
 #else
-    int smem_size = receiver_state_bytes_val;
+    int smem_size = receiver_state_bytes;
 #endif
 
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());

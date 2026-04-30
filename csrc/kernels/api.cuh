@@ -49,9 +49,9 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 // Intranode kernels
 namespace intranode {
 
-// Streaming-MoE consolidated dispatch metadata. Single launch fusing what used
-// to be three separate kernels (count_exchange + metadata_init + the inputs
-// to tile_remaining_init). Emits pool-shape outputs:
+// Streaming-MoE consolidated dispatch metadata. Single launch that does the
+// cross-rank (token, k) count exchange and emits all pool-shape outputs known
+// before the host poll on `total_tiles`:
 //   expert_frequency[E_local], expert_pool_block_offset[E_local + 1],
 //   base_pool[num_channels, num_ranks, E_local],
 //   rank_prefix_matrix[R, R] (this rank's column),
@@ -80,7 +80,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  cudaStream_t stream);
 
 // Pool-layout per-tile arrays (sized by total_tiles, so launched after the host
-// poll). Replaces the gather-A `tile_remaining_init`.
+// poll on streaming_total_tiles).
 //   tile_id_to_expert[total_tiles]   int32 — which expert this tile belongs to.
 //   pool_arrival_target[total_tiles] int32 — write count for tile to be ready
 //     (BLOCK_M for full tiles; leftover for each expert's last partial tile).

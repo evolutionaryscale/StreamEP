@@ -42,11 +42,11 @@ class StreamingHandle:
 
     # ── Pool metadata (kernel A scheduler + tests).
     expert_frequency: torch.Tensor             # [E_local] int32
-    expert_pool_block_offset: torch.Tensor     # [E_local + 1] int32 (replaces cumulative_tiles_before_e)
+    expert_pool_block_offset: torch.Tensor     # [E_local + 1] int32 — pool-block prefix-sum (BLOCK_M-tile units)
     base_pool: torch.Tensor                    # [num_channels, num_ranks, E_local] int32
 
     # ── Per-tile arrays.
-    tile_id_to_expert: torch.Tensor            # [total_tiles] int32 (replaces tile_records_expert_id)
+    tile_id_to_expert: torch.Tensor            # [total_tiles] int32 — per-tile expert lookup
     pool_arrival_target: torch.Tensor          # [total_tiles] int32 (per-tile firing-target)
     # Per-tile ready signal: dispatch's Pass 2 release-stores `dispatch_seq` into
     # `tile_ready[tile_id]` once pool_arrival_count[tile_id] reaches its target.
@@ -59,7 +59,7 @@ class StreamingHandle:
     dispatch_seq: int
 
     # Per-expert recv counts (aligned to expert_alignment), for interop with
-    # legacy MoE reference code paths.
+    # reference (non-streaming) MoE code paths.
     num_recv_tokens_per_expert: List[int] = None
 
 

@@ -561,8 +561,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // caller's stream, so kernels we launch on `comm_stream` see the allocator
     // events automatically — no extra cross-stream waits needed. The `compute_stream`
     // sync at the end (non-async path) is what the caller relies on for downstream
-    // ordering. The legacy `allocate_on_comm_stream` parameter is now redundant
-    // (always true) but we keep its presence in the API for callers that pass it.
+    // ordering. `allocate_on_comm_stream` is accepted for API symmetry with
+    // non-streaming dispatch but does not gate behavior here — the streaming
+    // path always allocates on comm_stream.
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
@@ -579,8 +580,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         moe_recv_expert_counter[i] = -1;
     *streaming_total_tiles = -1;
 
-    // Sender-side channel prefix matrix (filled by the dispatch sender preamble —
-    // the old `notify_dispatch` kernel was folded into dispatch in Phase 1).
+    // Sender-side channel prefix matrix (filled by the dispatch sender preamble).
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto channel_prefix_matrix = torch::empty({num_ranks, num_channels}, i32_opts);
 

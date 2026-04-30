@@ -192,7 +192,7 @@ public:
     //   10 channel_prefix_matrix Tensor[R, num_channels]     sender-side per-(rank, channel) cum count
     //   11 recv_channel_prefix_matrix  Tensor[R, num_channels]
     //   12 expert_frequency      Tensor[E_local]             per-expert (token, k) pair count
-    //   13 expert_pool_block_offset    Tensor[E_local + 1]   pool-block prefix-sum (replaces cumulative_tiles_before_e)
+    //   13 expert_pool_block_offset    Tensor[E_local + 1]   pool-block prefix-sum (in BLOCK_M-tile units)
     //   14 base_pool             Tensor[num_channels, R, E_local]  per-substream-per-expert pool slot start
     //   15 tile_id_to_expert     Tensor[total_tiles]         per-tile expert lookup
     //   16 pool_arrival_target   Tensor[total_tiles]         per-tile write count for tile_ready firing
