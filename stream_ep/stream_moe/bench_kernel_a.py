@@ -1,23 +1,18 @@
-"""Bench streaming kernel A vs the existing non-streaming gemm_gated on the
-same per-tile work. Both run on a single GPU with a Buffer.dispatch'd
+"""Bench streaming kernel A vs the non-streaming gemm_gated on the same
+per-tile work (pool layout). Both run on a single GPU with a Buffer.dispatch'd
 StreamingHandle as the source of truth for what gets computed.
 
 Setup
 -----
-- Run Buffer.dispatch once (2 GPUs are still required because DeepEP needs
-  a real distributed buffer to drive count_exchange + slot_assign).
-- After dispatch, build the equivalent input for the non-streaming reference:
-    * A_idx_flat: tile_records_recv_x_rows concatenated in expert order
-    * cu_seqlens_m: expert_frequency_offset (length E_local + 1)
-    * W1: same per-expert weights
-    * postact: (TK, I) flat output
+- Run Buffer.dispatch once (multi-GPU required for DeepEP).
+- Pool layout puts data into expert-major order with BLOCK_M-padded tiles, so
+  both kernels read the SAME pool tensor:
+    * streaming_moe_a uses tile_id_to_expert + expert_pool_block_offset and
+      strided TMA via the standard varlen_m path.
+    * gemm_gated uses cu_seqlens_m = expert_pool_block_offset * tile_m and
+      reads pool dense (no A_idx needed — pool is already expert-grouped).
 - Time both kernels (CUDA-event timed, repeated, median).
 - Sweep tile_n for each variant.
-
-The two kernels do the same total work (gather + matmul + SwiGLU on TK rows
-× expert weights). The non-streaming variant is the existing well-tuned QuACK
-gemm_gated path — its number is the floor we should be aiming for in the
-streaming kernel.
 
 Launch:
     torchrun --nproc_per_node=2 \
@@ -122,7 +117,7 @@ def main():
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
     # Run dispatch once to get a StreamingHandle. Reuse this for all timing.
-    recv_x, _, _, handle, _ = buffer.dispatch(
+    pool, handle, _ = buffer.dispatch(
         x,
         topk_idx,
         topk_weights,
@@ -133,41 +128,18 @@ def main():
     )
     torch.cuda.synchronize()
     total_tiles = handle.total_tiles
-    T_recv = recv_x.shape[0]
+    TK_padded = pool.shape[0]
 
-    # ── Build the equivalent flat input for non-streaming gemm_gated.
-    # tile_records_recv_x_rows is laid out in expert-then-tile order; the only
-    # complication is that the LAST tile of each expert may have -1 sentinel
-    # rows (if expert_frequency[e] is not divisible by tile_M). For the
-    # non-streaming reference we drop those sentinels and use the per-expert
-    # cu_seqlens_m derived from expert_frequency.
-    expert_frequency = handle.expert_frequency  # (E_local,)
-    expert_frequency_offset = handle.expert_frequency_offset  # (E_local+1,)
-    rows = handle.tile_records_recv_x_rows[:total_tiles].view(
-        -1
-    )  # (total_tiles*tile_m,)
-    valid_mask = rows >= 0
-    A_idx_flat = rows[valid_mask].contiguous()
-    TK = int(A_idx_flat.shape[0])
-    assert int(expert_frequency.sum().item()) == TK, "expert_frequency should sum to TK"
+    # Pool layout: cu_seqlens_m for both kernels is expert_pool_block_offset *
+    # tile_m. Pool is already expert-grouped, so neither kernel needs A_idx.
+    expert_frequency = handle.expert_frequency
+    expert_pool_block_offset = handle.expert_pool_block_offset
+    cu_seqlens_m = (expert_pool_block_offset.to(torch.int32) * TILE_M).contiguous()
+    TK = int(expert_frequency.sum().item())  # actual (token, k) pair count (no padding)
 
-    cu_seqlens_m = expert_frequency_offset.to(torch.int32).contiguous()  # (E_local+1,)
-
-    # Outputs.
-    postact_flat = torch.empty(TK, I, dtype=DTYPE, device=device)
-    preact_flat = torch.empty(TK, 2 * I, dtype=DTYPE, device=device)
-
-    # W1 layout for gemm_gated: (l=E_local, n=2I, k=H), k-major. We already have
-    # w1_local of shape (E_local, 2I, H) contiguous → that IS k-major per expert.
-    # gemm_gated handles this directly.
-    W1_for_gated = w1_local
-
-    # Streaming-side W1: (E_local, 2I, H) → (2I, H, E_local) view (k-major slab
-    # per expert) — this is what streaming_moe_a does internally via permute.
-    # Pre-permute outside the timed call to remove that ~25 μs/launch.
-    # streaming_moe_a still applies the permute internally; we'd need a separate
-    # path to skip it. For this bench, just leave it — its overhead is ~25 μs
-    # and the streaming kernel takes thousands of μs, so it's noise.
+    # Outputs sized to match the pool layout's per-expert padded blocks.
+    postact_flat = torch.empty(TK_padded, I, dtype=DTYPE, device=device)
+    preact_flat = torch.empty(TK_padded, 2 * I, dtype=DTYPE, device=device)
 
     if rank == 0:
         print(
@@ -175,12 +147,10 @@ def main():
             f"K={TOPK} T_per_rank={SEQ_LEN_PER_RANK} world={world_size}"
         )
         print(
-            f"        T_recv={T_recv} total_tiles={total_tiles} "
-            f"TK={TK} sentinels_dropped={int(rows.numel() - TK)}"
+            f"        TK_padded={TK_padded} total_tiles={total_tiles} "
+            f"TK={TK} padding_rows={TK_padded - TK}"
         )
-        flops = (
-            2 * 2 * TK * H * I
-        )  # gated → 2I output halved → I; both halves computed → 2*I; matmul 2*M*N*K
+        flops = 2 * 2 * TK * H * I  # gated: 2*M*N*K with N = 2I → halved → I
         print(f"        FLOPs/launch: {flops / 1e9:.2f} GFLOPs (bf16 matmul)")
         print()
         print(
@@ -196,14 +166,18 @@ def main():
         print(f"{name:>22s}  {tm:>6d}  {tn:>6d}  {t_us:>10.1f}  {tflops:>10.2f}")
 
     # ────────────────────────────────────────────────────────────────────
-    # Controlled experiment: force all tiles to expert 0 (and gemm_gated to a
-    # single batch). If L2 reuse on W1[e] is the cause of the streaming-vs-
-    # non-streaming gap, both should now run at the same speed (since every
-    # tile reads the same W1[0] and L2 is always warm).
+    # Single-expert control: force all tiles to expert 0 (override
+    # tile_id_to_expert and use a single-batch cu_seqlens_m). Tests whether
+    # multi-expert L2 thrashing on W1[e] is what slows the multi-expert run.
     # ────────────────────────────────────────────────────────────────────
-    handle_expert_orig = handle.tile_records_expert_id.clone()
-    handle.tile_records_expert_id[:total_tiles] = 0  # in-place override
-    cu_seqlens_m_single = torch.tensor([0, TK], dtype=torch.int32, device=device)
+    handle_expert_orig = handle.tile_id_to_expert.clone()
+    handle.tile_id_to_expert[:total_tiles] = 0  # force all tiles to expert 0
+    cu_seqlens_m_single = torch.tensor([0, TK_padded], dtype=torch.int32, device=device)
+    expert_pool_block_offset_se = torch.tensor(
+        [0, total_tiles] + [total_tiles] * (local_E - 1),
+        dtype=torch.int32,
+        device=device,
+    )
     if rank == 0:
         print()
         print("=== single-expert control (all tiles → expert 0) ===")
@@ -221,11 +195,11 @@ def main():
         def run_streaming_se():
             consumer_head.zero_()
             streaming_moe_a(
-                recv_x,
+                pool,
                 w1_local,
                 postact_se,
-                handle.tile_records_recv_x_rows,
-                handle.tile_records_expert_id,
+                handle.tile_id_to_expert,
+                expert_pool_block_offset_se,
                 handle.tile_ready,
                 consumer_head,
                 dispatch_seq=handle.dispatch_seq,
@@ -246,7 +220,7 @@ def main():
 
     def run_gated_se():
         gemm_act(
-            recv_x,
+            pool,
             w1_local[:1].contiguous(),  # only expert 0's slab
             preact_flat,
             None,
@@ -258,7 +232,7 @@ def main():
             cluster_M=1,
             cluster_N=1,
             cu_seqlens_m=cu_seqlens_m_single,
-            A_idx=A_idx_flat,
+            A_idx=None,
         )
 
     try:
@@ -269,8 +243,8 @@ def main():
         if rank == 0:
             print(f"gemm_gated SE: FAILED — {type(e).__name__}: {e}")
 
-    # Restore original expert ids for the cross-check below.
-    handle.tile_records_expert_id[:total_tiles] = handle_expert_orig[:total_tiles]
+    # Restore original expert ids for the multi-expert run.
+    handle.tile_id_to_expert[:total_tiles] = handle_expert_orig[:total_tiles]
     if rank == 0:
         print()
         print("=== production-shape (multi-expert) ===")
@@ -279,8 +253,6 @@ def main():
         )
         print(f"{'-'*22}  {'-'*6}  {'-'*6}  {'-'*10}  {'-'*10}")
 
-    # ── Streaming kernel A across tile_n sweep. tile_n=512 is unsupported by the
-    # MMA atom (8 ≤ N ≤ 256, N % 8 == 0); skipped.
     streaming_us = None
     for tile_n in (128, 256):
         consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
@@ -291,11 +263,11 @@ def main():
         def run_streaming():
             consumer_head.zero_()
             streaming_moe_a(
-                recv_x,
+                pool,
                 w1_local,
                 postact_streaming,
-                handle.tile_records_recv_x_rows,
-                handle.tile_records_expert_id,
+                handle.tile_id_to_expert,
+                handle.expert_pool_block_offset,
                 handle.tile_ready,
                 consumer_head,
                 dispatch_seq=handle.dispatch_seq,
@@ -314,26 +286,23 @@ def main():
                     f"streaming_moe_a tile_n={tile_n}: FAILED — {type(e).__name__}: {e}"
                 )
 
-    # ── Non-streaming gemm_gated reference at production tile shape. tile_M=256
-    # is dramatically slower (~18 ms/iter) and never the right choice — skipped.
-    # tile_N=512 is unsupported (same MMA-atom bound).
     gated_us = None
 
     def run_gated():
         gemm_act(
-            recv_x,  # A (T_recv, H), bf16, k-major
-            W1_for_gated,  # B (E_local, 2I, H)
-            preact_flat,  # D (TK, 2I)
-            None,  # C
-            postact_flat,  # PostAct (TK, I)
-            None,  # tile_count_semaphore
+            pool,
+            w1_local,  # B (E_local, 2I, H)
+            preact_flat,  # D (TK_padded, 2I)
+            None,
+            postact_flat,  # PostAct (TK_padded, I)
+            None,
             "swiglu",
             tile_M=128,
             tile_N=256,
             cluster_M=1,
             cluster_N=1,
             cu_seqlens_m=cu_seqlens_m,
-            A_idx=A_idx_flat,
+            A_idx=None,
         )
 
     try:

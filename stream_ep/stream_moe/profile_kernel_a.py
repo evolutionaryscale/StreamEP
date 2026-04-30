@@ -1,20 +1,19 @@
-"""Torch-profiler trace of DeepEP dispatch → streaming kernel A end-to-end.
+"""Torch-profiler trace of DeepEP dispatch → streaming kernel A end-to-end (pool layout).
 
 Validates the streaming property visually: kernel A's CTAs should be on the
-GPU timeline concurrently with DeepEP's dispatch tail / slot_assign, not
-strictly after them.
+GPU timeline concurrently with DeepEP's dispatch tail (Pass 2 firing per
+substream), not strictly after.
 
 What you should see in the resulting chrome trace
 -------------------------------------------------
-- `comm_stream`: notify_dispatch → streaming_count_exchange →
-  streaming_metadata_init → (single host poll) → dispatch main kernel.
-- `slot_assign_stream`: streaming_slot_assign launches concurrently with
-  dispatch main kernel; each substream block fires its tiles onto
-  tile_ready_queue as the matching `(c, src)` substream lands.
+- `comm_stream`: streaming_dispatch_metadata → (single host poll) →
+  tile_arrays_init → dispatch main kernel. The dispatch kernel's receiver
+  block does Pass 1 (per-batch slot allocation + data copy into pool) and
+  Pass 2 (substream-end expert-major tile_ready firing) inline.
 - `compute_a_stream`: streaming_moe_a (kernel A) launches early (overlapped
-  with the tail of dispatch + slot_assign). Its CTAs spin on
-  tile_ready_queue_seq[q_pos] until slot_assign fires that tile, then process
-  it. The first tiles should start computing before dispatch finishes.
+  with the tail of dispatch). Its CTAs spin on tile_ready[tile_id] until
+  dispatch's Pass 2 fires that tile, then process it. The first tiles should
+  start computing before dispatch finishes.
 
 Launch
 ------
@@ -90,10 +89,7 @@ def one_step(
     """A single dispatch + kernel A iteration. Returns the postact_a tensor and
     StreamingHandle so the caller can drop them after the profiler step.
     """
-    # Dispatch + slot_assign are handled internally by Buffer.dispatch on
-    # comm_stream / slot_assign_stream. The returned handle's tile_ready_queue*
-    # gets populated as slot_assign fires tiles.
-    recv_x, _recv_topk_idx, _recv_topk_weights, handle, _event = buffer.dispatch(
+    pool, handle, _event = buffer.dispatch(
         x,
         topk_idx,
         topk_weights,
@@ -104,32 +100,30 @@ def one_step(
     )
 
     total_tiles = handle.total_tiles
-    postact_a = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=recv_x.device)
-    consumer_head = torch.zeros(1, dtype=torch.int32, device=recv_x.device)
+    postact_a = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=pool.device)
+    consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
     # Tensors allocated on the comm/default stream are about to be read+written
     # on compute_a_stream. record_stream tells the caching allocator not to
-    # recycle them while kernel A is still in flight. Without this, repeated
-    # iterations hang because the allocator hands the same memory to the next
-    # dispatch's allocations before kernel A has consumed the queue / read recv_x.
+    # recycle them while kernel A is still in flight.
     for t in (
-        recv_x,
+        pool,
         postact_a,
         consumer_head,
-        handle.tile_records_recv_x_rows,
-        handle.tile_records_expert_id,
+        handle.tile_id_to_expert,
+        handle.expert_pool_block_offset,
         handle.tile_ready,
     ):
         t.record_stream(compute_a_stream)
 
-    # Kernel A on its own stream so it overlaps with dispatch's tail / slot_assign.
+    # Kernel A on its own stream so it overlaps with dispatch's tail.
     with torch.cuda.stream(compute_a_stream):
         streaming_moe_a(
-            recv_x,
+            pool,
             w1_local,
             postact_a,
-            handle.tile_records_recv_x_rows,
-            handle.tile_records_expert_id,
+            handle.tile_id_to_expert,
+            handle.expert_pool_block_offset,
             handle.tile_ready,
             consumer_head,
             dispatch_seq=handle.dispatch_seq,
