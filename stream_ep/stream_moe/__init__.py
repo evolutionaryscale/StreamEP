@@ -5,9 +5,9 @@ Public surface:
   - ``streaming_kernel_a.fire_tiles_with_delay`` — test-only producer for the
     cross-stream tile_ready signal.
   - ``streaming_tile_scheduler.StreamingTileScheduler`` /
-    ``StreamingTileSchedulerArguments`` / ``StreamingWorkTileInfo`` — the
-    linear-claim + per-tile-ready-spin scheduler that DeepEP's
-    ``Buffer.dispatch`` Pass 2 feeds via ``tile_ready[tile_id]``.
+    ``StreamingTileSchedulerArguments`` — the linear-claim + per-tile-ready-spin
+    scheduler that DeepEP's ``Buffer.dispatch`` Pass 2 feeds via
+    ``tile_ready[tile_id]``.
 
 The streaming additions used to live in the ``quack`` fork; they're hosted here
 so the rest of the streaming-MoE pipeline (DeepEP wrapper, profile/bench/smoke

@@ -18,9 +18,12 @@ isolated to two overrides:
   (2) get_scheduler_arguments — build StreamingTileSchedulerArguments from
       pool-shape metadata.
 
-The `sched_payload_ints = 5` constructor field bumps the scheduler-to-consumer
-SMEM payload to carry tile_id alongside (pid_m, pid_n, batch_idx, is_valid)
-for forward compatibility with kernel Y / combine.
+The streaming scheduler uses the upstream 4-int sched payload
+(pid_m, pid_n, batch_idx, is_valid) — no streaming-specific SMEM extension.
+Kernel A's mainloop and postact path land at the right pool rows via
+`cu_seqlens_m[batch_idx] + pid_m * tile_m` alone; tile_id is computed
+locally inside the scheduler warp's queue-pull and used only for the
+ready-spin and to derive expert_id/pid_m.
 """
 
 from __future__ import annotations
@@ -82,15 +85,6 @@ class StreamingMoeASm90(GemmGatedSm90):
     queue-pull scheduler. Pool layout means kernel A uses the base GEMM
     mainloop's varlen_m path verbatim — no per-tile gather indirection.
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Bump the scheduler-to-consumer SMEM payload from 4 ints
-        # (pid_m, pid_n, batch_idx, is_valid) to 5 ints (adds tile_id). tile_id
-        # is not consumed by kernel A's mainloop or postact path — both use
-        # batch_idx + pid_m via cu_seqlens_m — but is propagated through the
-        # scheduler payload for forward compatibility with kernel Y / combine.
-        self.sched_payload_ints = 5
 
     @cute.jit
     def __call__(

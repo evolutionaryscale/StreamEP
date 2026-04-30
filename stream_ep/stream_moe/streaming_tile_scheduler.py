@@ -14,6 +14,13 @@ in expert-major order at substream end. Linear claim order == tile_id order ==
 expert-major order, so 80 CTAs naturally converge on the same expert at the
 same time and L2 holds 1-2 W1[e] slabs throughout.
 
+Scheduler payload (sched_smem): the upstream 4-int layout
+``(pid_m, pid_n, batch_idx, is_valid)``. tile_id is computed locally in the
+scheduler warp's `_fetch_next_work_idx` (used for the spin and to derive
+expert_id/pid_m) but not propagated to consumer warps — kernel A's mainloop
+and postact path both hit the right pool rows via
+``cu_seqlens_m[batch_idx] + pid_m * tile_m`` alone.
+
 This file lives outside the quack tree so the streaming-MoE additions can be
 maintained alongside the rest of the streaming-MoE pipeline in evolutionaryscale.
 The base TileScheduler + supporting infrastructure (PipelineStateWAdvance,
@@ -32,24 +39,6 @@ from quack.pipeline import PipelineStateWAdvance
 from quack.tile_scheduler import PersistenceMode, TileScheduler
 
 from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import ld_acquire_sys_global
-
-
-class StreamingWorkTileInfo(cutlass.utils.WorkTileInfo):
-    """WorkTileInfo variant whose tile_idx carries 4 ints (pid_m, pid_n, tile_id,
-    batch_idx) rather than the standard 3 ints + None-K-slot. Used by
-    StreamingTileScheduler so the consumer's gather/postact paths can read
-    tile_id directly from work_tile.tile_idx[2].
-    """
-
-    def __new_from_mlir_values__(self, values: list) -> "StreamingWorkTileInfo":
-        assert (
-            len(values) == 5
-        ), f"StreamingWorkTileInfo expects 5 values, got {len(values)}"
-        new_tile_idx = cutlass.new_from_mlir_values(self._tile_idx, values[:-1])
-        new_is_valid_tile = cutlass.new_from_mlir_values(
-            self._is_valid_tile, [values[-1]]
-        )
-        return StreamingWorkTileInfo(new_tile_idx, new_is_valid_tile)
 
 
 @dataclass
@@ -110,15 +99,12 @@ class StreamingTileScheduler(TileScheduler):
     and L2 holds 1-2 W1[e] slabs throughout. No active-expert window or
     work-stealing logic in the scheduler.
 
-    The work tile produced for the consumer warps carries:
+    The work tile produced for the consumer warps carries the upstream-shape
+    tuple `(pid_m, pid_n, None, batch_idx)`:
       - `pid_m = tile_in_e` (drives the cu_seqlens_m row offset)
       - `pid_n` (the N-stripe)
-      - `tile_id` (used by epi_setup_postact for the per-tile postact_a slab)
+      - K-slot is unused (None), matching VarlenMTileScheduler's convention
       - `batch_idx = expert_id` (used by the kernel body to select W1[e])
-
-    INTEGRATION NOTE: 5 ints in the sched payload — (pid_m, pid_n, tile_id,
-    batch_idx, is_valid). tile_id is carried alongside (pid_m, expert_id)
-    because the postact_a destination is still tile-id-keyed.
     """
 
     @dataclass
@@ -161,7 +147,6 @@ class StreamingTileScheduler(TileScheduler):
         self,
         current_work_idx: Int32,
         num_tiles_executed: Int32,
-        current_tile_id: Int32,
         current_expert: Int32,
         current_pid_m: Int32,
         current_pid_n: Int32,
@@ -175,9 +160,6 @@ class StreamingTileScheduler(TileScheduler):
     ):
         # Streaming scheduler state, persisted across the persistent loop's
         # iterations via the MLIR pytree round-trip:
-        #   _current_tile_id: tile_id derived from the most recent linear claim.
-        #     Carried as tile_coord_mnkl[2] so the postact_a destination override
-        #     can compute `tile_id * tile_m` row offset.
         #   _current_expert: tile_id_to_expert[tile_id] for the current tile;
         #     surfaced via tile_coord_mnkl[3] for W1[e] selection.
         #   _current_pid_m: tile_in_e = tile_id - expert_pool_block_offset[expert_id].
@@ -186,9 +168,11 @@ class StreamingTileScheduler(TileScheduler):
         #     correct pool row.
         #   _current_pid_n: the N-stripe of the most recently claimed work,
         #     surfaced via tile_coord_mnkl[1].
+        # tile_id is computed locally in `_fetch_next_work_idx` (used for the
+        # ready spin and to derive expert_id/pid_m); not stashed on self
+        # because no consumer code reads it.
         self._current_work_idx = current_work_idx
         self.num_tiles_executed = num_tiles_executed
-        self._current_tile_id = current_tile_id
         self._current_expert = current_expert
         self._current_pid_m = current_pid_m
         self._current_pid_n = current_pid_n
@@ -226,7 +210,6 @@ class StreamingTileScheduler(TileScheduler):
         return StreamingTileScheduler(
             current_work_idx=Int32(-1),
             num_tiles_executed=Int32(0),
-            current_tile_id=Int32(-1),
             current_expert=Int32(0),
             current_pid_m=Int32(0),
             current_pid_n=Int32(0),
@@ -289,7 +272,6 @@ class StreamingTileScheduler(TileScheduler):
         linear_idx = cute.arch.shuffle_sync(linear_idx, 0)
 
         is_valid_i32 = Int32(linear_idx < total_work)
-        tile_id = Int32(-1)
         pid_n = Int32(0)
         pid_m = Int32(0)
         expert_id = Int32(0)
@@ -306,7 +288,6 @@ class StreamingTileScheduler(TileScheduler):
             expert_id = cute.arch.shuffle_sync(expert_id, 0)
             pid_m = cute.arch.shuffle_sync(pid_m, 0)
 
-        self._current_tile_id = tile_id
         self._current_expert = expert_id
         self._current_pid_m = pid_m
         self._current_pid_n = pid_n
@@ -327,23 +308,26 @@ class StreamingTileScheduler(TileScheduler):
         if const_expr(is_valid is None):
             is_valid = work_idx != Int32(0)
         # tile_coord_mnkl[0] (pid_m): tile_in_e — drives varlen_m m-offset.
-        # tile_coord_mnkl[2] (the K slot): tile_id — propagated for kernel Y / combine.
-        # tile_coord_mnkl[3] (batch_idx): expert_id — used by kernel body for W1[e].
+        # tile_coord_mnkl[2] (the K slot): None — same convention as
+        #   VarlenMTileScheduler. Kernel A's mainloop and postact path don't
+        #   read it; kernel Y will reconstruct tile_id from
+        #   `expert_pool_block_offset[batch_idx] + pid_m` if it needs the
+        #   per-pool-slot reverse-map index.
+        # tile_coord_mnkl[3] (batch_idx): expert_id — kernel body W1[e] select.
         tile_coord_mnkl = (
             self._current_pid_m,
             self._current_pid_n,
-            self._current_tile_id,
+            None,
             self._current_expert,
         )
-        return StreamingWorkTileInfo(tile_coord_mnkl, is_valid)
+        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
     @cute.jit
     def write_work_tile_to_smem(
         self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
     ):
-        """Write 5 ints to _sched_smem: (pid_m, pid_n, tile_id, batch_idx=expert_id, is_valid).
-        The 5th int (tile_id) is the streaming-specific extension; the consumer
-        warps' get_current_work reader needs to unpack 5 ints in streaming mode.
+        """Write 4 ints to _sched_smem: (pid_m, pid_n, batch_idx=expert_id, is_valid).
+        Matches the upstream payload layout — no streaming-specific extension.
         """
         params = self.params
         if const_expr(self._sched_smem is not None):
@@ -357,19 +341,19 @@ class StreamingTileScheduler(TileScheduler):
             sched_data = [
                 work_tile_info.tile_idx[0],  # pid_m
                 work_tile_info.tile_idx[1],  # pid_n
-                work_tile_info.tile_idx[2],  # tile_id (repurposed K slot)
                 work_tile_info.tile_idx[3],  # batch_idx = expert_id
                 Int32(work_tile_info.is_valid_tile),
             ]
             lane_idx = cute.arch.lane_idx()
             # Streaming uses cluster_shape_mnk = (1, 1, 1); multi-cluster would
-            # need store_shared_remote_x5 (vs existing store_shared_remote_x4).
+            # need store_shared_remote_x4 across clusters, which is what
+            # upstream already implements for the 4-int payload.
             assert (
                 cute.size(params.cluster_shape_mnk) == 1
             ), "StreamingTileScheduler currently requires cluster_shape == (1,1,1)"
             if lane_idx < cute.size(params.cluster_shape_mnk):
                 pipeline_idx = self._pipeline_state.index
-                for i in cutlass.range_constexpr(5):
+                for i in cutlass.range_constexpr(4):
                     self._sched_smem[i, pipeline_idx] = sched_data[i]
                 self._scheduler_pipeline.producer_commit(self._pipeline_state)
 
@@ -389,15 +373,14 @@ class StreamingTileScheduler(TileScheduler):
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
-        """Streaming variant: unpacks 5 ints from sched_smem
-        (pid_m, pid_n, tile_id, batch_idx=expert_id, is_valid). The tile_id is
-        carried in tile_coord_mnkl[2] (the K slot — unused in GEMM context) so
-        the consumer (gather setup, postact setup) can read it.
+        """Read the upstream 4-int payload from sched_smem
+        (pid_m, pid_n, batch_idx=expert_id, is_valid) and produce a
+        WorkTileInfo with tile_idx ``(pid_m, pid_n, None, batch_idx)``.
         """
         params = self.params
         self._scheduler_pipeline.consumer_wait(self._pipeline_state)
-        pid_m, pid_n, tile_id, batch_idx, is_valid_i32 = [
-            self._sched_smem[i, self._pipeline_state.index] for i in range(5)
+        pid_m, pid_n, batch_idx, is_valid_i32 = [
+            self._sched_smem[i, self._pipeline_state.index] for i in range(4)
         ]
         if const_expr(cute.size(params.cluster_shape_mnk) > 1):
             cute.arch.fence_view_async_shared()
@@ -405,8 +388,8 @@ class StreamingTileScheduler(TileScheduler):
         with cute.arch.elect_one():
             self._scheduler_pipeline.consumer_release(self._pipeline_state)
         self._pipeline_state.advance()
-        tile_coord_mnkl = (pid_m, pid_n, tile_id, batch_idx)
-        return StreamingWorkTileInfo(tile_coord_mnkl, Boolean(is_valid_i32))
+        tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
+        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid_i32))
 
     @cute.jit
     def advance_to_next_work(
@@ -435,7 +418,6 @@ class StreamingTileScheduler(TileScheduler):
         for obj in [
             self._current_work_idx,
             self.num_tiles_executed,
-            self._current_tile_id,
             self._current_expert,
             self._current_pid_m,
             self._current_pid_n,
@@ -455,7 +437,6 @@ class StreamingTileScheduler(TileScheduler):
             [
                 self._current_work_idx,
                 self.num_tiles_executed,
-                self._current_tile_id,
                 self._current_expert,
                 self._current_pid_m,
                 self._current_pid_n,
