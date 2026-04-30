@@ -35,7 +35,10 @@ import torch
 import torch.distributed as torch_dist
 import torch.profiler
 from deep_ep import Buffer as DeepEPBuffer
-from quack.moe_streaming_sm90 import streaming_moe_a
+
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    streaming_moe_a,
+)
 
 # Compact-but-meaningful config. Smaller than production but large enough that
 # kernel A has nontrivial compute time and total_tiles > num_persistent_ctas

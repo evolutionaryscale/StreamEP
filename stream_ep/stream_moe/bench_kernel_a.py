@@ -27,7 +27,10 @@ import torch
 import torch.distributed as torch_dist
 from deep_ep import Buffer as DeepEPBuffer
 from quack.gemm_act import gemm_act
-from quack.moe_streaming_sm90 import streaming_moe_a
+
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    streaming_moe_a,
+)
 
 H = 2048
 I = 2048
