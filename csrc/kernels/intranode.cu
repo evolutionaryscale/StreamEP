@@ -327,6 +327,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
                                                            float* recv_topk_weights,
                                                            int* recv_channel_offset,
                                                            int* send_head,
+                                                           int* per_token_remaining,
                                                            const int4* x,
                                                            const float* x_scales,
                                                            const topk_idx_t* topk_idx,
@@ -724,8 +725,15 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
                     }
 #endif
 
-                    // Per-pool-slot scalar writes.
+                    // Per-pool-slot scalar writes + per-recv-token K_local count.
+                    // Intranode: each recv-token is delivered by exactly one
+                    // substream, so the K_local count emitted here is final
+                    // (no cross-substream accumulation needed). Pass 2's
+                    // __threadfence_system + tile_ready release-store sequence
+                    // after this make per_token_remaining[r] visible to kernel Y
+                    // before kernel Y's first atomicSub on the same address.
                     if (lane_id == 0) {
+                        int k_local_count = 0;
                         for (int k = 0; k < num_topk; ++k) {
                             int slot = slot_row[k];
                             if (slot < 0) continue;
@@ -733,7 +741,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
                                 channel_topk_weights_buffers.buffer() + token_idx_in_buffer * num_topk + k);
                             pool_recv_token[slot] = recv_token_id;
                             pool_k_slot[slot] = k;
+                            ++k_local_count;
                         }
+                        if (k_local_count > 0)
+                            per_token_remaining[recv_token_id] = k_local_count;
                     }
 
                     // x_scales: per-(slot, scales_idx). Lanes split scales_idx within K.
@@ -815,6 +826,7 @@ void dispatch(void* pool,
               float* recv_topk_weights,
               int* recv_channel_offset,
               int* send_head,
+              int* per_token_remaining,
               const void* x,
               const float* x_scales,
               const topk_idx_t* topk_idx,
@@ -870,6 +882,7 @@ void dispatch(void* pool,
                       recv_topk_weights,                                 \
                       recv_channel_offset,                               \
                       send_head,                                         \
+                      per_token_remaining,                               \
                       reinterpret_cast<const int4*>(x),                  \
                       x_scales,                                          \
                       topk_idx,                                          \

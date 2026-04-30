@@ -54,6 +54,15 @@ class StreamingHandle:
     # order across substream blocks — preserves wave caching of W1[e].
     tile_ready: torch.Tensor                   # [total_tiles] int64
 
+    # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers (Phase C).
+    # All allocated on comm_stream; cross-stream visibility carried by the per-tile
+    # release/acquire pairs `tile_ready` (dispatch→A), `a_ready` (A→Y), and
+    # `compute_done_per_token` (Y→combine).
+    a_ready: torch.Tensor                      # [total_tiles] int64 — A→Y per-tile release stamp (zero-init)
+    per_token_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
+    compute_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
+    o: torch.Tensor                            # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
+
     total_tiles: int
     tile_m: int
     dispatch_seq: int
@@ -441,6 +450,7 @@ class Buffer:
          rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
          expert_frequency, expert_pool_block_offset, base_pool,
          tile_id_to_expert, pool_arrival_target, tile_ready,
+         a_ready, per_token_remaining, compute_done_per_token, o,
          total_tiles, event) = outputs
 
         handle = StreamingHandle(
@@ -462,6 +472,10 @@ class Buffer:
             tile_id_to_expert=tile_id_to_expert,
             pool_arrival_target=pool_arrival_target,
             tile_ready=tile_ready,
+            a_ready=a_ready,
+            per_token_remaining=per_token_remaining,
+            compute_done_per_token=compute_done_per_token,
+            o=o,
             total_tiles=total_tiles,
             tile_m=tile_m,
             dispatch_seq=dispatch_seq,

@@ -183,7 +183,28 @@ def main():
                 f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
             )
 
-    # ─── (6) Bit-determinism — re-run with same inputs, expect identical pool layout.
+    # ─── (6) Phase C buffer initialization. per_token_remaining[r] should equal
+    #         K_local(r) (the count of local-expert landings for recv-token r),
+    #         which is also the count of pool slots for r. compute_done_per_token
+    #         and o (and a_ready) should be zero-init.
+    per_token_remaining = handle.per_token_remaining.cpu()
+    assert per_token_remaining.shape == (T_recv,), (
+        f"per_token_remaining shape {per_token_remaining.shape} != ({T_recv},)"
+    )
+    expected_k_local = (expected_recv_topk_local >= 0).sum(dim=1).to(torch.int32)
+    assert torch.equal(per_token_remaining, expected_k_local), (
+        f"per_token_remaining mismatch; first deviating r: "
+        f"{(per_token_remaining != expected_k_local).nonzero().flatten()[:8]}"
+    )
+    compute_done = handle.compute_done_per_token.cpu()
+    assert (compute_done == 0).all(), "compute_done_per_token should be zero-init"
+    a_ready_t = handle.a_ready[:total_tiles].cpu()
+    assert (a_ready_t == 0).all(), "a_ready should be zero-init"
+    o_t = handle.o.cpu()
+    assert o_t.shape == (T_recv, hidden), f"o shape {o_t.shape} != ({T_recv}, {hidden})"
+    assert (o_t == 0).all(), "o should be zero-init"
+
+    # ─── (7) Bit-determinism — re-run with same inputs, expect identical pool layout.
     pool2, handle2, _ = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,
         tile_m=tile_m, dispatch_seq=2,

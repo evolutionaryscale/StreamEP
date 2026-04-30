@@ -502,8 +502,12 @@ std::tuple<torch::Tensor,                  // 0  pool
            torch::Tensor,                  // 15 tile_id_to_expert
            torch::Tensor,                  // 16 pool_arrival_target
            torch::Tensor,                  // 17 tile_ready
-           int,                            // 18 total_tiles
-           std::optional<EventHandle>>     // 19 event
+           torch::Tensor,                  // 18 a_ready
+           torch::Tensor,                  // 19 per_token_remaining
+           torch::Tensor,                  // 20 compute_done_per_token
+           torch::Tensor,                  // 21 o
+           int,                            // 22 total_tiles
+           std::optional<EventHandle>>     // 23 event
 Buffer::intranode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
                            const torch::Tensor& topk_idx,
@@ -686,6 +690,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto pool_arrival_target = torch::empty({total_tiles}, i32_opts);
     auto pool_arrival_count = torch::zeros({total_tiles}, i32_opts);
     auto tile_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
+    // a_ready[total_tiles]: kernel A → kernel Y per-tile release stamp. Allocated
+    // here on comm_stream so kernel A's release-store transitively observes the
+    // zero-init via the dispatch → A `tile_ready` acquire chain (same pattern as
+    // pool / tile_ready themselves).
+    auto a_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
     intranode::tile_arrays_init(expert_frequency.data_ptr<int>(),
                                 expert_pool_block_offset.data_ptr<int>(),
                                 tile_id_to_expert.data_ptr<int>(),
@@ -694,6 +703,20 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                 total_tiles,
                                 tile_m,
                                 comm_stream);
+
+    // ── Per-recv-token arrays for kernel Y's atomic-scatter epilogue + the
+    // eventual Phase D combine sender's per-token gate.
+    //   per_token_remaining: dispatch's Pass B writes K_local(r); kernel Y
+    //     atomicSubs on each contribution and release-stores compute_done on
+    //     hit-zero. Zero-init so unused slots stay 0 (no spurious decrements).
+    //   compute_done_per_token: int64 per-token release-store target (kernel Y
+    //     → combine sender). Zero-init; combine sender's spin condition is
+    //     `>= combine_seq` so stale-zero safely fails the spin.
+    //   o: per-recv-token output buffer (kernel Y atomicAdds into o[r, :]).
+    //     Zero-init; matches x's dtype for combine-side wire compatibility.
+    auto per_token_remaining = torch::zeros({num_recv_tokens}, i32_opts);
+    auto compute_done_per_token = torch::zeros({num_recv_tokens}, dtype(torch::kInt64).device(torch::kCUDA));
+    auto o = torch::zeros({num_recv_tokens, hidden}, x.options());
 
     EP_HOST_ASSERT(
         num_ranks * num_ranks * sizeof(int) +
@@ -716,6 +739,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         recv_topk_weights.data_ptr<float>(),
                         recv_channel_prefix_matrix.data_ptr<int>(),
                         send_head.data_ptr<int>(),
+                        per_token_remaining.data_ptr<int>(),
                         x.data_ptr(),
                         x_scales_ptr,
                         topk_idx.data_ptr<topk_idx_t>(),
@@ -751,7 +775,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         recv_topk_weights, recv_src_idx, send_head,
                         rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
                         expert_frequency, expert_pool_block_offset, base_pool,
-                        tile_id_to_expert, pool_arrival_target, pool_arrival_count, tile_ready}) {
+                        tile_id_to_expert, pool_arrival_target, pool_arrival_count, tile_ready,
+                        a_ready, per_token_remaining, compute_done_per_token, o}) {
             t.record_stream(comm_stream);
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
@@ -791,6 +816,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             tile_id_to_expert,
             pool_arrival_target,
             tile_ready,
+            a_ready,
+            per_token_remaining,
+            compute_done_per_token,
+            o,
             total_tiles,
             event};
 }

@@ -197,8 +197,12 @@ public:
     //   15 tile_id_to_expert     Tensor[total_tiles]         per-tile expert lookup
     //   16 pool_arrival_target   Tensor[total_tiles]         per-tile write count for tile_ready firing
     //   17 tile_ready            Tensor[total_tiles] int64   per-tile release stamp
-    //   18 total_tiles           int                         scalar count
-    //   19 event                 optional<EventHandle>
+    //   18 a_ready               Tensor[total_tiles] int64   per-tile kernel-A→Y release stamp (zero-init)
+    //   19 per_token_remaining   Tensor[T_recv] int32        K_local(r); kernel Y atomicSubs
+    //   20 compute_done_per_token  Tensor[T_recv] int64      per-token Y→combine release stamp (zero-init)
+    //   21 o                     Tensor[T_recv, hidden]      kernel Y atomic-scatter destination (zero-init)
+    //   22 total_tiles           int                         scalar count
+    //   23 event                 optional<EventHandle>
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                torch::Tensor,
@@ -208,6 +212,10 @@ public:
                torch::Tensor,
                torch::Tensor,
                std::vector<int>,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
