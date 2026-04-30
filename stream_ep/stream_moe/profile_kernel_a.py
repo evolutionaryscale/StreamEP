@@ -100,24 +100,28 @@ def one_step(
     )
 
     total_tiles = handle.total_tiles
-    postact_a = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=pool.device)
-    consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
-    # Tensors allocated on the comm/default stream are about to be read+written
-    # on compute_a_stream. record_stream tells the caching allocator not to
-    # recycle them while kernel A is still in flight.
+    # record_stream tells the caching allocator not to recycle these tensors
+    # while kernel A is still in flight. Their *contents* are made visible to
+    # compute_a_stream by the per-tile tile_ready release/acquire pair (kernel
+    # A's spin acquire-loads tile_ready[i] >= dispatch_seq, which pairs with
+    # dispatch's release-store; that pair flushes all prior dispatch-side
+    # writes including handle.tile_id_to_expert and handle.expert_pool_block_offset).
     for t in (
         pool,
-        postact_a,
-        consumer_head,
         handle.tile_id_to_expert,
         handle.expert_pool_block_offset,
         handle.tile_ready,
     ):
         t.record_stream(compute_a_stream)
 
-    # Kernel A on its own stream so it overlaps with dispatch's tail.
+    # Allocate postact_a + launch kernel A on compute_a_stream. Allocating on
+    # the same stream as the kernel keeps torch's zero-init / empty memory
+    # naturally ordered with the kernel's TMA stores — no cross-stream race.
+    # streaming_moe_a internally allocates its consumer_head counter on the
+    # current stream too.
     with torch.cuda.stream(compute_a_stream):
+        postact_a = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=pool.device)
         streaming_moe_a(
             pool,
             w1_local,
@@ -125,7 +129,6 @@ def one_step(
             handle.tile_id_to_expert,
             handle.expert_pool_block_offset,
             handle.tile_ready,
-            consumer_head,
             dispatch_seq=handle.dispatch_seq,
             tile_m=TILE_M,
             tile_n=TILE_N,

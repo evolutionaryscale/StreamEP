@@ -189,11 +189,9 @@ def main():
     se_streaming_us = None
     se_gated_us = None
     for tile_n in (128, 256):
-        consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
         postact_se = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=device)
 
         def run_streaming_se():
-            consumer_head.zero_()
             streaming_moe_a(
                 pool,
                 w1_local,
@@ -201,7 +199,6 @@ def main():
                 handle.tile_id_to_expert,
                 expert_pool_block_offset_se,
                 handle.tile_ready,
-                consumer_head,
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=TILE_M,
                 tile_n=tile_n,
@@ -255,13 +252,11 @@ def main():
 
     streaming_us = None
     for tile_n in (128, 256):
-        consumer_head = torch.zeros(1, dtype=torch.int32, device=device)
         postact_streaming = torch.empty(
             total_tiles, TILE_M, I, dtype=DTYPE, device=device
         )
 
         def run_streaming():
-            consumer_head.zero_()
             streaming_moe_a(
                 pool,
                 w1_local,
@@ -269,7 +264,6 @@ def main():
                 handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 handle.tile_ready,
-                consumer_head,
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=TILE_M,
                 tile_n=tile_n,
