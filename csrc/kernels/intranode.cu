@@ -10,62 +10,6 @@ namespace deep_ep {
 namespace intranode {
 
 
-// Sender-side per-(dst_rank, channel) token counts. One block per destination rank
-// scans this rank's `is_token_in_rank` channel-locally and produces the cumulative
-// `channel_prefix_matrix[num_ranks, num_channels]` consumed by the dispatch sender
-// and combine. No cross-rank exchange; receiver-side metadata (num_recv, per-expert
-// counts, rank_prefix_matrix) is produced by `streaming_metadata_init` from
-// `recv_count`. See new_design.md §"The count exchange".
-template <int kNumRanks>
-__global__ void notify_dispatch(int num_tokens,
-                                int num_channels,
-                                const bool* is_token_in_rank,
-                                int* channel_prefix_matrix) {
-    auto dst_rank = static_cast<int>(blockIdx.x);
-    auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
-    auto lane_id = thread_id % 32, warp_id = thread_id / 32, num_warps = num_threads / 32;
-
-    for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
-        int token_start_idx, token_end_idx;
-        get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
-
-        int count = 0;
-        for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32)
-            count += is_token_in_rank[i * kNumRanks + dst_rank];
-        count = warp_reduce_sum(count);
-        if (elect_one_sync())
-            channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
-    }
-    __syncthreads();
-
-    if (thread_id == 0) {
-        #pragma unroll
-        for (int i = 1; i < num_channels; ++i)
-            channel_prefix_matrix[dst_rank * num_channels + i] += channel_prefix_matrix[dst_rank * num_channels + i - 1];
-    }
-}
-
-void notify_dispatch(int num_ranks,
-                     int num_tokens,
-                     const bool* is_token_in_rank,
-                     int* channel_prefix_matrix,
-                     cudaStream_t stream,
-                     int num_channels) {
-#define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)   \
-    LAUNCH_KERNEL(&cfg,                      \
-                  notify_dispatch<ranks>,    \
-                  num_tokens,                \
-                  num_channels,              \
-                  is_token_in_rank,          \
-                  channel_prefix_matrix);    \
-    break
-
-    constexpr int kNumThreads = 128;
-    SETUP_LAUNCH_CONFIG(num_ranks, kNumThreads, stream);
-    SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
-#undef NOTIFY_DISPATCH_LAUNCH_CASE
-}
-
 // Streaming-MoE count exchange.
 //
 // Two-phase design, no cross-rank atomicAdds:
@@ -612,7 +556,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            const topk_idx_t* topk_idx,
                                                            const float* topk_weights,
                                                            const bool* is_token_in_rank,
-                                                           const int* channel_prefix_matrix,
+                                                           int* channel_prefix_matrix,
                                                            int num_tokens,
                                                            int num_worst_tokens,
                                                            int hidden_int4,
@@ -707,13 +651,30 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
-        // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
-        // NOTES: this is for distinguishing zero tokens
-        if (send_warp_id_in_rank == 0 and elect_one_sync()) {
-            int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
-            st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
-            value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
-            st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
+        // Compute the channel-prefix locally over `is_token_in_rank` (folded
+        // notify_dispatch). One warp per (channel, dst_rank) pair scans tokens
+        // [0, channel_end_of_c) and splits the count into start (i < channel_start)
+        // and end (full range) using lane-strided accumulation + warp_reduce.
+        if (send_warp_id_in_rank == 0) {
+            int channel_start, channel_end;
+            get_channel_task_range(num_tokens, num_channels, responsible_channel, channel_start, channel_end);
+            int start_count = 0, end_count = 0;
+            for (int i = lane_id; i < channel_end; i += 32) {
+                int v = is_token_in_rank[i * kNumRanks + responsible_rank];
+                if (i < channel_start) start_count += v;
+                else end_count += v;
+            }
+            start_count = warp_reduce_sum(start_count);
+            end_count = warp_reduce_sum(end_count) + start_count;
+
+            // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
+            // NOTES: this is for distinguishing zero tokens
+            if (elect_one_sync()) {
+                st_relaxed_sys_global(channel_start_offset.buffer(), -start_count - 1);
+                st_relaxed_sys_global(channel_end_offset.buffer(), -end_count - 1);
+                // Persist inclusive cumulative through this channel for combine.
+                channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = end_count;
+            }
         }
         __syncwarp();
 
@@ -963,7 +924,7 @@ void dispatch(void* recv_x,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               const bool* is_token_in_rank,
-              const int* channel_prefix_matrix,
+              int* channel_prefix_matrix,
               int num_tokens,
               int num_worst_tokens,
               int hidden_int4,

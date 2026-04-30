@@ -402,7 +402,7 @@ class Buffer:
     ) -> 'StreamingMetadata':
         """Pre-compute the prefix-sum metadata derived from a ``recv_count`` table.
 
-        Single GPU kernel; subsumes notify_dispatch's receiver-side metadata. Writes
+        Single GPU kernel. Writes
         ``num_recv``, ``num_recv_per_expert`` (aligned), and ``total_tiles`` to the
         Buffer's host-mapped sync slots (polled by the dispatch flow as a single sync
         per layer). Returns the GPU-side derivatives plus this rank's column of
@@ -440,9 +440,10 @@ class Buffer:
                   torch.Tensor, torch.Tensor, 'StreamingHandle', EventOverlap]:
         """Streaming-MoE consolidated dispatch.
 
-        Folds notify_dispatch (sender-side channel prefix), streaming_count_exchange,
-        streaming_metadata_init, the dispatch main kernel, and streaming_slot_assign
-        into one host call with a single host sync per layer (the combined poll on
+        Folds streaming_count_exchange, streaming_metadata_init, the dispatch main
+        kernel (which absorbs the sender-side channel-prefix scan that used to live
+        in a separate notify_dispatch kernel), and streaming_slot_assign into one
+        host call with a single host sync per layer (the combined poll on
         ``{moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}``).
 
         Arguments:

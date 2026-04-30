@@ -49,16 +49,6 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 // Intranode kernels
 namespace intranode {
 
-// Sender-side per-(dst_rank, channel) cumulative token counts. No cross-rank
-// exchange — receiver-side metadata (num_recv, per-expert counts, rank_prefix_matrix)
-// is produced by `streaming_metadata_init` from `recv_count`.
-void notify_dispatch(int num_ranks,
-                     int num_tokens,
-                     const bool* is_token_in_rank,
-                     int* channel_prefix_matrix,
-                     cudaStream_t stream,
-                     int num_channels);
-
 // Streaming-MoE: post-dispatch slot-assignment kernel. Reads recv_topk_idx +
 // metadata, writes tile_records and fires tiles via per-tile `tile_ready[tile_id]`
 // release-store. Pass 2 walks experts in expert-major order so tiles fire onto
@@ -140,7 +130,7 @@ void dispatch(void* recv_x,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               const bool* is_token_in_rank,
-              const int* channel_prefix_matrix,
+              int* channel_prefix_matrix,
               int num_tokens,
               int num_worst_tokens,
               int hidden_int4,

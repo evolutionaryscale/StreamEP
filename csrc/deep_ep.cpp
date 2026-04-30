@@ -588,11 +588,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         moe_recv_expert_counter[i] = -1;
     *streaming_total_tiles = -1;
 
-    // Sender-side channel prefix matrix (local computation, no cross-rank exchange).
+    // Sender-side channel prefix matrix (filled by the dispatch sender preamble —
+    // the old `notify_dispatch` kernel was folded into dispatch). Each (rank, channel)
+    // sender block writes its own cell; combine consumes the full matrix afterward.
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto channel_prefix_matrix = torch::empty({num_ranks, num_channels}, i32_opts);
-    intranode::notify_dispatch(num_ranks, num_tokens, is_token_in_rank.data_ptr<bool>(),
-                               channel_prefix_matrix.data_ptr<int>(), comm_stream, num_channels);
 
     // Cross-rank per-(channel, src, local_expert) count exchange via the IPC slab.
     // Also produces per-(channel, src) unique-token counts (num_recv source).

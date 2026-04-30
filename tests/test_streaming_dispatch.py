@@ -1,8 +1,10 @@
 """End-to-end test for the consolidated streaming-MoE dispatch (intranode).
 
-Exercises ``Buffer.dispatch`` (which folds notify_dispatch + streaming_count_exchange
-+ streaming_metadata_init + dispatch main + slot_assign into a single host call
-with one host sync per layer). Verifies:
+Exercises ``Buffer.dispatch`` (which folds streaming_count_exchange +
+streaming_metadata_init + dispatch main + slot_assign into a single host call
+with one host sync per layer; the sender-side channel-prefix scan that used to
+live in a separate ``notify_dispatch`` kernel is now inline in dispatch's sender
+preamble). Verifies:
 
   1. recv_x correctness — each landed token has the value `x = ones * src_rank`.
   2. recv_topk_idx agrees with the routed-to-this-rank entries from each source.

@@ -181,10 +181,11 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
-    // Streaming-MoE consolidated dispatch (intranode). Fuses notify_dispatch +
-    // streaming_count_exchange + streaming_metadata_init + dispatch main + slot_assign
-    // into a single host call with exactly one host sync (the combined poll on
-    // {moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}).
+    // Streaming-MoE consolidated dispatch (intranode). Fuses streaming_count_exchange
+    // + streaming_metadata_init + dispatch main (which absorbs notify_dispatch's
+    // sender-side prefix scan) + slot_assign into a single host call with exactly
+    // one host sync (the combined poll on {moe_recv_counter, moe_recv_expert_counter,
+    // streaming_total_tiles}).
     //
     // Return tuple (in order):
     //   0  recv_x, 1 recv_x_scales, 2 recv_topk_idx, 3 recv_topk_weights,
@@ -239,8 +240,7 @@ public:
     //     pair counts (one increment per (chunk, k) routed to a local expert).
     //   recv_unique_per_source[num_channels, num_ranks] int32 — per-(channel, src)
     //     UNIQUE token counts (one increment per token regardless of how many of
-    //     this rank's local experts it routes to). Subsumes notify_dispatch's
-    //     receiver-side sums; sums to num_recv.
+    //     this rank's local experts it routes to). Sums to num_recv.
     std::tuple<torch::Tensor, torch::Tensor>
     streaming_count_exchange(const torch::Tensor& topk_idx, int num_experts, int num_sms);
 
