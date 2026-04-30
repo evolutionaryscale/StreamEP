@@ -83,18 +83,6 @@ private:
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
 
-    // Stream for streaming_slot_assign — runs concurrently with the dispatch main
-    // kernel. slot_assign blocks acquire-spin on `substream_ready[c, s]` and start
-    // firing tile_ready_queue pushes as soon as each substream lands, instead of
-    // waiting for the entire dispatch to complete on comm_stream.
-    at::cuda::CUDAStream slot_assign_stream;
-
-    // Per-(channel, src_rank) "this substream's recv_topk_idx is fully written"
-    // signal. Released by the dispatch main kernel's receiver block at the end of
-    // each substream's processing; acquire-loaded by streaming_slot_assign at block
-    // entry. Reset to 0 at the start of every dispatch via cudaMemsetAsync.
-    int* substream_ready = nullptr;
-
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
 
@@ -181,35 +169,45 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
-    // Streaming-MoE consolidated dispatch (intranode). Fuses streaming_count_exchange
-    // + streaming_metadata_init + dispatch main (which absorbs notify_dispatch's
-    // sender-side prefix scan) + slot_assign into a single host call with exactly
-    // one host sync (the combined poll on {moe_recv_counter, moe_recv_expert_counter,
-    // streaming_total_tiles}).
+    // Streaming-MoE consolidated dispatch (intranode, pool layout). Single host
+    // call producing pool-shape outputs. Two kernel launches + one host sync:
+    //   1. streaming_dispatch_metadata: fused count_exchange + metadata derivation.
+    //   2. host poll on {moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}.
+    //   3. tile_arrays_init: per-tile (tile_id_to_expert, pool_arrival_target).
+    //   4. dispatch: pool-layout receiver writes pool[TK_padded, H], pool_x_scales,
+    //      pool_topk_weight, pool_recv_token, pool_k_slot. Pass 2 fires tile_ready
+    //      in expert-major order (preserves wave caching of W1[e]).
     //
-    // Return tuple (in order):
-    //   0  recv_x, 1 recv_x_scales, 2 recv_topk_idx, 3 recv_topk_weights,
-    //   4  num_recv_tokens_per_expert_list,
-    //   5  rank_prefix_matrix, 6 channel_prefix_matrix, 7 recv_channel_prefix_matrix,
-    //   8  recv_src_idx, 9 send_head,
-    //   10 recv_count, 11 expert_frequency, 12 expert_frequency_offset, 13 base,
-    //   14 cumulative_tiles_before_e, 15 per_source_rank_remaining,
-    //   16 tile_records_recv_x_rows, 17 tile_records_k_slots, 18 tile_records_expert_id,
-    //   19 tile_remaining, 20 tile_ready,
-    //   21 total_tiles (int),
-    //   22 EventHandle.
+    // Return tuple:
+    //   0  pool                  Tensor[TK_padded, hidden]   pool data (expert-major, BLOCK_M-padded)
+    //   1  pool_x_scales         optional<Tensor>            FP8 scales (pool-layout)
+    //   2  pool_topk_weight      Tensor[TK_padded]           per-pool-slot weight
+    //   3  pool_recv_token       Tensor[TK_padded]           per-pool-slot recv-token id (-1 = padding)
+    //   4  pool_k_slot           Tensor[TK_padded]           per-pool-slot k (-1 = padding)
+    //   5  recv_topk_weights     Tensor[T_recv, num_topk]    per-recv-token weights (combine input)
+    //   6  recv_src_idx          Tensor[T_recv]              recv-token → source token idx (combine input)
+    //   7  send_head             Tensor[T, R]                sender ring slot (combine input)
+    //   8  num_recv_tokens_per_expert_list  vector<int>      per-expert counts (host)
+    //   9  rank_prefix_matrix    Tensor[R, R]                cumulative recv-tokens per source rank
+    //   10 channel_prefix_matrix Tensor[R, num_channels]     sender-side per-(rank, channel) cum count
+    //   11 recv_channel_prefix_matrix  Tensor[R, num_channels]
+    //   12 expert_frequency      Tensor[E_local]             per-expert (token, k) pair count
+    //   13 expert_pool_block_offset    Tensor[E_local + 1]   pool-block prefix-sum (replaces cumulative_tiles_before_e)
+    //   14 base_pool             Tensor[num_channels, R, E_local]  per-substream-per-expert pool slot start
+    //   15 tile_id_to_expert     Tensor[total_tiles]         per-tile expert lookup
+    //   16 pool_arrival_target   Tensor[total_tiles]         per-tile write count for tile_ready firing
+    //   17 tile_ready            Tensor[total_tiles] int64   per-tile release stamp
+    //   18 total_tiles           int                         scalar count
+    //   19 event                 optional<EventHandle>
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                torch::Tensor,
                torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
                std::vector<int>,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
@@ -234,29 +232,6 @@ public:
                        std::optional<EventHandle>& previous_event,
                        bool async,
                        bool allocate_on_comm_stream);
-
-    // Streaming-MoE count exchange. Returns (recv_count, recv_unique_per_source):
-    //   recv_count[num_channels, num_ranks, num_local_experts] int32 — per-(token, k)
-    //     pair counts (one increment per (chunk, k) routed to a local expert).
-    //   recv_unique_per_source[num_channels, num_ranks] int32 — per-(channel, src)
-    //     UNIQUE token counts (one increment per token regardless of how many of
-    //     this rank's local experts it routes to). Sums to num_recv.
-    std::tuple<torch::Tensor, torch::Tensor>
-    streaming_count_exchange(const torch::Tensor& topk_idx, int num_experts, int num_sms);
-
-    // Streaming-MoE pre-compute. Reads recv_count and produces the prefix-sum metadata
-    // derived from the count exchange. All output shapes are known statically — no
-    // padding. total_tiles lands in both a [1] device int32 tensor and the host-mapped
-    // streaming_total_tiles slot; num_recv and num_recv_per_expert are written to the
-    // existing moe_recv_counter / moe_recv_expert_counter host-mapped slots. The
-    // dispatch flow polls these as a single combined sync per layer.
-    // Returns (expert_frequency, expert_frequency_offset, base, cumulative_tiles_before_e,
-    //         per_source_rank_remaining, rank_prefix_matrix, total_tiles_device).
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-               torch::Tensor, torch::Tensor>
-    streaming_metadata_init(const torch::Tensor& recv_count,
-                            const torch::Tensor& recv_unique_per_source,
-                            int tile_m, int expert_alignment);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,

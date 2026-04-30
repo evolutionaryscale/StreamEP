@@ -141,7 +141,6 @@ Buffer::Buffer(int rank,
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
       comm_stream(at::cuda::getStreamFromPool(true)),
-      slot_assign_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -240,15 +239,6 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaMallocHost(&streaming_total_tiles, sizeof(int), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(&streaming_total_tiles_mapped, const_cast<int*>(streaming_total_tiles), 0));
     *streaming_total_tiles = -1;
-
-    // Per-(channel, src_rank) substream-done signal. Sized for the worst case
-    // (max channels = num_device_sms / 2, NUM_MAX_NVL_PEERS source ranks).
-    int max_num_channels = num_device_sms / 2;
-    CUDA_CHECK(cudaMalloc(&substream_ready,
-                          static_cast<size_t>(max_num_channels) * NUM_MAX_NVL_PEERS * sizeof(int)));
-    CUDA_CHECK(cudaMemsetAsync(substream_ready, 0,
-                               static_cast<size_t>(max_num_channels) * NUM_MAX_NVL_PEERS * sizeof(int),
-                               comm_stream));
 }
 
 Buffer::~Buffer() noexcept(false) {
@@ -356,9 +346,6 @@ void Buffer::destroy() {
 
     // Free streaming sync slot
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(streaming_total_tiles)));
-
-    // Free per-substream done signal buffer
-    CUDA_CHECK(cudaFree(substream_ready));
 
     destroyed = true;
     available = false;
@@ -497,29 +484,26 @@ Buffer::get_dispatch_layout(
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
 }
 
-std::tuple<torch::Tensor,
-           std::optional<torch::Tensor>,
-           torch::Tensor,
-           torch::Tensor,
-           std::vector<int>,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           torch::Tensor,
-           int,
-           std::optional<EventHandle>>
+std::tuple<torch::Tensor,                  // 0  pool
+           std::optional<torch::Tensor>,   // 1  pool_x_scales
+           torch::Tensor,                  // 2  pool_topk_weight
+           torch::Tensor,                  // 3  pool_recv_token
+           torch::Tensor,                  // 4  pool_k_slot
+           torch::Tensor,                  // 5  recv_topk_weights
+           torch::Tensor,                  // 6  recv_src_idx
+           torch::Tensor,                  // 7  send_head
+           std::vector<int>,               // 8  num_recv_tokens_per_expert_list
+           torch::Tensor,                  // 9  rank_prefix_matrix
+           torch::Tensor,                  // 10 channel_prefix_matrix
+           torch::Tensor,                  // 11 recv_channel_prefix_matrix
+           torch::Tensor,                  // 12 expert_frequency
+           torch::Tensor,                  // 13 expert_pool_block_offset
+           torch::Tensor,                  // 14 base_pool
+           torch::Tensor,                  // 15 tile_id_to_expert
+           torch::Tensor,                  // 16 pool_arrival_target
+           torch::Tensor,                  // 17 tile_ready
+           int,                            // 18 total_tiles
+           std::optional<EventHandle>>     // 19 event
 Buffer::intranode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
                            const torch::Tensor& topk_idx,
@@ -571,81 +555,71 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
 
-    // Allocate tensors on comm stream if requested.
+    // Snapshot the caller's stream and route ALL torch::empty/zeros allocations
+    // through `comm_stream` for the duration of this function. This makes the
+    // PyTorch caching allocator's events live on `comm_stream` instead of the
+    // caller's stream, so kernels we launch on `comm_stream` see the allocator
+    // events automatically — no extra cross-stream waits needed. The `compute_stream`
+    // sync at the end (non-async path) is what the caller relies on for downstream
+    // ordering. The legacy `allocate_on_comm_stream` parameter is now redundant
+    // (always true) but we keep its presence in the API for callers that pass it.
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
     }
     if (previous_event.has_value())
         stream_wait(comm_stream, previous_event.value());
     else
         stream_wait(comm_stream, compute_stream);
+    at::cuda::setCurrentCUDAStream(comm_stream);
 
-    // Reset host-mapped sync slots before metadata_init writes.
+    // Reset host-mapped sync slots before metadata writes.
     *moe_recv_counter = -1;
     for (int i = 0; i < num_local_experts; ++i)
         moe_recv_expert_counter[i] = -1;
     *streaming_total_tiles = -1;
 
     // Sender-side channel prefix matrix (filled by the dispatch sender preamble —
-    // the old `notify_dispatch` kernel was folded into dispatch). Each (rank, channel)
-    // sender block writes its own cell; combine consumes the full matrix afterward.
+    // the old `notify_dispatch` kernel was folded into dispatch in Phase 1).
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto channel_prefix_matrix = torch::empty({num_ranks, num_channels}, i32_opts);
 
-    // Cross-rank per-(channel, src, local_expert) count exchange via the IPC slab.
-    // Also produces per-(channel, src) unique-token counts (num_recv source).
-    auto recv_count = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
-    auto recv_unique_per_source = torch::empty({num_channels, num_ranks}, i32_opts);
-    intranode::streaming_count_exchange(topk_idx.data_ptr<topk_idx_t>(),
-                                        recv_count.data_ptr<int>(),
-                                        recv_unique_per_source.data_ptr<int>(),
-                                        num_tokens,
-                                        num_topk,
-                                        num_local_experts,
-                                        num_channels,
-                                        streaming_section_offset,
-                                        buffer_ptrs_gpu,
-                                        barrier_signal_ptrs_gpu,
-                                        rank,
-                                        num_ranks,
-                                        comm_stream);
-
-    // Derive metadata + write host-mapped {num_recv, num_recv_per_expert, total_tiles}.
+    // Pool-shape metadata (E_local + R + (c, src, e)-sized; produced before the
+    // host poll). The fused kernel does cross-rank count exchange + receiver-side
+    // prefix-sum derivation in a single launch.
     auto expert_frequency = torch::empty({num_local_experts}, i32_opts);
-    auto expert_frequency_offset = torch::empty({num_local_experts + 1}, i32_opts);
-    auto base_table = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
-    auto cumulative_tiles_before_e = torch::empty({num_local_experts + 1}, i32_opts);
-    auto per_source_rank_remaining = torch::empty({num_channels, num_ranks}, i32_opts);
+    auto expert_pool_block_offset = torch::empty({num_local_experts + 1}, i32_opts);
+    auto base_pool = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
     auto rank_prefix_matrix = torch::zeros({num_ranks, num_ranks}, i32_opts);
     auto total_tiles_device = torch::empty({1}, i32_opts);
-    intranode::streaming_metadata_init(recv_count.data_ptr<int>(),
-                                       recv_unique_per_source.data_ptr<int>(),
-                                       expert_frequency.data_ptr<int>(),
-                                       expert_frequency_offset.data_ptr<int>(),
-                                       base_table.data_ptr<int>(),
-                                       cumulative_tiles_before_e.data_ptr<int>(),
-                                       per_source_rank_remaining.data_ptr<int>(),
-                                       rank_prefix_matrix.data_ptr<int>(),
-                                       total_tiles_device.data_ptr<int>(),
-                                       moe_recv_counter_mapped,
-                                       moe_recv_expert_counter_mapped,
-                                       streaming_total_tiles_mapped,
-                                       num_channels,
-                                       num_ranks,
-                                       num_local_experts,
-                                       tile_m,
-                                       expert_alignment,
-                                       rank,
-                                       comm_stream);
+    intranode::streaming_dispatch_metadata(topk_idx.data_ptr<topk_idx_t>(),
+                                           expert_frequency.data_ptr<int>(),
+                                           expert_pool_block_offset.data_ptr<int>(),
+                                           base_pool.data_ptr<int>(),
+                                           rank_prefix_matrix.data_ptr<int>(),
+                                           total_tiles_device.data_ptr<int>(),
+                                           moe_recv_counter_mapped,
+                                           moe_recv_expert_counter_mapped,
+                                           streaming_total_tiles_mapped,
+                                           num_tokens,
+                                           num_topk,
+                                           num_local_experts,
+                                           num_channels,
+                                           streaming_section_offset,
+                                           buffer_ptrs_gpu,
+                                           barrier_signal_ptrs_gpu,
+                                           rank,
+                                           num_ranks,
+                                           tile_m,
+                                           expert_alignment,
+                                           comm_stream);
 
     // The dispatch main kernel reads rank_prefix_matrix from buffer_ptrs[rank]
-    // (the IPC slab, offset 0) and the channel queue metadata immediately after
-    // (offset num_ranks * num_ranks). The queue metadata (start_offset, end_offset,
-    // head_idx, tail_idx — 4 × num_channels × num_ranks ints) must be zeroed
-    // each dispatch so the receiver's spin on `channel_start_offset != 0`
-    // doesn't latch onto a stale value from a prior dispatch.
+    // (the IPC slab, offset 0) and the channel queue metadata immediately after.
+    // The queue metadata (start_offset, end_offset, head_idx, tail_idx —
+    // 4 × num_channels × num_ranks ints) must be zeroed each dispatch so the
+    // receiver's spin on `channel_start_offset != 0` doesn't latch onto a stale
+    // value from a prior dispatch.
     int num_memset_int = num_channels * num_ranks * 4;
     EP_HOST_ASSERT((num_ranks * num_ranks + num_memset_int) * sizeof(int) <= num_nvl_bytes);
     CUDA_CHECK(cudaMemcpyAsync(buffer_ptrs[nvl_rank],
@@ -657,8 +631,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                0,
                                num_memset_int * sizeof(int),
                                comm_stream));
-    // Cross-rank barrier so the dispatch sender doesn't write to a peer's queue
-    // metadata before the peer's memset completes.
     intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_ranks, comm_stream);
 
     // Single host poll: {num_recv, num_recv_per_expert[E_local], total_tiles}.
@@ -681,76 +653,66 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
     auto num_recv_tokens_per_expert_list =
         std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
+    int64_t TK_padded = static_cast<int64_t>(total_tiles) * tile_m;
 
-    // Allocate dispatch outputs sized by the polled values.
-    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    // ── Pool-layout dispatch outputs sized by polled values. Padding rows are
+    // zero-initialized so kernel A's GEMM on partial tiles produces zero output
+    // (no uninitialized data flowing into kernel Y's scatter), and so the pool
+    // tensor compares bit-equal across dispatches with the same cached routing.
+    // The current stream is `comm_stream` (set above), so all zeros() / full()
+    // memsets land on comm_stream and are naturally ordered with the dispatch
+    // kernel that reads them.
+    auto pool = torch::zeros({TK_padded, hidden}, x.options());
+    auto pool_topk_weight = torch::zeros({TK_padded}, dtype(torch::kFloat32).device(torch::kCUDA));
+    auto pool_recv_token = torch::full({TK_padded}, -1, i32_opts);
+    auto pool_k_slot = torch::full({TK_padded}, -1, i32_opts);
+
+    // ── Recv-token-indexed outputs (combine still consumes these).
     auto recv_src_idx = torch::empty({num_recv_tokens}, i32_opts);
-    auto recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx.options());
     auto recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights.options());
     auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, i32_opts);
     auto send_head = torch::empty({num_tokens, num_ranks}, i32_opts);
 
-    auto recv_x_scales = std::optional<torch::Tensor>();
-    float* recv_x_scales_ptr = nullptr;
+    // Pool-shape x_scales (FP8 path; otherwise unused).
+    auto pool_x_scales = std::optional<torch::Tensor>();
+    float* pool_x_scales_ptr = nullptr;
     if (x_scales.has_value()) {
-        recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
-                                             : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
-        recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
+        pool_x_scales = torch::zeros({TK_padded, num_scales}, x_scales->options());
+        pool_x_scales_ptr = static_cast<float*>(pool_x_scales->data_ptr());
     }
 
-    // Allocate streaming tile-keyed buffers.
-    auto tile_records_recv_x_rows = torch::full({total_tiles, tile_m}, -1, i32_opts);
-    auto tile_records_k_slots = torch::full({total_tiles, tile_m}, -1, i32_opts);
-    auto tile_records_expert_id = torch::full({total_tiles}, -1, i32_opts);
-    auto tile_remaining = torch::empty({total_tiles}, i32_opts);
-    // Per-tile ready signal: slot_assign release-stores `dispatch_seq` into
-    // `tile_ready[tile_id]` when its tile_remaining hits zero. Consumer spins
-    // until the value is >= dispatch_seq. Initialized to 0 (< any valid seq).
+    // ── Per-tile arrays (sized by total_tiles, post-host-poll).
+    auto tile_id_to_expert = torch::empty({total_tiles}, i32_opts);
+    auto pool_arrival_target = torch::empty({total_tiles}, i32_opts);
+    auto pool_arrival_count = torch::zeros({total_tiles}, i32_opts);
     auto tile_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
-    intranode::tile_remaining_init(expert_frequency.data_ptr<int>(),
-                                   cumulative_tiles_before_e.data_ptr<int>(),
-                                   tile_remaining.data_ptr<int>(),
-                                   num_local_experts,
-                                   total_tiles,
-                                   tile_m,
-                                   comm_stream);
+    intranode::tile_arrays_init(expert_frequency.data_ptr<int>(),
+                                expert_pool_block_offset.data_ptr<int>(),
+                                tile_id_to_expert.data_ptr<int>(),
+                                pool_arrival_target.data_ptr<int>(),
+                                num_local_experts,
+                                total_tiles,
+                                tile_m,
+                                comm_stream);
 
-    // Reset per-(channel, src_rank) substream-done flags before dispatch fires them.
-    CUDA_CHECK(cudaMemsetAsync(substream_ready, 0,
-                               static_cast<size_t>(num_channels) * num_ranks * sizeof(int),
-                               comm_stream));
-
-    // Sanity: ensure dispatch's NVL slab usage stays under num_nvl_bytes.
     EP_HOST_ASSERT(
         num_ranks * num_ranks * sizeof(int) +
             num_channels * num_ranks * sizeof(int) +
             num_channels * num_ranks * sizeof(int) +
             num_channels * num_ranks * sizeof(int) * 2 +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * recv_x.element_size() +
+            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * pool.element_size() +
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales
         <= num_nvl_bytes);
 
-    // Cross-stream sync: slot_assign_stream must see all metadata kernels +
-    // substream_ready memset + tile_remaining_init before it launches slot_assign.
-    // After this event, slot_assign_stream and comm_stream run concurrently:
-    //   - dispatch main kernel writes recv_topk_idx + releases substream_ready[c, s]
-    //     as each substream completes.
-    //   - slot_assign blocks acquire-spin on substream_ready and start firing tiles
-    //     as soon as their substream lands. This is the streaming property: kernel A
-    //     consumes tile_ready while dispatch is still running.
-    cudaEvent_t metadata_ready;
-    CUDA_CHECK(cudaEventCreateWithFlags(&metadata_ready, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventRecord(metadata_ready, comm_stream));
-    CUDA_CHECK(cudaStreamWaitEvent(slot_assign_stream, metadata_ready, 0));
-    CUDA_CHECK(cudaEventDestroy(metadata_ready));
-
-    intranode::dispatch(recv_x.data_ptr(),
-                        recv_x_scales_ptr,
+    intranode::dispatch(pool.data_ptr(),
+                        pool_x_scales_ptr,
+                        pool_topk_weight.data_ptr<float>(),
+                        pool_recv_token.data_ptr<int>(),
+                        pool_k_slot.data_ptr<int>(),
                         recv_src_idx.data_ptr<int>(),
-                        recv_topk_idx.data_ptr<topk_idx_t>(),
                         recv_topk_weights.data_ptr<float>(),
                         recv_channel_prefix_matrix.data_ptr<int>(),
                         send_head.data_ptr<int>(),
@@ -760,9 +722,13 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         topk_weights.data_ptr<float>(),
                         is_token_in_rank.data_ptr<bool>(),
                         channel_prefix_matrix.data_ptr<int>(),
+                        base_pool.data_ptr<int>(),
+                        pool_arrival_count.data_ptr<int>(),
+                        pool_arrival_target.data_ptr<int>(),
+                        tile_ready.data_ptr<int64_t>(),
+                        dispatch_seq,
                         num_tokens,
-                        /*num_worst_tokens=*/0,
-                        static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)),
+                        static_cast<int>(hidden * pool.element_size() / sizeof(int4)),
                         num_topk,
                         num_experts,
                         num_scales,
@@ -775,64 +741,25 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
                         config.num_max_nvl_chunked_recv_tokens,
-                        substream_ready);
+                        tile_m);
 
-    // Slot assignment runs on slot_assign_stream concurrently with dispatch.
-    // Each block acquire-spins on substream_ready[c, s] until its substream lands,
-    // then writes tile_records and atomicSubs tile_remaining; tiles fire onto
-    // tile_ready as their counters reach zero.
-    intranode::streaming_slot_assign(recv_topk_idx.data_ptr<topk_idx_t>(),
-                                     recv_channel_prefix_matrix.data_ptr<int>(),
-                                     rank_prefix_matrix.data_ptr<int>(),
-                                     base_table.data_ptr<int>(),
-                                     expert_frequency_offset.data_ptr<int>(),
-                                     cumulative_tiles_before_e.data_ptr<int>(),
-                                     substream_ready,
-                                     tile_records_recv_x_rows.data_ptr<int>(),
-                                     tile_records_k_slots.data_ptr<int>(),
-                                     tile_records_expert_id.data_ptr<int>(),
-                                     tile_remaining.data_ptr<int>(),
-                                     tile_ready.data_ptr<int64_t>(),
-                                     per_source_rank_remaining.data_ptr<int>(),
-                                     rank,
-                                     num_ranks,
-                                     num_channels,
-                                     num_local_experts,
-                                     num_topk,
-                                     tile_m,
-                                     dispatch_seq,
-                                     slot_assign_stream);
-
-    // Stream bookkeeping. Inputs / dispatch outputs / metadata tensors live on
-    // comm_stream. Tile-keyed buffers (written by streaming_slot_assign on
-    // slot_assign_stream) need a record on slot_assign_stream too.
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
         for (auto& t : {x, is_token_in_rank, topk_idx, topk_weights,
-                        recv_x, recv_topk_idx, recv_topk_weights,
+                        pool, pool_topk_weight, pool_recv_token, pool_k_slot,
+                        recv_topk_weights, recv_src_idx, send_head,
                         rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
-                        recv_src_idx, send_head, recv_count,
-                        expert_frequency, expert_frequency_offset, base_table,
-                        cumulative_tiles_before_e, per_source_rank_remaining}) {
+                        expert_frequency, expert_pool_block_offset, base_pool,
+                        tile_id_to_expert, pool_arrival_target, pool_arrival_count, tile_ready}) {
             t.record_stream(comm_stream);
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& t : {tile_records_recv_x_rows, tile_records_k_slots, tile_records_expert_id,
-                        tile_remaining, tile_ready,
-                        // slot_assign also reads recv_topk_idx and the metadata tensors
-                        recv_topk_idx, recv_channel_prefix_matrix, rank_prefix_matrix,
-                        base_table, expert_frequency_offset, cumulative_tiles_before_e,
-                        per_source_rank_remaining}) {
-            t.record_stream(slot_assign_stream);
+        if (pool_x_scales.has_value()) {
+            pool_x_scales->record_stream(comm_stream);
             if (allocate_on_comm_stream)
-                t.record_stream(compute_stream);
-        }
-        if (recv_x_scales.has_value()) {
-            recv_x_scales->record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                recv_x_scales->record_stream(compute_stream);
+                pool_x_scales->record_stream(compute_stream);
         }
         if (x_scales.has_value()) {
             x_scales->record_stream(comm_stream);
@@ -840,126 +767,32 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                 x_scales->record_stream(compute_stream);
         }
     } else {
-        // Sync mode: caller's compute_stream waits for both dispatch (comm) and
-        // slot_assign (slot_assign_stream).
         stream_wait(compute_stream, comm_stream);
-        stream_wait(compute_stream, slot_assign_stream);
     }
-    if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
+    // Restore caller's stream (we set current to comm_stream at the top so
+    // PyTorch's allocator events live on comm_stream).
+    at::cuda::setCurrentCUDAStream(compute_stream);
 
-    return {recv_x,
-            recv_x_scales,
-            recv_topk_idx,
+    return {pool,
+            pool_x_scales,
+            pool_topk_weight,
+            pool_recv_token,
+            pool_k_slot,
             recv_topk_weights,
+            recv_src_idx,
+            send_head,
             num_recv_tokens_per_expert_list,
             rank_prefix_matrix,
             channel_prefix_matrix,
             recv_channel_prefix_matrix,
-            recv_src_idx,
-            send_head,
-            recv_count,
             expert_frequency,
-            expert_frequency_offset,
-            base_table,
-            cumulative_tiles_before_e,
-            per_source_rank_remaining,
-            tile_records_recv_x_rows,
-            tile_records_k_slots,
-            tile_records_expert_id,
-            tile_remaining,
+            expert_pool_block_offset,
+            base_pool,
+            tile_id_to_expert,
+            pool_arrival_target,
             tile_ready,
             total_tiles,
             event};
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-Buffer::streaming_metadata_init(const torch::Tensor& recv_count,
-                                const torch::Tensor& recv_unique_per_source,
-                                int tile_m, int expert_alignment) {
-    EP_HOST_ASSERT(recv_count.is_contiguous() && recv_count.dim() == 3 && recv_count.dtype() == torch::kInt32);
-    EP_HOST_ASSERT(recv_unique_per_source.is_contiguous() && recv_unique_per_source.dim() == 2 &&
-                   recv_unique_per_source.dtype() == torch::kInt32);
-    EP_HOST_ASSERT(tile_m > 0);
-    EP_HOST_ASSERT(expert_alignment > 0);
-
-    int num_channels = static_cast<int>(recv_count.size(0));
-    int num_ranks_in = static_cast<int>(recv_count.size(1));
-    int num_experts_per_rank = static_cast<int>(recv_count.size(2));
-    EP_HOST_ASSERT(num_ranks_in == num_ranks);
-    EP_HOST_ASSERT(recv_unique_per_source.size(0) == num_channels);
-    EP_HOST_ASSERT(recv_unique_per_source.size(1) == num_ranks);
-
-    auto opts = dtype(torch::kInt32).device(torch::kCUDA);
-    auto expert_frequency = torch::empty({num_experts_per_rank}, opts);
-    auto expert_frequency_offset = torch::empty({num_experts_per_rank + 1}, opts);
-    auto base = torch::empty({num_channels, num_ranks, num_experts_per_rank}, opts);
-    auto cumulative_tiles_before_e = torch::empty({num_experts_per_rank + 1}, opts);
-    auto per_source_rank_remaining = torch::empty({num_channels, num_ranks}, opts);
-    auto rank_prefix_matrix = torch::zeros({num_ranks, num_ranks}, opts);
-    auto total_tiles_device = torch::empty({1}, opts);
-
-    // Reset host-mapped sync slots before the kernel writes (sentinels for poll loop).
-    *moe_recv_counter = -1;
-    for (int i = 0; i < num_experts_per_rank; ++i)
-        moe_recv_expert_counter[i] = -1;
-    *streaming_total_tiles = -1;
-
-    intranode::streaming_metadata_init(recv_count.data_ptr<int>(),
-                                       recv_unique_per_source.data_ptr<int>(),
-                                       expert_frequency.data_ptr<int>(),
-                                       expert_frequency_offset.data_ptr<int>(),
-                                       base.data_ptr<int>(),
-                                       cumulative_tiles_before_e.data_ptr<int>(),
-                                       per_source_rank_remaining.data_ptr<int>(),
-                                       rank_prefix_matrix.data_ptr<int>(),
-                                       total_tiles_device.data_ptr<int>(),
-                                       moe_recv_counter_mapped,
-                                       moe_recv_expert_counter_mapped,
-                                       streaming_total_tiles_mapped,
-                                       num_channels,
-                                       num_ranks,
-                                       num_experts_per_rank,
-                                       tile_m,
-                                       expert_alignment,
-                                       rank,
-                                       comm_stream);
-    return {expert_frequency, expert_frequency_offset, base, cumulative_tiles_before_e,
-            per_source_rank_remaining, rank_prefix_matrix, total_tiles_device};
-}
-
-std::tuple<torch::Tensor, torch::Tensor>
-Buffer::streaming_count_exchange(const torch::Tensor& topk_idx, int num_experts, int num_sms) {
-    EP_HOST_ASSERT(is_available());
-    EP_HOST_ASSERT(num_rdma_bytes == 0 && "streaming_count_exchange is intranode-only in Phase A");
-    EP_HOST_ASSERT(topk_idx.is_contiguous() && topk_idx.dim() == 2);
-    EP_HOST_ASSERT(num_experts > 0 && num_experts % num_ranks == 0);
-    EP_HOST_ASSERT(num_sms > 0 && num_sms % 2 == 0);
-
-    int num_tokens = static_cast<int>(topk_idx.size(0));
-    int num_topk = static_cast<int>(topk_idx.size(1));
-    int num_experts_per_rank = num_experts / num_ranks;
-    int num_channels = num_sms / 2;
-    EP_HOST_ASSERT(num_experts_per_rank <= NUM_MAX_LOCAL_EXPERTS);
-    EP_HOST_ASSERT(num_channels <= num_device_sms / 2);
-
-    auto opts = dtype(torch::kInt32).device(torch::kCUDA);
-    auto recv_count = torch::empty({num_channels, num_ranks, num_experts_per_rank}, opts);
-    auto recv_unique_per_source = torch::empty({num_channels, num_ranks}, opts);
-    intranode::streaming_count_exchange(topk_idx.data_ptr<topk_idx_t>(),
-                                        recv_count.data_ptr<int>(),
-                                        recv_unique_per_source.data_ptr<int>(),
-                                        num_tokens,
-                                        num_topk,
-                                        num_experts_per_rank,
-                                        num_channels,
-                                        streaming_section_offset,
-                                        buffer_ptrs_gpu,
-                                        barrier_signal_ptrs_gpu,
-                                        rank,
-                                        num_ranks,
-                                        comm_stream);
-    return {recv_count, recv_unique_per_source};
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> Buffer::intranode_combine(
@@ -2070,8 +1903,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
-        .def("streaming_count_exchange", &deep_ep::Buffer::streaming_count_exchange)
-        .def("streaming_metadata_init", &deep_ep::Buffer::streaming_metadata_init)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)

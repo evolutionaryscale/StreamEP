@@ -49,79 +49,56 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 // Intranode kernels
 namespace intranode {
 
-// Streaming-MoE: post-dispatch slot-assignment kernel. Reads recv_topk_idx +
-// metadata, writes tile_records and fires tiles via per-tile `tile_ready[tile_id]`
-// release-store. Pass 2 walks experts in expert-major order so tiles fire onto
-// `tile_ready` in expert-monotonic order. One warp per (channel, src_rank)
-// substream block. See new_design.md §"Receiver slot assignment".
-void streaming_slot_assign(const topk_idx_t* recv_topk_idx,
-                           const int* recv_channel_offset,
-                           const int* rank_prefix_matrix,
-                           const int* base_table,
-                           const int* expert_frequency_offset,
-                           const int* cumulative_tiles_before_e,
-                           const int* substream_ready,
-                           int* tile_records_recv_x_rows,
-                           int* tile_records_k_slots,
-                           int* tile_records_expert_id,
-                           int* tile_remaining,
-                           int64_t* tile_ready,
-                           const int* per_source_rank_remaining,
-                           int rank,
-                           int num_ranks,
-                           int num_channels,
-                           int num_experts_per_rank,
-                           int num_topk,
-                           int tile_m,
-                           int64_t dispatch_seq,
-                           cudaStream_t stream);
+// Streaming-MoE consolidated dispatch metadata. Single launch fusing what used
+// to be three separate kernels (count_exchange + metadata_init + the inputs
+// to tile_remaining_init). Emits pool-shape outputs:
+//   expert_frequency[E_local], expert_pool_block_offset[E_local + 1],
+//   base_pool[num_channels, num_ranks, E_local],
+//   rank_prefix_matrix[R, R] (this rank's column),
+//   total_tiles (host-mapped + device int), num_recv (host-mapped),
+//   num_recv_per_expert[E_local] (host-mapped, aligned).
+void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
+                                 int* expert_frequency,
+                                 int* expert_pool_block_offset,
+                                 int* base_pool,
+                                 int* rank_prefix_matrix,
+                                 int* total_tiles_out,
+                                 int* num_recv_mapped,
+                                 int* num_recv_per_expert_mapped,
+                                 int* total_tiles_mapped,
+                                 int num_tokens,
+                                 int num_topk,
+                                 int num_experts_per_rank,
+                                 int num_channels,
+                                 int64_t streaming_section_offset,
+                                 void** buffer_ptrs,
+                                 int** barrier_signal_ptrs,
+                                 int rank,
+                                 int num_ranks,
+                                 int tile_m,
+                                 int expert_alignment,
+                                 cudaStream_t stream);
 
-void streaming_count_exchange(const topk_idx_t* topk_idx,
-                              int* recv_count_out,
-                              int* recv_unique_per_source_out,
-                              int num_tokens,
-                              int num_topk,
-                              int num_experts_per_rank,
-                              int num_channels,
-                              int64_t streaming_section_offset,
-                              void** buffer_ptrs,
-                              int** barrier_signal_ptrs,
-                              int rank,
-                              int num_ranks,
-                              cudaStream_t stream);
+// Pool-layout per-tile arrays (sized by total_tiles, so launched after the host
+// poll). Replaces the gather-A `tile_remaining_init`.
+//   tile_id_to_expert[total_tiles]   int32 — which expert this tile belongs to.
+//   pool_arrival_target[total_tiles] int32 — write count for tile to be ready
+//     (BLOCK_M for full tiles; leftover for each expert's last partial tile).
+void tile_arrays_init(const int* expert_frequency,
+                      const int* expert_pool_block_offset,
+                      int* tile_id_to_expert,
+                      int* pool_arrival_target,
+                      int num_experts_per_rank,
+                      int total_tiles,
+                      int tile_m,
+                      cudaStream_t stream);
 
-void streaming_metadata_init(const int* recv_count,
-                             const int* recv_unique_per_source,
-                             int* expert_frequency,
-                             int* expert_frequency_offset,
-                             int* base,
-                             int* cumulative_tiles_before_e,
-                             int* per_source_rank_remaining,
-                             int* rank_prefix_matrix,
-                             int* total_tiles_out,
-                             int* num_recv_mapped,
-                             int* num_recv_per_expert_mapped,
-                             int* total_tiles_mapped,
-                             int num_channels,
-                             int num_ranks,
-                             int num_experts_per_rank,
-                             int tile_m,
-                             int expert_alignment,
-                             int my_rank,
-                             cudaStream_t stream);
-
-void tile_remaining_init(const int* expert_frequency,
-                         const int* cumulative_tiles_before_e,
-                         int* tile_remaining,
-                         int num_experts_per_rank,
-                         int total_tiles,
-                         int tile_m,
-                         cudaStream_t stream);
-
-void dispatch(void* recv_x,
-              float* recv_x_scales,
+void dispatch(void* pool,
+              float* pool_x_scales,
+              float* pool_topk_weight,
+              int* pool_recv_token,
+              int* pool_k_slot,
               int* recv_src_idx,
-              topk_idx_t* recv_topk_idx,
               float* recv_topk_weights,
               int* recv_channel_offset,
               int* send_head,
@@ -131,8 +108,12 @@ void dispatch(void* recv_x,
               const float* topk_weights,
               const bool* is_token_in_rank,
               int* channel_prefix_matrix,
+              const int* base_pool,
+              int* pool_arrival_count,
+              const int* pool_arrival_target,
+              int64_t* tile_ready,
+              int64_t dispatch_seq,
               int num_tokens,
-              int num_worst_tokens,
               int hidden_int4,
               int num_topk,
               int num_experts,
@@ -146,7 +127,7 @@ void dispatch(void* recv_x,
               int num_sms,
               int num_max_send_tokens,
               int num_recv_buffer_tokens,
-              int* substream_ready);
+              int tile_m);
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,

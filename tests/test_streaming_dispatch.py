@@ -1,19 +1,18 @@
-"""End-to-end test for the consolidated streaming-MoE dispatch (intranode).
+"""End-to-end test for the consolidated streaming-MoE dispatch (intranode, pool layout).
 
-Exercises ``Buffer.dispatch`` (which folds streaming_count_exchange +
-streaming_metadata_init + dispatch main + slot_assign into a single host call
-with one host sync per layer; the sender-side channel-prefix scan that used to
-live in a separate ``notify_dispatch`` kernel is now inline in dispatch's sender
-preamble). Verifies:
+Exercises ``Buffer.dispatch`` (pool-layout: dispatch's receiver writes each
+landed (token, k) pair routing to a local expert into its own pool slot, and
+fires tile_ready in expert-major order at substream end). Verifies:
 
-  1. recv_x correctness — each landed token has the value `x = ones * src_rank`.
-  2. recv_topk_idx agrees with the routed-to-this-rank entries from each source.
-  3. tile_remaining is all-zero post-slot_assign.
+  1. Pool data correctness — each pool slot matches its source rank's token data.
+  2. Pool layout — slots fall in their expert's pool region (bounded by
+     expert_pool_block_offset[e] * tile_m for each expert e); padding rows
+     have pool_recv_token == -1.
+  3. Per-(recv_token, k) coverage — every (r, k) with recv-side k routing to a
+     local expert is recorded in exactly one pool slot.
   4. tile_ready[tile_id] == dispatch_seq for every tile_id in [0, total_tiles).
-  5. tile_records (recv_x_rows, k_slots, expert_id) agrees with recv_topk_idx for
-     every (r, k) pair where recv_topk_idx[r, k] >= 0.
-  6. Bit-determinism: re-running dispatch on identical inputs yields identical
-     tile_records.
+  5. tile_id_to_expert agrees with the slot range.
+  6. Bit-determinism: re-running dispatch produces identical pool placement.
 """
 
 from __future__ import annotations
@@ -69,14 +68,17 @@ def main():
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
 
-    recv_x, recv_topk_idx, recv_topk_weights, handle, _event = buf.dispatch(
+    pool, handle, _event = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,
         tile_m=tile_m, dispatch_seq=1,
     )
     torch.cuda.synchronize()
 
-    # ─── (1) recv_x value check: each row should equal its source rank.
-    # Gather all source-rank routings to compute expected per-row src_rank for this rank.
+    total_tiles = handle.total_tiles
+    TK_padded = total_tiles * tile_m
+    e_lo, e_hi = rank * num_local_experts, (rank + 1) * num_local_experts
+
+    # Build expected (recv_token_id, k_local) → src_rank mapping by gathering.
     all_x = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(all_x, x, group=group)
     all_topk = [torch.empty_like(topk_idx) for _ in range(world_size)]
@@ -84,88 +86,120 @@ def main():
     all_is_in_rank = [torch.empty_like(is_token_in_rank) for _ in range(world_size)]
     dist.all_gather(all_is_in_rank, is_token_in_rank, group=group)
 
-    # Each source rank contributes (in src_token_idx order) its tokens whose is_token_in_rank[:, rank] is True.
-    # That order matches recv_x's layout (source-major intranode).
-    expected_recv_x = []
-    expected_src_idx = []
-    expected_recv_topk = []
+    # Recv-tokens are laid out source-major: rank 0's first, then rank 1's, etc.
+    # Each source rank's contribution is the ordered set of token indices where
+    # is_token_in_rank[:, my_rank] is True.
+    expected_recv_token_src_rank = []          # [T_recv] → src_rank
+    expected_recv_token_src_idx = []           # [T_recv] → src_token_idx
+    expected_recv_topk_local = []              # [T_recv, num_topk] → e_local or -1
     for src in range(world_size):
-        src_x = all_x[src]
         src_in = all_is_in_rank[src][:, rank]
         idx_in_src = torch.nonzero(src_in, as_tuple=False).flatten()
-        expected_recv_x.append(src_x[idx_in_src])
-        expected_src_idx.append(idx_in_src.to(torch.int32))
-        expected_recv_topk.append(all_topk[src][idx_in_src])
-    expected_recv_x = torch.cat(expected_recv_x, dim=0)
-    assert recv_x.shape == expected_recv_x.shape, f"shape {recv_x.shape} vs {expected_recv_x.shape}"
-    if not torch.equal(recv_x.cpu(), expected_recv_x.cpu()):
-        actual_first_col = recv_x[:, 0].cpu().to(torch.int32)
-        expected_first_col = expected_recv_x[:, 0].cpu().to(torch.int32)
-        diff_idx = (actual_first_col != expected_first_col).nonzero(as_tuple=False).flatten()[:10]
-        if rank == 0:
-            print(f"[rank {rank}] recv_x mismatch — first col actual vs expected:")
-            for i in diff_idx.tolist():
-                print(f"  row {i}: actual={actual_first_col[i].item()} expected={expected_first_col[i].item()}")
-            print(f"  recv_channel_prefix_matrix:\n{handle.recv_channel_prefix_matrix.cpu()}")
-            print(f"  rank_prefix_matrix col {rank}: {handle.rank_prefix_matrix[:, rank].cpu()}")
-        raise AssertionError("recv_x mismatch")
+        src_topk = all_topk[src][idx_in_src]
+        local_mask = (src_topk >= e_lo) & (src_topk < e_hi)
+        local_topk = torch.where(local_mask, src_topk - e_lo, torch.full_like(src_topk, -1))
+        expected_recv_token_src_rank.append(torch.full((idx_in_src.numel(),), src, dtype=torch.int32, device=device))
+        expected_recv_token_src_idx.append(idx_in_src.to(torch.int32))
+        expected_recv_topk_local.append(local_topk)
+    expected_recv_token_src_rank = torch.cat(expected_recv_token_src_rank, dim=0).cpu()
+    expected_recv_token_src_idx = torch.cat(expected_recv_token_src_idx, dim=0).cpu()
+    expected_recv_topk_local = torch.cat(expected_recv_topk_local, dim=0).cpu()
+    T_recv = expected_recv_token_src_rank.shape[0]
 
-    # ─── (2) recv_topk_idx — local-expert indices in [0, E_local) or -1 sentinel.
-    # The dispatch kernel rewrites global expert id → local id (subtracts e_lo) when
-    # routed to this rank, else writes -1.
-    expected_topk = torch.cat(expected_recv_topk, dim=0)
-    e_lo, e_hi = rank * num_local_experts, (rank + 1) * num_local_experts
-    local_mask = (expected_topk >= e_lo) & (expected_topk < e_hi)
-    expected_topk_local = torch.where(local_mask, expected_topk - e_lo, torch.full_like(expected_topk, -1))
-    actual_topk = recv_topk_idx.cpu()
-    assert torch.equal(actual_topk, expected_topk_local.cpu()), "recv_topk_idx mismatch"
+    pool_cpu = pool.cpu()
+    pool_recv_token = handle.pool_recv_token.cpu()
+    pool_k_slot = handle.pool_k_slot.cpu()
+    pool_topk_weight = handle.pool_topk_weight.cpu()
+    expert_pool_block_offset = handle.expert_pool_block_offset.cpu()
+    tile_id_to_expert = handle.tile_id_to_expert.cpu()
+    pool_arrival_target = handle.pool_arrival_target.cpu()
+    expert_frequency = handle.expert_frequency.cpu()
+    recv_src_idx = handle.recv_src_idx.cpu()
 
-    # ─── (3) tile_remaining all-zero
-    tr = handle.tile_remaining[:handle.total_tiles].cpu()
-    assert (tr == 0).all(), f"tile_remaining nonzero: {tr.nonzero()}"
+    # ─── (1) Per-pool-slot validation. For every slot s with pool_recv_token[s] >= 0:
+    #         (a) the slot lies in the right expert's pool region,
+    #         (b) pool[s, :] == src_rank's tokens-of-ones value,
+    #         (c) (recv_token, k) pair is unique across slots.
+    seen_rk = torch.zeros((T_recv, num_topk), dtype=torch.bool)
+    for s in range(TK_padded):
+        rt = int(pool_recv_token[s].item())
+        k = int(pool_k_slot[s].item())
+        if rt < 0:
+            continue  # padding slot
+        assert 0 <= rt < T_recv, f"slot {s} pool_recv_token {rt} out of [0, {T_recv})"
+        assert 0 <= k < num_topk, f"slot {s} pool_k_slot {k} out of [0, {num_topk})"
+        e_local = int(expected_recv_topk_local[rt, k].item())
+        assert e_local >= 0, f"slot {s} maps to (rt={rt}, k={k}) but expected_recv_topk_local[rt,k] = {e_local}"
+        # Slot must fall in expert e_local's pool block range.
+        block_start = int(expert_pool_block_offset[e_local].item()) * tile_m
+        block_end = int(expert_pool_block_offset[e_local + 1].item()) * tile_m
+        assert block_start <= s < block_end, (
+            f"slot {s} for expert {e_local} outside [{block_start}, {block_end})"
+        )
+        # Per-pool-slot data: src_rank's value.
+        src_rank = int(expected_recv_token_src_rank[rt].item())
+        actual = pool_cpu[s, 0].to(torch.int32).item()
+        assert actual == src_rank, f"slot {s}: pool[s,0] = {actual} != src_rank {src_rank}"
+        # Uniqueness.
+        assert not seen_rk[rt, k], f"(recv_token={rt}, k={k}) appears in multiple slots"
+        seen_rk[rt, k] = True
+        # pool_topk_weight matches the source token's topk_weight for this k.
+        # (We don't explicitly gather topk_weights from peers; just sanity-check finiteness.)
+        assert torch.isfinite(pool_topk_weight[s])
+    expected_seen = (expected_recv_topk_local >= 0)
+    assert torch.equal(seen_rk, expected_seen), (
+        f"pool covers {seen_rk.sum()} (rt, k) pairs but expected {expected_seen.sum()}"
+    )
 
-    # ─── (4) Every tile fired exactly once: tile_ready[tile_id] == dispatch_seq
-    # for all tile_id in [0, total_tiles). With per-tile ready signal, the
-    # firing test is just an equality check on the int64 array.
-    ready = handle.tile_ready[:handle.total_tiles].cpu()
-    assert (ready == 1).all(), f"tile_ready not all == dispatch_seq (1): {(ready != 1).nonzero()}"
+    # ─── (2) recv_src_idx matches the gathered source-token-index list.
+    assert torch.equal(recv_src_idx, expected_recv_token_src_idx), "recv_src_idx mismatch"
 
-    # ─── (5) tile_records consistency with recv_topk_idx
-    rows = handle.tile_records_recv_x_rows[:handle.total_tiles].cpu()
-    kslots = handle.tile_records_k_slots[:handle.total_tiles].cpu()
-    eids = handle.tile_records_expert_id[:handle.total_tiles].cpu()
-    seen = torch.zeros(actual_topk.shape, dtype=torch.bool)
-    for tile_id in range(handle.total_tiles):
-        e_local = int(eids[tile_id].item())
-        for slot in range(tile_m):
-            r = int(rows[tile_id, slot].item())
-            k = int(kslots[tile_id, slot].item())
-            if r == -1:
-                continue
-            assert int(actual_topk[r, k].item()) == e_local, \
-                f"tile {tile_id} slot {slot}: r={r} k={k} expert={e_local} but recv_topk_idx={actual_topk[r,k]}"
-            assert not seen[r, k], f"(r={r}, k={k}) appears in multiple tile slots"
-            seen[r, k] = True
-    expected_seen = (actual_topk >= 0)
-    assert torch.equal(seen, expected_seen), \
-        f"tile_records covers {seen.sum()} (r,k) pairs but recv_topk_idx has {expected_seen.sum()} valid"
+    # ─── (3) tile_ready[tile_id] == dispatch_seq for all tile_id.
+    ready = handle.tile_ready[:total_tiles].cpu()
+    assert (ready == 1).all(), f"tile_ready not all == dispatch_seq (1); mismatches at {(ready != 1).nonzero().flatten()[:8]}"
 
-    # ─── (6) Bit-determinism
-    recv_x2, recv_topk_idx2, _, handle2, _ = buf.dispatch(
+    # ─── (4) tile_id_to_expert agrees with the expert_pool_block_offset partition.
+    for tile_id in range(total_tiles):
+        e_actual = int(tile_id_to_expert[tile_id].item())
+        e_block_start = int(expert_pool_block_offset[e_actual].item())
+        e_block_end = int(expert_pool_block_offset[e_actual + 1].item())
+        assert e_block_start <= tile_id < e_block_end, (
+            f"tile {tile_id}: tile_id_to_expert={e_actual} but tile not in [{e_block_start}, {e_block_end})"
+        )
+
+    # ─── (5) pool_arrival_target: BLOCK_M for full tiles, leftover for last per expert.
+    for e in range(num_local_experts):
+        e_block_start = int(expert_pool_block_offset[e].item())
+        e_block_end = int(expert_pool_block_offset[e + 1].item())
+        n_e = int(expert_frequency[e].item())
+        for tile_id in range(e_block_start, e_block_end):
+            tile_in_e = tile_id - e_block_start
+            target = int(pool_arrival_target[tile_id].item())
+            if tile_id == e_block_end - 1:
+                expected = n_e - tile_in_e * tile_m
+            else:
+                expected = tile_m
+            assert target == expected, (
+                f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
+            )
+
+    # ─── (6) Bit-determinism — re-run with same inputs, expect identical pool layout.
+    pool2, handle2, _ = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,
         tile_m=tile_m, dispatch_seq=2,
     )
     torch.cuda.synchronize()
-    rows2 = handle2.tile_records_recv_x_rows[:handle2.total_tiles].cpu()
-    kslots2 = handle2.tile_records_k_slots[:handle2.total_tiles].cpu()
-    eids2 = handle2.tile_records_expert_id[:handle2.total_tiles].cpu()
-    assert torch.equal(rows, rows2), "tile_records_recv_x_rows not deterministic"
-    assert torch.equal(kslots, kslots2), "tile_records_k_slots not deterministic"
-    assert torch.equal(eids, eids2), "tile_records_expert_id not deterministic"
+    assert torch.equal(handle.pool_recv_token.cpu(), handle2.pool_recv_token.cpu()), \
+        "pool_recv_token not deterministic"
+    assert torch.equal(handle.pool_k_slot.cpu(), handle2.pool_k_slot.cpu()), \
+        "pool_k_slot not deterministic"
+    assert torch.equal(pool.cpu(), pool2.cpu()), "pool data not deterministic"
+    assert torch.equal(handle.tile_id_to_expert.cpu(), handle2.tile_id_to_expert.cpu()), \
+        "tile_id_to_expert not deterministic"
 
     if rank == 0:
-        print(f"PASS: rank={rank} world={world_size} T_recv={recv_x.size(0)} "
-              f"total_tiles={handle.total_tiles}")
+        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} "
+              f"TK_padded={TK_padded} total_tiles={total_tiles}")
 
 
 if __name__ == "__main__":
