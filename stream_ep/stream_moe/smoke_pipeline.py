@@ -1,16 +1,15 @@
-"""Smoke test for streaming kernel A at any world size.
+"""Smoke test for the streaming pipeline up to kernel Y.
 
-Runs the same dispatch + kernel A pipeline as profile_kernel_a.py but without
-torch.profiler. Times a few warmup iterations and a few timed iterations,
-prints per-rank timings. Useful to bisect whether 8-GPU slowness comes from
-the profiler or from the pipeline itself.
+Runs the same dispatch + kernel A + kernel Y pipeline as profile_pipeline.py
+but without torch.profiler. Times warmup + timed iterations and prints
+per-rank timings. Useful to bisect whether multi-GPU slowness comes from the
+profiler vs. the pipeline itself, or to sanity-check that the full pipeline
+runs end-to-end without hanging or producing invalid results.
 
 Launch:
-    torchrun --nproc_per_node=8 \
-        -m evolutionaryscale.models.moe.streaming_moe.smoke_kernel_a
+    torchrun --nproc_per_node=8 \\
+        -m evolutionaryscale.models.moe.streaming_moe.smoke_pipeline
 """
-
-from __future__ import annotations
 
 import argparse
 import os
@@ -19,18 +18,21 @@ import time
 import torch
 import torch.distributed as torch_dist
 
-from evolutionaryscale.models.moe.streaming_moe.profile_kernel_a import (
+from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     DTYPE,
     NUM_EXPERTS,
     NUM_SMS,
     SEQ_LEN_PER_RANK,
+    TILE_M,
+    TILE_N_A,
+    TILE_N_Y,
     TOPK,
     H,
     I,
     make_buffer,
     make_uniform_topk_idx,
-    one_step,
 )
+from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
 
 
 def main():
@@ -62,14 +64,18 @@ def main():
     t0 = time.time()
     buffer = make_buffer(group, args.num_sms)
     if rank == 0:
-        print(f"[smoke] buffer init: {time.time()-t0:.2f}s", flush=True)
+        print(f"[smoke] buffer init: {time.time() - t0:.2f}s", flush=True)
 
     g = torch.Generator(device=device).manual_seed(42)
     w1_full = (
         torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g)
         * 0.02
     ).contiguous()
+    w2_full = (
+        torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02
+    ).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
+    w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
 
     torch.manual_seed(100 + rank)
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
@@ -85,50 +91,66 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
+    comm_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
+    compute_y_stream = torch.cuda.Stream()
     torch_dist.barrier(group=group)
 
     t0 = time.time()
     for warm_seq in range(1, args.n_warmup + 1):
-        one_step(
+        streaming_moe_layer(
             buffer,
             x,
             topk_idx,
             topk_weights,
             is_token_in_rank,
             w1_local,
-            compute_a_stream,
+            w2_local,
+            comm_stream=comm_stream,
+            compute_a_stream=compute_a_stream,
+            compute_y_stream=compute_y_stream,
+            num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
+            tile_m=TILE_M,
+            tile_n_a=TILE_N_A,
+            tile_n_y=TILE_N_Y,
         )
     torch.cuda.synchronize()
     torch_dist.barrier(group=group)
     t_warmup = time.time() - t0
     if rank == 0:
         print(
-            f"[smoke] warmup ({args.n_warmup} iters, includes JIT): {t_warmup:.2f}s "
-            f"({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)",
+            f"[smoke] warmup ({args.n_warmup} iters, includes JIT): "
+            f"{t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)",
             flush=True,
         )
 
     t0 = time.time()
     for step in range(args.n_iter):
-        one_step(
+        streaming_moe_layer(
             buffer,
             x,
             topk_idx,
             topk_weights,
             is_token_in_rank,
             w1_local,
-            compute_a_stream,
+            w2_local,
+            comm_stream=comm_stream,
+            compute_a_stream=compute_a_stream,
+            compute_y_stream=compute_y_stream,
+            num_experts=NUM_EXPERTS,
             dispatch_seq=100 + step,
+            tile_m=TILE_M,
+            tile_n_a=TILE_N_A,
+            tile_n_y=TILE_N_Y,
         )
     torch.cuda.synchronize()
     torch_dist.barrier(group=group)
     t_iter = time.time() - t0
     if rank == 0:
         print(
-            f"[smoke] timed   ({args.n_iter} iters):              {t_iter:.2f}s "
-            f"({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)",
+            f"[smoke] timed   ({args.n_iter} iters):              "
+            f"{t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)",
             flush=True,
         )
         print("[smoke] OK", flush=True)

@@ -80,6 +80,13 @@ def device():
     return torch.device("cuda")
 
 
+def _make_a_ready(total_tiles: int, device) -> torch.Tensor:
+    """Zero-init a_ready[total_tiles] int64 — kernel A's output release-stamp
+    array (consumed by kernel Y).
+    """
+    return torch.zeros(total_tiles, dtype=torch.int64, device=device)
+
+
 def test_streaming_moe_a_compiles(device):
     """JIT-compile only (no launch) for a representative production-shape config."""
     from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
@@ -101,6 +108,7 @@ def test_streaming_moe_a_compiles(device):
         [0, 0, 0, 0], E_local, device
     )
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    a_ready = _make_a_ready(total_tiles, device)
 
     import quack.cache_utils as cu
 
@@ -114,7 +122,9 @@ def test_streaming_moe_a_compiles(device):
             tile_id_to_expert,
             expert_pool_block_offset,
             tile_ready,
+            a_ready,
             dispatch_seq=1,
+            compute_seq=1,
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -147,6 +157,7 @@ def test_streaming_moe_a_single_tile(device):
         [chosen_expert], E_local, device
     )
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    a_ready = _make_a_ready(total_tiles, device)
 
     streaming_moe_a(
         pool,
@@ -155,7 +166,9 @@ def test_streaming_moe_a_single_tile(device):
         tile_id_to_expert,
         expert_pool_block_offset,
         tile_ready,
+        a_ready,
         dispatch_seq=1,
+        compute_seq=7,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -171,6 +184,13 @@ def test_streaming_moe_a_single_tile(device):
     assert (
         rel.max().item() < 5e-2
     ), f"max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
+
+    # All tiles' a_ready should be flipped to compute_seq=7 (one release-store
+    # per tile, fired by the last N-stripe to complete).
+    assert (a_ready == 7).all(), (
+        f"a_ready not all set to compute_seq=7 (kernel A's per-tile release "
+        f"didn't fire for all tiles); got unique values {a_ready.unique().tolist()}"
+    )
 
 
 def test_streaming_moe_a_multi_tile_static(device):
@@ -201,6 +221,7 @@ def test_streaming_moe_a_multi_tile_static(device):
         tile_to_expert_list, E_local, device
     )
     tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    a_ready = _make_a_ready(total_tiles, device)
 
     streaming_moe_a(
         pool,
@@ -209,7 +230,9 @@ def test_streaming_moe_a_multi_tile_static(device):
         tile_id_to_expert,
         expert_pool_block_offset,
         tile_ready,
+        a_ready,
         dispatch_seq=1,
+        compute_seq=11,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -226,6 +249,12 @@ def test_streaming_moe_a_multi_tile_static(device):
             f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, "
             f"max abs diff {diff.max().item():.4f}"
         )
+    # Per-tile a_ready release fires once per tile_id (after multi-pid_n
+    # gating). All tiles should have flipped to compute_seq=11.
+    assert (a_ready == 11).all(), (
+        f"a_ready not all set; bad indices "
+        f"{(a_ready != 11).nonzero().squeeze().tolist()}"
+    )
 
 
 def test_streaming_moe_a_producer_consumer(device):
@@ -256,6 +285,7 @@ def test_streaming_moe_a_producer_consumer(device):
     tile_ready = _make_tile_ready(
         total_tiles, dispatch_seq=1, device=device, fired=False
     )
+    a_ready = _make_a_ready(total_tiles, device)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
     # concurrent launch (use dispatch_seq=999 then reset).
@@ -275,7 +305,9 @@ def test_streaming_moe_a_producer_consumer(device):
             tile_id_to_expert,
             expert_pool_block_offset,
             tile_ready,
+            a_ready,
             dispatch_seq=1,
+            compute_seq=13,
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -295,6 +327,10 @@ def test_streaming_moe_a_producer_consumer(device):
             f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, "
             f"max abs diff {diff.max().item():.4f}"
         )
+    assert (a_ready == 13).all(), (
+        f"a_ready not all set under producer-consumer; bad indices "
+        f"{(a_ready != 13).nonzero().squeeze().tolist()}"
+    )
 
 
 if __name__ == "__main__":

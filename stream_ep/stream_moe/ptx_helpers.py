@@ -1,17 +1,21 @@
 """PTX wrappers for the streaming-MoE pipeline.
 
-Two groups:
+Three groups:
 
 1. **Cross-stream signaling** (kernel A scheduler) — system-scope acquire /
    release / fence pair so the linear-claim scheduler can spin on
    `tile_ready[tile_id]` written by DeepEP dispatch's Pass 2 on a different
    stream.
 
-2. **Vectorized atomic-add** (kernel Y AtomicScatterStore epilogue) — packed
-   bf16x2 / f16x2 and scalar f32 reductions into the local-rank output buffer
-   `o[T_recv, H]`. Intra-GPU scope is enough; cross-stream visibility for the
-   eventual combine sender is carried by `compute_done_per_token[r]`'s separate
-   release-store.
+2. **bf16-pair packing** — `pack_bf16x2` reads two bf16 from SMEM and packs
+   them into a single Int32 (bf16x2 layout). Sidesteps the
+   `cute.recast_tensor`-on-swizzled-SMEM trap (recast does NOT preserve
+   bf16x2 pair-adjacency under swizzle).
+
+3. **Vectorized atomic-add** (kernel Y AtomicScatterStore epilogue) —
+   `red_add_bf16x2_v4` issues a 16-byte / 8-bf16 reduction. Intra-GPU
+   scope is enough; cross-stream visibility for the eventual combine sender
+   is carried by `compute_done_per_token[r]`'s separate release-store.
 
 Lifted out of `quack/utils.py` so the streaming code is self-contained in
 evolutionaryscale and doesn't require a quack fork that adds these wrappers.
@@ -19,7 +23,8 @@ evolutionaryscale and doesn't require a quack fork that adds these wrappers.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import llvm
+from cutlass import BFloat16
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
@@ -66,67 +71,71 @@ def threadfence_system(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def red_add_bf16x2(
-    gmem_ptr: cute.Pointer, packed: cutlass.Int32, *, loc=None, ip=None
+def red_add_bf16x2_v4(
+    gmem_ptr: cute.Pointer,
+    p0: cutlass.Int32,
+    p1: cutlass.Int32,
+    p2: cutlass.Int32,
+    p3: cutlass.Int32,
+    *,
+    loc=None,
+    ip=None,
 ) -> None:
-    """Packed bf16x2 atomic-add into 4-byte-aligned global memory.
+    """16-byte vector packed bf16x2 atomic-add (8 bf16 lanes per call).
 
-    `packed` carries two bf16 lanes in a single 32-bit register (lo lane in
-    bits 0-15, hi lane in bits 16-31). Caller is responsible for the pack —
-    typically via `cute.recast_tensor(rD_bf16, Int32)` on a contiguous-2 view
-    of the register tensor.
-
-    The pointer must be 4-byte aligned; the targeted bf16x2 pair is the
-    `(2*j, 2*j+1)` adjacent elements at that address.
+    Issues ``red.global.add.noftz.v4.bf16x2 [ptr], {p0, p1, p2, p3};``.
+    Each Int32 payload is one bf16x2 packed pair (lo bits 0-15, hi bits
+    16-31). Pointer must be **16-byte aligned**; targets the contiguous
+    8 bf16 elements (p0 → bf16[0..1], p1 → bf16[2..3], p2 → bf16[4..5],
+    p3 → bf16[6..7]).
 
     Default `.gpu`-scope `.relaxed` semantics: kernel Y's atomic-scatter is
-    intra-GPU, and the per-token completion signal (`compute_done_per_token`)
-    carries the actual release/acquire to combine.
+    intra-GPU; cross-stream visibility for the eventual combine sender is
+    carried by `compute_done_per_token[r]`'s separate release-store.
 
-    PTX requires `.noftz` for `red.add.bf16x2` (denormals must NOT be flushed
-    to zero — required even though SM90 hardware ignores the bit; ptxas rejects
-    the instruction without it).
+    Verified on SM90 H100: ptxas accepts the encoding and the hardware
+    executes it as 8 logically-atomic adds (functionally equivalent to four
+    sequential `red.add.bf16x2`). Cuts atomic-op count 4× at the SMEM-staged
+    scatter loop in kernel Y when `epi_tile_N >= 8`. PTX requires `.noftz`
+    (denormals must NOT be flushed; ptxas rejects the instruction without it).
     """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
-        [gmem_ptr_i64, cutlass.Int32(packed).ir_value(loc=loc, ip=ip)],
-        "red.global.add.noftz.bf16x2 [$0], $1;",
-        "l,r",
+        [
+            gmem_ptr_i64,
+            cutlass.Int32(p0).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(p1).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(p2).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(p3).ir_value(loc=loc, ip=ip),
+        ],
+        "red.global.add.noftz.v4.bf16x2 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
     )
 
 
 @dsl_user_op
-def red_add_f16x2(
-    gmem_ptr: cute.Pointer, packed: cutlass.Int32, *, loc=None, ip=None
-) -> None:
-    """Packed f16x2 atomic-add. Same packing/alignment contract as
-    `red_add_bf16x2`. ``.noftz`` required by ptxas (same as bf16x2)."""
-    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [gmem_ptr_i64, cutlass.Int32(packed).ir_value(loc=loc, ip=ip)],
-        "red.global.add.noftz.f16x2 [$0], $1;",
-        "l,r",
-        has_side_effects=True,
-        is_align_stack=False,
+def pack_bf16x2(lo: BFloat16, hi: BFloat16, *, loc=None, ip=None) -> cutlass.Int32:
+    """Pack two bf16 values into a single Int32 (lo bits 0-15, hi bits 16-31).
+
+    Used by kernel Y's atomic-scatter epilogue: bf16x2 atomic-add (`red.global.add.bf16x2`)
+    requires the two bf16 lanes packed in one 32-bit register. Reading them
+    individually from swizzled SMEM and packing via this helper is correct
+    regardless of the SMEM swizzle (which can shuffle 4-byte adjacency
+    relative to the original bf16 layout — `cute.recast_tensor(swizzled_smem,
+    Int32)` does NOT preserve the bf16x2 pair-adjacency in general).
+    """
+    vec_bf16x2 = vector.from_elements(
+        T.vector(2, T.bf16()),
+        (lo.ir_value(loc=loc, ip=ip), hi.ir_value(loc=loc, ip=ip)),
+        loc=loc,
+        ip=ip,
     )
-
-
-@dsl_user_op
-def red_add_f32(
-    gmem_ptr: cute.Pointer, val: cutlass.Float32, *, loc=None, ip=None
-) -> None:
-    """Scalar f32 atomic-add. Used when `o[r, :]` is fp32 (e.g. accumulator
-    debug path) or for the trailing odd-H tail when H is not a multiple of 2."""
-    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [gmem_ptr_i64, cutlass.Float32(val).ir_value(loc=loc, ip=ip)],
-        "red.global.add.f32 [$0], $1;",
-        "l,f",
-        has_side_effects=True,
-        is_align_stack=False,
+    vec_i32x1 = vector.bitcast(T.vector(1, T.i32()), vec_bf16x2)
+    return cutlass.Int32(
+        vector.extract(
+            vec_i32x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+        )
     )

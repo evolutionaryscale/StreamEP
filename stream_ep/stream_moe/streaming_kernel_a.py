@@ -26,25 +26,28 @@ locally inside the scheduler warp's queue-pull and used only for the
 ready-spin and to derive expert_id/pid_m.
 """
 
-from __future__ import annotations
-
-from typing import NamedTuple, Optional, Type
+from dataclasses import MISSING
+from typing import Callable, NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import quack.utils as utils
 import torch
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64, const_expr
 from quack.activation import gate_fn_map
 from quack.cache_utils import COMPILE_ONLY, jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
+    ParamsBase,
     get_device_capacity,
     get_max_active_clusters,
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.gemm_act import GemmGatedSm90
+from quack.epi_ops import EpiOp
+from quack.gemm_act import GemmGatedMixin
+from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.rounding import RoundingMode
 from quack.tile_scheduler import PersistenceMode
@@ -58,6 +61,99 @@ from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import 
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-tile a_ready release. Kernel A's downstream consumer is kernel Y, which
+# acquire-spins on a_ready[tile_id] >= compute_seq before reading postact_a's
+# per-tile slab. The release-store has to happen AFTER kernel A's TMA stores
+# for THIS tile have actually committed to HBM — a thread-side
+# `cp.async.bulk.wait_group(0)` drains the TMA store pipeline before the
+# release.
+#
+# Multi-pid_n gating: a single tile_id is split across `num_pid_n` CTAs (one
+# per N-stripe). The release-store fires ONCE per tile, when the last
+# N-stripe completes. Atomic-add on `tile_n_stripes_done[tile_id]` provides
+# the gating; the CTA whose atomic-add returns `num_pid_n - 1` is the last,
+# fires `threadfence_system` + `st_release_sys_global(a_ready[tile_id], compute_seq)`.
+# ---------------------------------------------------------------------------
+@mlir_namedtuple
+class TileReadyParams(NamedTuple):
+    a_ready: cute.Tensor  # [total_tiles] int64 — A → Y release stamp
+    tile_n_stripes_done: cute.Tensor  # [total_tiles] int32 — per-tile N-stripe arrival
+    compute_seq: Int64  # value to release-store on hit-(num_pid_n - 1)
+    num_pid_n: Int32  # ceil(2I / tile_N)
+    tile_m: cutlass.Constexpr[
+        int
+    ]  # for tile_id = cu_seqlens_m[batch_idx] // tile_m + pid_m
+
+
+class TileReadyRelease(EpiOp):
+    """Per-tile a_ready[tile_id] = compute_seq release-store, with multi-pid_n
+    gating and TMA-store drain.
+
+    No SMEM. Just a cross-CTA arrival counter (gmem) + a release-store on the
+    last-stripe.
+    """
+
+    def __init__(self, name: str = "tile_ready"):
+        super().__init__(name)
+
+    def param_fields(self):
+        return [(self.name, object, MISSING)]
+
+    def to_params(self, gemm, args):
+        return {self.name: getattr(args, self.name)}
+
+    @cute.jit
+    def end(
+        self,
+        gemm,
+        param,
+        state,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        if const_expr(param is None):
+            return
+        # Drain THIS CTA's TMA stores (cp.async.bulk.wait_group<0>) so that
+        # postact_a is observable to kernel Y before a_ready[tile_id] flips.
+        # Without this, the release-store can race ahead of the TMA hardware
+        # and kernel Y reads stale postact_a.
+        cute.arch.cp_async_bulk_wait_group(0, read=False)
+
+        # Reconstruct tile_id from (batch_idx, pid_m).
+        # cu_seqlens_m carries `expert_pool_block_offset * tile_m`, so
+        # tile_id = expert_pool_block_offset[batch_idx] + pid_m
+        #        = cu_seqlens_m[batch_idx] // tile_m + pid_m.
+        batch_idx = tile_coord_mnkl[3]
+        pid_m = tile_coord_mnkl[0]
+        tile_id = (
+            varlen_manager.params.cu_seqlens_m[batch_idx] // Int32(param.tile_m) + pid_m
+        )
+
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_idx = cute.arch.lane_idx()
+        is_thread0 = (warp_idx == Int32(0)) & (lane_idx == Int32(0))
+
+        if is_thread0:
+            # Count this CTA's N-stripe as done. Atomic-add provides acq_rel
+            # ordering across CTAs — the CTA that gets `prev == num_pid_n - 1`
+            # observes all earlier CTAs' TMA-store drains too.
+            stripes_ptr = utils.elem_pointer(param.tile_n_stripes_done, (tile_id,))
+            prev = utils.atomic_add_i32(Int32(1), stripes_ptr)
+            is_last_stripe = prev == (param.num_pid_n - Int32(1))
+            if is_last_stripe:
+                # All N-stripes for this tile have drained their TMA stores.
+                # System fence then release-store so kernel Y on a different
+                # stream can acquire-load with cross-stream visibility.
+                threadfence_system()
+                a_ready_ptr = utils.elem_pointer(param.a_ready, (tile_id,))
+                st_release_sys_global(a_ready_ptr, param.compute_seq)
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +176,37 @@ class StreamingTileSchedulerOptions(NamedTuple):
 # ---------------------------------------------------------------------------
 # Streaming kernel A class.
 # ---------------------------------------------------------------------------
-class StreamingMoeASm90(GemmGatedSm90):
+class StreamingMoeASm90(GemmGatedMixin, GemmSm90):
     """Streaming-MoE kernel A: standard strided varlen_m GEMM + SwiGLU with
     queue-pull scheduler. Pool layout means kernel A uses the base GEMM
     mainloop's varlen_m path verbatim — no per-tile gather indirection.
+
+    Adds a per-tile `a_ready[tile_id] = compute_seq` release-store at the end
+    of each tile's epilogue (after TMA-store drain + multi-pid_n gating) so
+    kernel Y's per-tile acquire-spin observes a_ready cross-stream.
     """
+
+    # Append TileReadyRelease to GemmGatedMixin's _epi_ops chain. Order
+    # matters: the framework iterates ops for begin/end; the postact TileStore
+    # must run before our release-drain so postact_a's TMA stores have been
+    # COMMITTED before our wait_group(0) drains them.
+    _epi_ops = (*GemmGatedMixin._epi_ops, TileReadyRelease("tile_ready"))
+    _epi_param_bases = (ParamsBase,)
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        tile_ready: TileReadyParams
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+
+    # EpilogueParams auto-generated from _epi_ops + _extra_param_fields by
+    # ComposableEpiMixin.__init_subclass__.
 
     @cute.jit
     def __call__(
@@ -208,6 +330,8 @@ def _compile_streaming_moe_a(
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
+    a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    tile_n_stripes_done = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
 
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),  # set at runtime; 0 here keeps fake compile happy
@@ -219,8 +343,19 @@ def _compile_streaming_moe_a(
         total_tiles=Int32(0),
     )
 
-    epi_args = GemmGatedSm90.EpilogueArguments(
-        mPostAct=mPostAct, act_fn=gate_fn_map[activation], rounding_mode=RoundingMode.RN
+    tile_ready_params = TileReadyParams(
+        a_ready=a_ready,
+        tile_n_stripes_done=tile_n_stripes_done,
+        compute_seq=Int64(0),
+        num_pid_n=Int32(0),
+        tile_m=tile_m,
+    )
+
+    epi_args = StreamingMoeASm90.EpilogueArguments(
+        mPostAct=mPostAct,
+        tile_ready=tile_ready_params,
+        act_fn=gate_fn_map[activation],
+        rounding_mode=RoundingMode.RN,
     )
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
@@ -331,16 +466,24 @@ def streaming_moe_a(
     postact_a: torch.Tensor,  # (total_tiles, tile_M, I) bf16
     tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
-    tile_ready: torch.Tensor,  # (total_tiles,) int64 release stamps
+    tile_ready: torch.Tensor,  # (total_tiles,) int64 release stamps (input from dispatch)
+    a_ready: torch.Tensor,  # (total_tiles,) int64 release stamps (output to kernel Y)
     dispatch_seq: int,
+    compute_seq: int,
     *,
     tile_m: int = 128,
     tile_n: int = 256,
     cluster_m: int = 1,
     cluster_n: int = 1,
     activation: str = "swiglu",
+    num_sms: int | None = None,
 ) -> None:
     """Launch streaming-MoE kernel A on the caller's current CUDA stream (pool layout).
+
+    ``num_sms`` caps the persistent-grid CTA count to the given value. When
+    ``None`` (default) the kernel fills the GPU via ``get_max_active_clusters``.
+    Smaller caps leave SMs available for kernel Y to run concurrently — see
+    design.md §"SM budget".
 
     Caller is responsible for:
       - allocating ``postact_a`` ``(total_tiles, tile_M, I)`` ON THE SAME STREAM
@@ -352,15 +495,17 @@ def streaming_moe_a(
         per-tile acquire-spin handles cross-stream visibility for ``tile_ready``
         and the dispatch metadata it transitively depends on.
 
-    The internal ``consumer_head`` (per-call linear-claim counter) is allocated
-    on the calling stream so its zero-init is naturally ordered with the kernel.
+    The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
+    allocated on the calling stream so their zero-init is naturally ordered
+    with the kernel.
 
-    Numerical correctness: each CTA atomic-claims a linear work index, decomposes
-    to (tile_id, pid_n), spins on tile_ready[tile_id], reads
-    expert_id = tile_id_to_expert[tile_id] and pid_m = tile_id -
-    expert_pool_block_offset[expert_id], strided-TMA-loads the pool[tile_id*tile_M : ...]
-    rows (via the standard varlen_m m-offset), runs GEMM against W1[expert_id],
-    applies SwiGLU, and TMA-stores into postact_a[tile_id, :, :].
+    Per-tile a_ready release: at the end of each tile's epilogue (after all
+    pid_n N-stripes have drained their TMA stores), kernel A release-stores
+    ``a_ready[tile_id] = compute_seq`` with system scope. Kernel Y on
+    ``compute_y_stream`` acquire-spins on this signal before reading the
+    tile's postact_a slab. Multi-pid_n gating via an atomic-add to
+    ``tile_n_stripes_done[tile_id]`` ensures the release fires once per tile,
+    not once per N-stripe.
     """
     assert pool.is_cuda and W1.is_cuda and postact_a.is_cuda
     assert pool.dim() == 2 and pool.is_contiguous()
@@ -370,6 +515,7 @@ def streaming_moe_a(
     assert postact_tile_m == tile_m
     assert tile_id_to_expert.shape == (total_tiles,)
     assert tile_ready.shape == (total_tiles,) and tile_ready.dtype == torch.int64
+    assert a_ready.shape == (total_tiles,) and a_ready.dtype == torch.int64
     H = pool.shape[1]
     E_local = W1.shape[0]
     assert expert_pool_block_offset.shape == (E_local + 1,)
@@ -425,6 +571,10 @@ def streaming_moe_a(
         return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
+    if num_sms is not None:
+        max_active_clusters = min(
+            max_active_clusters, num_sms // (cluster_m * cluster_n)
+        )
 
     # Internal scheduler counter — allocate on the calling stream (which is the
     # one the kernel will run on) so the zero-init is naturally ordered with
@@ -433,8 +583,25 @@ def streaming_moe_a(
     # values from a recycled allocator slot, causing CTAs to early-exit.
     consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
-    epi_args = GemmGatedSm90.EpilogueArguments(
+    # Multi-pid_n N-stripe arrival counter. The CTA whose atomic-add returns
+    # `num_pid_n - 1` is the last N-stripe to complete for its tile_id and
+    # fires the per-tile a_ready release-store.
+    num_pid_n = (2 * I + tile_n - 1) // tile_n
+    tile_n_stripes_done = torch.zeros(
+        total_tiles, dtype=torch.int32, device=pool.device
+    )
+
+    tile_ready_params = TileReadyParams(
+        a_ready=a_ready,
+        tile_n_stripes_done=tile_n_stripes_done,
+        compute_seq=Int64(compute_seq),
+        num_pid_n=Int32(num_pid_n),
+        tile_m=None,  # Constexpr; burned in at compile, pass None at call time
+    )
+
+    epi_args = StreamingMoeASm90.EpilogueArguments(
         mPostAct=postact_flat,
+        tile_ready=tile_ready_params,
         act_fn=None,  # Constexpr; pass None at call time
         rounding_mode=None,  # Constexpr; pass None at call time
     )

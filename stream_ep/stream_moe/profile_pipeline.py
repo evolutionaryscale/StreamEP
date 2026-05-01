@@ -1,32 +1,33 @@
-"""Torch-profiler trace of DeepEP dispatch → streaming kernel A end-to-end (pool layout).
+"""Torch-profiler trace of the streaming pipeline up to kernel Y
+(dispatch → kernel A → kernel Y), the slice that's fully implemented today.
 
-Validates the streaming property visually: kernel A's CTAs should be on the
-GPU timeline concurrently with DeepEP's dispatch tail (Pass 2 firing per
-substream), not strictly after.
+Validates the streaming property visually: kernel A's CTAs should overlap
+with the tail of dispatch (Pass 2 firing per substream), and kernel Y's
+CTAs should overlap with the tail of kernel A (per-tile a_ready firing).
 
 What you should see in the resulting chrome trace
 -------------------------------------------------
-- `comm_stream`: streaming_dispatch_metadata → (single host poll) →
-  tile_arrays_init → dispatch main kernel. The dispatch kernel's receiver
-  block does Pass 1 (per-batch slot allocation + data copy into pool) and
-  Pass 2 (substream-end expert-major tile_ready firing) inline.
-- `compute_a_stream`: streaming_moe_a (kernel A) launches early (overlapped
-  with the tail of dispatch). Its CTAs spin on tile_ready[tile_id] until
-  dispatch's Pass 2 fires that tile, then process it. The first tiles should
-  start computing before dispatch finishes.
+- `comm_stream`: streaming_dispatch_metadata → host poll → tile_arrays_init
+  → dispatch main kernel. The dispatch kernel's receiver does Pass 1
+  (per-batch slot allocation + data copy into pool) and Pass 2
+  (substream-end expert-major tile_ready firing) inline.
+- `compute_a_stream`: streaming_moe_a launches early, overlapped with the
+  tail of dispatch. Its CTAs spin on tile_ready[tile_id] then process.
+  Per-tile a_ready[tile_id] release-stores happen at the end of each tile.
+- `compute_y_stream`: streaming_moe_y launches early, overlapped with the
+  tail of kernel A. Its CTAs spin on a_ready[tile_id] then GEMM + per-warp
+  coalesced atomic-scatter into o[T_recv, H], finishing with per-token
+  bookkeeping (per_token_remaining decrement + compute_done release).
 
 Launch
 ------
-    torchrun --nproc_per_node=2 \
-        -m evolutionaryscale.models.moe.streaming_moe.profile_kernel_a \
+    torchrun --nproc_per_node=2 \\
+        -m evolutionaryscale.models.moe.streaming_moe.profile_pipeline \\
         [--out_dir /path/to/profiles]
 
-The profile is taken with the standard torch.profiler schedule
-(wait=1, warmup=2, active=5, repeat=1). Trace files land per-rank in
-`{repo_root}/profiles/`. Open with chrome://tracing or TensorBoard.
+Trace files land per-rank in `{repo_root}/profiles/`. Open with
+chrome://tracing or TensorBoard.
 """
-
-from __future__ import annotations
 
 import argparse
 import os
@@ -36,13 +37,8 @@ import torch.distributed as torch_dist
 import torch.profiler
 from deep_ep import Buffer as DeepEPBuffer
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
-    streaming_moe_a,
-)
+from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
 
-# Compact-but-meaningful config. Smaller than production but large enough that
-# kernel A has nontrivial compute time and total_tiles > num_persistent_ctas
-# so the queue-pull dispatch is exercised.
 H = 2048
 I = 2048
 NUM_EXPERTS = 64
@@ -51,7 +47,8 @@ TOPK = 4
 DTYPE = torch.bfloat16
 NUM_SMS = 24
 TILE_M = 128
-TILE_N = 256
+TILE_N_A = 256
+TILE_N_Y = 128
 
 
 def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
@@ -79,66 +76,6 @@ def make_buffer(group, num_sms):
     )
 
 
-def one_step(
-    buffer,
-    x,
-    topk_idx,
-    topk_weights,
-    is_token_in_rank,
-    w1_local,
-    compute_a_stream,
-    dispatch_seq,
-):
-    """A single dispatch + kernel A iteration. Returns the postact_a tensor and
-    StreamingHandle so the caller can drop them after the profiler step.
-    """
-    pool, handle, _event = buffer.dispatch(
-        x,
-        topk_idx,
-        topk_weights,
-        is_token_in_rank,
-        NUM_EXPERTS,
-        tile_m=TILE_M,
-        dispatch_seq=dispatch_seq,
-    )
-
-    total_tiles = handle.total_tiles
-
-    # record_stream tells the caching allocator not to recycle these tensors
-    # while kernel A is still in flight. Their *contents* are made visible to
-    # compute_a_stream by the per-tile tile_ready release/acquire pair (kernel
-    # A's spin acquire-loads tile_ready[i] >= dispatch_seq, which pairs with
-    # dispatch's release-store; that pair flushes all prior dispatch-side
-    # writes including handle.tile_id_to_expert and handle.expert_pool_block_offset).
-    for t in (
-        pool,
-        handle.tile_id_to_expert,
-        handle.expert_pool_block_offset,
-        handle.tile_ready,
-    ):
-        t.record_stream(compute_a_stream)
-
-    # Allocate postact_a + launch kernel A on compute_a_stream. Allocating on
-    # the same stream as the kernel keeps torch's zero-init / empty memory
-    # naturally ordered with the kernel's TMA stores — no cross-stream race.
-    # streaming_moe_a internally allocates its consumer_head counter on the
-    # current stream too.
-    with torch.cuda.stream(compute_a_stream):
-        postact_a = torch.empty(total_tiles, TILE_M, I, dtype=DTYPE, device=pool.device)
-        streaming_moe_a(
-            pool,
-            w1_local,
-            postact_a,
-            handle.tile_id_to_expert,
-            handle.expert_pool_block_offset,
-            handle.tile_ready,
-            dispatch_seq=handle.dispatch_seq,
-            tile_m=TILE_M,
-            tile_n=TILE_N,
-        )
-    return postact_a, handle
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -154,6 +91,11 @@ def main():
     )
     p.add_argument("--num_sms", type=int, default=NUM_SMS)
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
+    p.add_argument("--num_sms_a", type=int, default=None)
+    p.add_argument("--num_sms_y", type=int, default=None)
+    p.add_argument("--tile_m", type=int, default=TILE_M)
+    p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
+    p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
     args = p.parse_args()
 
     rank = int(os.environ.get("RANK", "0"))
@@ -168,13 +110,17 @@ def main():
 
     buffer = make_buffer(group, args.num_sms)
 
-    # Replicated W1 across ranks (each rank slices its E_local share).
+    # Replicated W1 / W2 across ranks (each rank slices its E_local share).
     g = torch.Generator(device=device).manual_seed(42)
     w1_full = (
         torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g)
         * 0.02
     ).contiguous()
+    w2_full = (
+        torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02
+    ).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
+    w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
 
     torch.manual_seed(100 + rank)
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
@@ -190,7 +136,9 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
+    comm_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
+    compute_y_stream = torch.cuda.Stream()
 
     os.makedirs(args.out_dir, exist_ok=True)
     if rank == 0:
@@ -198,21 +146,30 @@ def main():
         print(
             f"config: world={world_size} num_sms={args.num_sms} "
             f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-            f"tile_m={TILE_M} tile_n={TILE_N}",
+            f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y}",
             flush=True,
         )
 
-    # Warm: dispatch + kernel A JIT, kernel cache, allocator.
+    # Warm: dispatch + kernel A + kernel Y JIT, kernel cache, allocator.
     for warm_seq in range(1, 6):
-        _post, _handle = one_step(
+        _o, _handle = streaming_moe_layer(
             buffer,
             x,
             topk_idx,
             topk_weights,
             is_token_in_rank,
             w1_local,
-            compute_a_stream,
+            w2_local,
+            comm_stream=comm_stream,
+            compute_a_stream=compute_a_stream,
+            compute_y_stream=compute_y_stream,
+            num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
+            tile_m=args.tile_m,
+            tile_n_a=args.tile_n_a,
+            tile_n_y=args.tile_n_y,
+            num_sms_a=args.num_sms_a,
+            num_sms_y=args.num_sms_y,
         )
     torch.cuda.synchronize()
     torch_dist.barrier(group=group)
@@ -231,16 +188,27 @@ def main():
     ) as prof:
         seq = 100  # bumped past warmup seqs so it's clearly distinct in the trace
         for step in range(1 + 2 + 5):
-            with torch.profiler.record_function(f"step_{step}_dispatch+kernelA"):
-                _post, _handle = one_step(
+            with torch.profiler.record_function(
+                f"step_{step}_dispatch+kernelA+kernelY"
+            ):
+                _o, _handle = streaming_moe_layer(
                     buffer,
                     x,
                     topk_idx,
                     topk_weights,
                     is_token_in_rank,
                     w1_local,
-                    compute_a_stream,
+                    w2_local,
+                    comm_stream=comm_stream,
+                    compute_a_stream=compute_a_stream,
+                    compute_y_stream=compute_y_stream,
+                    num_experts=NUM_EXPERTS,
                     dispatch_seq=seq + step,
+                    tile_m=args.tile_m,
+                    tile_n_a=args.tile_n_a,
+                    tile_n_y=args.tile_n_y,
+                    num_sms_a=args.num_sms_a,
+                    num_sms_y=args.num_sms_y,
                 )
             prof.step()
 
