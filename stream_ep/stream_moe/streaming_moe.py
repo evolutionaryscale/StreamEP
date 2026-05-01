@@ -3,8 +3,10 @@
 Streams are caller-owned — created once and passed in. Per-call inputs vary
 (routing changes layer-to-layer in production), and so do the per-call
 intermediate allocations: ``postact_a`` is sized by ``total_tiles × tile_M × I``
-(varies with routing) and ``o_with_trash`` by ``T_recv + 1``. Both are allocated
-fresh inside this function and freed when it returns.
+(varies with routing). The kernel-Y output ``o`` is reused from
+``handle.o`` (allocated by DeepEP at ``[T_recv, hidden]`` zero-init); kernel
+Y writes into it via PTX-predicated atomic-scatter. Phase D's combine sender
+will read the same buffer.
 
 Within a layer the three streams overlap (intra-layer); across layers they
 serialize via the layer-start ``comm_stream.wait_stream(caller)`` and layer-end
@@ -50,9 +52,9 @@ def streaming_moe_layer(
 ) -> Tuple[torch.Tensor, StreamingHandle]:
     """One MoE forward layer: dispatch + kernel A + kernel Y.
 
-    Returns ``(o, handle)`` where ``o`` has shape ``[T_recv + 1, hidden]``.
-    The trailing trash row at index ``T_recv`` absorbs writes from padding
-    pool slots; slice ``o[:T_recv]`` for the strict per-recv-token output.
+    Returns ``(o, handle)`` where ``o`` is ``handle.o`` with shape
+    ``[T_recv, hidden]`` — kernel Y writes into the DeepEP-allocated output
+    via PTX-predicated atomic-scatter, so no separate buffer is needed.
     """
     caller_stream = torch.cuda.current_stream()
 
@@ -75,8 +77,6 @@ def streaming_moe_layer(
     compute_y_stream.wait_event(metadata_done)
 
     total_tiles = handle.total_tiles
-    T_recv = handle.o.shape[0]
-    hidden = w2_local.shape[1]
     intermediate = w2_local.shape[2]
 
     # `record_stream` only on the stream(s) that actually consume each
@@ -109,6 +109,10 @@ def streaming_moe_layer(
     handle.pool_topk_weight.record_stream(compute_y_stream)
     handle.per_token_remaining.record_stream(compute_y_stream)
     handle.compute_done_per_token.record_stream(compute_y_stream)
+    # `handle.o` is allocated on comm_stream (inside Buffer.dispatch) and
+    # written by kernel Y on compute_y_stream — same cross-stream allocator
+    # contract as the per-tile signals above.
+    handle.o.record_stream(compute_y_stream)
 
     with torch.cuda.stream(compute_a_stream):
         postact_a = torch.empty(
@@ -136,13 +140,10 @@ def streaming_moe_layer(
     # while kernel Y is mid-read.
     postact_a.record_stream(compute_y_stream)
     with torch.cuda.stream(compute_y_stream):
-        o_with_trash = torch.zeros(
-            T_recv + 1, hidden, dtype=x.dtype, device=pool.device
-        )
         streaming_moe_y(
             postact_a,
             w2_local,
-            o_with_trash,
+            handle.o,
             handle.pool_recv_token,
             handle.pool_topk_weight,
             handle.per_token_remaining,
@@ -161,4 +162,4 @@ def streaming_moe_layer(
     caller_stream.wait_stream(comm_stream)
     caller_stream.wait_stream(compute_a_stream)
     caller_stream.wait_stream(compute_y_stream)
-    return o_with_trash, handle
+    return handle.o, handle

@@ -12,10 +12,13 @@ Three groups:
    `cute.recast_tensor`-on-swizzled-SMEM trap (recast does NOT preserve
    bf16x2 pair-adjacency under swizzle).
 
-3. **Vectorized atomic-add** (kernel Y AtomicScatterStore epilogue) —
-   `red_add_bf16x2_v4` issues a 16-byte / 8-bf16 reduction. Intra-GPU
-   scope is enough; cross-stream visibility for the eventual combine sender
-   is carried by `compute_done_per_token[r]`'s separate release-store.
+3. **Vectorized predicated atomic-add** (kernel Y AtomicScatterStore
+   epilogue) — `red_add_bf16x2_v4_pred` issues a 16-byte / 8-bf16
+   reduction with PTX-level predication so out-of-range / padding lanes
+   skip the atomic entirely (no HBM op, no need for a trash-row sink).
+   Intra-GPU scope is enough; cross-stream visibility for the eventual
+   combine sender is carried by `compute_done_per_token[r]`'s separate
+   release-store.
 
 Lifted out of `quack/utils.py` so the streaming code is self-contained in
 evolutionaryscale and doesn't require a quack fork that adds these wrappers.
@@ -71,19 +74,32 @@ def threadfence_system(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def red_add_bf16x2_v4(
+def red_add_bf16x2_v4_pred(
     gmem_ptr: cute.Pointer,
     p0: cutlass.Int32,
     p1: cutlass.Int32,
     p2: cutlass.Int32,
     p3: cutlass.Int32,
+    pred: cutlass.Int32,
     *,
     loc=None,
     ip=None,
 ) -> None:
-    """16-byte vector packed bf16x2 atomic-add (8 bf16 lanes per call).
+    """16-byte vector predicated bf16x2 atomic-add (8 bf16 lanes per call).
 
-    Issues ``red.global.add.noftz.v4.bf16x2 [ptr], {p0, p1, p2, p3};``.
+    Issues ``@%p red.global.add.noftz.v4.bf16x2 [ptr], {p0, p1, p2, p3};``
+    where ``%p`` is set from `pred != 0`. When pred is false, the
+    instruction is skipped entirely at issue time — no memory op, no
+    atomic side-effect — so the address is allowed to be any valid 16-byte-
+    aligned pointer (caller can clamp to a safe in-bounds address without
+    needing a trash row).
+
+    PTX-level predicated execution is **not** the same as a divergent C-level
+    branch around `red`: the latter caused non-deterministic atomic drops in
+    earlier kernel-Y attempts (Phase C scaffolding session, see logbook).
+    Predication is per-instruction at issue time and stress-tested to drop
+    zero atomics across 32 iters × 1M divergent-predicate threads on H100.
+
     Each Int32 payload is one bf16x2 packed pair (lo bits 0-15, hi bits
     16-31). Pointer must be **16-byte aligned**; targets the contiguous
     8 bf16 elements (p0 → bf16[0..1], p1 → bf16[2..3], p2 → bf16[4..5],
@@ -93,11 +109,8 @@ def red_add_bf16x2_v4(
     intra-GPU; cross-stream visibility for the eventual combine sender is
     carried by `compute_done_per_token[r]`'s separate release-store.
 
-    Verified on SM90 H100: ptxas accepts the encoding and the hardware
-    executes it as 8 logically-atomic adds (functionally equivalent to four
-    sequential `red.add.bf16x2`). Cuts atomic-op count 4× at the SMEM-staged
-    scatter loop in kernel Y when `epi_tile_N >= 8`. PTX requires `.noftz`
-    (denormals must NOT be flushed; ptxas rejects the instruction without it).
+    PTX requires `.noftz` (denormals must NOT be flushed; ptxas rejects the
+    instruction without it).
     """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
@@ -108,9 +121,16 @@ def red_add_bf16x2_v4(
             cutlass.Int32(p1).ir_value(loc=loc, ip=ip),
             cutlass.Int32(p2).ir_value(loc=loc, ip=ip),
             cutlass.Int32(p3).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
         ],
-        "red.global.add.noftz.v4.bf16x2 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
+        (
+            "{\n\t"
+            ".reg .pred %p1;\n\t"
+            "setp.ne.b32 %p1, $5, 0;\n\t"
+            "@%p1 red.global.add.noftz.v4.bf16x2 [$0], {$1, $2, $3, $4};\n\t"
+            "}"
+        ),
+        "l,r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
     )

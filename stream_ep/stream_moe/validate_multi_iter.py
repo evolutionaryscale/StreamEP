@@ -55,7 +55,7 @@ def torch_reference_recv(
     tile_m: int,
 ) -> torch.Tensor:
     """Eager torch reproduction of kernel A + kernel Y on the local-rank
-    receive side. Returns o_ref[T_recv, H] (no trash row).
+    receive side. Returns o_ref[T_recv, H].
 
     For each pool slot s:
       a = SwiGLU(pool[s] @ W1[expert(s)])    # tile_m × I → I
@@ -176,7 +176,7 @@ def main():
     fail_count = 0
     for step in range(args.n_iter):
         seq = 100 + step
-        o_with_trash, handle = streaming_moe_layer(
+        o_actual, handle = streaming_moe_layer(
             buffer,
             x,
             topk_idx,
@@ -195,7 +195,7 @@ def main():
         )
         torch.cuda.synchronize()
 
-        # streaming_moe_layer returns (o_with_trash, handle) but not pool —
+        # streaming_moe_layer returns (o_actual, handle) but not pool —
         # re-dispatch privately with a distinct seq to grab a pool snapshot
         # for the reference. Cross-checking infrastructure, not on the perf
         # path; cheap relative to the validation cost.
@@ -225,7 +225,7 @@ def main():
             tile_m=TILE_M,
         )
 
-        o_actual = o_with_trash[:T_recv].to(torch.float32)
+        o_actual = o_actual.to(torch.float32)
         o_ref_f = o_ref.to(torch.float32)
         diff = (o_actual - o_ref_f).abs()
         rel = diff / (o_ref_f.abs() + 1e-3)

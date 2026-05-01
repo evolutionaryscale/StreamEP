@@ -209,10 +209,9 @@ def main():
     # Reference y buffer for kernel Y baseline (TK_padded rows, then scattered).
     y_ref = torch.empty(TK_padded, H, dtype=DTYPE, device=device)
 
-    # `o` with a trailing trash row for the branch-free padding mask.
-    # DeepEP's handle.o is sized [T_recv, H] (no trash row); we allocate our
-    # own [T_recv + 1, H] and let kernel Y write padding rows to o[T_recv].
-    o_with_trash = torch.zeros(T_recv + 1, H, dtype=DTYPE, device=device)
+    # `o` is `handle.o` from DeepEP, sized [T_recv, H], zero-init. Kernel Y
+    # writes via PTX-predicated atomic-scatter (no trash row).
+    o_buf = handle.o
 
     if rank == 0:
         # MoE forward FLOPs (kernel A + kernel Y bf16 matmuls).
@@ -279,11 +278,11 @@ def main():
         # calls so we reset by hand.)
         handle.per_token_remaining.copy_(_per_token_remaining_init)
         handle.compute_done_per_token.zero_()
-        o_with_trash.zero_()
+        o_buf.zero_()
         streaming_moe_y(
             postact_a,
             w2_local,
-            o_with_trash,
+            o_buf,
             handle.pool_recv_token,
             handle.pool_topk_weight,
             handle.per_token_remaining,

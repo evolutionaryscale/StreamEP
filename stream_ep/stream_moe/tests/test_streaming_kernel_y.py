@@ -10,8 +10,8 @@ Mirrors the kernel-A 4-case suite plus an extra padding-row case.
     multiple contributions). Validates per-token accumulation and end-of-tile
     bookkeeping (per_token_remaining decrement + compute_done_per_token release).
   * test_padding_rows: tile contains some pool slots with pool_recv_token == -1.
-    Validates branch-free trash-row redirect (no contributions land in valid
-    rows from padding slots).
+    Validates PTX-predicated atomic-add: padding lanes skip the atomic at
+    issue time so no contributions land in valid rows from padding slots.
   * test_producer_consumer: kernel Y on compute_y_stream spins on a_ready while
     a producer kernel on a separate stream fires slot-by-slot.
 
@@ -20,7 +20,8 @@ All cases assert:
     (pool_topk_weight[s] * (postact_a[s] @ W2[expert_id(s)].T))
   - per_token_remaining[r] hits 0 (each contribution decremented exactly once)
   - compute_done_per_token[r] == combine_seq (release fired exactly once)
-  - Trash row o[T_recv, :] is not asserted to be 0 (padding writes land here)
+  - No trash row needed: predicated atomic skips padding lanes entirely
+    (verified by per_token_remaining[r] == 0 for all valid r).
 """
 
 from __future__ import annotations
@@ -110,7 +111,7 @@ def test_streaming_moe_y_compiles(device):
     dtype = torch.bfloat16
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
     W2 = torch.zeros(E_local, H, I, dtype=dtype, device=device)
-    o = torch.zeros(T_recv + 1, H, dtype=dtype, device=device)
+    o = torch.zeros(T_recv, H, dtype=dtype, device=device)
     pool_recv_token = torch.zeros(TK_padded, dtype=torch.int32, device=device)
     pool_topk_weight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
     per_token_remaining = torch.zeros(T_recv, dtype=torch.int32, device=device)
@@ -168,7 +169,7 @@ def test_streaming_moe_y_single_tile(device):
     )
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
-    o = torch.zeros(T_recv + 1, H, dtype=dtype, device=device)
+    o = torch.zeros(T_recv, H, dtype=dtype, device=device)
     # pool_recv_token: slot s → recv-token s (1:1 mapping, K_local=1 each)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     pool_topk_weight = torch.rand(TK_padded, dtype=torch.float32, device=device)
@@ -248,7 +249,7 @@ def test_streaming_moe_y_multi_tile_static(device):
     )
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
-    o = torch.zeros(T_recv + 1, H, dtype=dtype, device=device)
+    o = torch.zeros(T_recv, H, dtype=dtype, device=device)
 
     # Build pool_recv_token so each recv-token r appears in exactly 3 slots
     # (TK_padded / T_recv = 768 / 256 = 3). Simple deterministic distribution.
@@ -325,7 +326,8 @@ def test_streaming_moe_y_multi_tile_static(device):
 
 def test_streaming_moe_y_padding_rows(device):
     """Some pool slots have pool_recv_token == -1 (padding rows from BLOCK_M
-    padding in dispatch). Validates branch-free trash-row redirect: no padding
+    padding in dispatch). Validates PTX-predicated atomic-add: padding lanes
+    skip `red.global.add.noftz.v4.bf16x2` at issue time, so no padding
     contribution lands in any valid o[r, :].
     """
     from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
@@ -345,7 +347,7 @@ def test_streaming_moe_y_padding_rows(device):
     )
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
-    o = torch.zeros(T_recv + 1, H, dtype=dtype, device=device)
+    o = torch.zeros(T_recv, H, dtype=dtype, device=device)
 
     # First tile: slots 0..99 → recv-tokens 0..99 (valid), slots 100..127 padding.
     # Second tile: slots 128..227 → recv-tokens 0..99 (K_local=2), slots 228..255 padding.
@@ -436,7 +438,7 @@ def test_streaming_moe_y_producer_consumer(device):
     )
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
-    o = torch.zeros(T_recv + 1, H, dtype=dtype, device=device)
+    o = torch.zeros(T_recv, H, dtype=dtype, device=device)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     pool_topk_weight = torch.rand(TK_padded, dtype=torch.float32, device=device)
     per_token_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)

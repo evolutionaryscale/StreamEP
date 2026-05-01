@@ -37,9 +37,10 @@ Streaming machinery is shared with kernel A:
     `per_token_remaining`, `compute_done_per_token`, `o`, `a_ready`,
     `tile_id_to_expert`, `expert_pool_block_offset` from `Buffer.dispatch`.
 
-Padding rows (pool_recv_token[s] == -1): branch-free trash-row redirect to
-`o[T_recv, :]`. Caller allocates `o` with shape `(T_recv + 1, H)` and
-ignores the trash row on read.
+Padding rows (pool_recv_token[s] == -1) and other masked lanes: PTX-level
+`@%p red.global.add.noftz.v4.bf16x2` predication skips the atomic at issue
+time, so caller allocates `o` with the natural shape `(T_recv, H)` — no
+trash row needed.
 """
 
 from dataclasses import MISSING
@@ -72,7 +73,7 @@ from quack.varlen_utils import VarlenArguments
 
 from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import (
     pack_bf16x2,
-    red_add_bf16x2_v4,
+    red_add_bf16x2_v4_pred,
     st_release_sys_global,
     threadfence_system,
 )
@@ -88,7 +89,7 @@ from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import 
 # ---------------------------------------------------------------------------
 @mlir_namedtuple
 class ScatterParams(NamedTuple):
-    mO: cute.Tensor  # [(T_recv + 1), H]  bf16  — scatter dest + trash row
+    mO: cute.Tensor  # [T_recv, H]  bf16  — atomic-scatter destination
     pool_recv_token: cute.Tensor  # [TK_padded]        int32 — slot → r (-1 = padding)
     per_token_remaining: cute.Tensor  # [T_recv]           int32 — kernel Y atomicSubs
     compute_done_per_token: (
@@ -100,7 +101,7 @@ class ScatterParams(NamedTuple):
     expert_pool_block_offset: (
         cute.Tensor
     )  # [E_local + 1]      int32 — pool-block prefix-sum (for tile_id reconstruct)
-    T_recv: Int32  # trash-row index (== mO.shape[0] - 1)
+    T_recv: Int32  # row count == mO.shape[0]
     combine_seq: Int64  # value to release-store on hit-zero
     num_pid_n: Int32  # N-stripe count per tile (= ceil(H / tile_N))
 
@@ -503,9 +504,13 @@ class StreamingMoeYSm90(ComposableEpiMixin, GemmSm90):
             m_safe = m_in_subtile if row_in_range else Int32(0)
             m_local_in_tile = m_subtile_origin + m_safe
             r_raw = recv_token_t[m_local_in_tile]
-            # Branch-free padding/oob redirect to trash row.
-            r_in_range = (r_raw >= Int32(0)) & (r_raw < T_recv) & row_in_range
-            r_safe = r_raw if r_in_range else T_recv
+            # Padding rows (r_raw == -1), out-of-range warp rows, and
+            # work_idx-out-of-range lanes all collapse into one predicate.
+            # PTX-level @%p on the v4 atomic skips the instruction entirely
+            # at issue time — no HBM op, no atomic side-effect — so the
+            # address can be any clamped in-bounds pointer.
+            atomic_pred = (r_raw >= Int32(0)) & (r_raw < T_recv) & row_in_range
+            r_safe = r_raw if atomic_pred else Int32(0)
 
             # 8 adjacent bf16 starting at bf16-idx (v4_chunk * 8).
             bf16_base = v4_chunk * Int32(8)
@@ -521,14 +526,6 @@ class StreamingMoeYSm90(ComposableEpiMixin, GemmSm90):
             p1 = pack_bf16x2(b2, b3)
             p2 = pack_bf16x2(b4, b5)
             p3 = pack_bf16x2(b6, b7)
-            # Single mask covers padding-row redirect AND
-            # work_idx-out-of-range edge case (only fires when
-            # work_per_warp % 32 != 0, i.e., not at our defaults).
-            lane_mask = -Int32(r_in_range & work_in_range)
-            p0_safe = p0 & lane_mask
-            p1_safe = p1 & lane_mask
-            p2_safe = p2 & lane_mask
-            p3_safe = p3 & lane_mask
             # v4 needs 16-byte alignment (8 bf16). bf16_base is multiple
             # of 8 by construction; n_origin is multiple of epi_tile_N
             # (≥ 8 by config); together address is 16-byte aligned.
@@ -536,7 +533,7 @@ class StreamingMoeYSm90(ComposableEpiMixin, GemmSm90):
             o_row = scatter.mO[r_safe, None]
             o_row_as_i32 = cute.recast_tensor(o_row, Int32)
             target_ptr = utils.elem_pointer(o_row_as_i32, (n_global // Int32(2),))
-            red_add_bf16x2_v4(target_ptr, p0_safe, p1_safe, p2_safe, p3_safe)
+            red_add_bf16x2_v4_pred(target_ptr, p0, p1, p2, p3, Int32(atomic_pred))
 
         # 5. Producer-commit (balance pipeline state).
         cute.arch.fence_view_async_shared()
@@ -624,7 +621,7 @@ def _compile_streaming_moe_y(
     H_sym = cute.sym_int()
     E_sym = cute.sym_int()
     TK_padded_sym = cute.sym_int()
-    Trecv_plus1_sym = cute.sym_int()
+    Trecv_sym = cute.sym_int()
     total_tiles_sym = cute.sym_int()
     cu_seqlens_len_sym = cute.sym_int()  # = E_local + 1
 
@@ -632,12 +629,13 @@ def _compile_streaming_moe_y(
     mA = fake_tensor(a_dtype, (TK_padded_sym, I_sym), leading_dim=1, divisibility=8)
     # B: W2 (H, I, E_local), k-major per expert (I contiguous), batch dim = E_local.
     mB = fake_tensor(b_dtype, (H_sym, I_sym, E_sym), leading_dim=1, divisibility=8)
-    # No D / C — streaming kernel Y outputs via atomic-scatter into o[T_recv+1, H].
+    # No D / C — streaming kernel Y outputs via predicated atomic-scatter
+    # into o[T_recv, H] (no trash row).
     mD = None
     mC = None
 
-    # Scatter destination: (T_recv + 1, H), n-major.
-    mO = fake_tensor(o_dtype, (Trecv_plus1_sym, H_sym), leading_dim=1, divisibility=8)
+    # Scatter destination: (T_recv, H), n-major.
+    mO = fake_tensor(o_dtype, (Trecv_sym, H_sym), leading_dim=1, divisibility=8)
     pool_recv_token = fake_tensor(
         cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
     )
@@ -726,7 +724,7 @@ def _compile_streaming_moe_y(
 def streaming_moe_y(
     postact_a: torch.Tensor,  # (total_tiles, tile_m, I) bf16
     W2: torch.Tensor,  # (E_local, H, I) bf16 — k-major per expert
-    o: torch.Tensor,  # (T_recv + 1, H) bf16 — last row = trash row
+    o: torch.Tensor,  # (T_recv, H) bf16 — atomic-scatter destination
     pool_recv_token: torch.Tensor,  # (TK_padded,) int32
     pool_topk_weight: torch.Tensor,  # (TK_padded,) float32
     per_token_remaining: torch.Tensor,  # (T_recv,) int32
@@ -751,9 +749,10 @@ def streaming_moe_y(
     available for kernel A to run concurrently — see design.md §"SM budget".
 
     Caller is responsible for:
-      - allocating ``o`` with shape ``(T_recv + 1, H)`` (extra row is the
-        trash row for padding redirects), zero-initialized, on the same stream
-        this function is called from.
+      - allocating ``o`` with shape ``(T_recv, H)``, zero-initialized, on
+        the same stream this function is called from. Padding rows and
+        other masked lanes are handled via PTX-level predicated atomic-add
+        (no trash row needed).
       - allocating ``per_token_remaining`` with the K_local count for each
         recv-token (DeepEP's dispatch sets this in Pass B's per-pool-slot block).
       - allocating ``compute_done_per_token`` zero-initialized.
@@ -767,8 +766,7 @@ def streaming_moe_y(
     assert o.dim() == 2
     total_tiles, postact_tile_m, I = postact_a.shape
     assert postact_tile_m == tile_m
-    Trecv_plus1, H = o.shape
-    T_recv = Trecv_plus1 - 1
+    T_recv, H = o.shape
     E_local = W2.shape[0]
     assert W2.shape == (E_local, H, I), (
         f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected "
