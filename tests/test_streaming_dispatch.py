@@ -214,7 +214,10 @@ def main():
         "pool_recv_token not deterministic"
     assert torch.equal(handle.pool_k_slot.cpu(), handle2.pool_k_slot.cpu()), \
         "pool_k_slot not deterministic"
-    assert torch.equal(pool.cpu(), pool2.cpu()), "pool data not deterministic"
+    # `pool` padding rows are now left uninitialized (kernel Y's pool_recv_token
+    # predicate is the actual safety mechanism). Compare valid rows only.
+    valid = (handle.pool_recv_token.cpu() >= 0)
+    assert torch.equal(pool.cpu()[valid], pool2.cpu()[valid]), "pool data (valid rows) not deterministic"
     assert torch.equal(handle.tile_id_to_expert.cpu(), handle2.tile_id_to_expert.cpu()), \
         "tile_id_to_expert not deterministic"
 

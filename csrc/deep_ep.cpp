@@ -606,14 +606,14 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
     int64_t TK_padded = static_cast<int64_t>(total_tiles) * tile_m;
 
-    // ── Pool-layout dispatch outputs sized by polled values. Padding rows are
-    // zero-initialized so kernel A's GEMM on partial tiles produces zero output
-    // (no uninitialized data flowing into kernel Y's scatter), and so the pool
-    // tensor compares bit-equal across dispatches with the same cached routing.
-    // PyTorch's caching allocator uses `getCurrentCUDAStream`, so all zeros() /
-    // full() memsets land on the caller's stream and are naturally ordered with
+    // ── Pool-layout dispatch outputs sized by polled values. Padding rows in
+    // `pool` are left uninitialized: kernel Y's scatter is gated on
+    // `pool_recv_token[s] >= 0` (set to -1 below for padding slots), so any
+    // garbage that kernel A's GEMM produces on partial tiles never reaches `o`.
+    // PyTorch's caching allocator uses `getCurrentCUDAStream`, so the full()
+    // memsets below land on the caller's stream and are naturally ordered with
     // the dispatch kernel that reads them.
-    auto pool = torch::zeros({TK_padded, hidden}, x.options());
+    auto pool = torch::empty({TK_padded, hidden}, x.options());
     auto pool_topk_weight = torch::zeros({TK_padded}, dtype(torch::kFloat32).device(torch::kCUDA));
     auto pool_recv_token = torch::full({TK_padded}, -1, i32_opts);
     auto pool_k_slot = torch::full({TK_padded}, -1, i32_opts);
