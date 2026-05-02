@@ -55,6 +55,9 @@ namespace intranode {
 //   expert_frequency[E_local], expert_pool_block_offset[E_local + 1],
 //   base_pool[num_channels, num_ranks, E_local],
 //   rank_prefix_matrix[R, R] (this rank's column),
+//   tile_id_to_expert[total_tiles_max], pool_arrival_target[total_tiles_max]
+//     (only the [0, total_tiles) prefix is written; caller pre-allocates at
+//     `total_tiles_max = ceil(N * K * R / tile_m) + E_local`),
 //   total_tiles (host-mapped + device int), num_recv (host-mapped),
 //   num_recv_per_expert[E_local] (host-mapped, aligned).
 void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
@@ -62,6 +65,8 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* expert_pool_block_offset,
                                  int* base_pool,
                                  int* rank_prefix_matrix,
+                                 int* tile_id_to_expert,
+                                 int* pool_arrival_target,
                                  int* total_tiles_out,
                                  int* num_recv_mapped,
                                  int* num_recv_per_expert_mapped,
@@ -78,20 +83,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int tile_m,
                                  int expert_alignment,
                                  cudaStream_t stream);
-
-// Pool-layout per-tile arrays (sized by total_tiles, so launched after the host
-// poll on streaming_total_tiles).
-//   tile_id_to_expert[total_tiles]   int32 — which expert this tile belongs to.
-//   pool_arrival_target[total_tiles] int32 — write count for tile to be ready
-//     (BLOCK_M for full tiles; leftover for each expert's last partial tile).
-void tile_arrays_init(const int* expert_frequency,
-                      const int* expert_pool_block_offset,
-                      int* tile_id_to_expert,
-                      int* pool_arrival_target,
-                      int num_experts_per_rank,
-                      int total_tiles,
-                      int tile_m,
-                      cudaStream_t stream);
 
 void dispatch(void* pool,
               float* pool_x_scales,

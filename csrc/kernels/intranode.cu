@@ -50,6 +50,10 @@ __host__ __device__ inline int receiver_state_smem_bytes(int num_ranks, int E_lo
 //        total_tiles (host + device), num_recv (host),
 //        num_recv_per_expert[E_local] (host).
 //   7. base_pool fill: per-expert serial accumulation over (c, src) lex order.
+//   8. Per-tile arrays: `tile_id_to_expert[total_tiles]` and
+//      `pool_arrival_target[total_tiles]`. Pre-allocated at `total_tiles_max`
+//      by the host (sized by num_tokens × num_topk × num_ranks / tile_m + E,
+//      ~8 KB at production); only the prefix [0, total_tiles) is written.
 //
 // Pool layout: each expert's region in `pool` starts at
 // `expert_pool_block_offset[e] * BLOCK_M` (BLOCK_M = tile_m) and is padded up to
@@ -62,6 +66,8 @@ __global__ void streaming_dispatch_metadata_kernel(
         int* expert_pool_block_offset,
         int* base_pool,
         int* rank_prefix_matrix,
+        int* tile_id_to_expert,
+        int* pool_arrival_target,
         int* total_tiles_out,
         int* num_recv_mapped,
         int* num_recv_per_expert_mapped,
@@ -211,6 +217,26 @@ __global__ void streaming_dispatch_metadata_kernel(
             acc += my_e_inbox[cs * E + e];
         }
     }
+
+    // Phase 8: per-tile arrays for the dispatch hot path. Each thread owns one
+    // expert and walks its tile range [s_pool_blk[e], s_pool_blk[e+1]) writing
+    //   tile_id_to_expert[tile_id]   = e
+    //   pool_arrival_target[tile_id] = tile_m for full tiles,
+    //                                  s_freq[e] - tile_in_e * tile_m for the
+    //                                  last (possibly partial) tile per expert.
+    // No sync required vs. phase 7: writes target disjoint global regions and
+    // s_pool_blk / s_freq remain valid in SMEM since phase 6 (the only writers).
+    for (int e = thread_id; e < E; e += num_threads) {
+        int e_start = s_pool_blk[e];
+        int e_end = s_pool_blk[e + 1];
+        int n_tiles = e_end - e_start;
+        int n_e = s_freq[e];
+        for (int t = 0; t < n_tiles; ++t) {
+            int tile_id = e_start + t;
+            tile_id_to_expert[tile_id] = e;
+            pool_arrival_target[tile_id] = (t == n_tiles - 1) ? (n_e - t * tile_m) : tile_m;
+        }
+    }
 }
 
 void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
@@ -218,6 +244,8 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* expert_pool_block_offset,
                                  int* base_pool,
                                  int* rank_prefix_matrix,
+                                 int* tile_id_to_expert,
+                                 int* pool_arrival_target,
                                  int* total_tiles_out,
                                  int* num_recv_mapped,
                                  int* num_recv_per_expert_mapped,
@@ -242,6 +270,8 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                   expert_pool_block_offset,                                                  \
                   base_pool,                                                                 \
                   rank_prefix_matrix,                                                        \
+                  tile_id_to_expert,                                                         \
+                  pool_arrival_target,                                                       \
                   total_tiles_out,                                                           \
                   num_recv_mapped,                                                           \
                   num_recv_per_expert_mapped,                                                \
@@ -264,57 +294,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
     cfg.dynamicSmemBytes = smem_bytes;
     SWITCH_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
 #undef STREAMING_DISPATCH_METADATA_LAUNCH_CASE
-}
-
-// Pool-layout per-tile arrays. Sized by `total_tiles` (known only after the host
-// poll on streaming_total_tiles), so this is a separate launch from the metadata
-// kernel. Outputs:
-//   - tile_id_to_expert[total_tiles]      int32 — which expert this tile belongs to.
-//   - pool_arrival_target[total_tiles]    int32 — write count needed for the tile
-//       to be considered "ready" (BLOCK_M for full tiles, leftover for the last
-//       partial tile of each expert).
-__global__ void tile_arrays_init_kernel(const int* __restrict__ expert_frequency,
-                                        const int* __restrict__ expert_pool_block_offset,
-                                        int* tile_id_to_expert,
-                                        int* pool_arrival_target,
-                                        int E,
-                                        int total_tiles,
-                                        int tile_m) {
-    int tile_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tile_id >= total_tiles)
-        return;
-
-    int e = 0;
-    while (e < E && expert_pool_block_offset[e + 1] <= tile_id)
-        ++e;
-    int e_start = expert_pool_block_offset[e];
-    int e_end = expert_pool_block_offset[e + 1];
-    int tile_in_e = tile_id - e_start;
-
-    tile_id_to_expert[tile_id] = e;
-    if (tile_id == e_end - 1) {
-        int rem = expert_frequency[e] - tile_in_e * tile_m;
-        pool_arrival_target[tile_id] = rem;
-    } else {
-        pool_arrival_target[tile_id] = tile_m;
-    }
-}
-
-void tile_arrays_init(const int* expert_frequency,
-                      const int* expert_pool_block_offset,
-                      int* tile_id_to_expert,
-                      int* pool_arrival_target,
-                      int num_experts_per_rank,
-                      int total_tiles,
-                      int tile_m,
-                      cudaStream_t stream) {
-    if (total_tiles == 0)
-        return;
-    int threads = 128;
-    int blocks = (total_tiles + threads - 1) / threads;
-    tile_arrays_init_kernel<<<blocks, threads, 0, stream>>>(
-        expert_frequency, expert_pool_block_offset, tile_id_to_expert, pool_arrival_target,
-        num_experts_per_rank, total_tiles, tile_m);
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>

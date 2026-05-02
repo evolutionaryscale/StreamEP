@@ -543,11 +543,24 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto base_pool = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
     auto rank_prefix_matrix = torch::zeros({num_ranks, num_ranks}, i32_opts);
     auto total_tiles_device = torch::empty({1}, i32_opts);
+
+    // Per-tile arrays produced by the metadata kernel's phase 8. Sized at the
+    // worst-case `total_tiles_max` upper bound — every (token, k) at every
+    // sender contributes at most one slot, plus up to E_local extra tiles from
+    // per-expert ceil-padding. Production: 8192×4×8/128 + 8 = 2056 ints (~8 KB
+    // per array). The dispatch return slices these down to the polled
+    // `total_tiles` so consumers see only the valid prefix.
+    int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
+    auto tile_id_to_expert = torch::empty({total_tiles_max}, i32_opts);
+    auto pool_arrival_target = torch::empty({total_tiles_max}, i32_opts);
+
     intranode::streaming_dispatch_metadata(topk_idx.data_ptr<topk_idx_t>(),
                                            expert_frequency.data_ptr<int>(),
                                            expert_pool_block_offset.data_ptr<int>(),
                                            base_pool.data_ptr<int>(),
                                            rank_prefix_matrix.data_ptr<int>(),
+                                           tile_id_to_expert.data_ptr<int>(),
+                                           pool_arrival_target.data_ptr<int>(),
                                            total_tiles_device.data_ptr<int>(),
                                            moe_recv_counter_mapped,
                                            moe_recv_expert_counter_mapped,
@@ -632,9 +645,12 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         pool_x_scales_ptr = static_cast<float*>(pool_x_scales->data_ptr());
     }
 
-    // ── Per-tile arrays (sized by total_tiles, post-host-poll).
-    auto tile_id_to_expert = torch::empty({total_tiles}, i32_opts);
-    auto pool_arrival_target = torch::empty({total_tiles}, i32_opts);
+    // ── Per-tile arrays (sized by total_tiles, post-host-poll). `tile_id_to_expert`
+    // and `pool_arrival_target` were already filled by the metadata kernel's
+    // phase 8 into a `total_tiles_max`-sized backing buffer; narrow the visible
+    // tensors to `[0, total_tiles)` so consumers see only the valid prefix.
+    tile_id_to_expert = tile_id_to_expert.narrow(0, 0, total_tiles);
+    pool_arrival_target = pool_arrival_target.narrow(0, 0, total_tiles);
     auto pool_arrival_count = torch::zeros({total_tiles}, i32_opts);
     auto tile_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
     // a_ready[total_tiles]: kernel A → kernel Y per-tile release stamp. Allocated
@@ -642,16 +658,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // the zero-init via the dispatch → A `tile_ready` acquire chain (same pattern
     // as pool / tile_ready themselves).
     auto a_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
-    intranode::tile_arrays_init(expert_frequency.data_ptr<int>(),
-                                expert_pool_block_offset.data_ptr<int>(),
-                                tile_id_to_expert.data_ptr<int>(),
-                                pool_arrival_target.data_ptr<int>(),
-                                num_local_experts,
-                                total_tiles,
-                                tile_m,
-                                stream);
 
-    // Record the metadata-done event between `tile_arrays_init` and the dispatch
+    // Record the metadata-done event between the metadata kernel and the dispatch
     // main kernel. Consumer streams (kernel A, kernel Y, combine sender) wait
     // on this event to safely read metadata tensors (expert_pool_block_offset,
     // pool_recv_token, pool_topk_weight, etc.) without serializing against the
