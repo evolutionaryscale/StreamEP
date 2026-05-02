@@ -531,28 +531,68 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         moe_recv_expert_counter[i] = -1;
     *streaming_total_tiles = -1;
 
-    // Sender-side channel prefix matrix (filled by the dispatch sender preamble).
+    // ── Pre-host-poll consolidated allocation. ──────────────────────────────
+    //
+    // The metadata kernel's outputs + the dispatch sender's per-(rank,channel)
+    // prefix matrix all live on `comm_stream`. We bundle them into a single
+    // int8 slab and view typed sub-tensors via `narrow` + `view(dtype)`.
+    //
+    // Why one slab + one memset instead of 8 separate `torch::empty/zeros`:
+    // each per-tensor `torch::empty` costs ~5–10 µs of host-side aten-op +
+    // caching-allocator overhead at production shape, and each `torch::zeros`
+    // adds another `aten::zero_` + `cudaLaunchKernel` for the per-tensor
+    // memset. Trace evidence (profiles/phase_d_reorder/) showed ~150 µs of
+    // host-side work between the metadata kernel ending and dispatch_main
+    // launching, dominated by ~12 individual aten ops; consolidating into
+    // one alloc + one memset reclaims the bulk of that latency.
+    //
+    // Per-tensor init requirements (audit):
+    //   rank_prefix_matrix       atomicAdd target in metadata phase 4–5 → MUST be 0.
+    //   {channel,base,...}_*     written by metadata kernel; init value irrelevant.
+    //   tile_id_to_expert        written by phase 8 at indices < total_tiles; tail unused.
+    //   pool_arrival_target      written by phase 8 at indices < total_tiles; tail unused.
+    // Single bundle-wide memset(0) is correctness-preserving and simplest.
+    //
+    // `total_tiles_max` is the upper-bound tile count (every (token, k) at
+    // every sender contributes at most one slot, plus up to E_local extra
+    // tiles from per-expert ceil-padding). Production: 8192×4×8/128 + 8 =
+    // 2056 ints (~8 KB per array). The dispatch return slices these down to
+    // the polled `total_tiles` so consumers see only the valid prefix.
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
-    auto channel_prefix_matrix = torch::empty({num_ranks, num_channels}, i32_opts);
+    auto i8_opts = dtype(torch::kInt8).device(torch::kCUDA);
 
-    // Pool-shape metadata (E_local + R + (c, src, e)-sized; produced before the
-    // host poll). The fused kernel does cross-rank count exchange + receiver-side
-    // prefix-sum derivation in a single launch.
-    auto expert_frequency = torch::empty({num_local_experts}, i32_opts);
-    auto expert_pool_block_offset = torch::empty({num_local_experts + 1}, i32_opts);
-    auto base_pool = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
-    auto rank_prefix_matrix = torch::zeros({num_ranks, num_ranks}, i32_opts);
-    auto total_tiles_device = torch::empty({1}, i32_opts);
-
-    // Per-tile arrays produced by the metadata kernel's phase 8. Sized at the
-    // worst-case `total_tiles_max` upper bound — every (token, k) at every
-    // sender contributes at most one slot, plus up to E_local extra tiles from
-    // per-expert ceil-padding. Production: 8192×4×8/128 + 8 = 2056 ints (~8 KB
-    // per array). The dispatch return slices these down to the polled
-    // `total_tiles` so consumers see only the valid prefix.
     int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
-    auto tile_id_to_expert = torch::empty({total_tiles_max}, i32_opts);
-    auto pool_arrival_target = torch::empty({total_tiles_max}, i32_opts);
+
+    auto align16 = [](int64_t x) { return (x + 15) & ~static_cast<int64_t>(15); };
+    int64_t pre_off_channel_prefix_matrix    = align16(0);
+    int64_t pre_off_expert_frequency         = align16(pre_off_channel_prefix_matrix    + static_cast<int64_t>(num_ranks) * num_channels * sizeof(int));
+    int64_t pre_off_expert_pool_block_offset = align16(pre_off_expert_frequency         + static_cast<int64_t>(num_local_experts) * sizeof(int));
+    int64_t pre_off_base_pool                = align16(pre_off_expert_pool_block_offset + static_cast<int64_t>(num_local_experts + 1) * sizeof(int));
+    int64_t pre_off_rank_prefix_matrix       = align16(pre_off_base_pool                + static_cast<int64_t>(num_channels) * num_ranks * num_local_experts * sizeof(int));
+    int64_t pre_off_total_tiles_device       = align16(pre_off_rank_prefix_matrix       + static_cast<int64_t>(num_ranks) * num_ranks * sizeof(int));
+    int64_t pre_off_tile_id_to_expert        = align16(pre_off_total_tiles_device       + static_cast<int64_t>(1) * sizeof(int));
+    int64_t pre_off_pool_arrival_target      = align16(pre_off_tile_id_to_expert        + total_tiles_max * sizeof(int));
+    int64_t pre_total_bytes                  = align16(pre_off_pool_arrival_target      + total_tiles_max * sizeof(int));
+
+    auto pre_bundle = torch::empty({pre_total_bytes}, i8_opts);
+    auto* pre_base = static_cast<int8_t*>(pre_bundle.data_ptr());
+    CUDA_CHECK(cudaMemsetAsync(pre_base, 0, pre_total_bytes, stream));
+
+    // Lambda capturing `pre_bundle` by value to keep storage alive for the
+    // lifetime of any returned view. Each `at::from_blob` clones this lambda
+    // (incrementing pre_bundle's refcount); on tensor free, the storage
+    // deleter destructs the lambda, releasing the refcount. Bundle freed back
+    // to the caching allocator once all views are dropped.
+    auto pre_keep = [pre_bundle](void*) {};
+
+    auto channel_prefix_matrix    = at::from_blob(pre_base + pre_off_channel_prefix_matrix,    {num_ranks, num_channels},                            pre_keep, i32_opts);
+    auto expert_frequency         = at::from_blob(pre_base + pre_off_expert_frequency,         {num_local_experts},                                  pre_keep, i32_opts);
+    auto expert_pool_block_offset = at::from_blob(pre_base + pre_off_expert_pool_block_offset, {num_local_experts + 1},                              pre_keep, i32_opts);
+    auto base_pool                = at::from_blob(pre_base + pre_off_base_pool,                {num_channels, num_ranks, num_local_experts},         pre_keep, i32_opts);
+    auto rank_prefix_matrix       = at::from_blob(pre_base + pre_off_rank_prefix_matrix,       {num_ranks, num_ranks},                               pre_keep, i32_opts);
+    auto total_tiles_device       = at::from_blob(pre_base + pre_off_total_tiles_device,       {1},                                                  pre_keep, i32_opts);
+    auto tile_id_to_expert        = at::from_blob(pre_base + pre_off_tile_id_to_expert,        {total_tiles_max},                                    pre_keep, i32_opts);
+    auto pool_arrival_target      = at::from_blob(pre_base + pre_off_pool_arrival_target,      {total_tiles_max},                                    pre_keep, i32_opts);
 
     intranode::streaming_dispatch_metadata(topk_idx.data_ptr<topk_idx_t>(),
                                            expert_frequency.data_ptr<int>(),
@@ -619,25 +659,44 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
     int64_t TK_padded = static_cast<int64_t>(total_tiles) * tile_m;
 
-    // ── Pool-layout dispatch outputs sized by polled values. Padding rows in
-    // `pool` are left uninitialized: kernel Y's scatter is gated on
-    // `pool_recv_token[s] >= 0` (set to -1 below for padding slots), so any
-    // garbage that kernel A's GEMM produces on partial tiles never reaches `o`.
-    // PyTorch's caching allocator uses `getCurrentCUDAStream`, so the full()
-    // memsets below land on the caller's stream and are naturally ordered with
-    // the dispatch kernel that reads them.
+    // ── Post-host-poll consolidated allocation. ─────────────────────────────
+    //
+    // All small/medium per-recv-token + per-tile outputs go into ONE int8
+    // slab with three `cudaMemsetAsync` calls (different offsets, different
+    // fill bytes, with `metadata_done` recorded between them). Bundling
+    // saves ~80 µs of host aten-op overhead vs the previous 11 separate
+    // torch::zeros/empty calls.
+    //
+    // The `metadata_done` event placement matters for kernel A streaming
+    // overlap: consumer streams wait on metadata_done before reading any
+    // metadata tensors, but only some of the post-poll buffers are needed
+    // by kernel A's start (it spins on tile_ready). So we split the Z region
+    // into two halves around the event:
+    //
+    //   Z_pre (zeroed BEFORE metadata_done — kernel A / kernel Y read these
+    //          via the dispatch_main → tile_ready → kernel_A chain):
+    //     pool_topk_weight, recv_src_idx, recv_topk_weights,
+    //     recv_channel_prefix_matrix, send_head, pool_arrival_count,
+    //     tile_ready, a_ready
+    //
+    //   N (0xFF = -1, BEFORE metadata_done — kernel Y reads via predicate):
+    //     pool_recv_token, pool_k_slot
+    //
+    //   Z_post (zeroed AFTER metadata_done — kernel Y atomic-scatter
+    //          destinations + combine sender state. Kernel Y waits on
+    //          a_ready (kernel A's release), which serializes after this
+    //          memset on comm_stream → no race):
+    //     per_token_remaining, compute_done_per_token, o
+    //
+    // Kept separate (memory wall — too big to bundle without forcing a
+    // different size class on PyTorch's caching allocator each iter):
+    //   pool[TK_padded, hidden] (~290 MB at production; no init needed —
+    //     kernel Y's predicate skips padding slots).
+    //   pool_x_scales (FP8 path; conditional).
     auto pool = torch::empty({TK_padded, hidden}, x.options());
-    auto pool_topk_weight = torch::zeros({TK_padded}, dtype(torch::kFloat32).device(torch::kCUDA));
-    auto pool_recv_token = torch::full({TK_padded}, -1, i32_opts);
-    auto pool_k_slot = torch::full({TK_padded}, -1, i32_opts);
 
-    // ── Recv-token-indexed outputs (combine still consumes these).
-    auto recv_src_idx = torch::empty({num_recv_tokens}, i32_opts);
-    auto recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights.options());
-    auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, i32_opts);
-    auto send_head = torch::empty({num_tokens, num_ranks}, i32_opts);
-
-    // Pool-shape x_scales (FP8 path; otherwise unused).
+    // Pool-shape x_scales (FP8 path; otherwise unused). Kept separate from
+    // the post-poll bundle since it's conditional and FP8-specific.
     auto pool_x_scales = std::optional<torch::Tensor>();
     float* pool_x_scales_ptr = nullptr;
     if (x_scales.has_value()) {
@@ -645,40 +704,83 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         pool_x_scales_ptr = static_cast<float*>(pool_x_scales->data_ptr());
     }
 
-    // ── Per-tile arrays (sized by total_tiles, post-host-poll). `tile_id_to_expert`
-    // and `pool_arrival_target` were already filled by the metadata kernel's
-    // phase 8 into a `total_tiles_max`-sized backing buffer; narrow the visible
-    // tensors to `[0, total_tiles)` so consumers see only the valid prefix.
-    tile_id_to_expert = tile_id_to_expert.narrow(0, 0, total_tiles);
-    pool_arrival_target = pool_arrival_target.narrow(0, 0, total_tiles);
-    auto pool_arrival_count = torch::zeros({total_tiles}, i32_opts);
-    auto tile_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
-    // a_ready[total_tiles]: kernel A → kernel Y per-tile release stamp. Allocated
-    // here on the caller's stream; kernel A's release-store transitively observes
-    // the zero-init via the dispatch → A `tile_ready` acquire chain (same pattern
-    // as pool / tile_ready themselves).
-    auto a_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
+    int64_t hidden_bytes_per_recv_token = static_cast<int64_t>(hidden) * x.element_size();
 
-    // Record the metadata-done event between the metadata kernel and the dispatch
-    // main kernel. Consumer streams (kernel A, kernel Y, combine sender) wait
-    // on this event to safely read metadata tensors (expert_pool_block_offset,
-    // pool_recv_token, pool_topk_weight, etc.) without serializing against the
-    // dispatch main kernel — preserving the per-tile dispatch→A streaming overlap.
+    // Z_pre region offsets (zeroed before metadata_done event).
+    int64_t off_pool_topk_weight    = align16(0);
+    int64_t off_recv_src_idx        = align16(off_pool_topk_weight    + TK_padded * sizeof(float));
+    int64_t off_recv_topk_weights   = align16(off_recv_src_idx        + static_cast<int64_t>(num_recv_tokens) * sizeof(int));
+    int64_t off_recv_channel_prefix = align16(off_recv_topk_weights   + static_cast<int64_t>(num_recv_tokens) * num_topk * sizeof(float));
+    int64_t off_send_head           = align16(off_recv_channel_prefix + static_cast<int64_t>(num_ranks) * num_channels * sizeof(int));
+    int64_t off_pool_arrival_count  = align16(off_send_head           + static_cast<int64_t>(num_tokens) * num_ranks * sizeof(int));
+    int64_t off_tile_ready          = align16(off_pool_arrival_count  + static_cast<int64_t>(total_tiles) * sizeof(int));
+    int64_t off_a_ready             = align16(off_tile_ready          + static_cast<int64_t>(total_tiles) * sizeof(int64_t));
+    int64_t z_pre_bytes             = align16(off_a_ready             + static_cast<int64_t>(total_tiles) * sizeof(int64_t));
+
+    // N region offsets (-1 fill, before metadata_done).
+    int64_t off_pool_recv_token = align16(z_pre_bytes);
+    int64_t off_pool_k_slot     = align16(off_pool_recv_token + TK_padded * sizeof(int));
+    int64_t n_end               = align16(off_pool_k_slot     + TK_padded * sizeof(int));
+
+    // Z_post region offsets (zeroed after metadata_done).
+    int64_t off_per_token_remaining    = align16(n_end);
+    int64_t off_compute_done_per_token = align16(off_per_token_remaining    + static_cast<int64_t>(num_recv_tokens) * sizeof(int));
+    int64_t off_o                      = align16(off_compute_done_per_token + static_cast<int64_t>(num_recv_tokens) * sizeof(int64_t));
+    int64_t post_total_bytes           = align16(off_o                      + static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
+
+    auto post_bundle = torch::empty({post_total_bytes}, i8_opts);
+    auto* post_base = static_cast<int8_t*>(post_bundle.data_ptr());
+
+    // Z_pre + N memsets (queued BEFORE metadata_done event recording).
+    CUDA_CHECK(cudaMemsetAsync(post_base,                0x00, z_pre_bytes,         stream));
+    CUDA_CHECK(cudaMemsetAsync(post_base + z_pre_bytes,  0xFF, n_end - z_pre_bytes, stream));
+
+    auto post_keep = [post_bundle](void*) {};
+    auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
+    auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // Z_pre + N views (consumed by kernel A / kernel Y / combine via
+    // tile_ready / a_ready / per-token-gate chains; serialized after the
+    // memsets above via metadata_done event).
+    auto pool_topk_weight           = at::from_blob(post_base + off_pool_topk_weight,    {TK_padded},                          post_keep, f32_opts);
+    auto recv_src_idx               = at::from_blob(post_base + off_recv_src_idx,        {num_recv_tokens},                    post_keep, i32_opts);
+    auto recv_topk_weights          = at::from_blob(post_base + off_recv_topk_weights,   {num_recv_tokens, num_topk},          post_keep, topk_weights.options());
+    auto recv_channel_prefix_matrix = at::from_blob(post_base + off_recv_channel_prefix, {num_ranks, num_channels},            post_keep, i32_opts);
+    auto send_head                  = at::from_blob(post_base + off_send_head,           {num_tokens, num_ranks},              post_keep, i32_opts);
+    auto pool_arrival_count         = at::from_blob(post_base + off_pool_arrival_count,  {total_tiles},                        post_keep, i32_opts);
+    auto tile_ready                 = at::from_blob(post_base + off_tile_ready,          {total_tiles},                        post_keep, i64_opts);
+    auto a_ready                    = at::from_blob(post_base + off_a_ready,             {total_tiles},                        post_keep, i64_opts);
+    auto pool_recv_token            = at::from_blob(post_base + off_pool_recv_token,     {TK_padded},                          post_keep, i32_opts);
+    auto pool_k_slot                = at::from_blob(post_base + off_pool_k_slot,         {TK_padded},                          post_keep, i32_opts);
+
+    // Narrow the per-tile arrays from total_tiles_max → total_tiles for the
+    // returned views (the metadata kernel wrote indices < total_tiles). One
+    // narrow per tensor here (vs replacing with from_blob): the source
+    // tensor (already from_blob'd into pre_bundle) keeps its storage alive
+    // and `narrow` on a from_blob'd tensor returns another view sharing the
+    // same storage — net cost is one extra `aten::narrow` event per tensor,
+    // unavoidable since the visible size is only known post-poll.
+    tile_id_to_expert   = tile_id_to_expert.narrow(0, 0, total_tiles);
+    pool_arrival_target = pool_arrival_target.narrow(0, 0, total_tiles);
+
+    // Record the metadata-done event between the metadata kernel + Z_pre/N
+    // memsets and the dispatch main kernel. Consumer streams (kernel A,
+    // kernel Y, combine sender) wait on this event to safely read metadata
+    // tensors (expert_pool_block_offset, pool_recv_token, pool_topk_weight,
+    // etc.) without serializing against the dispatch main kernel —
+    // preserving the per-tile dispatch→A streaming overlap.
     auto metadata_done_event = EventHandle(stream);
 
-    // ── Per-recv-token arrays for kernel Y's atomic-scatter epilogue + the
-    // eventual Phase D combine sender's per-token gate.
-    //   per_token_remaining: dispatch's Pass B writes K_local(r); kernel Y
-    //     atomicSubs on each contribution and release-stores compute_done on
-    //     hit-zero. Zero-init so unused slots stay 0 (no spurious decrements).
-    //   compute_done_per_token: int64 per-token release-store target (kernel Y
-    //     → combine sender). Zero-init; combine sender's spin condition is
-    //     `>= combine_seq` so stale-zero safely fails the spin.
-    //   o: per-recv-token output buffer (kernel Y atomicAdds into o[r, :]).
-    //     Zero-init; matches x's dtype for combine-side wire compatibility.
-    auto per_token_remaining = torch::zeros({num_recv_tokens}, i32_opts);
-    auto compute_done_per_token = torch::zeros({num_recv_tokens}, dtype(torch::kInt64).device(torch::kCUDA));
-    auto o = torch::zeros({num_recv_tokens, hidden}, x.options());
+    // Z_post memset (queued AFTER metadata_done event recording — kernel A
+    // doesn't depend on these tensors at start; kernel Y reaches them only
+    // through the a_ready release-acquire chain which serializes after
+    // dispatch_main and kernel A on comm_stream / compute_a_stream).
+    CUDA_CHECK(cudaMemsetAsync(post_base + n_end, 0x00, post_total_bytes - n_end, stream));
+
+    // Z_post views.
+    auto per_token_remaining    = at::from_blob(post_base + off_per_token_remaining,    {num_recv_tokens},          post_keep, i32_opts);
+    auto compute_done_per_token = at::from_blob(post_base + off_compute_done_per_token, {num_recv_tokens},          post_keep, i64_opts);
+    auto o                      = at::from_blob(post_base + off_o,                      {num_recv_tokens, hidden},  post_keep, x.options());
 
     EP_HOST_ASSERT(
         num_ranks * num_ranks * sizeof(int) +
