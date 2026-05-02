@@ -151,9 +151,10 @@ class AtomicScatterStore(EpiOp):
         if arg is None:
             return 0
         # Conservative upper bound (epi_stage decided at runtime). Mirrors the
-        # bytes TileStore would charge plus the small int32 recv_token area.
+        # bytes TileStore would charge plus the small int32 recv_token area
+        # plus a 4-byte is_last_flag scratch.
         bf16_bytes_per_stage = cute.size(cute.shape(epi_tile)) * 2
-        return bf16_bytes_per_stage * 4 + cta_tile_shape_mnk[0] * 4
+        return bf16_bytes_per_stage * 4 + cta_tile_shape_mnk[0] * 4 + 16
 
     def smem_struct_field(self, gemm, params):
         layout_key = self._layout_key()
@@ -170,6 +171,12 @@ class AtomicScatterStore(EpiOp):
                 cute.struct.MemRange[scatter_dtype, bf16_size], gemm.buffer_align_bytes
             ]
             recv_token: cute.struct.Align[cute.struct.MemRange[Int32, tile_M], 16]
+            # `is_last_flag`: 1-int32 scratch slot for the last-N-stripe gate
+            # broadcast in `end()`. Thread 0 writes 0/1 here after its
+            # atomic_add on tile_n_stripes_done; an epilogue-scoped named
+            # barrier makes it visible to the other 127 epilogue threads,
+            # which then parallel-execute the per-row bookkeeping.
+            is_last_flag: cute.struct.Align[cute.struct.MemRange[Int32, 1], 4]
 
         return (f"s_{self.name}", ScatterStorage)
 
@@ -182,7 +189,8 @@ class AtomicScatterStore(EpiOp):
         recv_token_t = s_struct.recv_token.get_tensor(
             cute.make_layout(gemm.cta_tile_shape_mnk[0])
         )
-        return (staging_t, recv_token_t)
+        is_last_t = s_struct.is_last_flag.get_tensor(cute.make_layout(1))
+        return (staging_t, recv_token_t, is_last_t)
 
     # --- Device lifecycle ---------------------------------------------------
     @cute.jit
@@ -193,7 +201,7 @@ class AtomicScatterStore(EpiOp):
         """
         if const_expr(param is None):
             return None
-        staging_t, recv_token_t = smem_tensor
+        staging_t, recv_token_t, is_last_t = smem_tensor
         # pool_start = cu_seqlens_m[batch_idx] + pid_m * tile_M.
         # cu_seqlens_m carries `expert_pool_block_offset * tile_m` (host-side build
         # in the streaming_moe_y wrapper); for the streaming scheduler
@@ -212,7 +220,7 @@ class AtomicScatterStore(EpiOp):
         # if `needs_async_fence()` is True. We do a synchronous load above, so we
         # rely on the surrounding epilogue_barrier (called by the consumer side)
         # to make the load visible.
-        return (staging_t, recv_token_t, pool_start)
+        return (staging_t, recv_token_t, is_last_t, pool_start)
 
     def begin_loop(self, gemm, state, epi_coord):
         # epi_subtile_store reads the staging + recv_token directly from `state`.
@@ -247,7 +255,7 @@ class AtomicScatterStore(EpiOp):
         """
         if const_expr(param is None):
             return
-        staging_t, recv_token_t, pool_start = state
+        staging_t, recv_token_t, is_last_t, pool_start = state
 
         # Reconstruct tile_id from batch_idx + pid_m.
         # tile_id = expert_pool_block_offset[batch_idx] + pid_m.
@@ -255,51 +263,54 @@ class AtomicScatterStore(EpiOp):
         pid_m = tile_coord_mnkl[0]
         tile_id = param.expert_pool_block_offset[batch_idx] + pid_m
 
-        # Threadfence-gpu (the atomic-add below provides system-scope ordering).
-        # Only thread 0 of warp 0 does the gate increment. Other threads sync
-        # via epilogue_barrier. Then thread 0 broadcasts whether it's the last.
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
         is_thread0 = (warp_idx == Int32(0)) & (lane_idx == Int32(0))
 
-        # Use a single int register to share the "is last" bit across the CTA.
-        # Each warp's threads will read the same is_last flag from the
-        # epilogue_barrier rendez-vous.
-        # Simpler approach: thread 0 atomic-adds, branches; other warps' lane 0
-        # await on a shared atomic-loaded value or just have all warps decide
-        # again via reading tile_n_stripes_done back. To minimize sync, all
-        # threads of the CTA participate in the atomic-add (the value returned
-        # is per-thread), but we only TRUST thread 0's result and broadcast.
-        # Even simpler: have ONLY thread 0 do everything (atomic-add + per-row
-        # bookkeeping). The bookkeeping is small (~tile_M scalar atomics), so
-        # serializing on thread 0 is acceptable.
+        tile_M = const_expr(gemm.cta_tile_shape_mnk[0])
+        T_recv = param.T_recv
+        combine_seq = param.combine_seq
+        num_epi_threads = const_expr(gemm.num_epi_warps * 32)
 
+        # Thread 0 of the CTA does the per-tile gate atomic on
+        # tile_n_stripes_done. The CTA whose atomic returns `num_pid_n - 1`
+        # is the last N-stripe → it owns the per-row bookkeeping for this
+        # tile. Thread 0 stamps the gate result into is_last_t SMEM; an
+        # epilogue-scoped named barrier propagates it to the other 127
+        # epilogue threads, which then **parallel-execute** the per-row
+        # atomicSub + release-store (one thread per row) — replacing the
+        # old serialized 128-row chain on thread 0 that was the dominant
+        # cost of the kernel-Y epilogue (bisected: ~700 µs of structural
+        # tail).
         if is_thread0:
             stripes_ptr = utils.elem_pointer(param.tile_n_stripes_done, (tile_id,))
             prev_stripes = utils.atomic_add_i32(Int32(1), stripes_ptr)
             is_last_stripe = prev_stripes == (param.num_pid_n - Int32(1))
-
             if is_last_stripe:
                 # Make all atomic-scatters from all N-stripes globally visible
-                # before the per-token release-store. The cross-CTA ordering
-                # is already provided by the atomic-add above (acq_rel), but
-                # add an explicit threadfence_system to be safe.
+                # before the per-token release-stores below. The threadfence
+                # is followed by the SMEM-stamp + named barrier, so all 128
+                # epilogue threads observe its effect before issuing their
+                # release-stores.
                 threadfence_system()
+            is_last_t[0] = Int32(1) if is_last_stripe else Int32(0)
 
-                tile_M = const_expr(gemm.cta_tile_shape_mnk[0])
-                T_recv = param.T_recv
-                combine_seq = param.combine_seq
+        # Epilogue-scoped named barrier (id=8 — outside NamedBarrierGemm's
+        # 1..7 range). Synchronizes all `num_epi_threads` epilogue threads
+        # of the CTA so they observe thread 0's stamp + threadfence above.
+        cute.arch.barrier(barrier_id=8, number_of_threads=num_epi_threads)
 
-                for m in cutlass.range_constexpr(tile_M):
-                    r = recv_token_t[m]
-                    if r >= Int32(0) and r < T_recv:
-                        rem_ptr = utils.elem_pointer(param.per_token_remaining, (r,))
-                        prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
-                        if prev == Int32(1):
-                            done_ptr = utils.elem_pointer(
-                                param.compute_done_per_token, (r,)
-                            )
-                            st_release_sys_global(done_ptr, combine_seq)
+        is_last = is_last_t[0]
+        if is_last == Int32(1) and tidx < Int32(tile_M):
+            r = recv_token_t[tidx]
+            if r >= Int32(0) and r < T_recv:
+                rem_ptr = utils.elem_pointer(param.per_token_remaining, (r,))
+                prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
+                if prev == Int32(1):
+                    done_ptr = utils.elem_pointer(
+                        param.compute_done_per_token, (r,)
+                    )
+                    st_release_sys_global(done_ptr, combine_seq)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +427,7 @@ class StreamingMoeYSm90(ComposableEpiMixin, GemmSm90):
         logbook 2026-04-30).
         """
         scatter = params.scatter
-        staging_t, recv_token_t, pool_start = epi_loop_tensors["scatter"]
+        staging_t, recv_token_t, _is_last_t, pool_start = epi_loop_tensors["scatter"]
 
         # 1. Producer-acquire (balance pipeline state across the persistent loop).
         if is_tma_warp:

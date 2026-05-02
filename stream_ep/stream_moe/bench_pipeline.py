@@ -47,7 +47,14 @@ NUM_EXPERTS = 64
 SEQ_LEN_PER_RANK = 8192
 TOPK = 4
 DTYPE = torch.bfloat16
-NUM_SMS = 24
+NUM_SMS = 132  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
+               # i.e. 132 on H100). Sweep (logs/sweep/) shows pipeline e2e
+               # plateaus past num_sms=64 at ~1645–1665 µs (vs 1816 µs at the
+               # old 24 default). Past the plateau the dispatch tail finishes
+               # well before kernel A (~376 µs vs ~794 µs), so any further
+               # dispatch speedup just enlarges an already-overlapping gap;
+               # the critical path is kernel A. Default to the ceiling rather
+               # than picking a mid-range sweet spot that's within noise.
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128
