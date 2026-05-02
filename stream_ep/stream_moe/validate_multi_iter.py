@@ -1,14 +1,21 @@
-"""Cross-layer correctness check for the streaming pipeline.
+"""End-to-end correctness check for the streaming pipeline (dispatch + A + Y + combine).
 
 Runs `streaming_moe_layer` for N iterations with the SAME inputs and asserts
-each iteration's output matches a torch-eager reference. This catches the
-class of cross-layer race the historical kernel-A had, where some CTAs of
-iter N+1 saw stale "all done" state from iter N (or vice versa) and produced
-wrong outputs in some iterations but not others.
+each iteration's output matches a torch-eager full MoE forward reference. The
+reference is computed in plain torch using all ranks' weights (gathered across
+the group) so that for each source token ``t`` on this rank,
 
-Symptom signature for that bug class: iter 0 correct, iter K (K >= 1) silently
-wrong. The bench_pipeline.py timing harness wouldn't catch it (timing-only),
-and the per-kernel test suite uses a single iter.
+    output[t, :] = Σ over k of topk_weights[t, k] * SwiGLU(x[t] @ W1[topk_idx[t, k]]) @ W2[topk_idx[t, k]]
+
+This catches both (a) the cross-layer-race class the historical kernel-A had
+(iter 0 correct, iter K silently wrong because some CTAs of iter N+1 saw stale
+"all done" state from iter N) and (b) any regression in the dispatch + A + Y
++ combine pipeline as a whole — including the per-token gate's interaction
+with kernel Y's release-store path.
+
+Symptom signature for the cross-layer race: iter 0 PASS, iter K (K >= 1) FAIL.
+The bench_pipeline.py timing harness wouldn't catch it (timing-only), and the
+per-kernel test suite uses a single iter.
 
 Launch
 ------
@@ -43,51 +50,60 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
 
 
-def torch_reference_recv(
-    pool: torch.Tensor,
-    pool_recv_token: torch.Tensor,
-    pool_topk_weight: torch.Tensor,
-    tile_id_to_expert: torch.Tensor,
-    expert_pool_block_offset: torch.Tensor,
-    w1_local: torch.Tensor,
-    w2_local: torch.Tensor,
-    T_recv: int,
-    tile_m: int,
+def torch_reference_full_moe(
+    x: torch.Tensor,  # (T, H) — this rank's source tokens
+    topk_idx: torch.Tensor,  # (T, K) global expert indices
+    topk_weights: torch.Tensor,  # (T, K) float32
+    w1_full: torch.Tensor,  # (E_total, 2I, H) all ranks' W1
+    w2_full: torch.Tensor,  # (E_total, H, I) all ranks' W2
 ) -> torch.Tensor:
-    """Eager torch reproduction of kernel A + kernel Y on the local-rank
-    receive side. Returns o_ref[T_recv, H].
+    """Eager full MoE forward: for each source token t, compute the topk-weighted
+    sum of SwiGLU(x[t] @ W1[topk_idx[t, k]]) @ W2[topk_idx[t, k]] over k. Returns
+    [T, H] in the same dtype as x.
 
-    For each pool slot s:
-      a = SwiGLU(pool[s] @ W1[expert(s)])    # tile_m × I → I
-      y = a @ W2[expert(s)]                   # I → H
-      o[recv_token(s)] += topk_weight(s) * y
+    This is the production-output target for ``streaming_moe_layer``: dispatch
+    sends each (t, k) pair to its expert's rank, kernel A + Y compute the
+    weighted contribution locally, and combine reduces them back into out[t]
+    on the source rank.
+
+    Implementation: group-by-expert. For each expert e, gather the (token,
+    k-slot) pairs that route to e, run one expert forward per pair-batch, then
+    weighted-scatter back into out. Avoids expanding to (T, 2I, H) per K
+    (~8 GB per K at production shape) which OOMs at 80GB.
     """
-    H_dim = pool.shape[1]
-    o_ref = torch.zeros(T_recv, H_dim, dtype=torch.float32, device=pool.device)
-    E_local = expert_pool_block_offset.shape[0] - 1
+    T, H_dim = x.shape
+    E_total, two_I, _ = w1_full.shape
+    out = torch.zeros(T, H_dim, dtype=torch.float32, device=x.device)
+    x_f = x.to(torch.float32)
+    w_f = topk_weights.to(torch.float32)
 
-    # W1: (E_local, 2I, H), W2: (E_local, H, I).
-    for e in range(E_local):
-        slot_lo = expert_pool_block_offset[e].item() * tile_m
-        slot_hi = expert_pool_block_offset[e + 1].item() * tile_m
-        if slot_lo == slot_hi:
+    # Flatten (token, k) pairs and bucket by expert.
+    flat_e = topk_idx.flatten()  # (T*K,)
+    flat_t = (
+        torch.arange(T, device=x.device)
+        .unsqueeze(1)
+        .expand(T, topk_idx.shape[1])
+        .flatten()
+    )  # (T*K,)
+    flat_w = w_f.flatten()  # (T*K,)
+
+    for e in range(E_total):
+        mask_e = flat_e == e
+        if not mask_e.any():
             continue
-        # pool slice for this expert: (slot_hi - slot_lo) × H
-        x_e = pool[slot_lo:slot_hi].to(torch.float32)
-        # h = x_e @ W1[e].T → (n_slots, 2I)
-        h = x_e @ w1_local[e].to(torch.float32).T
-        # SwiGLU: split 2I into [2I/2, 2I/2], silu(first) * second
+        idx_e = mask_e.nonzero(as_tuple=False).flatten()  # (n_e,)
+        t_e = flat_t[idx_e]  # (n_e,) — token indices
+        w_e = flat_w[idx_e]  # (n_e,) — weights for these (t, k) pairs
+        x_e = x_f[t_e]  # (n_e, H)
+
+        h = x_e @ w1_full[e].to(torch.float32).T  # (n_e, 2I)
         u, v = h.chunk(2, dim=-1)
-        a = F.silu(u) * v  # (n_slots, I)
-        # y = a @ W2[e].T → (n_slots, H)
-        y = a @ w2_local[e].to(torch.float32).T
-        # weighted scatter
-        weights = pool_topk_weight[slot_lo:slot_hi].to(torch.float32)
-        recv_tokens = pool_recv_token[slot_lo:slot_hi]
-        valid = recv_tokens >= 0
-        weighted = weights[:, None] * y
-        o_ref.index_add_(0, recv_tokens[valid].to(torch.int64), weighted[valid])
-    return o_ref.to(DTYPE)
+        a = F.silu(u) * v  # (n_e, I)
+        y = a @ w2_full[e].to(torch.float32).T  # (n_e, H)
+
+        out.index_add_(0, t_e.to(torch.int64), w_e[:, None] * y)
+
+    return out.to(x.dtype)
 
 
 def main():
@@ -120,6 +136,10 @@ def main():
 
     buffer = make_buffer(group, args.num_sms)
 
+    # Build GLOBAL weights (same across ranks via shared seed). w1_local /
+    # w2_local are the rank's slice for the streaming pipeline; the eager
+    # reference uses the FULL weights to compute each token's expert
+    # contributions regardless of which rank owns them.
     g = torch.Generator(device=device).manual_seed(42)
     w1_full = (
         torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g)
@@ -145,9 +165,13 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
+    # Compute the eager full-MoE reference once (inputs are fixed across iters).
+    out_ref = torch_reference_full_moe(x, topk_idx, topk_weights, w1_full, w2_full)
+
     comm_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
     compute_y_stream = torch.cuda.Stream()
+    combine_send_stream = torch.cuda.Stream()
     torch_dist.barrier(group=group)
 
     # Warmup (no validation).
@@ -163,6 +187,7 @@ def main():
             comm_stream=comm_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
+            combine_send_stream=combine_send_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=TILE_M,
@@ -176,7 +201,7 @@ def main():
     fail_count = 0
     for step in range(args.n_iter):
         seq = 100 + step
-        o_actual, handle = streaming_moe_layer(
+        out_actual, _handle = streaming_moe_layer(
             buffer,
             x,
             topk_idx,
@@ -187,6 +212,7 @@ def main():
             comm_stream=comm_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
+            combine_send_stream=combine_send_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=seq,
             tile_m=TILE_M,
@@ -195,40 +221,10 @@ def main():
         )
         torch.cuda.synchronize()
 
-        # streaming_moe_layer returns (o_actual, handle) but not pool —
-        # re-dispatch privately with a distinct seq to grab a pool snapshot
-        # for the reference. Cross-checking infrastructure, not on the perf
-        # path; cheap relative to the validation cost.
-        T_recv = handle.o.shape[0]
-        with torch.cuda.stream(comm_stream):
-            pool_check, handle_check, _ = buffer.dispatch(
-                x,
-                topk_idx,
-                topk_weights,
-                is_token_in_rank,
-                NUM_EXPERTS,
-                tile_m=TILE_M,
-                dispatch_seq=10000 + step,
-            )
-        torch.cuda.current_stream().wait_stream(comm_stream)
-        torch.cuda.synchronize()
-
-        o_ref = torch_reference_recv(
-            pool_check,
-            handle_check.pool_recv_token,
-            handle_check.pool_topk_weight,
-            handle_check.tile_id_to_expert,
-            handle_check.expert_pool_block_offset,
-            w1_local,
-            w2_local,
-            T_recv=T_recv,
-            tile_m=TILE_M,
-        )
-
-        o_actual = o_actual.to(torch.float32)
-        o_ref_f = o_ref.to(torch.float32)
-        diff = (o_actual - o_ref_f).abs()
-        rel = diff / (o_ref_f.abs() + 1e-3)
+        out_actual_f = out_actual.to(torch.float32)
+        out_ref_f = out_ref.to(torch.float32)
+        diff = (out_actual_f - out_ref_f).abs()
+        rel = diff / (out_ref_f.abs() + 1e-3)
         bad = (diff > args.atol) & (rel > args.rtol)
         max_abs = diff.max().item()
         max_rel = rel.max().item()

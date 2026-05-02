@@ -94,6 +94,7 @@ def main():
     comm_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
     compute_y_stream = torch.cuda.Stream()
+    combine_send_stream = torch.cuda.Stream()
     torch_dist.barrier(group=group)
 
     t0 = time.time()
@@ -109,6 +110,7 @@ def main():
             comm_stream=comm_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
+            combine_send_stream=combine_send_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=TILE_M,
@@ -138,6 +140,7 @@ def main():
             comm_stream=comm_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
+            combine_send_stream=combine_send_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=100 + step,
             tile_m=TILE_M,

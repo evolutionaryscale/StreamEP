@@ -48,13 +48,13 @@ SEQ_LEN_PER_RANK = 8192
 TOPK = 4
 DTYPE = torch.bfloat16
 NUM_SMS = 132  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
-               # i.e. 132 on H100). Sweep (logs/sweep/) shows pipeline e2e
-               # plateaus past num_sms=64 at ~1645–1665 µs (vs 1816 µs at the
-               # old 24 default). Past the plateau the dispatch tail finishes
-               # well before kernel A (~376 µs vs ~794 µs), so any further
-               # dispatch speedup just enlarges an already-overlapping gap;
-               # the critical path is kernel A. Default to the ceiling rather
-               # than picking a mid-range sweet spot that's within noise.
+# i.e. 132 on H100). Sweep (logs/sweep/) shows pipeline e2e
+# plateaus past num_sms=64 at ~1645–1665 µs (vs 1816 µs at the
+# old 24 default). Past the plateau the dispatch tail finishes
+# well before kernel A (~376 µs vs ~794 µs), so any further
+# dispatch speedup just enlarges an already-overlapping gap;
+# the critical path is kernel A. Default to the ceiling rather
+# than picking a mid-range sweet spot that's within noise.
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128
@@ -165,14 +165,15 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    # Three caller-managed streams. `comm_stream` for dispatch; `compute_a_stream`
-    # for kernel A; `compute_y_stream` for kernel Y. The metadata-done event
-    # records between `tile_arrays_init` and the dispatch main kernel — consumer
-    # streams `wait_event` on it to safely read metadata tensors without
-    # serializing against dispatch main.
+    # Four caller-managed streams. `comm_stream` for dispatch; `compute_a_stream`
+    # for kernel A; `compute_y_stream` for kernel Y; `combine_send_stream` for
+    # the combine sender. The metadata-done event records between the metadata
+    # kernel and the dispatch main kernel — consumer streams `wait_event` on it
+    # to safely read metadata tensors without serializing against dispatch main.
     comm_stream = torch.cuda.Stream(device=device)
     compute_a_stream = torch.cuda.Stream(device=device)
     compute_y_stream = torch.cuda.Stream(device=device)
+    combine_send_stream = torch.cuda.Stream(device=device)
 
     # Run dispatch once to get a StreamingHandle. Reuse this for all isolated
     # kernel timing runs (kernel A / kernel Y individually).
@@ -325,14 +326,31 @@ def main():
             cu_seqlens_m=cu_seqlens_m,
         )
 
+    def run_combine_only():
+        # Combine sender's per-token gate spins on
+        # `compute_done_per_token[r] >= combine_seq`. Kernel Y populated
+        # `compute_done_per_token` to `handle.dispatch_seq` for every recv-token
+        # in the preceding `run_streaming_y_only()` warmup; refresh defensively
+        # in case run_streaming_y_only zeroed it before the gate was supposed to
+        # fire (it doesn't, but the explicit fill_ keeps the isolated timing
+        # decoupled from kernel-Y call ordering).
+        handle.compute_done_per_token.fill_(handle.dispatch_seq)
+        buffer.combine(
+            handle.o,
+            handle,
+            topk_weights=handle.recv_topk_weights,
+            combine_seq=handle.dispatch_seq,
+        )
+
     # Capture initial per_token_remaining so isolated y timing can reset it.
     _per_token_remaining_init = handle.per_token_remaining.clone()
 
-    # Warm everything up: A, gemm_gated, Y, gemm.
+    # Warm everything up: A, gemm_gated, Y, gemm, combine.
     run_streaming_a()
     run_gemm_gated_ref()
     run_streaming_y_only()
     run_gemm_y_ref()
+    run_combine_only()
     torch.cuda.synchronize()
     torch_dist.barrier(group=group)
 
@@ -373,20 +391,29 @@ def main():
         "gemm (ref, no scatter)", args.tile_m, args.tile_n_y, gemm_y_us, 2 * TK * H * I
     )
 
+    combine_us = time_kernel(run_combine_only)
+    if rank == 0:
+        # Combine isn't a matmul — print as raw µs without TFLOPs.
+        print(
+            f"{'buffer.combine':>26s}  {'-':>6s}  {'-':>6s}  {combine_us:>10.1f}  {'-':>10s}"
+        )
+
     if rank == 0:
         print()
 
     # ────────────────────────────────────────────────────────────────────
-    # End-to-end pipeline timing: dispatch + A + Y on three streams.
+    # End-to-end pipeline timing: dispatch + A + Y + combine on four streams.
     # ────────────────────────────────────────────────────────────────────
     # Each iteration runs a fresh dispatch (so DeepEP allocates fresh per-token
-    # state) followed by kernel A on compute_a_stream and kernel Y on
-    # compute_y_stream, with cross-stream visibility provided by:
-    # (a) `metadata_done` event recorded by dispatch between tile_arrays_init
-    #     and the dispatch main kernel — consumer streams wait_event on this
-    #     to safely read metadata tensors without serializing against dispatch
-    #     main, preserving per-tile streaming overlap;
-    # (b) per-tile `tile_ready` / `a_ready` release/acquire pairs.
+    # state) followed by kernel A on compute_a_stream, kernel Y on
+    # compute_y_stream, and combine sender on combine_send_stream.
+    # Cross-stream visibility:
+    # (a) `metadata_done` event recorded by dispatch between the metadata
+    #     kernel and the dispatch main kernel — consumer streams wait_event on
+    #     this to safely read metadata tensors without serializing against
+    #     dispatch main, preserving per-tile streaming overlap.
+    # (b) per-tile `tile_ready` (dispatch→A) / `a_ready` (A→Y) release/acquire
+    #     pairs and per-token `compute_done_per_token` (Y→combine sender) gate.
 
     def run_pipeline_step(seq):
         streaming_moe_layer(
@@ -400,6 +427,7 @@ def main():
             comm_stream=comm_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
+            combine_send_stream=combine_send_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=seq,
             tile_m=args.tile_m,
@@ -441,13 +469,14 @@ def main():
     dispatch_us = time_kernel(dispatch_only, warmup=pipe_warmup, iters=pipe_iters)
 
     if rank == 0:
-        print("=== end-to-end pipeline (dispatch + A + Y, 3 streams) ===")
+        print("=== end-to-end pipeline (dispatch + A + Y + combine, 4 streams) ===")
         print(f"  dispatch (alone, comm_stream):           {dispatch_us:7.1f} μs")
         print(f"  streaming_moe_a (alone, compute_a):      {streaming_a_us:7.1f} μs")
         print(f"  streaming_moe_y (alone, compute_y):      {streaming_y_us:7.1f} μs")
-        sequential_sum = dispatch_us + streaming_a_us + streaming_y_us
+        print(f"  buffer.combine (alone, combine_send):    {combine_us:7.1f} μs")
+        sequential_sum = dispatch_us + streaming_a_us + streaming_y_us + combine_us
         print(f"  serial sum of stages:                    {sequential_sum:7.1f} μs")
-        print(f"  pipeline end-to-end (3 streams, real overlap): {pipeline_us:7.1f} μs")
+        print(f"  pipeline end-to-end (4 streams, real overlap): {pipeline_us:7.1f} μs")
         if pipeline_us < sequential_sum:
             saved = sequential_sum - pipeline_us
             pct = 100.0 * saved / sequential_sum

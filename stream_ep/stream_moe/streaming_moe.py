@@ -1,17 +1,19 @@
-"""Streaming-MoE forward layer: dispatch → kernel A → kernel Y on three streams.
+"""Streaming-MoE forward layer: dispatch → kernel A → kernel Y → combine on four streams.
 
 Streams are caller-owned — created once and passed in. Per-call inputs vary
 (routing changes layer-to-layer in production), and so do the per-call
 intermediate allocations: ``postact_a`` is sized by ``total_tiles × tile_M × I``
-(varies with routing). The kernel-Y output ``o`` is reused from
-``handle.o`` (allocated by DeepEP at ``[T_recv, hidden]`` zero-init); kernel
-Y writes into it via PTX-predicated atomic-scatter. Phase D's combine sender
-will read the same buffer.
+(varies with routing). The kernel-Y output ``handle.o`` is allocated by DeepEP
+inside ``Buffer.dispatch`` at ``[T_recv, hidden]`` zero-init; kernel Y
+atomic-scatters into it via PTX-predicated atomics, and the combine sender
+consumes it on a separate stream — its per-warp send loop spins on
+``handle.compute_done_per_token[r] >= dispatch_seq`` (Phase D's per-token gate)
+before pushing ``o[r]`` back to ``r``'s origin rank.
 
-Within a layer the three streams overlap (intra-layer); across layers they
-serialize via the layer-start ``comm_stream.wait_stream(caller)`` and layer-end
-``caller.wait_stream(...)`` back-edges. See design.md §"Cross-stream sync chain
-per layer".
+Within a layer the four streams overlap (intra-layer); across layers they
+serialize via the layer-start ``{comm,combine_send}_stream.wait_stream(caller)``
+and layer-end ``caller.wait_stream(...)`` back-edges. See design.md
+§"Cross-stream sync chain per layer".
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ def streaming_moe_layer(
     comm_stream: torch.cuda.Stream,
     compute_a_stream: torch.cuda.Stream,
     compute_y_stream: torch.cuda.Stream,
+    combine_send_stream: torch.cuda.Stream,
     num_experts: int,
     dispatch_seq: int,
     tile_m: int = 128,
@@ -50,18 +53,25 @@ def streaming_moe_layer(
     num_sms_a: int | None = None,
     num_sms_y: int | None = None,
 ) -> Tuple[torch.Tensor, StreamingHandle]:
-    """One MoE forward layer: dispatch + kernel A + kernel Y.
+    """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
-    Returns ``(o, handle)`` where ``o`` is ``handle.o`` with shape
-    ``[T_recv, hidden]`` — kernel Y writes into the DeepEP-allocated output
-    via PTX-predicated atomic-scatter, so no separate buffer is needed.
+    Returns ``(out, handle)`` where ``out`` is the cross-rank-reduced output
+    of shape ``[num_tokens, hidden]`` produced by the combine receiver — the
+    standard MoE forward output for this rank's source tokens. Kernel Y's
+    locally-summed buffer ``handle.o`` is reachable on the handle if needed.
     """
     caller_stream = torch.cuda.current_stream()
 
-    # Layer-start back-edge — see design.md §"Cross-stream sync chain per
-    # layer". Without it iter N's persistent kernel A / kernel Y CTAs starve
-    # iter N+1's dispatch_main on shared SMs.
+    # Layer-start back-edges — see design.md §"Cross-stream sync chain per
+    # layer". Without these, iter N's persistent kernel A / kernel Y CTAs
+    # (and the combine sender's per-channel CTAs) starve iter N+1's
+    # dispatch_main on shared SMs. We only need to gate the streams that
+    # launch their first kernel of the layer with the host (comm_stream and
+    # combine_send_stream both launch directly from the host); compute_a /
+    # compute_y are gated by ``metadata_done`` below, which is recorded
+    # downstream of caller_stream → comm_stream's serialization.
     comm_stream.wait_stream(caller_stream)
+    combine_send_stream.wait_stream(caller_stream)
 
     with torch.cuda.stream(comm_stream):
         pool, handle, metadata_done = buffer.dispatch(
@@ -75,16 +85,24 @@ def streaming_moe_layer(
         )
     compute_a_stream.wait_event(metadata_done)
     compute_y_stream.wait_event(metadata_done)
+    # Combine sender reads handle.{recv_src_idx, rank_prefix_matrix,
+    # channel_prefix_matrix, send_head, recv_topk_weights} (all metadata
+    # outputs of dispatch) plus handle.{compute_done_per_token, o} (which
+    # kernel Y populates on compute_y_stream — visibility carried by the
+    # per-token release/acquire pair on compute_done_per_token, not by this
+    # event). The wait_event here only ensures combine sees metadata-tensor
+    # writes without serializing against dispatch main.
+    combine_send_stream.wait_event(metadata_done)
 
     total_tiles = handle.total_tiles
     intermediate = w2_local.shape[2]
 
     # `record_stream` only on the stream(s) that actually consume each
     # tensor. Cross-stream data visibility itself comes from the per-tile
-    # tile_ready / a_ready release/acquire pairs (`.sys` scope), not from
-    # these calls — `record_stream` only governs the caching allocator's
-    # recycle policy (don't recycle until each recorded stream's events
-    # at free-time have completed).
+    # release/acquire pairs (`.sys` scope), not from these calls —
+    # `record_stream` only governs the caching allocator's recycle policy
+    # (don't recycle until each recorded stream's events at free-time have
+    # completed).
     #
     # Per-tensor consumers:
     #   pool                       — kernel A reads (compute_a only)
@@ -95,8 +113,12 @@ def streaming_moe_layer(
     #   pool_recv_token            — kernel Y reads (compute_y only)
     #   pool_topk_weight           — kernel Y reads (compute_y only)
     #   per_token_remaining        — kernel Y atomic-decrements (compute_y only)
-    #   compute_done_per_token     — kernel Y release-stores (compute_y only;
-    #                                Phase D will add combine_send_stream)
+    #   compute_done_per_token     — kernel Y release-stores (compute_y);
+    #                                combine sender acquire-loads (combine_send)
+    #   o                          — kernel Y atomic-scatter (compute_y);
+    #                                combine sender reads (combine_send)
+    #   recv_src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+    #   recv_topk_weights          — combine sender reads (combine_send only)
     pool.record_stream(compute_a_stream)
     handle.tile_ready.record_stream(compute_a_stream)
     handle.tile_id_to_expert.record_stream(compute_a_stream)
@@ -109,10 +131,14 @@ def streaming_moe_layer(
     handle.pool_topk_weight.record_stream(compute_y_stream)
     handle.per_token_remaining.record_stream(compute_y_stream)
     handle.compute_done_per_token.record_stream(compute_y_stream)
-    # `handle.o` is allocated on comm_stream (inside Buffer.dispatch) and
-    # written by kernel Y on compute_y_stream — same cross-stream allocator
-    # contract as the per-tile signals above.
+    handle.compute_done_per_token.record_stream(combine_send_stream)
     handle.o.record_stream(compute_y_stream)
+    handle.o.record_stream(combine_send_stream)
+    handle.recv_src_idx.record_stream(combine_send_stream)
+    handle.rank_prefix_matrix.record_stream(combine_send_stream)
+    handle.channel_prefix_matrix.record_stream(combine_send_stream)
+    handle.send_head.record_stream(combine_send_stream)
+    handle.recv_topk_weights.record_stream(combine_send_stream)
 
     with torch.cuda.stream(compute_a_stream):
         postact_a = torch.empty(
@@ -158,8 +184,24 @@ def streaming_moe_layer(
             num_sms=num_sms_y,
         )
 
-    # Layer-end back-edge — see design.md §"Cross-stream sync chain per layer".
+    # Combine on its own stream: per-(channel, dst_rank) sender warps spin on
+    # handle.compute_done_per_token[r] >= dispatch_seq before pushing o[r]
+    # to r's origin rank. The per-token gate lets early-completing tokens
+    # (K_local=1 first-wave-expert tokens) ship while late-wave tokens are
+    # still landing — combine ↔ kernel Y tail overlap. Streaming granularity
+    # = NVL chunk size (default 4 tokens per chunk at 8-rank intranode per
+    # Buffer.get_combine_config).
+    with torch.cuda.stream(combine_send_stream):
+        out, _ = buffer.combine(
+            handle.o,
+            handle,
+            topk_weights=handle.recv_topk_weights,
+            combine_seq=dispatch_seq,
+        )
+
+    # Layer-end back-edges — see design.md §"Cross-stream sync chain per layer".
     caller_stream.wait_stream(comm_stream)
     caller_stream.wait_stream(compute_a_stream)
     caller_stream.wait_stream(compute_y_stream)
-    return handle.o, handle
+    caller_stream.wait_stream(combine_send_stream)
+    return out, handle

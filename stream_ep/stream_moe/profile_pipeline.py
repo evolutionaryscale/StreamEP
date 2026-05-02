@@ -139,6 +139,7 @@ def main():
     comm_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
     compute_y_stream = torch.cuda.Stream()
+    combine_send_stream = torch.cuda.Stream()
 
     os.makedirs(args.out_dir, exist_ok=True)
     if rank == 0:
@@ -150,9 +151,9 @@ def main():
             flush=True,
         )
 
-    # Warm: dispatch + kernel A + kernel Y JIT, kernel cache, allocator.
+    # Warm: dispatch + kernel A + kernel Y + combine JIT, kernel cache, allocator.
     for warm_seq in range(1, 6):
-        _o, _handle = streaming_moe_layer(
+        _out, _handle = streaming_moe_layer(
             buffer,
             x,
             topk_idx,
@@ -163,6 +164,7 @@ def main():
             comm_stream=comm_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
+            combine_send_stream=combine_send_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=args.tile_m,
@@ -189,9 +191,9 @@ def main():
         seq = 100  # bumped past warmup seqs so it's clearly distinct in the trace
         for step in range(1 + 2 + 5):
             with torch.profiler.record_function(
-                f"step_{step}_dispatch+kernelA+kernelY"
+                f"step_{step}_dispatch+kernelA+kernelY+combine"
             ):
-                _o, _handle = streaming_moe_layer(
+                _out, _handle = streaming_moe_layer(
                     buffer,
                     x,
                     topk_idx,
@@ -202,6 +204,7 @@ def main():
                     comm_stream=comm_stream,
                     compute_a_stream=compute_a_stream,
                     compute_y_stream=compute_y_stream,
+                    combine_send_stream=combine_send_stream,
                     num_experts=NUM_EXPERTS,
                     dispatch_seq=seq + step,
                     tile_m=args.tile_m,
