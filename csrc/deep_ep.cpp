@@ -764,6 +764,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
     const torch::Tensor& rank_prefix_matrix,
     const torch::Tensor& channel_prefix_matrix,
     const torch::Tensor& send_head,
+    const torch::Tensor& compute_done_per_token,
+    int64_t combine_seq,
     const Config& config) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
@@ -772,6 +774,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
                    rank_prefix_matrix.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(channel_prefix_matrix.dim() == 2 and channel_prefix_matrix.is_contiguous() and
                    channel_prefix_matrix.scalar_type() == torch::kInt32);
+    // Phase-D per-token gate: kernel Y release-stores `combine_seq` into
+    // compute_done_per_token[r] once per_token_remaining[r] hits zero. The
+    // combine sender's per-warp send loop spins on the same address before its
+    // data copy of o[r], pairing with kernel Y's `.sys`-scope release.
+    EP_HOST_ASSERT(compute_done_per_token.dim() == 1 and compute_done_per_token.is_contiguous() and
+                   compute_done_per_token.scalar_type() == torch::kInt64);
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -783,6 +791,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
     EP_HOST_ASSERT(send_head.size(1) == num_ranks);
     EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
     EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
+    // compute_done_per_token is indexed by combine sender's iteration variable
+    // `token_idx` ∈ [0, num_tokens), which (in combine's naming convention)
+    // is the number of input rows of `x` = handle.o.size(0) = T_recv from
+    // dispatch's perspective. Note combine's `num_recv_tokens` is dispatch's
+    // source-token count (output rows of combine), NOT the size of the gate.
+    EP_HOST_ASSERT(compute_done_per_token.size(0) == num_tokens);
     EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
 
     // All kernels + allocations run on the caller's current stream.
@@ -844,6 +858,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
                        send_head.data_ptr<int>(),
+                       compute_done_per_token.data_ptr<int64_t>(),
+                       combine_seq,
                        num_tokens,
                        num_recv_tokens,
                        hidden,

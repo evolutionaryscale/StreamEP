@@ -985,6 +985,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                                                           const int* rank_prefix_matrix,
                                                           const int* channel_prefix_matrix,
                                                           int* send_head,
+                                                          const int64_t* compute_done_per_token,
+                                                          int64_t combine_seq,
                                                           int num_tokens,
                                                           int num_recv_tokens,
                                                           int hidden,
@@ -1083,22 +1085,41 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // Send by chunk
             #pragma unroll
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
+                // Phase-D per-token gate: kernel Y release-stores `combine_seq` into
+                // compute_done_per_token[my_token] once per_token_remaining[my_token]
+                // hits zero (all K_local(my_token) contributions to o[my_token] have
+                // landed). Spin until the gate clears, then issue the warp-cooperative
+                // copy below — the acquire pairs with kernel Y's `.sys`-scope release
+                // and makes o[my_token]'s writes globally visible to this warp.
+                auto my_token = token_idx + i;
+                if (elect_one_sync()) {
+                    auto gate_start = clock64();
+                    while (ld_acquire_sys_global(&compute_done_per_token[my_token]) < combine_seq) {
+                        if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                            printf("DeepEP timeout for combine sender gate, rank %d, channel %d, token %d\n",
+                                   rank, responsible_channel, static_cast<int>(my_token));
+                            trap();
+                        }
+                    }
+                }
+                __syncwarp();
+
                 // Get an empty slot
                 int dst_slot_idx = (current_channel_tail_idx + i) % num_recv_buffer_tokens;
 
                 // Copy data
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
-                auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
+                auto shifted_x = x_int4 + my_token * hidden_int4;
                 UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
                 // Send source index
                 if (elect_one_sync())
-                    channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i);
+                    channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + my_token);
 
                 // Send `topk_weights`
                 if (num_topk > 0 and lane_id < num_topk)
                     channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-                        __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
+                        __ldg(topk_weights + my_token * num_topk + lane_id);
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
@@ -1328,6 +1349,8 @@ void combine(cudaDataType_t type,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
              int* send_head,
+             const int64_t* compute_done_per_token,
+             int64_t combine_seq,
              int num_tokens,
              int num_recv_tokens,
              int hidden,
@@ -1361,6 +1384,8 @@ void combine(cudaDataType_t type,
                       rank_prefix_matrix,                                      \
                       channel_prefix_matrix,                                   \
                       send_head,                                               \
+                      compute_done_per_token,                                  \
+                      combine_seq,                                             \
                       num_tokens,                                              \
                       num_recv_tokens,                                         \
                       hidden,                                                  \

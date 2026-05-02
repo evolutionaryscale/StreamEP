@@ -472,12 +472,24 @@ class Buffer:
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
                 topk_weights: Optional[torch.Tensor] = None,
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
+                *,
+                combine_seq: int = 1,
                 config: Optional[Config] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
         returned by ``Buffer.dispatch``. Intranode only for now (Phase E for internode).
 
         Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
+
+        The combine sender's per-warp send loop spins on
+        ``handle.compute_done_per_token[r] >= combine_seq`` before reading
+        ``x[r]`` for each token ``r`` it owns — kernel Y release-stores
+        ``combine_seq`` into the same address once all ``K_local(r)``
+        contributions to ``x[r]`` (= ``handle.o[r]`` in production) have
+        landed. Caller threads the same int through ``Buffer.dispatch``
+        (``dispatch_seq``), kernel A / Y (``compute_seq``, ``combine_seq``),
+        and this call so all four release/acquire pairs key off one layer-
+        monotonic ID.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
 
@@ -485,10 +497,18 @@ class Buffer:
             raise NotImplementedError("Internode streaming combine lands in Phase E.")
 
         bias_0, bias_1 = Buffer._unpack_bias(bias)
+        # Combine sender on rank R, for warp targeting send_rank_id=S, iterates
+        # R's recv-tokens that originated from S (so it can ship back the locally-
+        # accumulated o[r] to S). The per-channel sub-partition needs the count
+        # # of R's recv-tokens-from-S in channels 0..c — that's the *receiver*-
+        # side cumulative `recv_channel_prefix_matrix[S, c]` (R's view), NOT
+        # `channel_prefix_matrix[S, c]` which is sender-side (R's tokens going
+        # to S). Different traffic; different count.
         return self.runtime.intranode_combine(
             x, topk_weights, bias_0, bias_1,
             handle.recv_src_idx, handle.rank_prefix_matrix,
-            handle.channel_prefix_matrix, handle.send_head,
+            handle.recv_channel_prefix_matrix, handle.send_head,
+            handle.compute_done_per_token, combine_seq,
             config)
 
     # noinspection PyTypeChecker

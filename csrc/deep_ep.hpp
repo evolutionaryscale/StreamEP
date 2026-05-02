@@ -244,6 +244,8 @@ public:
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
         const torch::Tensor& send_head,
+        const torch::Tensor& compute_done_per_token,
+        int64_t combine_seq,
         const Config& config);
 
     std::tuple<torch::Tensor,
