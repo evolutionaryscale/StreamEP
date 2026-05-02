@@ -80,9 +80,6 @@ private:
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
-    // Stream for communication
-    at::cuda::CUDAStream comm_stream;
-
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
 
@@ -154,20 +151,15 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    torch::Stream get_comm_stream() const;
-
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
     void destroy();
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>> get_dispatch_layout(
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor> get_dispatch_layout(
         const torch::Tensor& topk_idx,
-        int num_experts,
-        std::optional<EventHandle>& previous_event,
-        bool async,
-        bool allocate_on_comm_stream);
+        int num_experts);
 
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Single host
     // call producing pool-shape outputs. Two kernel launches + one host sync:
@@ -202,7 +194,12 @@ public:
     //   20 compute_done_per_token  Tensor[T_recv] int64      per-token Y→combine release stamp (zero-init)
     //   21 o                     Tensor[T_recv, hidden]      kernel Y atomic-scatter destination (zero-init)
     //   22 total_tiles           int                         scalar count
-    //   23 event                 optional<EventHandle>
+    //   23 metadata_done_event   EventHandle                 recorded between tile_arrays_init and dispatch main;
+    //                                                        consumer streams wait_event on this to safely read
+    //                                                        metadata tensors (expert_pool_block_offset, etc.)
+    //                                                        without serializing against dispatch main.
+    //
+    // Streams: kernels run on `at::cuda::getCurrentCUDAStream()` — caller-managed.
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                torch::Tensor,
@@ -226,7 +223,7 @@ public:
                torch::Tensor,
                torch::Tensor,
                int,
-               std::optional<EventHandle>>
+               EventHandle>
     intranode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
                        const torch::Tensor& topk_idx,
@@ -236,12 +233,9 @@ public:
                        int expert_alignment,
                        int tile_m,
                        int64_t dispatch_seq,
-                       const Config& config,
-                       std::optional<EventHandle>& previous_event,
-                       bool async,
-                       bool allocate_on_comm_stream);
+                       const Config& config);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>> intranode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
         const std::optional<torch::Tensor>& bias_0,
@@ -250,10 +244,7 @@ public:
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
         const torch::Tensor& send_head,
-        const Config& config,
-        std::optional<EventHandle>& previous_event,
-        bool async,
-        bool allocate_on_comm_stream);
+        const Config& config);
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
@@ -268,8 +259,7 @@ public:
                torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>,
-               std::optional<EventHandle>>
+               std::optional<torch::Tensor>>
     internode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
                        const std::optional<torch::Tensor>& topk_idx,
@@ -286,12 +276,9 @@ public:
                        const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                        int expert_alignment,
                        int num_worst_tokens,
-                       const Config& config,
-                       std::optional<EventHandle>& previous_event,
-                       bool async,
-                       bool allocate_on_comm_stream);
+                       const Config& config);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> internode_combine(
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>> internode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
         const std::optional<torch::Tensor>& bias_0,
@@ -303,10 +290,7 @@ public:
         const torch::Tensor& gbl_channel_prefix_matrix,
         const torch::Tensor& combined_rdma_head,
         const torch::Tensor& combined_nvl_head,
-        const Config& config,
-        std::optional<EventHandle>& previous_event,
-        bool async,
-        bool allocate_on_comm_stream);
+        const Config& config);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 
@@ -315,7 +299,6 @@ public:
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
-               std::optional<EventHandle>,
                std::optional<std::function<void()>>>
     low_latency_dispatch(const torch::Tensor& x,
                          const torch::Tensor& topk_idx,
@@ -326,10 +309,9 @@ public:
                          bool use_fp8,
                          bool round_scale,
                          bool use_ue8m0,
-                         bool async,
                          bool return_recv_hook);
 
-    std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> low_latency_combine(
+    std::tuple<torch::Tensor, std::optional<std::function<void()>>> low_latency_combine(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -340,7 +322,6 @@ public:
         int num_experts,
         bool use_logfmt,
         bool zero_copy,
-        bool async,
         bool return_recv_hook,
         const std::optional<torch::Tensor>& out = std::nullopt);
 

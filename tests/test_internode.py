@@ -85,7 +85,7 @@ def test_main(args: argparse.Namespace,
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 
-    ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
+    ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
@@ -112,14 +112,12 @@ def test_main(args: argparse.Namespace,
             assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
             check_start = check_end
 
-    for previous_mode in (False, True):
-        for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3):
-                for with_topk in (False, True):
+    for current_x in (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3):
+            for with_topk in (False, True):
                     is_rand = current_x is x_pure_rand or current_x is x_pure_rand_e4m3
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k ...',
                             flush=True,
                             end='')
                     dispatch_args = {
@@ -129,15 +127,11 @@ def test_main(args: argparse.Namespace,
                         'is_token_in_rank': is_token_in_rank,
                         'num_tokens_per_expert': num_tokens_per_expert,
                         'config': config,
-                        'async_finish': async_mode
                     }
                     if with_topk:
                         dispatch_args.update({'topk_idx': topk_idx, 'topk_weights': topk_weights_pure_rand if is_rand else topk_weights})
-                    if previous_mode:
-                        dispatch_args.update({'previous_event': buffer.capture()})
-                    recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(
+                    recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle = buffer.dispatch(
                         **dispatch_args)
-                    event.current_stream_wait() if async_mode else ()
 
                     if current_x is x_pure_rand or current_x is x:
                         hash_value += hash_tensor(recv_x)
@@ -174,8 +168,7 @@ def test_main(args: argparse.Namespace,
                     if with_topk:
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({'num_worst_tokens': num_worst_tokens})
-                        recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
-                        event.current_stream_wait() if async_mode else ()
+                        recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _ = buffer.dispatch(**dispatch_args)
                         recv_worst_x = per_token_cast_back(*recv_worst_x) if isinstance(recv_worst_x, tuple) else recv_worst_x
                         assert len(empty_list) == 0
                         assert num_worst_tokens == recv_worst_x.size(0)
@@ -188,11 +181,8 @@ def test_main(args: argparse.Namespace,
 
                     # Test cached dispatch (must without top-k staffs)
                     if not with_topk:
-                        dispatch_args = {'x': current_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
-                        if previous_mode:
-                            dispatch_args.update({'previous_event': buffer.capture()})
-                        recv_x, _, _, _, _, event = buffer.dispatch(**dispatch_args)
-                        event.current_stream_wait() if async_mode else ()
+                        dispatch_args = {'x': current_x, 'handle': handle, 'config': config}
+                        recv_x, _, _, _, _ = buffer.dispatch(**dispatch_args)
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
                         if not is_rand:
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
@@ -200,13 +190,10 @@ def test_main(args: argparse.Namespace,
                     # Test combine
                     bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
                     bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                    combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config, 'async_finish': async_mode}
+                    combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config}
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
-                    if previous_mode:
-                        combine_args.update({'previous_event': buffer.capture()})
-                    combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
-                    event.current_stream_wait() if async_mode else ()
+                    combined_x, combined_topk_weights = buffer.combine(**combine_args)
                     check_x = (combined_x.float() - bias_0.float() - bias_1.float()) / is_token_in_rank.sum(dim=1).unsqueeze(1)
                     ref_x = x_pure_rand if is_rand else x
                     assert calc_diff(check_x, ref_x) < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
@@ -280,7 +267,7 @@ def test_main(args: argparse.Namespace,
         'num_tokens_per_expert': num_tokens_per_expert,
         'config': dispatch_config if dispatch_config is not None else config
     }
-    recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+    recv_x, _, _, _, handle = buffer.dispatch(**dispatch_args)
 
     # Tune combine performance
     best_time, best_results = 1e10, None

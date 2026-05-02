@@ -22,21 +22,16 @@ struct EventHandle {
     EventHandle(const EventHandle& other) = default;
 
     void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
+
+    // Make `stream` wait on this event. Mirrors the `event.wait(stream)` shape
+    // of `torch.cuda.Event`, so callers can write
+    // `compute_a_stream.wait_event(metadata_done_event)` — `Stream.wait_event`
+    // is implemented in PyTorch as `event.wait(self)`, so any object exposing
+    // a `.wait(stream)` method is duck-compatible.
+    void wait(torch::Stream stream) const {
+        at::cuda::CUDAStream cuda_stream(stream);
+        cuda_stream.unwrap().wait(*event);
+    }
 };
-
-torch::Event create_event(const at::cuda::CUDAStream& s) {
-    auto event = torch::Event(torch::kCUDA);
-    event.record(s);
-    return event;
-}
-
-void stream_wait(const at::cuda::CUDAStream& s_0, const at::cuda::CUDAStream& s_1) {
-    EP_HOST_ASSERT(s_0.id() != s_1.id());
-    s_0.unwrap().wait(create_event(s_1));
-}
-
-void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event) {
-    s.unwrap().wait(*event.event);
-}
 
 }  // namespace deep_ep

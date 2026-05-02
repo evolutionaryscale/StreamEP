@@ -94,12 +94,13 @@ def test_main(num_tokens: int,
                         num_times += 1
                         for _ in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
-                            packed_recv_x, packed_recv_count, handle, event, hook = \
+                            packed_recv_x, packed_recv_count, handle, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                                            async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
-                            hook() if return_recv_hook else event.current_stream_wait()
+                                                            return_recv_hook=return_recv_hook)
+                            if return_recv_hook:
+                                hook()
                         if shrink_test:
                             query_mask_buffer_and_check("dispatch", buffer, mask_status, expected_masked_ranks)
                         packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
@@ -153,16 +154,16 @@ def test_main(num_tokens: int,
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                            combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x,
-                                                                                 topk_idx,
-                                                                                 topk_weights,
-                                                                                 handle,
-                                                                                 use_logfmt=use_logfmt,
-                                                                                 async_finish=not return_recv_hook,
-                                                                                 zero_copy=zero_copy,
-                                                                                 return_recv_hook=return_recv_hook,
-                                                                                 out=out)
-                            hook() if return_recv_hook else event.current_stream_wait()
+                            combined_x, hook = buffer.low_latency_combine(simulated_gemm_x,
+                                                                          topk_idx,
+                                                                          topk_weights,
+                                                                          handle,
+                                                                          use_logfmt=use_logfmt,
+                                                                          zero_copy=zero_copy,
+                                                                          return_recv_hook=return_recv_hook,
+                                                                          out=out)
+                            if return_recv_hook:
+                                hook()
                             if shrink_test:
                                 query_mask_buffer_and_check("combine", buffer, mask_status, expected_masked_ranks)
                             if do_check:
@@ -199,17 +200,17 @@ def test_main(num_tokens: int,
 
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
-        recv_x, recv_count, handle, event, hook = \
+        recv_x, recv_count, handle, hook = \
             buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                        use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook)
+                                        use_fp8=True, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
-        combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x,
-                                                             topk_idx,
-                                                             topk_weights,
-                                                             handle,
-                                                             use_logfmt=use_logfmt,
-                                                             return_recv_hook=return_recv_hook)
+        combined_x, hook = buffer.low_latency_combine(simulated_gemm_x,
+                                                      topk_idx,
+                                                      topk_weights,
+                                                      handle,
+                                                      use_logfmt=use_logfmt,
+                                                      return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
     # Calculate bandwidth

@@ -140,7 +140,6 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-      comm_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -208,14 +207,15 @@ Buffer::Buffer(int rank,
             reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
-        CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
+        auto current_stream = at::cuda::getCurrentCUDAStream();
+        CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, current_stream));
         CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + streaming_section_offset, 0,
-                                   streaming_section_bytes, comm_stream));
+                                   streaming_section_bytes, current_stream));
     }
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
-    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, at::cuda::getCurrentCUDAStream()));
 
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
@@ -297,10 +297,6 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
-torch::Stream Buffer::get_comm_stream() const {
-    return comm_stream;
-}
-
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
 
@@ -309,7 +305,7 @@ void Buffer::destroy() {
 
     if (num_nvl_bytes > 0) {
         // Barrier
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, at::cuda::getCurrentCUDAStream());
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Close remote IPC
@@ -418,27 +414,15 @@ void Buffer::sync(const std::vector<int>& device_ids,
     available = true;
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
-Buffer::get_dispatch_layout(
-    const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
+Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts) {
     EP_HOST_ASSERT(topk_idx.dim() == 2);
     EP_HOST_ASSERT(topk_idx.is_contiguous());
     EP_HOST_ASSERT(num_experts > 0);
 
-    // Allocate all tensors on comm stream if set
-    // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
-        EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
-    }
+    // All kernels run on the caller's stream. Allocations naturally land here
+    // because PyTorch's caching allocator uses `getCurrentCUDAStream`.
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
     auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -457,31 +441,9 @@ Buffer::get_dispatch_layout(
                                 num_topk,
                                 num_ranks,
                                 num_experts,
-                                comm_stream);
+                                stream);
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
-        for (auto& t : {topk_idx, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                t.record_stream(compute_stream);
-        }
-        for (auto& to : {num_tokens_per_rdma_rank}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
-    } else {
-        stream_wait(compute_stream, comm_stream);
-    }
-
-    // Switch back compute stream
-    if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
-
-    return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
+    return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank};
 }
 
 std::tuple<torch::Tensor,                  // 0  pool
@@ -507,7 +469,7 @@ std::tuple<torch::Tensor,                  // 0  pool
            torch::Tensor,                  // 20 compute_done_per_token
            torch::Tensor,                  // 21 o
            int,                            // 22 total_tiles
-           std::optional<EventHandle>>     // 23 event
+           EventHandle>                    // 23 metadata_done_event
 Buffer::intranode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
                            const torch::Tensor& topk_idx,
@@ -517,10 +479,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            int expert_alignment,
                            int tile_m,
                            int64_t dispatch_seq,
-                           const Config& config,
-                           std::optional<EventHandle>& previous_event,
-                           bool async,
-                           bool allocate_on_comm_stream) {
+                           const Config& config) {
     // One channel uses two blocks (sender + receiver).
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -559,24 +518,12 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
 
-    // Snapshot the caller's stream and route ALL torch::empty/zeros allocations
-    // through `comm_stream` for the duration of this function. This makes the
-    // PyTorch caching allocator's events live on `comm_stream` instead of the
-    // caller's stream, so kernels we launch on `comm_stream` see the allocator
-    // events automatically — no extra cross-stream waits needed. The `compute_stream`
-    // sync at the end (non-async path) is what the caller relies on for downstream
-    // ordering. `allocate_on_comm_stream` is accepted for API symmetry with
-    // non-streaming dispatch but does not gate behavior here — the streaming
-    // path always allocates on comm_stream.
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
-        EP_HOST_ASSERT(previous_event.has_value() and async);
-    }
-    if (previous_event.has_value())
-        stream_wait(comm_stream, previous_event.value());
-    else
-        stream_wait(comm_stream, compute_stream);
-    at::cuda::setCurrentCUDAStream(comm_stream);
+    // All kernels + allocations run on the caller's current stream. The caller
+    // is expected to have set its `comm_stream` as current via
+    // `with torch.cuda.stream(comm_stream)` before calling. PyTorch's caching
+    // allocator uses `getCurrentCUDAStream`, so allocations land on this same
+    // stream and are naturally ordered with the kernels we launch.
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     // Reset host-mapped sync slots before metadata writes.
     *moe_recv_counter = -1;
@@ -616,7 +563,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                            num_ranks,
                                            tile_m,
                                            expert_alignment,
-                                           comm_stream);
+                                           stream);
 
     // The dispatch main kernel reads rank_prefix_matrix from buffer_ptrs[rank]
     // (the IPC slab, offset 0) and the channel queue metadata immediately after.
@@ -630,12 +577,12 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                rank_prefix_matrix.data_ptr<int>(),
                                num_ranks * num_ranks * sizeof(int),
                                cudaMemcpyDeviceToDevice,
-                               comm_stream));
+                               stream));
     CUDA_CHECK(cudaMemsetAsync(static_cast<int*>(buffer_ptrs[nvl_rank]) + num_ranks * num_ranks,
                                0,
                                num_memset_int * sizeof(int),
-                               comm_stream));
-    intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_ranks, comm_stream);
+                               stream));
+    intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_ranks, stream);
 
     // Single host poll: {num_recv, num_recv_per_expert[E_local], total_tiles}.
     int num_recv_tokens = -1;
@@ -663,9 +610,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // zero-initialized so kernel A's GEMM on partial tiles produces zero output
     // (no uninitialized data flowing into kernel Y's scatter), and so the pool
     // tensor compares bit-equal across dispatches with the same cached routing.
-    // The current stream is `comm_stream` (set above), so all zeros() / full()
-    // memsets land on comm_stream and are naturally ordered with the dispatch
-    // kernel that reads them.
+    // PyTorch's caching allocator uses `getCurrentCUDAStream`, so all zeros() /
+    // full() memsets land on the caller's stream and are naturally ordered with
+    // the dispatch kernel that reads them.
     auto pool = torch::zeros({TK_padded, hidden}, x.options());
     auto pool_topk_weight = torch::zeros({TK_padded}, dtype(torch::kFloat32).device(torch::kCUDA));
     auto pool_recv_token = torch::full({TK_padded}, -1, i32_opts);
@@ -691,9 +638,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto pool_arrival_count = torch::zeros({total_tiles}, i32_opts);
     auto tile_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
     // a_ready[total_tiles]: kernel A → kernel Y per-tile release stamp. Allocated
-    // here on comm_stream so kernel A's release-store transitively observes the
-    // zero-init via the dispatch → A `tile_ready` acquire chain (same pattern as
-    // pool / tile_ready themselves).
+    // here on the caller's stream; kernel A's release-store transitively observes
+    // the zero-init via the dispatch → A `tile_ready` acquire chain (same pattern
+    // as pool / tile_ready themselves).
     auto a_ready = torch::zeros({total_tiles}, dtype(torch::kInt64).device(torch::kCUDA));
     intranode::tile_arrays_init(expert_frequency.data_ptr<int>(),
                                 expert_pool_block_offset.data_ptr<int>(),
@@ -702,7 +649,14 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                 num_local_experts,
                                 total_tiles,
                                 tile_m,
-                                comm_stream);
+                                stream);
+
+    // Record the metadata-done event between `tile_arrays_init` and the dispatch
+    // main kernel. Consumer streams (kernel A, kernel Y, combine sender) wait
+    // on this event to safely read metadata tensors (expert_pool_block_offset,
+    // pool_recv_token, pool_topk_weight, etc.) without serializing against the
+    // dispatch main kernel — preserving the per-tile dispatch→A streaming overlap.
+    auto metadata_done_event = EventHandle(stream);
 
     // ── Per-recv-token arrays for kernel Y's atomic-scatter epilogue + the
     // eventual Phase D combine sender's per-token gate.
@@ -761,42 +715,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         buffer_ptrs_gpu,
                         rank,
                         num_ranks,
-                        comm_stream,
+                        stream,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
                         config.num_max_nvl_chunked_recv_tokens,
                         tile_m);
-
-    std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
-        for (auto& t : {x, is_token_in_rank, topk_idx, topk_weights,
-                        pool, pool_topk_weight, pool_recv_token, pool_k_slot,
-                        recv_topk_weights, recv_src_idx, send_head,
-                        rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
-                        expert_frequency, expert_pool_block_offset, base_pool,
-                        tile_id_to_expert, pool_arrival_target, pool_arrival_count, tile_ready,
-                        a_ready, per_token_remaining, compute_done_per_token, o}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                t.record_stream(compute_stream);
-        }
-        if (pool_x_scales.has_value()) {
-            pool_x_scales->record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                pool_x_scales->record_stream(compute_stream);
-        }
-        if (x_scales.has_value()) {
-            x_scales->record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                x_scales->record_stream(compute_stream);
-        }
-    } else {
-        stream_wait(compute_stream, comm_stream);
-    }
-    // Restore caller's stream (we set current to comm_stream at the top so
-    // PyTorch's allocator events live on comm_stream).
-    at::cuda::setCurrentCUDAStream(compute_stream);
 
     return {pool,
             pool_x_scales,
@@ -821,10 +744,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             compute_done_per_token,
             o,
             total_tiles,
-            event};
+            metadata_done_event};
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> Buffer::intranode_combine(
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combine(
     const torch::Tensor& x,
     const std::optional<torch::Tensor>& topk_weights,
     const std::optional<torch::Tensor>& bias_0,
@@ -833,10 +756,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const torch::Tensor& rank_prefix_matrix,
     const torch::Tensor& channel_prefix_matrix,
     const torch::Tensor& send_head,
-    const Config& config,
-    std::optional<EventHandle>& previous_event,
-    bool async,
-    bool allocate_on_comm_stream) {
+    const Config& config) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
@@ -857,20 +777,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
     EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
 
-    // Allocate all tensors on comm stream if set
-    // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
-        EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
-    }
+    // All kernels + allocations run on the caller's current stream.
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     int num_topk = 0;
     auto recv_topk_weights = std::optional<torch::Tensor>();
@@ -896,7 +804,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      barrier_signal_ptrs_gpu,
                                      rank,
                                      num_ranks,
-                                     comm_stream);
+                                     stream);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -935,34 +843,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        buffer_ptrs_gpu,
                        rank,
                        num_ranks,
-                       comm_stream,
+                       stream,
                        config.num_sms,
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens);
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
-        for (auto& t : {x, src_idx, send_head, rank_prefix_matrix, channel_prefix_matrix, recv_x}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                t.record_stream(compute_stream);
-        }
-        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
-    } else {
-        stream_wait(compute_stream, comm_stream);
-    }
-
-    // Switch back compute stream
-    if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
-
-    return {recv_x, recv_topk_weights, event};
+    return {recv_x, recv_topk_weights};
 }
 
 std::tuple<torch::Tensor,
@@ -978,8 +864,7 @@ std::tuple<torch::Tensor,
            torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>,
-           std::optional<EventHandle>>
+           std::optional<torch::Tensor>>
 Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
                            const std::optional<torch::Tensor>& topk_idx,
@@ -996,10 +881,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                            int expert_alignment,
                            int num_worst_tokens,
-                           const Config& config,
-                           std::optional<EventHandle>& previous_event,
-                           bool async,
-                           bool allocate_on_comm_stream) {
+                           const Config& config) {
 #ifndef DISABLE_NVSHMEM
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
@@ -1093,20 +975,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
 
-    // Allocate all tensors on comm stream if set
-    // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
-        EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
-    }
+    // All kernels + allocations run on the caller's current stream.
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     // Create handles (only return for non-cached mode)
     int num_recv_tokens = -1, num_rdma_recv_tokens = -1;
@@ -1143,7 +1013,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  config.num_max_nvl_chunked_recv_tokens,
                                  barrier_signal_ptrs_gpu,
                                  rank,
-                                 comm_stream,
+                                 stream,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                  num_nvl_bytes,
                                  true,
@@ -1184,7 +1054,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    config.num_max_nvl_chunked_recv_tokens,
                                    barrier_signal_ptrs_gpu,
                                    rank,
-                                   comm_stream,
+                                   stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
                                    low_latency_mode);
@@ -1291,54 +1161,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         rank,
                         num_ranks,
                         cached_mode,
-                        comm_stream,
+                        stream,
                         num_channels,
                         low_latency_mode);
-
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
-        for (auto& t : {x,
-                        is_token_in_rank,
-                        recv_x,
-                        rdma_channel_prefix_matrix,
-                        recv_rdma_rank_prefix_sum,
-                        gbl_channel_prefix_matrix,
-                        recv_gbl_rank_prefix_sum}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                t.record_stream(compute_stream);
-        }
-        for (auto& to : {x_scales,
-                         topk_idx,
-                         topk_weights,
-                         num_tokens_per_rank,
-                         num_tokens_per_rdma_rank,
-                         num_tokens_per_expert,
-                         cached_rdma_channel_prefix_matrix,
-                         cached_recv_rdma_rank_prefix_sum,
-                         cached_gbl_channel_prefix_matrix,
-                         cached_recv_gbl_rank_prefix_sum,
-                         recv_topk_idx,
-                         recv_topk_weights,
-                         recv_x_scales,
-                         recv_rdma_channel_prefix_matrix,
-                         recv_gbl_channel_prefix_matrix,
-                         send_rdma_head,
-                         send_nvl_head,
-                         recv_src_meta}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
-    } else {
-        stream_wait(compute_stream, comm_stream);
-    }
-
-    // Switch back compute stream
-    if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
 
     // Return values
     return {recv_x,
@@ -1354,15 +1179,14 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             recv_gbl_rank_prefix_sum,
             recv_src_meta,
             send_rdma_head,
-            send_nvl_head,
-            event};
+            send_nvl_head};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
 #endif
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> Buffer::internode_combine(
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::internode_combine(
     const torch::Tensor& x,
     const std::optional<torch::Tensor>& topk_weights,
     const std::optional<torch::Tensor>& bias_0,
@@ -1374,10 +1198,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const torch::Tensor& gbl_channel_prefix_matrix,
     const torch::Tensor& combined_rdma_head,
     const torch::Tensor& combined_nvl_head,
-    const Config& config,
-    std::optional<EventHandle>& previous_event,
-    bool async,
-    bool allocate_on_comm_stream) {
+    const Config& config) {
 #ifndef DISABLE_NVSHMEM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1410,20 +1231,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                    combined_rdma_head.size(1) == num_rdma_ranks);
     EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
 
-    // Allocate all tensors on comm stream if set
-    // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    if (allocate_on_comm_stream) {
-        EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-    }
-
-    // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
-    }
+    // All kernels + allocations run on the caller's current stream.
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     // Top-k checks
     int num_topk = 0;
@@ -1462,7 +1271,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              config.num_max_nvl_chunked_recv_tokens,
                              barrier_signal_ptrs_gpu,
                              rank,
-                             comm_stream,
+                             stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                              num_nvl_bytes,
                              false,
@@ -1508,42 +1317,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        config.num_max_nvl_chunked_recv_tokens,
                        rank,
                        num_ranks,
-                       comm_stream,
+                       stream,
                        num_channels,
                        low_latency_mode);
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
-        for (auto& t : {x,
-                        src_meta,
-                        is_combined_token_in_rank,
-                        rdma_channel_prefix_matrix,
-                        rdma_rank_prefix_sum,
-                        gbl_channel_prefix_matrix,
-                        combined_x,
-                        combined_rdma_head,
-                        combined_nvl_head}) {
-            t.record_stream(comm_stream);
-            if (allocate_on_comm_stream)
-                t.record_stream(compute_stream);
-        }
-        for (auto& to : {topk_weights, combined_topk_weights, bias_0, bias_1}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
-    } else {
-        stream_wait(compute_stream, comm_stream);
-    }
-
-    // Switch back compute stream
-    if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
-
     // Return values
-    return {combined_x, combined_topk_weights, event};
+    return {combined_x, combined_topk_weights};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
@@ -1584,7 +1363,6 @@ std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,
            torch::Tensor,
-           std::optional<EventHandle>,
            std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch(const torch::Tensor& x,
                              const torch::Tensor& topk_idx,
@@ -1595,7 +1373,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool use_fp8,
                              bool round_scale,
                              bool use_ue8m0,
-                             bool async,
                              bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
@@ -1631,13 +1408,8 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
-    // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
+    // All kernels + allocations run on the caller's current stream.
+    auto launch_stream = at::cuda::getCurrentCUDAStream();
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
@@ -1703,30 +1475,20 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
-        // so in Python API, we must wrap all tensors into the event handle.
-        event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
-    }
-
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
-    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
+    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
 #endif
 }
 
-std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> Buffer::low_latency_combine(
+std::tuple<torch::Tensor, std::optional<std::function<void()>>> Buffer::low_latency_combine(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -1737,7 +1499,6 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     int num_experts,
     bool use_logfmt,
     bool zero_copy,
-    bool async,
     bool return_recv_hook,
     const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
@@ -1776,13 +1537,8 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
-    // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
+    // All kernels + allocations run on the caller's current stream.
+    auto launch_stream = at::cuda::getCurrentCUDAStream();
 
     // Allocate output tensor
     torch::Tensor combined_x;
@@ -1827,23 +1583,13 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
-    // Wait streams
-    std::optional<EventHandle> event;
-    if (async) {
-        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
-        // so in Python API, we must wrap all tensors into the event handle.
-        event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
-    }
-
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
-    return {combined_x, event, recv_hook};
+    return {combined_x, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
@@ -1914,7 +1660,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
         .def(pybind11::init<>())
-        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
+        .def("wait", &deep_ep::EventHandle::wait);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
@@ -1926,7 +1673,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
-        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)

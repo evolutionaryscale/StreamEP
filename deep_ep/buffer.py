@@ -8,7 +8,7 @@ from typing import Callable, List, Tuple, Optional, Union
 import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
-from .utils import EventOverlap, check_nvlink_connections
+from .utils import check_nvlink_connections
 
 
 @dataclass
@@ -225,16 +225,6 @@ class Buffer:
         Buffer.num_sms = new_num_sms
 
     @staticmethod
-    def capture() -> EventOverlap:
-        """
-        Capture a CUDA event on the current stream, i.e. `torch.cuda.current_stream()`.
-
-        Returns:
-            event: the captured event.
-        """
-        return EventOverlap(EventHandle())
-
-    @staticmethod
     def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
         """
         Get a minimum size requirement for the RDMA buffer. The size calculation will be done with BF16.
@@ -249,16 +239,6 @@ class Buffer:
             size: the RDMA buffer size recommended.
         """
         return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
-
-    def get_comm_stream(self) -> torch.Stream:
-        """
-        Get the communication stream.
-
-        Returns:
-            stream: the communication stream.
-        """
-        ts: torch.Stream = self.runtime.get_comm_stream()
-        return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
     def get_local_buffer_tensor(self,
                                 dtype: torch.dtype,
@@ -352,20 +332,18 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
-    def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
-                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                            allocate_on_comm_stream: bool = False) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, EventOverlap]:
+    def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         Calculate the layout required for later communication.
+
+        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement
+        via ``with torch.cuda.stream(...)``.
 
         Arguments:
             topk_idx: `[num_tokens, num_topk]`, dtype must be `deep_ep.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by each token, `-1` means no selections.
             num_experts: the number of experts.
-            previous_event: the event to wait before actually executing the kernel.
-            async_finish: the current stream will not wait for the communication kernels to be finished if set.
-            allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
 
         Returns:
             num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
@@ -373,12 +351,8 @@ class Buffer:
                 rank (with the same GPU index), return `None` for intranode settings.
             num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
-            event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
-            self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
-                                             async_finish, allocate_on_comm_stream)
-        return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
+        return self.runtime.get_dispatch_layout(topk_idx, num_experts)
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -390,13 +364,19 @@ class Buffer:
                  expert_alignment: int = 1,
                  tile_m: int = 128,
                  dispatch_seq: int = 1,
-                 config: Optional[Config] = None,
-                 previous_event: Optional[EventOverlap] = None,
-                 async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 config: Optional[Config] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
-                  'StreamingHandle', EventOverlap]:
+                  'StreamingHandle', EventHandle]:
         """Streaming-MoE pool-layout dispatch (intranode).
+
+        Runs on ``torch.cuda.current_stream()``. The caller is expected to wrap
+        this call in ``with torch.cuda.stream(comm_stream):`` so dispatch's
+        kernels and allocations land on ``comm_stream``. Cross-stream
+        consumers (kernel A, kernel Y, combine sender) wait on the returned
+        ``metadata_done_event`` to safely read metadata tensors
+        (``expert_pool_block_offset``, ``pool_recv_token``, ``pool_topk_weight``,
+        etc.) without serializing against the dispatch main kernel — preserving
+        the per-tile dispatch→A streaming overlap.
 
         Two kernel launches + one host sync per layer:
           1. ``streaming_dispatch_metadata`` — fused cross-rank count exchange +
@@ -404,7 +384,8 @@ class Buffer:
           2. host poll on ``{moe_recv_counter, moe_recv_expert_counter,
              streaming_total_tiles}``.
           3. ``tile_arrays_init`` — per-tile (tile_id_to_expert, pool_arrival_target).
-          4. ``dispatch`` — pool-layout receiver. Each landed (token, k) routing
+          4. ``metadata_done_event`` recorded on the current stream.
+          5. ``dispatch`` — pool-layout receiver. Each landed (token, k) routing
              to a local expert lands in a deterministic pool slot derived from
              ``base_pool[c, src, e]`` plus a per-warp per-expert thread offset.
              Pass 2 (substream end) walks experts in order and atomic-adds to
@@ -421,15 +402,18 @@ class Buffer:
             expert_alignment: alignment for per-expert receive counts (default 1).
             tile_m: pool block size (default 128).
             dispatch_seq: monotonic int64 release-stamp on tile_ready.
-            config / previous_event / async_finish / allocate_on_comm_stream:
-                standard DeepEP stream-management options.
 
         Returns:
             recv: ``handle.pool`` (Tensor) or ``(handle.pool, handle.pool_x_scales)``
                 tuple for FP8.
             handle: ``StreamingHandle`` carrying pool tensors + per-tile metadata
                 + recv-token-indexed combine inputs.
-            event: completion event (valid only when ``async_finish``).
+            metadata_done_event: ``EventHandle`` recorded between
+                ``tile_arrays_init`` and the dispatch main kernel. Use as
+                ``compute_a_stream.wait_event(metadata_done_event)`` (or the
+                equivalent ``metadata_done_event.wait(compute_a_stream)``) to
+                make a consumer stream see metadata-tensor writes without
+                serializing against dispatch main.
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
@@ -437,11 +421,10 @@ class Buffer:
             raise NotImplementedError("Internode streaming dispatch is out of scope (intranode-only).")
 
         x_tensor, x_scales = x if isinstance(x, tuple) else (x, None)
-        prev_event_obj = getattr(previous_event, 'event', None)
         outputs = self.runtime.intranode_dispatch(
             x_tensor, x_scales, topk_idx, topk_weights, is_token_in_rank,
             num_experts, expert_alignment, tile_m, dispatch_seq,
-            config, prev_event_obj, async_finish, allocate_on_comm_stream,
+            config,
         )
         (pool, pool_x_scales,
          pool_topk_weight, pool_recv_token, pool_k_slot,
@@ -451,7 +434,7 @@ class Buffer:
          expert_frequency, expert_pool_block_offset, base_pool,
          tile_id_to_expert, pool_arrival_target, tile_ready,
          a_ready, per_token_remaining, compute_done_per_token, o,
-         total_tiles, event) = outputs
+         total_tiles, metadata_done_event) = outputs
 
         handle = StreamingHandle(
             pool=pool,
@@ -483,18 +466,18 @@ class Buffer:
         )
 
         recv = (pool, pool_x_scales) if x_scales is not None else pool
-        return recv, handle, EventOverlap(event)
+        return recv, handle, metadata_done_event
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
                 topk_weights: Optional[torch.Tensor] = None,
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
-                config: Optional[Config] = None,
-                previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                allocate_on_comm_stream: bool = False) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+                config: Optional[Config] = None) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
         returned by ``Buffer.dispatch``. Intranode only for now (Phase E for internode).
+
+        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
 
@@ -502,13 +485,11 @@ class Buffer:
             raise NotImplementedError("Internode streaming combine lands in Phase E.")
 
         bias_0, bias_1 = Buffer._unpack_bias(bias)
-        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
+        return self.runtime.intranode_combine(
             x, topk_weights, bias_0, bias_1,
             handle.recv_src_idx, handle.rank_prefix_matrix,
             handle.channel_prefix_matrix, handle.send_head,
-            config, getattr(previous_event, 'event', None),
-            async_finish, allocate_on_comm_stream)
-        return recv_x, recv_topk_weights, EventOverlap(event)
+            config)
 
     # noinspection PyTypeChecker
     def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -516,14 +497,14 @@ class Buffer:
                            num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
                            is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
                            topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
-                           num_worst_tokens: int = 0, config: Optional[Config] = None,
-                           previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                           allocate_on_comm_stream: bool = False) -> \
+                           num_worst_tokens: int = 0, config: Optional[Config] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
-            Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+            Optional[torch.Tensor], List[int], Tuple]:
         """
         Internode dispatch implementation, for more details, please refer to the `dispatch` docs.
         Normally, you should not directly call this function.
+
+        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
         """
         assert config is not None
 
@@ -537,41 +518,40 @@ class Buffer:
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _ = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
-            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
+                expert_alignment, num_worst_tokens, config)
+            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
+                recv_src_meta, send_rdma_head, send_nvl_head = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, num_worst_tokens, config)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
             return (
                 recv_x, recv_x_scales
-            ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(
-                event)
+            ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
 
     # noinspection PyTypeChecker
     def internode_combine(self, x: torch.Tensor, handle: Union[tuple, list],
                           topk_weights: Optional[torch.Tensor] = None,
                           bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
-                          config: Optional[Config] = None,
-                          previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                          allocate_on_comm_stream: bool = False) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+                          config: Optional[Config] = None) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Internode combine implementation, for more details, please refer to the `combine` docs.
         Normally, you should not directly call this function.
+
+        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
         """
         assert config is not None
 
@@ -583,13 +563,11 @@ class Buffer:
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
-        combined_x, combined_topk_weights, event = self.runtime.internode_combine(x, topk_weights, bias_0, bias_1, src_meta,
-                                                                                  is_combined_token_in_rank, rdma_channel_prefix_matrix,
-                                                                                  rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
-                                                                                  send_rdma_head, send_nvl_head, config,
-                                                                                  getattr(previous_event, 'event',
-                                                                                          None), async_finish, allocate_on_comm_stream)
-        return combined_x, combined_topk_weights, EventOverlap(event)
+        return self.runtime.internode_combine(
+            x, topk_weights, bias_0, bias_1, src_meta,
+            is_combined_token_in_rank, rdma_channel_prefix_matrix,
+            rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
+            send_rdma_head, send_nvl_head, config)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
         """
@@ -611,14 +589,16 @@ class Buffer:
                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
-                             async_finish: bool = False, return_recv_hook: bool = False) -> \
-            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
+                             return_recv_hook: bool = False) -> \
+            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
             (specifically, IBGDA must be enabled).
         Warning: as there are only two buffers, and the returned tensors reuse the buffer, you cannot hold more than 2
             low-latency kernels' result tensors at a single moment.
+
+        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
 
         Arguments:
             x: `torch.Tensor` with `torch.bfloat16`, shaped as `[num_tokens, hidden]`, only several hidden shapes are
@@ -636,7 +616,6 @@ class Buffer:
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
             round_scale: whether round the scaling factors into power of 2.
             use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).
-            async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
@@ -657,29 +636,25 @@ class Buffer:
             recv_count: a tensor shaped `[num_local_experts]` with type `torch.int`, indicating how many tokens each
                 expert receives. As mentioned before, not all tokens are valid in `recv_x`.
             handle: the communication handle to be used in the `low_latency_combine` function.
-            event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
-        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
                                               dispatch_wait_recv_cost_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
-                                              async_finish, return_recv_hook)
+                                              return_recv_hook)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
-        tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
-                             packed_recv_layout_range, cumulative_local_expert_recv_stats)
-        return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
-            EventOverlap(event, tensors_to_record if async_finish else None), hook
+        return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, hook
 
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                            handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
+                            handle: tuple, use_logfmt: bool = False, zero_copy: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
-            Tuple[torch.Tensor, EventOverlap, Callable]:
+            Tuple[torch.Tensor, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
@@ -699,7 +674,6 @@ class Buffer:
             use_logfmt: whether to use an internal "LogFMT with dynamic per-64-channel cast" format (10 bits).
             zero_copy: whether the tensor is already copied into the RDMA buffer, should be cooperative
                 with `get_next_low_latency_combine_buffer`.
-            async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
@@ -710,16 +684,15 @@ class Buffer:
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
-            event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
-                                                                   num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
-        tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
-        return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+        combined_x, hook = self.runtime.low_latency_combine(
+            x, topk_idx, topk_weights, src_info, layout_range,
+            combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+            num_experts, use_logfmt, zero_copy, return_recv_hook, out)
+        return combined_x, hook
 
     def low_latency_update_mask_buffer(self, rank_to_mask: int, mask: bool = False):
         """
