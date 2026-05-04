@@ -88,6 +88,52 @@ def _ref_dL_dpostact_a(
     return out
 
 
+def _ref_dL_dweight(
+    dL_do_pool: torch.Tensor,  # (TK_padded, H) bf16
+    W2: torch.Tensor,  # (E_local, H, I) bf16
+    preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16
+    tile_to_expert_list: list[int],
+    tile_m: int,
+) -> torch.Tensor:
+    """Eager torch reference for per-slot dL/dweight = postact · g (sum over I).
+
+    g  = dL_do_pool[tile] @ W2[e]               (unweighted; matches kernel)
+    postact[m, i] = silu(preact[m, 2i]) * preact[m, 2i+1]
+                                                (paired-N, mirrors fwd kernel A)
+    dL/dweight[slot] = Σ_i postact[m, i] * g[m, i]
+    Returns fp32 (TK_padded,).
+    """
+    total_tiles = len(tile_to_expert_list)
+    TK_padded = total_tiles * tile_m
+    out = torch.zeros(TK_padded, dtype=torch.float32, device=dL_do_pool.device)
+    for t in range(total_tiles):
+        e = tile_to_expert_list[t]
+        rows = slice(t * tile_m, (t + 1) * tile_m)
+        g = dL_do_pool[rows].float() @ W2[e].float()  # (tile_m, I)
+        # Recompute postact from preact, paired-N: gate at 0::2, up at 1::2.
+        gate = preact_a[t, :, 0::2].float()
+        up = preact_a[t, :, 1::2].float()
+        postact = torch.nn.functional.silu(gate) * up  # (tile_m, I)
+        out[rows] = (postact * g).sum(dim=-1)
+    return out
+
+
+def _alloc_preact(total_tiles, tile_m, I, dtype, device, seed):
+    """Allocate a (total_tiles, tile_m, 2*I) bf16 preact buffer with reproducible
+    randn values."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    return (
+        torch.randn(total_tiles, tile_m, 2 * I, dtype=dtype, device=device, generator=g)
+        * 0.5
+    )
+
+
+def _alloc_dL_dweight_partials(TK_padded, tile_n, I, device):
+    """ColVecReduce destination — zero-init (TK_padded, num_pid_n) fp32."""
+    num_pid_n = (I + tile_n - 1) // tile_n
+    return torch.zeros(TK_padded, num_pid_n, dtype=torch.float32, device=device)
+
+
 @pytest.fixture
 def device():
     if not torch.cuda.is_available():
@@ -112,6 +158,8 @@ def test_streaming_moe_y_bwd_compiles(device):
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
     dL_dpostact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
     pool_topk_weight = torch.ones(TK_padded, dtype=torch.float32, device=device)
+    preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
+    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
@@ -129,6 +177,8 @@ def test_streaming_moe_y_bwd_compiles(device):
             W2,
             dL_dpostact_a,
             pool_topk_weight,
+            preact_a,
+            dL_dweight_per_stripe,
             tile_id_to_expert,
             expert_pool_block_offset,
             bwd_y_ready,
@@ -168,6 +218,8 @@ def test_streaming_moe_y_bwd_single_tile(device):
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
+    preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
+    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
 
     tile_to_expert_list = [chosen_expert]
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
@@ -181,6 +233,8 @@ def test_streaming_moe_y_bwd_single_tile(device):
         W2,
         dL_dpostact_a,
         pool_topk_weight,
+        preact_a,
+        dL_dweight_per_stripe,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_y_ready,
@@ -207,6 +261,24 @@ def test_streaming_moe_y_bwd_single_tile(device):
         f"{bad.sum().item()} elements exceed both rtol={rel_thresh} and "
         f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
         f"max rel diff {rel.max().item():.4f}"
+    )
+    # dL/dweight: sum the per-stripe partials → per-slot scalar; compare
+    # against eager `Σ_i postact[i] * g[i]` reference. Tolerance scales with
+    # I (the reduction length): per-element noise multiplied by ~sqrt(I)
+    # for sum-of-squares-like patterns.
+    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
+    dL_dweight_ref = _ref_dL_dweight(
+        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
+    )
+    diff_w = (dL_dweight - dL_dweight_ref).abs()
+    rel_w = diff_w / (dL_dweight_ref.abs() + 1e-3)
+    abs_thresh_w, rel_thresh_w = 5e-2, 5e-2
+    bad_w = (diff_w > abs_thresh_w) & (rel_w > rel_thresh_w)
+    assert not bad_w.any(), (
+        f"dL/dweight: {bad_w.sum().item()} elements exceed both "
+        f"rtol={rel_thresh_w} and atol={abs_thresh_w}; "
+        f"max abs diff {diff_w.max().item():.4f}, "
+        f"max rel diff {rel_w.max().item():.4f}"
     )
     assert (bwd_a_ready == seq).all(), (
         f"bwd_a_ready not all set to dispatch_seq={seq} (per-tile release "
@@ -238,6 +310,8 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
+    preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=43)
+    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
@@ -250,6 +324,8 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         W2,
         dL_dpostact_a,
         pool_topk_weight,
+        preact_a,
+        dL_dweight_per_stripe,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_y_ready,
@@ -274,6 +350,22 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
             f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
             f"max rel diff {rel.max().item():.4f}"
         )
+
+    # dL/dweight: per-stripe partials summed across the n-stripe dim.
+    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
+    dL_dweight_ref = _ref_dL_dweight(
+        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
+    )
+    diff_w = (dL_dweight - dL_dweight_ref).abs()
+    rel_w = diff_w / (dL_dweight_ref.abs() + 1e-3)
+    abs_thresh_w, rel_thresh_w = 5e-2, 5e-2
+    bad_w = (diff_w > abs_thresh_w) & (rel_w > rel_thresh_w)
+    assert not bad_w.any(), (
+        f"dL/dweight: {bad_w.sum().item()} elements exceed both "
+        f"rtol={rel_thresh_w} and atol={abs_thresh_w}; "
+        f"max abs diff {diff_w.max().item():.4f}, "
+        f"max rel diff {rel_w.max().item():.4f}"
+    )
     assert (bwd_a_ready == seq).all(), (
         f"bwd_a_ready not all set; bad indices "
         f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
@@ -308,6 +400,8 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
+    preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=44)
+    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
@@ -331,6 +425,8 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             W2,
             dL_dpostact_a,
             pool_topk_weight,
+            preact_a,
+            dL_dweight_per_stripe,
             tile_id_to_expert,
             expert_pool_block_offset,
             bwd_y_ready,
@@ -358,6 +454,22 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
             f"max rel diff {rel.max().item():.4f}"
         )
+
+    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
+    dL_dweight_ref = _ref_dL_dweight(
+        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
+    )
+    diff_w = (dL_dweight - dL_dweight_ref).abs()
+    rel_w = diff_w / (dL_dweight_ref.abs() + 1e-3)
+    abs_thresh_w, rel_thresh_w = 5e-2, 5e-2
+    bad_w = (diff_w > abs_thresh_w) & (rel_w > rel_thresh_w)
+    assert not bad_w.any(), (
+        f"dL/dweight: {bad_w.sum().item()} elements exceed both "
+        f"rtol={rel_thresh_w} and atol={abs_thresh_w}; "
+        f"max abs diff {diff_w.max().item():.4f}, "
+        f"max rel diff {rel_w.max().item():.4f}"
+    )
+
     assert (bwd_a_ready == seq).all(), (
         f"bwd_a_ready not all set under producer-consumer; bad indices "
         f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
