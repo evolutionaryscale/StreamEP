@@ -57,13 +57,12 @@ def main():
     rank_zero_print(
         f"[smoke] config: world={world_size} num_sms={args.num_sms} "
         f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-        f"n_warmup={args.n_warmup} n_iter={args.n_iter}",
-        flush=True,
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter}"
     )
 
     t0 = time.time()
     buffer = make_buffer(group, args.num_sms)
-    rank_zero_print(f"[smoke] buffer init: {time.time() - t0:.2f}s", flush=True)
+    rank_zero_print(f"[smoke] buffer init: {time.time() - t0:.2f}s")
 
     g = torch.Generator(device=device).manual_seed(42)
     w1_full = (
@@ -121,8 +120,7 @@ def main():
     t_warmup = time.time() - t0
     rank_zero_print(
         f"[smoke] warmup ({args.n_warmup} iters, includes JIT): "
-        f"{t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)",
-        flush=True,
+        f"{t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)"
     )
 
     t0 = time.time()
@@ -150,10 +148,9 @@ def main():
     t_iter = time.time() - t0
     rank_zero_print(
         f"[smoke] timed   ({args.n_iter} iters):              "
-        f"{t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)",
-        flush=True,
+        f"{t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)"
     )
-    rank_zero_print("[smoke] OK", flush=True)
+    rank_zero_print("[smoke] OK")
 
     torch_dist.destroy_process_group()
 
