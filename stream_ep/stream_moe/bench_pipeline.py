@@ -217,15 +217,17 @@ def main():
     # capture one set from a single dispatch_grads call below and reuse it
     # across timed iters.
     dL_dy_in = (torch.randn_like(x) * 0.01).contiguous()
-    num_pid_n_y_bwd = (I + args.tile_n_a - 1) // args.tile_n_a
     dL_dswiglu_in = torch.empty(
         total_tiles, args.tile_m, 2 * I, dtype=DTYPE, device=device
     )
-    dL_dweight_per_stripe = torch.zeros(
-        TK_padded, num_pid_n_y_bwd, dtype=torch.float32, device=device
+    # postact_a_for_dW2: kernel_y_bwd's mPostAct TMA-store output (weighted
+    # postact = postact * pool_topk_weight, bf16 (M, I)). Reused as input
+    # to dW2's grouped GEMM in the orchestrator.
+    postact_a_for_dW2 = torch.empty(
+        total_tiles, args.tile_m, I, dtype=DTYPE, device=device
     )
+    dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=DTYPE, device=device)
-    weight_grads = torch.zeros(TK_padded, dtype=torch.float32, device=device)
     # Pre-fired bwd ready signals so each bwd kernel can be timed in isolation.
     bwd_y_ready_fired = torch.full(
         (total_tiles,), handle.dispatch_seq, dtype=torch.int64, device=device
@@ -372,18 +374,20 @@ def main():
         torch.cuda.current_stream().wait_stream(streams.dispatch)
 
     def run_streaming_y_bwd():
-        # Reset bwd_a_ready (kernel_y_bwd's release target) so the multi-pid_n
-        # stripe-done gating sees zero on the first stripe, and zero the
-        # ColVecReduce accumulator (otherwise partials accumulate forever).
+        # Reset bwd_a_ready (kernel_y_bwd's release target) so the
+        # multi-pid_n stripe-done gating sees zero on the first stripe.
+        # Zero dL_dweight too — kernel atomic-adds into it; non-zero would
+        # double-count across iterations.
         bwd_a_ready_for_y.zero_()
-        dL_dweight_per_stripe.zero_()
+        dL_dweight.zero_()
         streaming_moe_y_bwd(
             _dL_do_pool_captured,
             w2_local,
             dL_dswiglu_in,
+            postact_a_for_dW2,
             handle.pool_topk_weight,
             preact_a,
-            dL_dweight_per_stripe,
+            dL_dweight,
             handle.tile_id_to_expert,
             handle.expert_pool_block_offset,
             bwd_y_ready_fired,
@@ -464,12 +468,12 @@ def main():
     def run_combine_grads_only():
         # combine_grads's sender gate is `bwd_compute_done_per_token`; pre-fire
         # the same way run_combine_only fires `compute_done_per_token`. The
-        # kernel runs to completion using captured `dL_dx_per_r` / `weight_grads`.
+        # kernel runs to completion using captured `dL_dx_per_r` / `dL_dweight`.
         bwd_compute_done_per_token.fill_(handle.dispatch_seq)
         buffer.combine_grads(
             dL_dx_per_r,
             handle,
-            weight_grads,
+            dL_dweight,
             bwd_compute_done_per_token,
             dispatch_seq=handle.dispatch_seq,
         )
@@ -482,13 +486,13 @@ def main():
     ).contiguous()
     dW2_local_buf = torch.empty_like(w2_local)
     dW1_local_buf = torch.empty_like(w1_local)
-    postact_a_for_dW2 = torch.empty(TK_padded, I, dtype=DTYPE, device=device)
+    postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
 
     def run_dW2_grouped_gemm():
         # dW2[e] = postact_a[slot_range_e].T @ dL_do_pool[slot_range_e]
         gemm(
             _dL_do_pool_captured.t(),
-            postact_a_for_dW2.t(),
+            postact_a_for_dW2_flat.t(),
             dW2_local_buf,
             None,
             None,

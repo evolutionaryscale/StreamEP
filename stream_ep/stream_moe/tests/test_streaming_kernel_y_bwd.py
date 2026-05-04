@@ -154,10 +154,48 @@ def _alloc_preact(total_tiles, tile_m, I, dtype, device, seed):
     )
 
 
-def _alloc_dL_dweight_partials(TK_padded, tile_n, I, device):
-    """ColVecReduce destination — zero-init (TK_padded, num_pid_n) fp32."""
-    num_pid_n = (I + tile_n - 1) // tile_n
-    return torch.zeros(TK_padded, num_pid_n, dtype=torch.float32, device=device)
+def _alloc_dL_dweight(TK_padded, device):
+    """ColVecReduceAtomic destination — flat (TK_padded,) fp32 zero-init.
+
+    Kernel atomic-adds per-pid_n stripe partials into this buffer via
+    ``red.global.add.f32``; collapsed in-kernel (no post-hoc .sum() needed).
+    """
+    return torch.zeros(TK_padded, dtype=torch.float32, device=device)
+
+
+def _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device):
+    """mPostAct destination — bf16 (total_tiles, tile_m, I) empty buffer.
+
+    Kernel writes weighted postact (= postact * pool_topk_weight) into
+    each pid_n CTA's (tile_M, tile_N) slab via TMA. Plain bf16 store, no
+    f32-recast — same path GemmActMixin uses for fwd postact.
+    """
+    return torch.empty(total_tiles, tile_m, I, dtype=dtype, device=device)
+
+
+def _ref_postact_a_for_dW2(
+    pool_topk_weight: torch.Tensor,  # (TK_padded,) fp32
+    preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16
+    tile_m: int,
+) -> torch.Tensor:
+    """Eager torch reference for postact_a_for_dW2 = silu(gate)*up*w in bf16.
+
+    Mirrors what kernel_y_bwd's epilogue computes (postact byproduct of
+    dswiglu, multiplied by per-row pool_topk_weight, cast to bf16).
+    """
+    total_tiles, _, two_I = preact_a.shape
+    I = two_I // 2
+    TK_padded = total_tiles * tile_m
+    out = torch.empty(
+        total_tiles, tile_m, I, dtype=preact_a.dtype, device=preact_a.device
+    )
+    w = pool_topk_weight.view(total_tiles, tile_m, 1)
+    gate = preact_a[..., 0::2].float()
+    up = preact_a[..., 1::2].float()
+    postact = torch.nn.functional.silu(gate) * up
+    out.copy_((postact * w).to(preact_a.dtype))
+    _ = TK_padded  # silence unused-name warning; helper documents shape
+    return out
 
 
 @pytest.fixture
@@ -185,7 +223,8 @@ def test_streaming_moe_y_bwd_compiles(device):
     dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     pool_topk_weight = torch.ones(TK_padded, dtype=torch.float32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
-    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
+    dL_dweight = _alloc_dL_dweight(TK_padded, device)
+    postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
@@ -202,9 +241,10 @@ def test_streaming_moe_y_bwd_compiles(device):
             dL_do_pool,
             W2,
             dL_dswiglu_in,
+            postact_a_for_dW2,
             pool_topk_weight,
             preact_a,
-            dL_dweight_per_stripe,
+            dL_dweight,
             tile_id_to_expert,
             expert_pool_block_offset,
             bwd_y_ready,
@@ -245,7 +285,8 @@ def test_streaming_moe_y_bwd_single_tile(device):
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
-    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
+    dL_dweight = _alloc_dL_dweight(TK_padded, device)
+    postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
     tile_to_expert_list = [chosen_expert]
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
@@ -258,9 +299,10 @@ def test_streaming_moe_y_bwd_single_tile(device):
         dL_do_pool,
         W2,
         dL_dswiglu_in,
+        postact_a_for_dW2,
         pool_topk_weight,
         preact_a,
-        dL_dweight_per_stripe,
+        dL_dweight,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_y_ready,
@@ -286,11 +328,11 @@ def test_streaming_moe_y_bwd_single_tile(device):
         f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
         f"max rel diff {rel.max().item():.4f}"
     )
-    # dL/dweight: sum the per-stripe partials → per-slot scalar; compare
-    # against eager `Σ_i postact[i] * g[i]` reference. Tolerance scales with
-    # I (the reduction length): per-element noise multiplied by ~sqrt(I)
+    # dL/dweight: kernel-side per-pid_n red.global.add.f32 atomic-add
+    # collapsed across N-stripes (no post-hoc .sum()). Compare against
+    # eager `Σ_i postact[i] * g[i]` reference. Tolerance scales with I
+    # (the reduction length): per-element noise multiplied by ~sqrt(I)
     # for sum-of-squares-like patterns.
-    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
     dL_dweight_ref = _ref_dL_dweight(
         dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
     )
@@ -303,6 +345,16 @@ def test_streaming_moe_y_bwd_single_tile(device):
         f"rtol={rel_thresh_w} and atol={abs_thresh_w}; "
         f"max abs diff {diff_w.max().item():.4f}, "
         f"max rel diff {rel_w.max().item():.4f}"
+    )
+    # postact_a_for_dW2: kernel-side mPostAct TMA store (= postact * w in bf16).
+    postact_ref = _ref_postact_a_for_dW2(pool_topk_weight, preact_a, tile_m)
+    diff_p = (postact_a_for_dW2.float() - postact_ref.float()).abs()
+    rel_p = diff_p / (postact_ref.float().abs() + 1e-3)
+    bad_p = (diff_p > 1e-2) & (rel_p > 5e-2)
+    assert not bad_p.any(), (
+        f"postact_a_for_dW2: {bad_p.sum().item()} elements exceed both "
+        f"rtol=5e-2 and atol=1e-2; max abs {diff_p.max().item():.4f}, "
+        f"max rel {rel_p.max().item():.4f}"
     )
     assert (bwd_a_ready == seq).all(), (
         f"bwd_a_ready not all set to dispatch_seq={seq} (per-tile release "
@@ -350,7 +402,8 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=43)
-    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
+    dL_dweight = _alloc_dL_dweight(TK_padded, device)
+    postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
@@ -362,9 +415,10 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         dL_do_pool,
         W2,
         dL_dswiglu_in,
+        postact_a_for_dW2,
         pool_topk_weight,
         preact_a,
-        dL_dweight_per_stripe,
+        dL_dweight,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_y_ready,
@@ -381,7 +435,6 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list)
 
     # dL/dweight: per-stripe partials summed across the n-stripe dim.
-    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
     dL_dweight_ref = _ref_dL_dweight(
         dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
     )
@@ -430,7 +483,8 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=44)
-    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
+    dL_dweight = _alloc_dL_dweight(TK_padded, device)
+    postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
@@ -453,9 +507,10 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             dL_do_pool,
             W2,
             dL_dswiglu_in,
+            postact_a_for_dW2,
             pool_topk_weight,
             preact_a,
-            dL_dweight_per_stripe,
+            dL_dweight,
             tile_id_to_expert,
             expert_pool_block_offset,
             bwd_y_ready,
@@ -474,7 +529,6 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     )
     _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list)
 
-    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
     dL_dweight_ref = _ref_dL_dweight(
         dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
     )
@@ -575,7 +629,8 @@ def test_streaming_moe_y_bwd_dense_padding(device):
         -0.5, 1.5, real_mask.sum().item(), dtype=torch.float32, device=device
     )
 
-    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
+    dL_dweight = _alloc_dL_dweight(TK_padded, device)
+    postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
@@ -586,9 +641,10 @@ def test_streaming_moe_y_bwd_dense_padding(device):
         dL_do_pool,
         W2,
         dL_dswiglu_in,
+        postact_a_for_dW2,
         pool_topk_weight,
         preact_a,
-        dL_dweight_per_stripe,
+        dL_dweight,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_y_ready,
@@ -602,7 +658,6 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     # Reference dL_dweight per slot (computed on ALL rows; we filter to real
     # later). Uses the SAME garbage values the kernel sees, so any per-slot
     # disagreement is a kernel bug, not a missing-input bug.
-    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
     dL_dweight_ref = _ref_dL_dweight(
         dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
     )

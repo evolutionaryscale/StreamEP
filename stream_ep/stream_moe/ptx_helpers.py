@@ -151,6 +151,33 @@ def red_add_bf16x2_v4_pred(
 
 
 @dsl_user_op
+def red_add_f32(
+    gmem_ptr: cute.Pointer, val: cutlass.Float32, *, loc=None, ip=None
+) -> None:
+    """Single fp32 atomic-add via ``red.global.add.f32 [ptr], val;``.
+
+    Used by kernel_y_bwd's epilogue to accumulate per-pid_n stripe partials
+    into a flat per-slot ``dL_dweight[slot]`` fp32 buffer. ~256K total
+    atomics per layer at production (TK_padded × num_pid_n_y_bwd ≈ 32K × 8),
+    all hot in L2 — throughput-trivial.
+
+    Default ``.gpu``-scope ``.relaxed`` semantics: the cross-stream
+    visibility to combine_grads's sender is carried by the per-tile
+    ``bwd_a_ready`` release-store's ``threadfence_system`` (in the
+    ``TileReadyRelease`` epilogue end), not by this atomic itself.
+    """
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr_i64, cutlass.Float32(val).ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+@dsl_user_op
 def pack_bf16x2(lo: BFloat16, hi: BFloat16, *, loc=None, ip=None) -> cutlass.Int32:
     """Pack two bf16 values into a single Int32 (lo bits 0-15, hi bits 16-31).
 

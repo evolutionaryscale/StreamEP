@@ -42,7 +42,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from deep_ep import Buffer as DeepEPBuffer
 from quack.gemm import gemm
 
@@ -98,11 +97,16 @@ class StreamMoEFunc(torch.autograd.Function):
 
     Cross-stage synchronization is per-tile / per-recv-token via system-scope
     release/acquire stamps fired by each kernel — no `cudaStreamWaitEvent`
-    between bwd stages, no host syncs. The single cross-stream event in
-    backward is the small ``weight_grads_ready`` event that publishes the
-    post-hoc ``dL_dweight_per_stripe.sum(dim=-1)`` from streams.compute_y to
-    streams.combine (combine_grads's sender reads ``weight_grads`` directly,
-    not via a per-token kernel-fired release).
+    between bwd stages, no host syncs, and no cross-stream events at all.
+    kernel_y_bwd's per-tile ``bwd_a_ready`` release-store
+    (threadfence_system) fences ALL three of its outputs (dL_dswiglu_in,
+    postact_a_for_dW2, dL_dweight) system-scope. combine_grads's sender's
+    per-recv-token gate (``bwd_compute_done_per_token[r]``, fired by
+    kernel_a_bwd which acquires bwd_a_ready) transitively makes
+    ``dL_dweight`` visible to the sender — same chain that publishes
+    ``dL_dx_per_r``. Per-recv-token streaming on combine_grads is
+    preserved end-to-end (first packet ships when the first r's tile is
+    done, not when all of compute_y has drained).
     """
 
     @staticmethod
@@ -303,13 +307,14 @@ class StreamMoEFunc(torch.autograd.Function):
         per-tile acquire-spins inside each kernel handle cross-stream
         visibility.
 
-        The one cross-stream event in bwd is `weight_grads_ready`: the post-hoc
-        `dL_dweight_per_stripe.sum(dim=-1)` runs as a torch op on
-        streams.compute_y after kernel_y_bwd, and combine_grads (on
-        streams.combine) reads `weight_grads` directly — there is no per-token
-        kernel-fired release for it, so we publish the sum's completion via
-        `Event.record()` / `wait_event`. Everything else flows via per-tile /
-        per-token gates.
+        kernel_y_bwd writes THREE outputs (mD = dL_dswiglu_in,
+        mPostAct = postact_a_for_dW2, mColVecReduce = dL_dweight via
+        per-pid_n red.global.add.f32). All three are fenced by the
+        per-tile bwd_a_ready release-store; combine_grads's per-token
+        gate (bwd_compute_done_per_token[r], fired by kernel_a_bwd which
+        acquires bwd_a_ready) transitively publishes dL_dweight to
+        combine's sender. No cross-stream events anywhere in the bwd
+        path — purely device-side per-tile / per-token release/acquire.
 
         Per-stream zero-init setup ops are issued BEFORE the
         `wait_stream(caller_stream)` fan-out so they overlap with the upstream
@@ -347,8 +352,6 @@ class StreamMoEFunc(torch.autograd.Function):
         total_tiles = handle.total_tiles
         TK_padded = pool.shape[0]
         T_recv = handle.k_local_count.shape[0]
-        # ColVecReduce stripe count matches kernel_y_bwd's N-tiling on the I dim.
-        num_pid_n_y_bwd = (I + tile_n_a - 1) // tile_n_a
 
         # ── Per-stream setup, in parallel, before any wait_stream ──────────
         # Fresh-tensor zero-inits + the `bwd_a_ready` cross-stream signal
@@ -375,11 +378,19 @@ class StreamMoEFunc(torch.autograd.Function):
             dL_dswiglu_in = torch.empty(
                 total_tiles, tile_m, two_I, dtype=dtype, device=device
             )
-            # ColVecReduce destination — per-(slot, N-stripe) fp32 partials,
-            # collapsed to (TK_padded,) by the orchestrator after kernel_y_bwd.
-            dL_dweight_per_stripe = torch.zeros(
-                TK_padded, num_pid_n_y_bwd, dtype=torch.float32, device=device
+            # postact_a_for_dW2: kernel_y_bwd's mPostAct output (weighted
+            # postact, in-kernel ``postact * pool_topk_weight``). Direct
+            # input to dW2's grouped GEMM — eliminates the orchestrator-side
+            # 6-elementwise-kernel torch recompute path that cost ~1170 µs
+            # / iter on the production trace.
+            postact_a_for_dW2 = torch.empty(
+                total_tiles, tile_m, I, dtype=dtype, device=device
             )
+            # dL_dweight: kernel_y_bwd's per-pid_n fp32 atomic-add target.
+            # Zero-init mandatory (kernel atomic-adds, doesn't overwrite).
+            # No more dL_dweight_per_stripe + post-hoc .sum() — collapsed
+            # in-kernel via red.global.add.f32 across pid_n stripes.
+            dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
             # bwd_a_ready is produced by kernel_y_bwd on compute_y and acquired
             # by kernel_a_bwd on compute_a. Allocate + zero-init on the
             # producer stream so the kernel's first release-store is naturally
@@ -430,19 +441,24 @@ class StreamMoEFunc(torch.autograd.Function):
 
         # ── Stage 2 — kernel_y_bwd on streams.compute_y ────────────────────
         # Acquire-spins on bwd_y_ready[tile] internally; no cudaStreamWaitEvent
-        # between dispatch_grads and kernel_y_bwd. SwiGLU bwd is folded into
-        # the epilogue (dswiglu's postact byproduct → ColVecReduce for
-        # dL/dweight; per-row weight multiply on (dgate, dup) AFTER dswiglu so
-        # the ColVecReduce sees UNWEIGHTED g). mD is dL_dswiglu_in (bf16
-        # (M, 2I) viewed as fp32 (M, I) by the host wrapper).
+        # between dispatch_grads and kernel_y_bwd. SwiGLU bwd folded into the
+        # epilogue. The kernel writes THREE outputs in one tile-streamed pass:
+        #   - mD = dL_dswiglu_in  (bf16 (M, 2I) viewed fp32 (M, I))
+        #   - mPostAct = postact_a_for_dW2  (bf16 (M, I) — weighted postact)
+        #   - mColVecReduce = dL_dweight  (fp32 (M,) — per-pid_n atomic-add)
+        # Per-tile bwd_a_ready release fences ALL three outputs system-scope,
+        # so consumers on other streams (combine_grads on streams.combine
+        # via the bwd_compute_done chain, dW2 grouped GEMM in-stream below)
+        # see consistent values.
         with torch.cuda.stream(streams.compute_y):
             streaming_moe_y_bwd(
                 dL_do_pool,
                 w2_local,
                 dL_dswiglu_in,
+                postact_a_for_dW2,
                 handle.pool_topk_weight,
                 preact_a,
-                dL_dweight_per_stripe,
+                dL_dweight,
                 handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 bwd_y_ready,
@@ -452,46 +468,29 @@ class StreamMoEFunc(torch.autograd.Function):
                 tile_n=tile_n_a,
                 num_sms=num_sms_a,
             )
-            # dW2[e] = postact_a[slot_range_e].T @ dL_do_pool[slot_range_e]
+            # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
             #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
-            # Recompute postact_a element-wise from preact_a into a transient
-            # bf16 buffer (~190 µs HBM round-trip at production); cheaper than
-            # ctx-saving postact_a (~130 MB/layer permanent).
+            # postact_a_for_dW2 is the weighted postact (postact * pool_topk_weight)
+            # already materialised in bf16 by kernel_y_bwd's mPostAct path —
+            # NO orchestrator-side recompute. Chain rule on
+            #   o[t] = Σ_k topk_weights[t, k] · y_for_(t, k)
+            # gives dW2[e] = Σ_{slot in e} pool_topk_weight[slot] *
+            #               dL_do_pool[slot] outer postact_a[slot] — the
+            # weight factor now rides ON the postact via the in-kernel multiply.
             #
             # quack.gemm with cu_seqlens_k expects A: (M, total_K) m-major
             # (stride(-2)=1) and B: (N, total_K) n-major (stride(-2)=1); output
             # D: (L, M, N). For dW2: M=H, N=I, L=E_local, total_K=TK_padded.
-            #   A = dL_do_pool.t()   shape (H, TK_padded), strides (1, H) → m-major ✓
-            #   B = postact_flat.t() shape (I, TK_padded), strides (1, I) → n-major ✓
-            #   D = dW2_local        (E_local, H, I) ← matches w2_local layout ✓
-            # Weighted-postact for dW2: chain rule on
-            #   o[t] = Σ_k topk_weights[t, k] · y_for_(t, k)
-            # gives dW2[e] = Σ_{slot in e} pool_topk_weight[slot] *
-            #               dL_do_pool[slot] outer postact_a[slot]. The
-            # streaming pipeline ships UNWEIGHTED `dL_do_pool` via dispatch_grads
-            # (so kernel_y_bwd's ColVecReduce sees unweighted g for dL/dweight)
-            # — the missing pool_topk_weight factor has to enter somewhere
-            # before dW2's GEMM. Folding it into the postact recompute is the
-            # cheapest place: one extra fp32 mul per element on a tensor we're
-            # already materialising, no separate kernel.
-            ptw_reshaped = handle.pool_topk_weight.view(
-                preact_a.shape[0], preact_a.shape[1], 1
-            )
-            postact_a_for_dW2 = (
-                (
-                    F.silu(preact_a[..., 0::2].float())
-                    * preact_a[..., 1::2].float()
-                    * ptw_reshaped
-                )
-                .to(dtype)
-                .reshape(TK_padded, I)
-            )
+            #   A = dL_do_pool.t()             shape (H, TK_padded), strides (1, H) → m-major ✓
+            #   B = postact_a_for_dW2_flat.t() shape (I, TK_padded), strides (1, I) → n-major ✓
+            #   D = dW2_local                  (E_local, H, I) ← matches w2_local layout ✓
+            postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
             cu_seqlens_k_y = (
                 handle.expert_pool_block_offset.to(torch.int32) * tile_m
             ).contiguous()
             gemm(
                 dL_do_pool.t(),
-                postact_a_for_dW2.t(),
+                postact_a_for_dW2_flat.t(),
                 dW2_local,
                 None,
                 None,
@@ -501,18 +500,19 @@ class StreamMoEFunc(torch.autograd.Function):
                 cluster_N=1,
                 cu_seqlens_k=cu_seqlens_k_y,
             )
-            # Collapse ColVecReduce N-stripe partials → per-slot dL/dweight,
-            # then publish to streams.combine via a single event (combine_grads
-            # has no per-token kernel-fired release on weight_grads).
-            dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
-            weight_grads_ready = torch.cuda.Event()
-            weight_grads_ready.record()
 
         # bwd_a_ready / dL_dswiglu_in are written on compute_y, consumed on
         # compute_a (kernel_a_bwd + dW1 GEMM).
         bwd_a_ready.record_stream(streams.compute_a)
         dL_dswiglu_in.record_stream(streams.compute_a)
-        # dL_dweight is read by combine_grads on streams.combine.
+        # dL_dweight is read by combine_grads on streams.combine. The
+        # cross-stream visibility is carried by the per-tile bwd_a_ready
+        # release-store's threadfence_system (kernel_y_bwd) → kernel_a_bwd's
+        # acquire of bwd_a_ready → kernel_a_bwd's release of
+        # bwd_compute_done_per_token → combine_grads's per-token gate
+        # acquire. record_stream is just allocator bookkeeping (combine
+        # might free dL_dweight before compute_y has retired its writes
+        # without it).
         dL_dweight.record_stream(streams.combine)
 
         # ── Stage 3 — kernel_a_bwd on streams.compute_a ────────────────────
@@ -569,10 +569,18 @@ class StreamMoEFunc(torch.autograd.Function):
 
         # ── Stage 4 — combine_grads on streams.combine ─────────────────────
         # Sender per-warp loop spins on bwd_compute_done_per_token[r] >=
-        # dispatch_seq before reading dL_dx_per_r[r]. Cross-stream visibility
-        # of dL_dweight (post-sum) is via the one-shot weight_grads_ready
-        # event recorded on compute_y above.
-        streams.combine.wait_event(weight_grads_ready)
+        # dispatch_seq before reading dL_dx_per_r[r] AND dL_dweight[slot]
+        # (gathered via recv_token_to_slots[r, k]). Cross-stream visibility
+        # of BOTH is carried by the device-side fence chain:
+        #   kernel_y_bwd's per-tile bwd_a_ready release-store
+        #     (threadfence_system fences mPostAct + dL_dweight + dL_dswiglu_in)
+        #   → kernel_a_bwd acquire bwd_a_ready
+        #   → kernel_a_bwd release-store bwd_compute_done_per_token[r]
+        #     (per-token, fenced)
+        #   → combine_grads sender acquire bwd_compute_done_per_token[r]
+        # No explicit cross-stream event — per-recv-token streaming preserved
+        # (combine_grads's first packet ships when the FIRST r's tile is done,
+        # not when all of compute_y has drained).
         with torch.cuda.stream(streams.combine):
             dL_dx, dL_dtopk_weights = buffer.combine_grads(
                 dL_dx_per_r,

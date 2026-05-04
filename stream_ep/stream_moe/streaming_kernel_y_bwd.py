@@ -4,10 +4,11 @@ Backward of fwd kernel Y, with SwiGLU bwd folded into the epilogue. Per
 chain rule on `o = postact_a @ W2.T` and `postact_a = silu(gate) * up`:
   g[slot, :]               = dL_do_pool[slot, :] @ W2[expert_for_slot]
   dL/dpostact_a[slot, n]   = pool_topk_weight[slot] * g[slot, n]
-  (dgate, dup, _)          = dswiglu(gate, up, dL/dpostact_a)
+  (dgate, dup, postact)    = dswiglu(gate, up, dL/dpostact_a)
                            = (silu_grad(gate) * up * dpostact, silu(gate) * dpostact, postact)
   dL/dswiglu_in[slot, 2n]  = dgate;  dL/dswiglu_in[slot, 2n+1] = dup
   dL/dweight[slot]         = Σ_n postact[slot, n] * g[slot, n]   (UNWEIGHTED g)
+  postact_a_for_dW2[slot]  = pool_topk_weight[slot] * postact[slot]   (WEIGHTED, fed to dW2)
 
 Per tile:
   * Streaming scheduler acquire-spins on `bwd_y_ready[tile_id] >= dispatch_seq`.
@@ -20,8 +21,8 @@ Per tile:
     Σ_k A[m, k] * B[n, k] then evaluates to
       g[m, i] = Σ_h dL_do_pool[m, h] * W2[h, i]   = (dL_do_pool @ W2)[m, i]
     so g lands in registers as the unweighted gradient w.r.t. postact_a.
-  * **Epilogue: SwiGLU bwd + dL/dweight + dL/dswiglu_in store** (all
-    register-resident). mC is `preact_a[tile, :2I]` — the pre-SwiGLU gate-up
+  * **Epilogue: SwiGLU bwd + dL/dweight atomic + dL/dswiglu_in + postact_a_for_dW2 store**
+    (all register-resident). mC is `preact_a[tile, :2I]` — the pre-SwiGLU gate-up
     accumulator saved by fwd kernel A's mD TMA-store path. Storage is
     `(tile_m, 2I) bf16`; presented to the kernel as `(tile_m, I) fp32` via a
     host-side `.view(torch.float32)` (each fp32 element packs `(gate_i, up_i)`
@@ -31,24 +32,34 @@ Per tile:
        to fp32 → (gate, up) f32 pairs.
     2. `dswiglu(gate, up, g_unweighted) → (dgate, dup, postact)` per element.
        Returns recomputed postact as a free byproduct — used directly for
-       the ColVecReduce dot product without a separate silu·mul step.
-    3. `ColVecReduce` accumulates `Σ_n postact[m, n] * g[m, n]` (UNWEIGHTED g)
-       per row → per-(slot, N-stripe) fp32 partial sums for dL/dweight; final
-       `dL/dweight = sum across N-stripes` (orchestrator does the trailing
-       sum, ~1-line torch op).
-    4. Per-row weight multiply scales (dgate, dup) by `pool_topk_weight[slot]`
-       — SwiGLU bwd is linear in dpostact, so multiplying after dswiglu is
-       equivalent to multiplying before, and lets the ColVecReduce see the
-       unweighted g.
-    5. Pack (dgate, dup) bf16x2 → fp32 view; standard mD TMA-store lands the
-       result in `dL_dswiglu_in[tile, :2I]` (bf16 (M, 2I) on the host viewed
-       as fp32 (M, I) — same f32-recast trick on the output side as on input).
-  * Per-tile end: drain TMA stores, multi-pid_n gate, release-store
-    `bwd_a_ready[tile_id] = dispatch_seq` so kernel_a_bwd on a different
-    stream can acquire-load with cross-stream visibility. Threadfence_system
-    inside TileReadyRelease.end() also flushes the per-(slot, N-stripe)
-    ColVecReduce stores from each participating CTA, so combine_grads's
-    later read of dL/dweight observes them post-fence.
+       both the dL/dweight dot product and the postact_a_for_dW2 store.
+    3. `ColVecReduceAtomic` accumulates `Σ_n postact[m, n] * g[m, n]`
+       (UNWEIGHTED g) per row, intra-warp shuffle + cross-warp reduce → one
+       fp32 row sum per slot per pid_n CTA, then ``red.global.add.f32`` into
+       a flat ``dL_dweight[slot]`` fp32 buffer. The per-tile ``bwd_a_ready``
+       release-store transitively publishes ``dL_dweight`` writes via
+       system-scope fence — combine_grads's per-token gate
+       (``bwd_compute_done_per_token[r]``, fired by kernel_a_bwd which
+       acquires ``bwd_a_ready``) makes them visible to combine's sender so
+       per-recv-token streaming on combine_grads is preserved.
+    4. Per-row weight multiply on (dgate, dup, postact): SwiGLU bwd is
+       linear in dpostact, so `w * dgate(g) = dgate(w * g)`. Multiplying
+       after dswiglu is equivalent and lets the dL/dweight dot product see
+       the unweighted g. The same per-row weight is also applied to
+       ``postact`` to produce ``postact_a_for_dW2 = w * postact`` for the
+       second TMA-stored output (input to dW2's grouped GEMM).
+    5. Pack (dgate, dup) bf16x2 → fp32 view; standard mD TMA-store lands
+       the result in `dL_dswiglu_in[tile, :2I]` (bf16 (M, 2I) on the host
+       viewed as fp32 (M, I) — same f32-recast trick on the output side as
+       on input). ``postact_a_for_dW2`` rides ``mPostAct`` (TileStore) — bf16
+       (M, I) plain TMA-store, same path GemmActMixin uses for fwd postact.
+  * Per-tile end: drain TMA stores (mD + mPostAct), multi-pid_n gate,
+    release-store `bwd_a_ready[tile_id] = dispatch_seq` so kernel_a_bwd on a
+    different stream can acquire-load with cross-stream visibility.
+    Threadfence_system inside TileReadyRelease.end() flushes the per-tile
+    ``dL_dweight`` atomic-adds and ``postact_a_for_dW2`` TMA stores from
+    each participating CTA, so combine_grads's read of dL_dweight and dW2
+    grouped GEMM's read of postact_a_for_dW2 observe them post-fence.
 
 Folding SwiGLU bwd here (vs running it as a separate step before kernel_a_bwd)
 saves one read of preact_a from HBM in kernel_a_bwd at the cost of writing
@@ -66,7 +77,7 @@ Shares streaming machinery with fwd kernels:
     only the destination tensor changes (bwd_a_ready instead of a_ready).
 """
 
-from typing import NamedTuple, Optional, Type
+from typing import Callable, NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -83,14 +94,17 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import ColVecReduce, colvec_reduce_accumulate
-from quack.gemm_default_epi import GemmDefaultEpiMixin
+from quack.epi_ops import colvec_reduce_accumulate
+from quack.gemm_act import GemmActMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.rounding import RoundingMode
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
+from evolutionaryscale.models.moe.streaming_moe.streaming_epi_ops import (
+    ColVecReduceAtomic,
+)
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
     StreamingTileSchedulerOptions,
     TileReadyParams,
@@ -105,38 +119,55 @@ from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import 
 # ---------------------------------------------------------------------------
 # Streaming kernel Y bwd class.
 # ---------------------------------------------------------------------------
-class StreamingMoeYBwdSm90(GemmDefaultEpiMixin, GemmSm90):
+class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
     """Streaming-MoE kernel Y bwd: NN GEMM + SwiGLU bwd in epilogue +
-    dL/dweight ColVecReduce + per-tile bwd_a_ready release.
+    in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store +
+    per-tile bwd_a_ready release.
 
-    Inherits the standard mD TMA-store path from GemmDefaultEpiMixin. Both
-    mC (preact) and mD (dL/dswiglu_in) use the f32-recast trick — host-side
-    storage is bf16 (M, 2I), kernel sees fp32 (M, I) and recasts back to
-    bf16x2 in-epilogue (`implicit_dtype = bf16`, mirroring quack's
-    `gemm_dgated`). Compose the additional bwd-side EpiOps onto the
-    inherited chain:
-      - ColVecReduce("mColVecReduce") for the per-row dL/dweight dot product
-        accumulator (writes per-(slot, N-stripe) partials at end of tile).
+    Inherits the standard mD TMA-store path from GemmDefaultEpiMixin (via
+    GemmActMixin), plus a SECOND TMA-store path via ``TileStore("mPostAct")``
+    that we repurpose for ``postact_a_for_dW2`` (host shape bf16 (M, I), no
+    f32-recast — plain bf16 store, same layout fwd kernel A's mPostAct uses).
+    Both mC (preact) and mD (dL/dswiglu_in) still use the f32-recast trick —
+    host-side storage is bf16 (M, 2I), kernel sees fp32 (M, I) and recasts
+    back to bf16x2 in-epilogue (`implicit_dtype = bf16`, mirroring quack's
+    `gemm_dgated`). Compose the additional bwd-side EpiOps onto the inherited
+    chain:
+      - ColVecReduceAtomic("mColVecReduce") for in-kernel atomic-add of the
+        per-slot dL/dweight dot product (per-pid_n CTAs reduce intra-warp /
+        cross-warp then ``red.global.add.f32`` into a flat ``(M,)`` fp32
+        buffer; eliminates the post-hoc ``.sum(dim=-1)`` torch op + the
+        ``weight_grads_ready`` cross-stream event the orchestrator used to
+        carry).
       - TileReadyRelease("tile_ready") for the system-scope `bwd_a_ready[tile_id]`
-        release after mD TMA-store drain + multi-pid_n gating.
+        release after mD TMA-store drain + multi-pid_n gating. Its
+        threadfence_system also publishes the per-tile dL/dweight atomic-adds
+        and postact_a_for_dW2 TMA stores to other streams (combine_grads,
+        dW2 grouped GEMM).
 
-    `epi_visit_subtile` is fully overridden — it runs `dswiglu` against
+    `epi_visit_subtile` is fully overridden — runs `dswiglu` against
     UNWEIGHTED `g` (= the GEMM result), gets `(dgate, dup, postact)` in one
-    call (postact returned as a free byproduct, fed straight into the
-    ColVecReduce dot product), then per-row-weight-multiplies (dgate, dup)
-    AFTER the ColVecReduce since SwiGLU bwd is linear in dpostact. The
-    per-row weight multiply on (dgate, dup) is equivalent to multiplying
-    `g` first then running dswiglu, but lets ColVecReduce see UNWEIGHTED g
-    for `dL/dweight = postact · g` (the chain rule).
+    call (postact returned as a free byproduct, fed into both the dL/dweight
+    dot product and the postact_a_for_dW2 store), then per-row-weight-
+    multiplies (dgate, dup, postact) AFTER the ColVecReduceAtomic since
+    SwiGLU bwd is linear in dpostact and the dL/dweight dot product needs
+    UNWEIGHTED g (the per-row weight is what dW2 needs in postact_a_for_dW2;
+    chain rule yields `dW2[e] = Σ_slot postact[slot] * w[slot] · dL_do_pool[slot]`).
 
     `implicit_dtype` (the bf16 dtype that mC AND mD's fp32-view-storage
     actually hold) is set via a `post_init` hook passed to
     `compile_gemm_kernel` — same plumbing quack's `gemm_dgated` uses.
+
+    GemmActMixin's ``act_fn`` field is unused — we override
+    ``epi_visit_subtile`` to compute the weighted-postact register tensor
+    directly and return it (the framework's standard ``epi_convert_postact``
+    path then casts fp32 → bf16 for the ``mPostAct`` TMA store). Pass
+    ``act_fn=None`` in EpilogueArguments.
     """
 
     _epi_ops = (
-        *GemmDefaultEpiMixin._epi_ops,
-        ColVecReduce("mColVecReduce"),
+        *GemmActMixin._epi_ops,
+        ColVecReduceAtomic("mColVecReduce"),
         TileReadyRelease("tile_ready"),
     )
     _epi_param_bases = (ParamsBase,)
@@ -144,6 +175,8 @@ class StreamingMoeYBwdSm90(GemmDefaultEpiMixin, GemmSm90):
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         tile_ready: TileReadyParams
+        mPostAct: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -158,8 +191,11 @@ class StreamingMoeYBwdSm90(GemmDefaultEpiMixin, GemmSm90):
     @cute.jit
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
         """SwiGLU bwd in registers: outputs `dL/dswiglu_in` (M, 2I) packed
-        as bf16x2 in fp32 via mD's f32-recast trick. ColVecReduce-accumulates
-        `dL/dweight = postact · g` using the postact byproduct of `dswiglu`.
+        as bf16x2 in fp32 via mD's f32-recast trick AND ``postact_a_for_dW2``
+        (M, I) bf16 via mPostAct (returned as ``tRS_rPostAct``).
+        ColVecReduceAtomic-accumulates `dL/dweight = postact · g` using the
+        postact byproduct of `dswiglu`, atomic-adding into a flat per-slot
+        fp32 buffer.
 
         tRS_rC arrives as an fp32 (M, N) register tensor — host-side
         `preact_a.view(torch.float32)` of the bf16 (M, 2N) preact slab (each
@@ -172,16 +208,25 @@ class StreamingMoeYBwdSm90(GemmDefaultEpiMixin, GemmSm90):
               element. `tRS_rD` enters as the UNWEIGHTED GEMM result `g`;
               `dswiglu` returns the recomputed postact as its third element,
               avoiding a separate paired-N silu·mul recompute.
-          (3) ColVecReduce-accumulate `Σ_n postact[m, n] * g[m, n]` per row
-              (UNWEIGHTED g — chain rule for dL/dweight = postact · g).
-          (4) Per-row weight multiply on (dgate, dup): SwiGLU bwd is linear
-              in dpostact, so `w * dgate(g) = dgate(w * g)`. Multiplying
-              after dswiglu is equivalent and lets ColVecReduce see the
-              unweighted g.
+          (3) ColVecReduceAtomic-accumulate `Σ_n postact[m, n] * g[m, n]`
+              per row (UNWEIGHTED g — chain rule for dL/dweight =
+              postact · g). The atomic-add to ``dL_dweight[slot]`` happens
+              in ``ColVecReduceAtomic.end()`` after the in-CTA
+              warp/cross-warp reduce.
+          (4) Per-row weight multiply on (dgate, dup, postact): SwiGLU bwd
+              is linear in dpostact, so `w * dgate(g) = dgate(w * g)`.
+              Multiplying after dswiglu is equivalent and lets the dL/dweight
+              dot product see the unweighted g. Same multiply applied to
+              ``postact`` produces ``postact_a_for_dW2 = w * postact`` —
+              what dW2's grouped GEMM needs (chain rule on
+              ``o = Σ_k w * y`` puts the topk_weight on postact in dW2's
+              outer product input).
           (5) Pack (dgate, dup) bf16x2 → fp32 view; restore in tRS_rD for
               the standard mD store path. mD's host storage is bf16
               (Mflat, 2I), viewed as fp32 (Mflat, I) before launch — the
               kernel sees fp32 mD with implicit_dtype=bf16 packing.
+              ``tRS_rPostAct`` (weighted, fp32) is returned for the framework
+              to convert and TMA-store via mPostAct (bf16 (M, I)).
         """
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
@@ -203,17 +248,22 @@ class StreamingMoeYBwdSm90(GemmDefaultEpiMixin, GemmSm90):
                 tRS_rXY_f32[2 * i], tRS_rXY_f32[2 * i + 1], tRS_rD[i]
             )
 
-        # (3) ColVecReduce on UNWEIGHTED g — chain rule for dL/dweight.
+        # (3) ColVecReduceAtomic on UNWEIGHTED g — chain rule for dL/dweight.
+        # The intra-CTA reduction stays in-register here; the atomic-add
+        # to dL_dweight[slot] runs in ColVecReduceAtomic.end() after this
+        # subtile loop completes.
         if const_expr(tDrColVecReduce is not None):
             colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rD, rScale=tRS_rPostAct)
 
-        # (4) Per-row weight multiply on (dgate, dup). Equivalent to
-        # dswiglu(gate, up, w * g) by linearity in dout, but runs AFTER the
-        # ColVecReduce so the dot product sees the unweighted g.
+        # (4) Per-row weight multiply on (dgate, dup, postact). Equivalent
+        # to dswiglu(gate, up, w * g) by linearity in dout, but runs AFTER
+        # the ColVecReduceAtomic so the dot product sees the unweighted g.
+        # ``tRS_rPostAct`` is multiplied to produce postact_a_for_dW2 in-place.
         if const_expr(tDrColVec is not None):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                 tRS_rdXY_f32[2 * i] *= tDrColVec[i]
                 tRS_rdXY_f32[2 * i + 1] *= tDrColVec[i]
+                tRS_rPostAct[i] *= tDrColVec[i]
 
         # (5) Pack (dgate, dup) bf16x2 → fp32 view in tRS_rD for the
         # standard mD TMA-store. Lands in dL_dswiglu_in[tile, :2I] as bf16
@@ -221,7 +271,9 @@ class StreamingMoeYBwdSm90(GemmDefaultEpiMixin, GemmSm90):
         tRS_rdXY_b16 = cute.make_rmem_tensor(tRS_rdXY_f32.layout, implicit_dtype)
         tRS_rdXY_b16.store(tRS_rdXY_f32.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_b16, Float32).load())
-        return None
+        # Return weighted postact for the framework's mPostAct TMA-store path.
+        # epi_convert_postact (inherited) handles fp32 → bf16 (postact_dtype).
+        return tRS_rPostAct
 
     # -- scheduler hooks -----------------------------------------------------
 
@@ -308,7 +360,6 @@ def _compile_streaming_moe_y_bwd(
     Mflat_sym = cute.sym_int()  # total_tiles * tile_m, in dL_dswiglu_in's M dim
     total_tiles_sym = cute.sym_int()
     cu_seqlens_len_sym = cute.sym_int()  # E_local + 1 at runtime
-    n_tiles_sym = cute.sym_int()  # ceil(I / tile_n) — N-stripe count per tile
 
     # A: dL_do_pool (TK_padded, H), k-major (H is contiguous; same layout fwd
     # kernel A uses on pool).
@@ -341,13 +392,20 @@ def _compile_streaming_moe_y_bwd(
         cutlass.Float32, (TK_padded_sym,), leading_dim=0, divisibility=1
     )
 
-    # ColVecReduce destination — per-(slot, N-stripe) fp32 partial sums.
-    # Shape (Mflat, n_tiles) where n_tiles = ceil(I / tile_n) is the number
-    # of N-stripes per tile. Final dL/dweight = sum across n_tiles dim
-    # (orchestrator reduces post-hoc; cheap torch op).
+    # ColVecReduceAtomic destination — flat per-slot fp32 buffer that all
+    # pid_n CTAs atomic-add into via red.global.add.f32. Shape (Mflat,).
+    # No num_pid_n dim — the atomic-add collapses across stripes in-kernel,
+    # eliminating the post-hoc .sum() torch op + the cross-stream
+    # weight_grads_ready event the orchestrator used to need.
     mColVecReduce = fake_tensor(
-        cutlass.Float32, (Mflat_sym, n_tiles_sym), leading_dim=1, divisibility=1
+        cutlass.Float32, (Mflat_sym,), leading_dim=0, divisibility=1
     )
+
+    # mPostAct: postact_a_for_dW2 (M, I) bf16 — dW2 grouped GEMM's input,
+    # written via TileStore TMA path (same machinery GemmActMixin uses for
+    # fwd postact). Plain bf16 (no f32-recast); each pid_n CTA writes a
+    # (tile_M, tile_N) slab with no cross-CTA collisions, so no atomics.
+    mPostAct = fake_tensor(b_dtype, (Mflat_sym, I_sym), leading_dim=1, divisibility=8)
 
     # Scheduler tensors
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
@@ -379,6 +437,8 @@ def _compile_streaming_moe_y_bwd(
 
     epi_args = StreamingMoeYBwdSm90.EpilogueArguments(
         tile_ready=tile_ready_params,
+        mPostAct=mPostAct,
+        act_fn=None,
         mColVecBroadcast=pool_topk_weight,
         mColVecReduce=mColVecReduce,
         rounding_mode=RoundingMode.RN,
@@ -420,9 +480,10 @@ def streaming_moe_y_bwd(
     dL_do_pool: torch.Tensor,  # (TK_padded, H) bf16 — pool-layout incoming gradient
     W2: torch.Tensor,  # (E_local, H, I) bf16 — k-major per expert (same as fwd)
     dL_dswiglu_in: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16 — pool-layout output
+    postact_a_for_dW2: torch.Tensor,  # (total_tiles, tile_m, I) bf16 — weighted postact for dW2
     pool_topk_weight: torch.Tensor,  # (TK_padded,) fp32 — per-slot weight (from saved handle)
     preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16 — saved from fwd kernel A's mD
-    dL_dweight_per_stripe: torch.Tensor,  # (TK_padded, num_pid_n) fp32 — ColVecReduce partials
+    dL_dweight: torch.Tensor,  # (TK_padded,) fp32 — ZERO-INIT; per-pid_n atomic-add target
     tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
     bwd_y_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps (from dispatch_grads)
@@ -437,18 +498,38 @@ def streaming_moe_y_bwd(
 ) -> None:
     """Launch streaming-MoE kernel Y bwd on the caller's current CUDA stream.
 
-    Computes both Y-side gradients in one tile-streamed pass:
+    Computes Y-side gradients in one tile-streamed pass:
       g[slot, :]                = dL_do_pool[slot] @ W2[e]               (unweighted)
       dL_dpostact_a[slot, :I]   = pool_topk_weight[slot] * g[slot, :I]
       (dgate, dup, postact)     = dswiglu(gate, up, dL_dpostact_a)
       dL_dswiglu_in[slot, 2n]   = dgate;  dL_dswiglu_in[slot, 2n+1] = dup
-      dL_dweight_per_stripe[slot, n_stripe]  partial-sums Σ_n postact[slot, n] * g[slot, n]
+      dL_dweight[slot]         += Σ_n postact[slot, n] * g[slot, n]   (per-pid_n atomic-add)
+      postact_a_for_dW2[slot, n] = pool_topk_weight[slot] * postact[slot, n]
 
     SwiGLU bwd is folded into the epilogue — the recomputed postact is
-    returned by `dswiglu` as a free byproduct (used directly for the
-    ColVecReduce dot product), and the per-row weight multiply runs on
-    (dgate, dup) AFTER `dswiglu` (chain rule is linear in dpostact).
-    Output `dL_dswiglu_in` is the direct input to kernel_a_bwd's data-grad
+    returned by `dswiglu` as a free byproduct (used directly for both the
+    dL/dweight dot product and the postact_a_for_dW2 store). Per-row weight
+    multiply runs on (dgate, dup, postact) AFTER `dswiglu`: SwiGLU bwd is
+    linear in dpostact, so the multiply on (dgate, dup) is equivalent to
+    multiplying g first (lets the dL/dweight dot product see UNWEIGHTED g);
+    the multiply on postact is what dW2's grouped GEMM input requires
+    (chain rule on `o = Σ_k w * y` puts the topk_weight on postact).
+
+    ``dL_dweight`` is atomic-added in-kernel via ``red.global.add.f32`` —
+    each pid_n CTA contributes its in-CTA-reduced row sum to the flat
+    ``(TK_padded,)`` fp32 buffer. **Caller MUST zero-init ``dL_dweight``
+    before launch on the same stream.** The per-tile ``bwd_a_ready``
+    release-store transitively publishes ``dL_dweight`` writes to other
+    streams via the system-scope fence inside ``TileReadyRelease.end()``,
+    so combine_grads's per-token gate (``bwd_compute_done_per_token[r]``,
+    fired by kernel_a_bwd which acquires ``bwd_a_ready``) makes them
+    visible to combine's sender — no explicit cross-stream event needed.
+
+    ``postact_a_for_dW2`` is TMA-stored via the standard mPostAct path
+    (GemmActMixin's TileStore). Each pid_n CTA writes its (tile_M, tile_N)
+    slab; no cross-CTA collisions, no atomics.
+
+    Output ``dL_dswiglu_in`` is the direct input to kernel_a_bwd's data-grad
     GEMM and to dW1's grouped GEMM — no separate SwiGLU-bwd materialisation
     step needed.
 
@@ -461,42 +542,42 @@ def streaming_moe_y_bwd(
     overlap.
 
     Caller is responsible for:
-      - allocating ``dL_dswiglu_in`` and ``dL_dweight_per_stripe`` ON THE SAME
-        STREAM this function is called from (so the kernel's TMA stores +
-        ColVecReduce gmem stores are naturally ordered with the allocations).
+      - allocating ``dL_dswiglu_in`` and ``postact_a_for_dW2`` ON THE SAME
+        STREAM this function is called from (so the kernel's TMA stores
+        are naturally ordered with the allocations).
+      - **zero-initialising ``dL_dweight``** on the same stream (the kernel
+        atomic-adds into it; non-zero starting values would corrupt).
       - ensuring ``bwd_y_ready`` is populated by the producer
         (``dispatch_grads_main_kernel``'s Pass 2 or a test stub) on a stream
         that release-stores ``bwd_y_ready[tile_id] = dispatch_seq`` once the
         tile's ``dL_do_pool`` rows are ready. The per-tile acquire-spin
         handles cross-stream visibility.
-      - reducing ``dL_dweight_per_stripe`` across its N-stripe dim to get the
-        final per-slot ``dL_dweight``: ``dL_dweight = dL_dweight_per_stripe.sum(dim=-1)``.
-        This is a cheap torch op orchestrated between kernel_y_bwd and
-        combine_grads (mirror of sonic-moe's `db2_and_ds_kernel` post-hoc
-        sum across H-blocks; we don't need a custom kernel for it).
 
     The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
     allocated on the calling stream so their zero-init is naturally ordered
     with the kernel.
 
     Per-tile bwd_a_ready release: at the end of each tile's epilogue (after
-    all pid_n N-stripes have drained their TMA stores), the kernel
-    release-stores ``bwd_a_ready[tile_id] = dispatch_seq`` with system scope.
-    Kernel_a_bwd on its compute_a stream acquire-spins on this signal before
-    reading the tile's ``dL_dswiglu_in`` slab. Multi-pid_n gating via an
-    atomic-add to ``tile_n_stripes_done[tile_id]`` ensures the release fires
-    once per tile, not once per N-stripe.
+    all pid_n N-stripes have drained their TMA stores AND atomic-added their
+    dL_dweight contributions), the kernel release-stores
+    ``bwd_a_ready[tile_id] = dispatch_seq`` with system scope. Kernel_a_bwd
+    on its compute_a stream acquire-spins on this signal before reading the
+    tile's ``dL_dswiglu_in`` slab. Multi-pid_n gating via an atomic-add to
+    ``tile_n_stripes_done[tile_id]`` ensures the release fires once per
+    tile, not once per N-stripe.
 
-    Storage layouts (both use the f32-recast trick — same as quack's
-    gemm_dgated):
+    Storage layouts:
       - ``preact_a``: bf16 (total_tiles, tile_m, 2*I), viewed as fp32
         (total_tiles*tile_m, I) before launch — each fp32 element packs
-        (gate_n, up_n) as bf16x2. Kernel reads as mC.
+        (gate_n, up_n) as bf16x2. Kernel reads as mC. (f32-recast trick.)
       - ``dL_dswiglu_in``: bf16 (total_tiles, tile_m, 2*I), viewed as fp32
         (total_tiles*tile_m, I) before launch — each fp32 element packs
-        (dgate_n, dup_n) as bf16x2. Kernel writes as mD.
-    Both share the same `implicit_dtype` (bf16) which the kernel uses to
-    recast tRS_rC / tRS_rD between fp32 storage and bf16x2 math views.
+        (dgate_n, dup_n) as bf16x2. Kernel writes as mD. (f32-recast trick.)
+      - ``postact_a_for_dW2``: bf16 (total_tiles, tile_m, I), viewed flat
+        as bf16 (total_tiles*tile_m, I). Kernel writes as mPostAct. Plain
+        bf16 store (no f32-recast).
+    The two f32-recast tensors share the same `implicit_dtype` (bf16) which
+    the kernel uses to recast between fp32 storage and bf16x2 math views.
     """
     assert dL_do_pool.is_cuda and W2.is_cuda and dL_dswiglu_in.is_cuda
     assert dL_do_pool.dim() == 2 and dL_do_pool.is_contiguous()
@@ -535,20 +616,27 @@ def streaming_moe_y_bwd(
     assert (
         dL_dswiglu_in.element_size() == 2
     ), "dL_dswiglu_in must be 16-bit (bf16/fp16) for the f32-recast trick"
-    # ColVecReduce partials: per-(slot, N-stripe) fp32. Caller sums across
-    # the N-stripe dim post-hoc.
+    # postact_a_for_dW2: bf16 (total_tiles, tile_m, I) — TMA-stored via
+    # mPostAct. Same dtype as W2 (bf16); plain bf16 write, no f32-recast.
+    assert postact_a_for_dW2.is_cuda and postact_a_for_dW2.dim() == 3
+    assert postact_a_for_dW2.shape == (total_tiles, tile_m, I), (
+        f"postact_a_for_dW2 must be (total_tiles, tile_m, I) = "
+        f"{(total_tiles, tile_m, I)}; got {tuple(postact_a_for_dW2.shape)}"
+    )
+    assert postact_a_for_dW2.dtype == W2.dtype, (
+        f"postact_a_for_dW2 dtype must match W2's; got {postact_a_for_dW2.dtype} "
+        f"vs {W2.dtype}"
+    )
+    # dL_dweight: flat (TK_padded,) fp32 — atomic-add target. Caller MUST
+    # zero-init before launch (the kernel atomic-adds, doesn't overwrite).
     num_pid_n = (I + tile_n - 1) // tile_n
-    assert dL_dweight_per_stripe.is_cuda and dL_dweight_per_stripe.dim() == 2
-    assert dL_dweight_per_stripe.shape == (dL_do_pool.shape[0], num_pid_n), (
-        f"dL_dweight_per_stripe must be (TK_padded, num_pid_n) = "
-        f"({dL_do_pool.shape[0]}, {num_pid_n}); got "
-        f"{tuple(dL_dweight_per_stripe.shape)}"
+    assert dL_dweight.is_cuda and dL_dweight.dim() == 1
+    assert dL_dweight.shape == (dL_do_pool.shape[0],), (
+        f"dL_dweight must be (TK_padded,) = ({dL_do_pool.shape[0]},); "
+        f"got {tuple(dL_dweight.shape)}"
     )
-    assert dL_dweight_per_stripe.dtype == torch.float32
-    assert dL_dweight_per_stripe.stride(1) == 1, (
-        "dL_dweight_per_stripe must be n-major (n_stripes contiguous); "
-        "ColVecReduce.end() expects this layout"
-    )
+    assert dL_dweight.dtype == torch.float32
+    assert dL_dweight.is_contiguous()
 
     # Caller passes W2 as (E_local, H, I) k-major (I contiguous; same layout
     # used by fwd kernel Y). For the bwd's NN GEMM we need the kernel-side
@@ -644,10 +732,20 @@ def streaming_moe_y_bwd(
         tile_m=None,  # Constexpr; burned in at compile, pass None at call time
     )
 
+    # Flatten postact_a_for_dW2 (total_tiles, tile_m, I) → (Mflat, I) bf16
+    # for the mPostAct TMA path. No f32-recast — plain bf16 store.
+    postact_a_for_dW2_flat = postact_a_for_dW2.view(total_tiles * tile_m, I)
+    assert postact_a_for_dW2_flat.shape == (total_tiles * tile_m, I), (
+        f"postact_a_for_dW2_flat shape mismatch: got "
+        f"{tuple(postact_a_for_dW2_flat.shape)}, expected {(total_tiles * tile_m, I)}"
+    )
+
     epi_args = StreamingMoeYBwdSm90.EpilogueArguments(
         tile_ready=tile_ready_params,
+        mPostAct=postact_a_for_dW2_flat,
+        act_fn=None,  # weighted-postact computed inline in epi_visit_subtile
         mColVecBroadcast=pool_topk_weight,
-        mColVecReduce=dL_dweight_per_stripe,
+        mColVecReduce=dL_dweight,
         rounding_mode=None,  # Constexpr; pass None at call time
     )
     scheduler_args = StreamingTileSchedulerOptions(
