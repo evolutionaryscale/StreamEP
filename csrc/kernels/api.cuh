@@ -159,7 +159,7 @@ void cached_notify_combine(void** buffer_ptrs,
                            int num_ranks,
                            cudaStream_t stream);
 
-void combine(cudaDataType_t type,
+void launch_combine_main(cudaDataType_t type,
              void* recv_x,
              float* recv_topk_weights,
              const void* x,

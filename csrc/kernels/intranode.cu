@@ -33,6 +33,41 @@ __host__ __device__ inline int receiver_state_smem_bytes(int num_ranks, int E_lo
             num_ranks * kReceiverChunkSize * num_topk) * static_cast<int>(sizeof(int));
 }
 
+// ── Shared device helpers (used by both fwd and bwd sender code paths) ──
+
+// Block the calling warp until the destination IPC queue has at least
+// `num_required_free` empty slots. Lane-elected polling on `channel_head_idx`;
+// caller must `__syncwarp` after only if it needs all lanes to observe the
+// release point (this helper already does it).
+//
+// Used by fwd dispatch sender, fwd combine sender, and (after backward lands)
+// the bwd dispatch_grads / combine_grads senders. They all share the same
+// IPC ringbuffer protocol; only the per-call free-slot requirement differs.
+__device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
+                                                            int* channel_head_idx,
+                                                            int num_recv_buffer_tokens,
+                                                            int num_required_free,
+                                                            int rank,
+                                                            int responsible_channel,
+                                                            const char* role) {
+    auto start_time = clock64();
+    if (elect_one_sync()) {
+        while (true) {
+            // We only consider the worst case (cached_tail - head); counting
+            // the actual freed-but-not-yet-published slots is not worth it.
+            int num_used_slots = cached_tail_idx - ld_volatile_global(channel_head_idx);
+            if (num_recv_buffer_tokens - num_used_slots >= num_required_free)
+                break;
+            if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                printf("DeepEP timeout for %s, rank %d, responsible_channel = %d\n",
+                       role, rank, responsible_channel);
+                trap();
+            }
+        }
+    }
+    __syncwarp();
+}
+
 
 // Streaming-MoE consolidated dispatch metadata. Single-block kernel that does
 // the cross-rank (token, k) count exchange and emits the pool-shape outputs the
@@ -433,24 +468,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
-            // Check destination queue emptiness, or wait a buffer to be released (rare cases)
-            // NOTES: the head index received by different warps may not be the same
-            auto start_time = clock64();
-            if (elect_one_sync()) {
-                while (true) {
-                    // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                    int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
-                    if (env.num_recv_buffer_tokens - num_used_slots >= env.num_max_send_tokens)
-                        break;
-
-                    // Rare cases to loop again
-                    if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", env.rank, responsible_channel);
-                        trap();
-                    }
-                }
-            }
-            __syncwarp();
+            sender_wait_for_queue_space(cached_channel_tail_idx,
+                                        channel_head_idx.buffer(),
+                                        env.num_recv_buffer_tokens,
+                                        env.num_max_send_tokens,
+                                        env.rank, responsible_channel,
+                                        "dispatch senders");
 
             int chunk_token_idx = 0;
             while (chunk_token_idx < env.num_max_send_tokens and token_idx < token_end_idx) {
@@ -908,7 +931,7 @@ void cached_notify_combine(void** buffer_ptrs,
 }
 
 template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
-__global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
+__global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* recv_x,
                                                           float* recv_topk_weights,
                                                           const dtype_t* x,
                                                           const float* topk_weights,
@@ -996,24 +1019,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         // Iterate over all tokens and send by chunks
         int current_channel_tail_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
-            // Check destination queue emptiness, or wait a buffer to be released (rare cases)
-            auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
-            if (elect_one_sync()) {
-                while (true) {
-                    // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                    int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
-                    if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
-                        break;
-
-                    // Rare cases to loop again
-                    if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("DeepEP timeout for combine senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
-                        trap();
-                    }
-                }
-            }
-            __syncwarp();
+            sender_wait_for_queue_space(current_channel_tail_idx,
+                                        channel_head_idx.buffer(),
+                                        num_recv_buffer_tokens,
+                                        num_round_tokens,
+                                        rank, responsible_channel,
+                                        "combine senders");
 
             // Send by chunk
             #pragma unroll
@@ -1271,7 +1283,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
     }
 }
 
-void combine(cudaDataType_t type,
+void launch_combine_main(cudaDataType_t type,
              void* recv_x,
              float* recv_topk_weights,
              const void* x,
@@ -1301,9 +1313,9 @@ void combine(cudaDataType_t type,
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
 
-#define COMBINE_LAUNCH_CASE(dtype, ranks)                                      \
-    {                                                                          \
-        auto kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
+#define COMBINE_LAUNCH_CASE(dtype, ranks)                                                  \
+    {                                                                                      \
+        auto kernel = combine_main_kernel<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
         SET_SHARED_MEMORY_FOR_TMA(kernel);                                     \
         LAUNCH_KERNEL(&cfg,                                                    \
                       kernel,                                                  \
