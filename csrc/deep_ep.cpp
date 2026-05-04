@@ -455,6 +455,28 @@ constexpr inline int64_t align16(int64_t x) {
     return (x + 15) & ~static_cast<int64_t>(15);
 }
 
+// 16-byte-aligned offset accumulator for packing typed sub-tensors into a
+// single int8 slab (see allocate_pre_poll_bundle / allocate_post_poll_bundle).
+// Replaces the manual `int64_t off_X = align16(off_prev + size_prev)` chain
+// with one `reserve<T>(count)` per field — single source of truth for the
+// layout, and reordering fields no longer requires manually re-threading the
+// `off_prev + size_prev` chain.
+class SlabBuilder {
+public:
+    template <typename T>
+    int64_t reserve(int64_t count) {
+        return reserve_bytes(count * static_cast<int64_t>(sizeof(T)));
+    }
+    int64_t reserve_bytes(int64_t bytes) {
+        int64_t off = align16(cursor_);
+        cursor_ = align16(off + bytes);
+        return off;
+    }
+    int64_t total_bytes() const { return cursor_; }
+private:
+    int64_t cursor_ = 0;
+};
+
 struct XScalesInfo {
     float* ptr = nullptr;
     int num_scales = 0;
@@ -544,19 +566,19 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
 
-    int64_t off_channel_prefix_matrix    = align16(0);
-    int64_t off_expert_frequency         = align16(off_channel_prefix_matrix    + static_cast<int64_t>(num_ranks) * num_channels * sizeof(int));
-    int64_t off_expert_pool_block_offset = align16(off_expert_frequency         + static_cast<int64_t>(num_local_experts) * sizeof(int));
-    int64_t off_base_pool                = align16(off_expert_pool_block_offset + static_cast<int64_t>(num_local_experts + 1) * sizeof(int));
-    int64_t off_rank_prefix_matrix       = align16(off_base_pool                + static_cast<int64_t>(num_channels) * num_ranks * num_local_experts * sizeof(int));
-    int64_t off_total_tiles_device       = align16(off_rank_prefix_matrix       + static_cast<int64_t>(num_ranks) * num_ranks * sizeof(int));
-    int64_t off_tile_id_to_expert        = align16(off_total_tiles_device       + static_cast<int64_t>(1) * sizeof(int));
-    int64_t off_pool_arrival_target      = align16(off_tile_id_to_expert        + total_tiles_max * sizeof(int));
-    int64_t total_bytes                  = align16(off_pool_arrival_target      + total_tiles_max * sizeof(int));
+    SlabBuilder b;
+    int64_t off_channel_prefix_matrix    = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
+    int64_t off_expert_frequency         = b.reserve<int>(num_local_experts);
+    int64_t off_expert_pool_block_offset = b.reserve<int>(num_local_experts + 1);
+    int64_t off_base_pool                = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    int64_t off_rank_prefix_matrix       = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
+    int64_t off_total_tiles_device       = b.reserve<int>(1);
+    int64_t off_tile_id_to_expert        = b.reserve<int>(total_tiles_max);
+    int64_t off_pool_arrival_target      = b.reserve<int>(total_tiles_max);
 
-    auto bundle = torch::empty({total_bytes}, i8_opts);
+    auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
-    CUDA_CHECK(cudaMemsetAsync(base, 0, total_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(base, 0, b.total_bytes(), stream));
 
     // Lambda capturing the bundle by value to keep storage alive for the
     // lifetime of any returned view. Each at::from_blob clones the lambda
@@ -684,29 +706,29 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
 
     int64_t hidden_bytes_per_recv_token = static_cast<int64_t>(hidden) * x_options.dtype().itemsize();
 
-    // Z_pre region offsets (zeroed before metadata_done event).
-    int64_t off_pool_topk_weight    = align16(0);
-    int64_t off_recv_src_idx        = align16(off_pool_topk_weight    + TK_padded * sizeof(float));
-    int64_t off_recv_topk_weights   = align16(off_recv_src_idx        + static_cast<int64_t>(num_recv_tokens) * sizeof(int));
-    int64_t off_recv_channel_prefix = align16(off_recv_topk_weights   + static_cast<int64_t>(num_recv_tokens) * num_topk * sizeof(float));
-    int64_t off_send_head           = align16(off_recv_channel_prefix + static_cast<int64_t>(num_ranks) * num_channels * sizeof(int));
-    int64_t off_pool_arrival_count  = align16(off_send_head           + static_cast<int64_t>(num_tokens) * num_ranks * sizeof(int));
-    int64_t off_tile_ready          = align16(off_pool_arrival_count  + static_cast<int64_t>(total_tiles) * sizeof(int));
-    int64_t off_a_ready             = align16(off_tile_ready          + static_cast<int64_t>(total_tiles) * sizeof(int64_t));
-    int64_t z_pre_bytes             = align16(off_a_ready             + static_cast<int64_t>(total_tiles) * sizeof(int64_t));
+    SlabBuilder b;
+    // Z_pre region (zeroed before metadata_done event).
+    int64_t off_pool_topk_weight    = b.reserve<float>(TK_padded);
+    int64_t off_recv_src_idx        = b.reserve<int>(num_recv_tokens);
+    int64_t off_recv_topk_weights   = b.reserve<float>(static_cast<int64_t>(num_recv_tokens) * num_topk);
+    int64_t off_recv_channel_prefix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
+    int64_t off_send_head           = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_ranks);
+    int64_t off_pool_arrival_count  = b.reserve<int>(total_tiles);
+    int64_t off_tile_ready          = b.reserve<int64_t>(total_tiles);
+    int64_t off_a_ready             = b.reserve<int64_t>(total_tiles);
+    int64_t z_pre_bytes             = b.total_bytes();
 
-    // N region offsets (-1 fill, before metadata_done).
-    int64_t off_pool_recv_token = align16(z_pre_bytes);
-    int64_t off_pool_k_slot     = align16(off_pool_recv_token + TK_padded * sizeof(int));
-    int64_t n_end               = align16(off_pool_k_slot     + TK_padded * sizeof(int));
+    // N region (-1 fill, before metadata_done).
+    int64_t off_pool_recv_token = b.reserve<int>(TK_padded);
+    int64_t off_pool_k_slot     = b.reserve<int>(TK_padded);
+    int64_t n_end               = b.total_bytes();
 
-    // Z_post region offsets (zeroed after metadata_done).
-    int64_t off_per_token_remaining    = align16(n_end);
-    int64_t off_compute_done_per_token = align16(off_per_token_remaining    + static_cast<int64_t>(num_recv_tokens) * sizeof(int));
-    int64_t off_o                      = align16(off_compute_done_per_token + static_cast<int64_t>(num_recv_tokens) * sizeof(int64_t));
-    int64_t total_bytes                = align16(off_o                      + static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
+    // Z_post region (zeroed after metadata_done).
+    int64_t off_per_token_remaining    = b.reserve<int>(num_recv_tokens);
+    int64_t off_compute_done_per_token = b.reserve<int64_t>(num_recv_tokens);
+    int64_t off_o                      = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
 
-    auto bundle = torch::empty({total_bytes}, i8_opts);
+    auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
@@ -734,7 +756,7 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     out.metadata_done_event = EventHandle(stream);
 
     // Z_post memset (queued AFTER metadata_done event recording).
-    CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, total_bytes - n_end, stream));
+    CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
     out.per_token_remaining    = at::from_blob(base + off_per_token_remaining,    {num_recv_tokens},          keep, i32_opts);
     out.compute_done_per_token = at::from_blob(base + off_compute_done_per_token, {num_recv_tokens},          keep, i64_opts);
