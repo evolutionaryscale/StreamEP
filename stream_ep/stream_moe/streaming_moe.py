@@ -209,11 +209,11 @@ class StreamMoEFunc(torch.autograd.Function):
         streams.combine.wait_event(metadata_done)
         handle.compute_done_per_token.record_stream(streams.combine)
         handle.o.record_stream(streams.combine)
-        handle.recv_src_idx.record_stream(streams.combine)
         handle.rank_prefix_matrix.record_stream(streams.combine)
         handle.channel_prefix_matrix.record_stream(streams.combine)
         handle.send_head.record_stream(streams.combine)
-        handle.recv_topk_weights.record_stream(streams.combine)
+        handle.pool_topk_weight.record_stream(streams.combine)
+        handle.recv_token_to_slots.record_stream(streams.combine)
         with torch.cuda.stream(streams.combine):
             out, _ = buffer.combine(handle.o, handle, combine_seq=dispatch_seq)
 
