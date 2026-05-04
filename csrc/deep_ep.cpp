@@ -771,42 +771,55 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales
         <= num_nvl_bytes);
 
-    intranode::launch_dispatch_main(pool.data_ptr(),
-                        pool_x_scales_ptr,
-                        pool_topk_weight.data_ptr<float>(),
-                        pool_recv_token.data_ptr<int>(),
-                        pool_k_slot.data_ptr<int>(),
-                        recv_src_idx.data_ptr<int>(),
-                        recv_topk_weights.data_ptr<float>(),
-                        recv_channel_prefix_matrix.data_ptr<int>(),
-                        send_head.data_ptr<int>(),
-                        per_token_remaining.data_ptr<int>(),
-                        x.data_ptr(),
-                        x_scales_ptr,
-                        topk_idx.data_ptr<topk_idx_t>(),
-                        topk_weights.data_ptr<float>(),
-                        is_token_in_rank.data_ptr<bool>(),
-                        channel_prefix_matrix.data_ptr<int>(),
-                        base_pool.data_ptr<int>(),
-                        pool_arrival_count.data_ptr<int>(),
-                        pool_arrival_target.data_ptr<int>(),
-                        tile_ready.data_ptr<int64_t>(),
-                        dispatch_seq,
-                        num_tokens,
-                        static_cast<int>(hidden * pool.element_size() / sizeof(int4)),
-                        num_topk,
-                        num_experts,
-                        num_scales,
-                        scale_token_stride,
-                        scale_hidden_stride,
-                        buffer_ptrs_gpu,
-                        rank,
-                        num_ranks,
-                        stream,
-                        config.num_sms,
-                        config.num_max_nvl_chunked_send_tokens,
-                        config.num_max_nvl_chunked_recv_tokens,
-                        tile_m);
+    intranode::DispatchPoolOut dispatch_pool_out{
+        .pool             = reinterpret_cast<int4*>(pool.data_ptr()),
+        .pool_x_scales    = pool_x_scales_ptr,
+        .pool_topk_weight = pool_topk_weight.data_ptr<float>(),
+        .pool_recv_token  = pool_recv_token.data_ptr<int>(),
+        .pool_k_slot      = pool_k_slot.data_ptr<int>(),
+    };
+    intranode::DispatchPerTokenOut dispatch_per_token_out{
+        .recv_src_idx               = recv_src_idx.data_ptr<int>(),
+        .recv_topk_weights          = recv_topk_weights.data_ptr<float>(),
+        .recv_channel_prefix_matrix = recv_channel_prefix_matrix.data_ptr<int>(),
+        .send_head                  = send_head.data_ptr<int>(),
+        .per_token_remaining        = per_token_remaining.data_ptr<int>(),
+    };
+    intranode::DispatchInputs dispatch_inputs{
+        .x                = reinterpret_cast<const int4*>(x.data_ptr()),
+        .x_scales         = x_scales_ptr,
+        .topk_idx         = topk_idx.data_ptr<topk_idx_t>(),
+        .topk_weights     = topk_weights.data_ptr<float>(),
+        .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
+    };
+    intranode::DispatchTileSignal dispatch_tile_signal{
+        .channel_prefix_matrix = channel_prefix_matrix.data_ptr<int>(),
+        .base_pool             = base_pool.data_ptr<int>(),
+        .pool_arrival_count    = pool_arrival_count.data_ptr<int>(),
+        .pool_arrival_target   = pool_arrival_target.data_ptr<int>(),
+        .tile_ready            = tile_ready.data_ptr<int64_t>(),
+        .dispatch_seq          = dispatch_seq,
+    };
+    intranode::DispatchShape dispatch_shape{
+        .num_tokens          = num_tokens,
+        .hidden_int4         = static_cast<int>(hidden * pool.element_size() / sizeof(int4)),
+        .num_topk            = num_topk,
+        .num_experts         = num_experts,
+        .num_scales          = num_scales,
+        .scale_token_stride  = scale_token_stride,
+        .scale_hidden_stride = scale_hidden_stride,
+        .tile_m              = tile_m,
+    };
+    intranode::DispatchEnv dispatch_env{
+        .buffer_ptrs            = buffer_ptrs_gpu,
+        .rank                   = rank,
+        .num_max_send_tokens    = config.num_max_nvl_chunked_send_tokens,
+        .num_recv_buffer_tokens = config.num_max_nvl_chunked_recv_tokens,
+    };
+    intranode::launch_dispatch_main(dispatch_pool_out, dispatch_per_token_out,
+                                    dispatch_inputs, dispatch_tile_signal,
+                                    dispatch_shape, dispatch_env,
+                                    num_ranks, stream, config.num_sms);
 
     return StreamingDispatchOutputs{
         .pool                       = pool,

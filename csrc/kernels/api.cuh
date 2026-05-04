@@ -84,42 +84,70 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int expert_alignment,
                                  cudaStream_t stream);
 
-void launch_dispatch_main(void* pool,
-              float* pool_x_scales,
-              float* pool_topk_weight,
-              int* pool_recv_token,
-              int* pool_k_slot,
-              int* recv_src_idx,
-              float* recv_topk_weights,
-              int* recv_channel_prefix_matrix,
-              int* send_head,
-              int* per_token_remaining,
-              const void* x,
-              const float* x_scales,
-              const topk_idx_t* topk_idx,
-              const float* topk_weights,
-              const bool* is_token_in_rank,
-              int* channel_prefix_matrix,
-              const int* base_pool,
-              int* pool_arrival_count,
-              const int* pool_arrival_target,
-              int64_t* tile_ready,
-              int64_t dispatch_seq,
-              int num_tokens,
-              int hidden_int4,
-              int num_topk,
-              int num_experts,
-              int num_scales,
-              int scale_token_stride,
-              int scale_hidden_stride,
-              void** buffer_ptrs,
-              int rank,
-              int num_ranks,
-              cudaStream_t stream,
-              int num_sms,
-              int num_max_send_tokens,
-              int num_recv_buffer_tokens,
-              int tile_m);
+// Argument groupings for the streaming dispatch main kernel. Each struct
+// captures one logical concern; passing all six instead of 31 loose args makes
+// it easy to add / rename / reorder a single field — touch the struct, not
+// every signature copy.
+struct DispatchPoolOut {
+    int4* pool;                    // [TK_padded, hidden]   data (int4-vector)
+    float* pool_x_scales;          // [TK_padded, num_scales] (FP8 only)
+    float* pool_topk_weight;       // [TK_padded]           per-pool-slot weight
+    int* pool_recv_token;          // [TK_padded]           slot → recv-token id (-1 = padding)
+    int* pool_k_slot;              // [TK_padded]           slot → k (-1 = padding)
+};
+
+struct DispatchPerTokenOut {
+    int* recv_src_idx;             // [T_recv]              recv-token → source token idx
+    float* recv_topk_weights;      // [T_recv, num_topk]
+    int* recv_channel_prefix_matrix;  // [num_ranks, num_channels]  receiver-side cumulative
+    int* send_head;                // [num_tokens, num_ranks]
+    int* per_token_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs
+};
+
+struct DispatchInputs {
+    const int4* x;                 // [num_tokens, hidden]  (int4-vector)
+    const float* x_scales;         // [num_tokens, num_scales] (FP8 only)
+    const topk_idx_t* topk_idx;    // [num_tokens, num_topk]
+    const float* topk_weights;     // [num_tokens, num_topk]
+    const bool* is_token_in_rank;  // [num_tokens, num_ranks]
+};
+
+struct DispatchTileSignal {
+    int* channel_prefix_matrix;    // [num_ranks, num_channels]  sender-side cumulative
+    const int* base_pool;          // [num_channels, num_ranks, E_local]
+    int* pool_arrival_count;       // [total_tiles]   atomic-add target during pass 2
+    const int* pool_arrival_target;  // [total_tiles] firing target
+    int64_t* tile_ready;           // [total_tiles]   per-tile release stamp
+    int64_t dispatch_seq;
+};
+
+struct DispatchShape {
+    int num_tokens;
+    int hidden_int4;
+    int num_topk;
+    int num_experts;
+    int num_scales;
+    int scale_token_stride;
+    int scale_hidden_stride;
+    int tile_m;
+};
+
+struct DispatchEnv {
+    void** buffer_ptrs;
+    int rank;
+    int num_max_send_tokens;
+    int num_recv_buffer_tokens;
+};
+
+void launch_dispatch_main(const DispatchPoolOut& pool_out,
+                          const DispatchPerTokenOut& per_token_out,
+                          const DispatchInputs& inputs,
+                          const DispatchTileSignal& tile_signal,
+                          const DispatchShape& shape,
+                          const DispatchEnv& env,
+                          int num_ranks,
+                          cudaStream_t stream,
+                          int num_sms);
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,

@@ -306,39 +306,13 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
-__global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* pool,
-                                                           float* pool_x_scales,
-                                                           float* pool_topk_weight,
-                                                           int* pool_recv_token,
-                                                           int* pool_k_slot,
-                                                           int* recv_src_idx,
-                                                           float* recv_topk_weights,
-                                                           int* recv_channel_prefix_matrix,
-                                                           int* send_head,
-                                                           int* per_token_remaining,
-                                                           const int4* x,
-                                                           const float* x_scales,
-                                                           const topk_idx_t* topk_idx,
-                                                           const float* topk_weights,
-                                                           const bool* is_token_in_rank,
-                                                           int* channel_prefix_matrix,
-                                                           const int* base_pool,
-                                                           int* pool_arrival_count,
-                                                           const int* pool_arrival_target,
-                                                           int64_t* tile_ready,
-                                                           int64_t dispatch_seq,
-                                                           int num_tokens,
-                                                           int hidden_int4,
-                                                           int num_topk,
-                                                           int num_experts,
-                                                           int num_scales,
-                                                           int scale_token_stride,
-                                                           int scale_hidden_stride,
-                                                           void** buffer_ptrs,
-                                                           int rank,
-                                                           int num_max_send_tokens,
-                                                           int num_recv_buffer_tokens,
-                                                           int tile_m) {
+__global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
+        DispatchPoolOut pool_out,
+        DispatchPerTokenOut per_token_out,
+        DispatchInputs inputs,
+        DispatchTileSignal tile_signal,
+        DispatchShape shape,
+        DispatchEnv env) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -351,22 +325,22 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     const auto responsible_channel = sm_id / 2;
 
-    int num_experts_per_rank = num_experts / kNumRanks;
-    EP_DEVICE_ASSERT(num_experts_per_rank > 0 and num_topk > 0);
+    int num_experts_per_rank = shape.num_experts / kNumRanks;
+    EP_DEVICE_ASSERT(num_experts_per_rank > 0 and shape.num_topk > 0);
     // Pool-layout SMEM scratch is sized by E_local at runtime; a compile-time
     // upper bound keeps the receiver-block per-(chunk, k) slot computation
     // unrolled. The 32-lane bound covers any practical MoE: even Mixtral-style
     // routing has num_experts_per_rank well under 32 at world_size ≥ 8.
     EP_DEVICE_ASSERT(num_experts_per_rank <= kMaxLocalExpertsPerRank);
-    EP_DEVICE_ASSERT(num_topk <= kMaxTopK);
-    EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
-    EP_DEVICE_ASSERT(recv_topk_weights != nullptr);
+    EP_DEVICE_ASSERT(shape.num_topk <= kMaxTopK);
+    EP_DEVICE_ASSERT((inputs.topk_idx == nullptr) == (inputs.topk_weights == nullptr));
+    EP_DEVICE_ASSERT(per_token_out.recv_topk_weights != nullptr);
 
     // Calculate pointers by the specific layout
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
-    auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[is_sender ? responsible_rank : rank]) +
+    auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(env.buffer_ptrs[is_sender ? responsible_rank : env.rank]) +
                                        kNumRanks * kNumRanks * sizeof(int));
-    int target_rank = is_sender ? rank : responsible_rank;
+    int target_rank = is_sender ? env.rank : responsible_rank;
     auto num_channels_total = num_channels * kNumRanks;
     auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
 
@@ -384,26 +358,26 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
     auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
 
     // Channel data buffers, stored on the receiver side
-    // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
-    // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
-    // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(topk_idx_t)
-    // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
-    // `x_scales_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_scales * sizeof(float)
     auto channel_x_buffers = Buffer<int4>(
-        ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
-    auto channel_src_idx_buffers =
-        Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.hidden_int4,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.hidden_int4);
+    auto channel_src_idx_buffers = Buffer<int>(
+        ptr, num_channels_total * env.num_recv_buffer_tokens,
+        channel_rank_offset * env.num_recv_buffer_tokens);
     auto channel_topk_idx_buffers = Buffer<topk_idx_t>(
-        ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
-    auto channel_topk_weights_buffers =
-        Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_topk,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.num_topk);
+    auto channel_topk_weights_buffers = Buffer<float>(
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_topk,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.num_topk);
     auto channel_x_scales_buffers = Buffer<float>(
-        ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_scales,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.num_scales);
 
     // TMA stuffs
 #ifndef DISABLE_SM90_FEATURES
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    auto half_hidden_int4 = hidden_int4 / 2;
+    auto half_hidden_int4 = shape.hidden_int4 / 2;
     auto half_hidden_bytes = half_hidden_int4 * static_cast<int>(sizeof(int4));
     auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + half_hidden_bytes);
@@ -411,7 +385,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
     if (elect_one_sync()) {
         mbarrier_init(tma_mbarrier, 1);
         fence_barrier_init();
-        EP_DEVICE_ASSERT(hidden_int4 % 2 == 0 and half_hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(shape.hidden_int4 % 2 == 0 and half_hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
     }
     __syncwarp();
 #endif
@@ -431,10 +405,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
         // using lane-strided accumulation + warp_reduce.
         if (send_warp_id_in_rank == 0) {
             int channel_start, channel_end;
-            get_channel_task_range(num_tokens, num_channels, responsible_channel, channel_start, channel_end);
+            get_channel_task_range(shape.num_tokens, num_channels, responsible_channel, channel_start, channel_end);
             int start_count = 0, end_count = 0;
             for (int i = lane_id; i < channel_end; i += 32) {
-                int v = is_token_in_rank[i * kNumRanks + responsible_rank];
+                int v = inputs.is_token_in_rank[i * kNumRanks + responsible_rank];
                 if (i < channel_start) start_count += v;
                 else end_count += v;
             }
@@ -447,14 +421,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 st_relaxed_sys_global(channel_start_offset.buffer(), -start_count - 1);
                 st_relaxed_sys_global(channel_end_offset.buffer(), -end_count - 1);
                 // Persist inclusive cumulative through this channel for combine.
-                channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = end_count;
+                tile_signal.channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = end_count;
             }
         }
         __syncwarp();
 
         // Get tasks
         int token_start_idx, token_end_idx;
-        get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+        get_channel_task_range(shape.num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
 
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
@@ -466,12 +440,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                     int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
-                    if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
+                    if (env.num_recv_buffer_tokens - num_used_slots >= env.num_max_send_tokens)
                         break;
 
                     // Rare cases to loop again
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
+                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", env.rank, responsible_channel);
                         trap();
                     }
                 }
@@ -479,51 +453,51 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
             __syncwarp();
 
             int chunk_token_idx = 0;
-            while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
+            while (chunk_token_idx < env.num_max_send_tokens and token_idx < token_end_idx) {
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the
                 // following data
                 if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
-                    send_head[token_idx * kNumRanks + responsible_rank] =
-                        is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
+                    per_token_out.send_head[token_idx * kNumRanks + responsible_rank] =
+                        inputs.is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
 
                 // Skip if not selected
-                if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
+                if (not inputs.is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
                     token_idx++;
                     continue;
                 }
 
                 // Get an empty slot
-                int dst_slot_idx = (cached_channel_tail_idx++) % num_recv_buffer_tokens;
+                int dst_slot_idx = (cached_channel_tail_idx++) % env.num_recv_buffer_tokens;
                 if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank) {
                     // Copy data
-                    auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
-                    auto shifted_x = x + token_idx * hidden_int4;
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
+                    auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * shape.hidden_int4;
+                    auto shifted_x = inputs.x + token_idx * shape.hidden_int4;
+                    UNROLLED_WARP_COPY(5, lane_id, shape.hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
 
                     // Copy source index
                     if (elect_one_sync())
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
-                    if (lane_id < num_topk) {
+                    if (lane_id < shape.num_topk) {
                         // Top-k index
                         int recv_expert_begin = responsible_rank * num_experts_per_rank,
                             recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
-                        auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
+                        auto idx_value = __ldg(inputs.topk_idx + token_idx * shape.num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value;
+                        channel_topk_idx_buffers[dst_slot_idx * shape.num_topk + lane_id] = idx_value;
 
                         // Top-k weights
-                        auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
+                        auto weight_value = __ldg(inputs.topk_weights + token_idx * shape.num_topk + lane_id);
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value;
+                        channel_topk_weights_buffers[dst_slot_idx * shape.num_topk + lane_id] = weight_value;
                     }
 
                     // Copy `x_scales`
                     #pragma unroll
-                    for (int i = lane_id; i < num_scales; i += 32) {
-                        auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        channel_x_scales_buffers[dst_slot_idx * num_scales + i] = __ldg(x_scales + offset);
+                    for (int i = lane_id; i < shape.num_scales; i += 32) {
+                        auto offset = token_idx * shape.scale_token_stride + i * shape.scale_hidden_stride;
+                        channel_x_scales_buffers[dst_slot_idx * shape.num_scales + i] = __ldg(inputs.x_scales + offset);
                     }
                 }
 
@@ -577,9 +551,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
         int* smem_per_substream_seen = smem_recv_state;
 #endif
         const int seen_stride = E;
-        const int slot_stride = kReceiverChunkSize * num_topk;
+        const int slot_stride = kReceiverChunkSize * shape.num_topk;
         int* smem_batch_slot = smem_per_substream_seen + kNumRanks * seen_stride;
-        (void)num_max_send_tokens;
 
         // Initialize cumulative seen for this substream's local experts.
         if (recv_thread_id_in_rank < E)
@@ -587,8 +560,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
         __syncthreads();
 
         // Calculate offset
-        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
-        int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
+        auto rank_prefix_matrix = static_cast<int*>(env.buffer_ptrs[env.rank]);
+        int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + env.rank] : 0;
 
         // Receive channel offset.
         int total_offset, num_tokens_to_recv;
@@ -599,7 +572,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 ;
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
-                recv_channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = total_offset;
+                per_token_out.recv_channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
         total_offset = __shfl_sync(0xffffffff, total_offset, 0);
@@ -610,7 +583,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
 
         const int substream_csrc = responsible_channel * kNumRanks + responsible_rank;
-        const int* base_pool_substream = base_pool + substream_csrc * E;
+        const int* base_pool_substream = tile_signal.base_pool + substream_csrc * E;
         int* seen_substream       = smem_per_substream_seen + responsible_rank * seen_stride;
         int* batch_slot_substream = smem_batch_slot         + responsible_rank * slot_stride;
 
@@ -626,7 +599,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 }
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
-                           rank, responsible_channel, num_tokens_to_recv);
+                           env.rank, responsible_channel, num_tokens_to_recv);
                     trap();
                 }
             }
@@ -649,11 +622,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 if (recv_warp_id_in_rank == 0 and lane_id == 0) {
                     for (int sub_chunk = 0; sub_chunk < sub_size; ++sub_chunk) {
                         int chunk_idx = sub_start + sub_chunk;
-                        int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
-                        int* slot_row = batch_slot_substream + sub_chunk * num_topk;
-                        for (int k = 0; k < num_topk; ++k) {
+                        int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % env.num_recv_buffer_tokens;
+                        int* slot_row = batch_slot_substream + sub_chunk * shape.num_topk;
+                        for (int k = 0; k < shape.num_topk; ++k) {
                             int e_local = static_cast<int>(
-                                channel_topk_idx_buffers[token_idx_in_buffer * num_topk + k]);
+                                channel_topk_idx_buffers[token_idx_in_buffer * shape.num_topk + k]);
                             if (e_local >= 0 and e_local < E) {
                                 int slot = base_pool_substream[e_local] + seen_substream[e_local];
                                 seen_substream[e_local]++;
@@ -674,11 +647,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 for (int sub_chunk = recv_warp_id_in_rank; sub_chunk < sub_size;
                      sub_chunk += num_recv_warps_per_rank) {
                     int chunk_idx = sub_start + sub_chunk;
-                    int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
+                    int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % env.num_recv_buffer_tokens;
                     int recv_token_id = total_offset + chunk_idx;
-                    int* slot_row = batch_slot_substream + sub_chunk * num_topk;
+                    int* slot_row = batch_slot_substream + sub_chunk * shape.num_topk;
 
-                    auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
+                    auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * shape.hidden_int4;
 #ifndef DISABLE_SM90_FEATURES
                     // 2-piece pattern: tma_load piece p into tma_buffer, then for
                     // each local k tma_store piece p to pool[slot] + p*half_hidden.
@@ -691,11 +664,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                                         tma_mbarrier, half_hidden_bytes);
                             mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes);
                             mbarrier_wait(tma_mbarrier, tma_phase);
-                            for (int k = 0; k < num_topk; ++k) {
+                            for (int k = 0; k < shape.num_topk; ++k) {
                                 int slot = slot_row[k];
                                 if (slot < 0) continue;
                                 tma_store_1d(tma_buffer,
-                                             pool + static_cast<int64_t>(slot) * hidden_int4
+                                             pool_out.pool + static_cast<int64_t>(slot) * shape.hidden_int4
                                                   + piece * half_hidden_int4,
                                              half_hidden_bytes, false);
                             }
@@ -703,11 +676,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                         __syncwarp();
                     }
 #else
-                    for (int k = 0; k < num_topk; ++k) {
+                    for (int k = 0; k < shape.num_topk; ++k) {
                         int slot = slot_row[k];
                         if (slot < 0) continue;
-                        auto shifted_pool_int4 = pool + static_cast<int64_t>(slot) * hidden_int4;
-                        UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_pool_int4, shifted_buffer_x_int4,
+                        auto shifted_pool_int4 = pool_out.pool + static_cast<int64_t>(slot) * shape.hidden_int4;
+                        UNROLLED_WARP_COPY(5, lane_id, shape.hidden_int4, shifted_pool_int4, shifted_buffer_x_int4,
                                            ld_nc_global, st_na_global);
                     }
 #endif
@@ -721,37 +694,37 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                     // before kernel Y's first atomicSub on the same address.
                     if (lane_id == 0) {
                         int k_local_count = 0;
-                        for (int k = 0; k < num_topk; ++k) {
+                        for (int k = 0; k < shape.num_topk; ++k) {
                             int slot = slot_row[k];
                             if (slot < 0) continue;
-                            pool_topk_weight[slot] = ld_nc_global(
-                                channel_topk_weights_buffers.buffer() + token_idx_in_buffer * num_topk + k);
-                            pool_recv_token[slot] = recv_token_id;
-                            pool_k_slot[slot] = k;
+                            pool_out.pool_topk_weight[slot] = ld_nc_global(
+                                channel_topk_weights_buffers.buffer() + token_idx_in_buffer * shape.num_topk + k);
+                            pool_out.pool_recv_token[slot] = recv_token_id;
+                            pool_out.pool_k_slot[slot] = k;
                             ++k_local_count;
                         }
                         if (k_local_count > 0)
-                            per_token_remaining[recv_token_id] = k_local_count;
+                            per_token_out.per_token_remaining[recv_token_id] = k_local_count;
                     }
 
                     // x_scales: per-(slot, scales_idx). Lanes split scales_idx within K.
-                    if (num_scales > 0) {
-                        for (int k = 0; k < num_topk; ++k) {
+                    if (shape.num_scales > 0) {
+                        for (int k = 0; k < shape.num_topk; ++k) {
                             int slot = slot_row[k];
                             if (slot < 0) continue;
-                            for (int i = lane_id; i < num_scales; i += 32) {
-                                pool_x_scales[static_cast<int64_t>(slot) * num_scales + i] =
-                                    ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * num_scales + i);
+                            for (int i = lane_id; i < shape.num_scales; i += 32) {
+                                pool_out.pool_x_scales[static_cast<int64_t>(slot) * shape.num_scales + i] =
+                                    ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * shape.num_scales + i);
                             }
                         }
                     }
 
                     // Per-recv-token writes (combine consumes recv_src_idx + recv_topk_weights).
                     if (lane_id == 0)
-                        recv_src_idx[recv_token_id] = ld_nc_global(channel_src_idx_buffers.buffer() + token_idx_in_buffer);
-                    if (lane_id < num_topk) {
-                        recv_topk_weights[static_cast<int64_t>(recv_token_id) * num_topk + lane_id] =
-                            ld_nc_global(channel_topk_weights_buffers.buffer() + token_idx_in_buffer * num_topk + lane_id);
+                        per_token_out.recv_src_idx[recv_token_id] = ld_nc_global(channel_src_idx_buffers.buffer() + token_idx_in_buffer);
+                    if (lane_id < shape.num_topk) {
+                        per_token_out.recv_topk_weights[static_cast<int64_t>(recv_token_id) * shape.num_topk + lane_id] =
+                            ld_nc_global(channel_topk_weights_buffers.buffer() + token_idx_in_buffer * shape.num_topk + lane_id);
                     }
                 }
 
@@ -797,17 +770,17 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
                 if (n_writes_for_e == 0) continue;
                 int slot_start_e = base_pool_substream[e];
                 int slot_end_e = slot_start_e + n_writes_for_e;
-                int first_block = slot_start_e / tile_m;
-                int last_block = (slot_end_e - 1) / tile_m;
+                int first_block = slot_start_e / shape.tile_m;
+                int last_block = (slot_end_e - 1) / shape.tile_m;
                 for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                    int block_slot_start = block_id * tile_m;
-                    int block_slot_end = block_slot_start + tile_m;
+                    int block_slot_start = block_id * shape.tile_m;
+                    int block_slot_end = block_slot_start + shape.tile_m;
                     int writes_in_block =
                         min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-                    int cnt_before = atomicAdd(&pool_arrival_count[block_id], writes_in_block);
-                    if (cnt_before + writes_in_block == pool_arrival_target[block_id]) {
+                    int cnt_before = atomicAdd(&tile_signal.pool_arrival_count[block_id], writes_in_block);
+                    if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
                         memory_fence();
-                        st_release_sys_global(tile_ready + block_id, dispatch_seq);
+                        st_release_sys_global(tile_signal.tile_ready + block_id, tile_signal.dispatch_seq);
                     }
                 }
             }
@@ -815,96 +788,37 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* poo
     }
 }
 
-void launch_dispatch_main(void* pool,
-              float* pool_x_scales,
-              float* pool_topk_weight,
-              int* pool_recv_token,
-              int* pool_k_slot,
-              int* recv_src_idx,
-              float* recv_topk_weights,
-              int* recv_channel_prefix_matrix,
-              int* send_head,
-              int* per_token_remaining,
-              const void* x,
-              const float* x_scales,
-              const topk_idx_t* topk_idx,
-              const float* topk_weights,
-              const bool* is_token_in_rank,
-              int* channel_prefix_matrix,
-              const int* base_pool,
-              int* pool_arrival_count,
-              const int* pool_arrival_target,
-              int64_t* tile_ready,
-              int64_t dispatch_seq,
-              int num_tokens,
-              int hidden_int4,
-              int num_topk,
-              int num_experts,
-              int num_scales,
-              int scale_token_stride,
-              int scale_hidden_stride,
-              void** buffer_ptrs,
-              int rank,
-              int num_ranks,
-              cudaStream_t stream,
-              int num_sms,
-              int num_max_send_tokens,
-              int num_recv_buffer_tokens,
-              int tile_m) {
+void launch_dispatch_main(const DispatchPoolOut& pool_out,
+                          const DispatchPerTokenOut& per_token_out,
+                          const DispatchInputs& inputs,
+                          const DispatchTileSignal& tile_signal,
+                          const DispatchShape& shape,
+                          const DispatchEnv& env,
+                          int num_ranks,
+                          cudaStream_t stream,
+                          int num_sms) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
     constexpr int kNumWarps = kNumThreads / 32;
 
-    int E_local = num_experts / num_ranks;
-    int receiver_state_bytes = receiver_state_smem_bytes(num_ranks, E_local, num_topk);
+    int E_local = shape.num_experts / num_ranks;
+    int receiver_state_bytes = receiver_state_smem_bytes(num_ranks, E_local, shape.num_topk);
 #ifndef DISABLE_SM90_FEATURES
     int smem_size = kNumTMABytesPerWarp * kNumWarps + receiver_state_bytes;
 #else
     int smem_size = receiver_state_bytes;
 #endif
 
-    EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(static_cast<int64_t>(shape.num_scales) * shape.scale_hidden_stride < std::numeric_limits<int>::max());
 
-#define DISPATCH_LAUNCH_CASE(ranks)                                      \
-    {                                                                    \
+#define DISPATCH_LAUNCH_CASE(ranks)                                                  \
+    {                                                                                \
         auto kernel = dispatch_main_kernel<ranks, kNumThreads, kNumTMABytesPerWarp>; \
-        SET_SHARED_MEMORY_FOR_TMA(kernel);                               \
-        LAUNCH_KERNEL(&cfg,                                              \
-                      kernel,                                            \
-                      reinterpret_cast<int4*>(pool),                     \
-                      pool_x_scales,                                     \
-                      pool_topk_weight,                                  \
-                      pool_recv_token,                                   \
-                      pool_k_slot,                                       \
-                      recv_src_idx,                                      \
-                      recv_topk_weights,                                 \
-                      recv_channel_prefix_matrix,                               \
-                      send_head,                                         \
-                      per_token_remaining,                               \
-                      reinterpret_cast<const int4*>(x),                  \
-                      x_scales,                                          \
-                      topk_idx,                                          \
-                      topk_weights,                                      \
-                      is_token_in_rank,                                  \
-                      channel_prefix_matrix,                             \
-                      base_pool,                                         \
-                      pool_arrival_count,                                \
-                      pool_arrival_target,                               \
-                      tile_ready,                                        \
-                      dispatch_seq,                                      \
-                      num_tokens,                                        \
-                      hidden_int4,                                       \
-                      num_topk,                                          \
-                      num_experts,                                       \
-                      num_scales,                                        \
-                      scale_token_stride,                                \
-                      scale_hidden_stride,                               \
-                      buffer_ptrs,                                       \
-                      rank,                                              \
-                      num_max_send_tokens,                               \
-                      num_recv_buffer_tokens,                            \
-                      tile_m);                                           \
-    }                                                                    \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                           \
+        LAUNCH_KERNEL(&cfg, kernel,                                                  \
+                      pool_out, per_token_out, inputs,                               \
+                      tile_signal, shape, env);                                      \
+    }                                                                                \
     break
 
     EP_HOST_ASSERT(num_sms % 2 == 0);
