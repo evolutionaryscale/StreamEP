@@ -61,16 +61,28 @@ from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
 
 @dataclass(frozen=True)
 class StreamHolder:
-    """The four caller-owned streams driving one streaming-MoE layer."""
+    """The five caller-owned streams driving one streaming-MoE layer.
+
+    Forward uses four (``dispatch`` / ``compute_a`` / ``compute_y`` /
+    ``combine``); backward adds a fifth ``grads`` stream that hosts the
+    dW1 / dW2 grouped GEMMs. The dW grads are purely LOCAL (each rank
+    holds its E_local slice of the expert weight grads — never crosses
+    ranks), so they can run on a side stream that doesn't block
+    combine_grads. Without this, dW1 / dW2 sat in the tail of
+    ``compute_a`` / ``compute_y`` respectively and contended for SMs
+    with kernel_a_bwd / kernel_y_bwd, stretching the streaming-kernel
+    critical path.
+    """
 
     dispatch: torch.cuda.Stream
     compute_a: torch.cuda.Stream
     compute_y: torch.cuda.Stream
     combine: torch.cuda.Stream
+    grads: torch.cuda.Stream
 
 
 def make_streams(device: torch.device | int | None = None) -> StreamHolder:
-    """Allocate the four streams the layer expects.
+    """Allocate the five streams the layer expects.
 
     Caller creates this once (per training process) and reuses it across all
     layers and iterations — streams are not per-call state.
@@ -80,6 +92,7 @@ def make_streams(device: torch.device | int | None = None) -> StreamHolder:
         compute_a=torch.cuda.Stream(device=device),
         compute_y=torch.cuda.Stream(device=device),
         combine=torch.cuda.Stream(device=device),
+        grads=torch.cuda.Stream(device=device),
     )
 
 
@@ -361,7 +374,6 @@ class StreamMoEFunc(torch.autograd.Function):
         # ordering — these ops can overlap with the upstream layer's bwd tail.
 
         with torch.cuda.stream(streams.compute_a):
-            dW1_local = torch.zeros_like(w1_local)
             dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
             bwd_per_token_remaining = torch.empty(
                 T_recv, dtype=torch.int32, device=device
@@ -370,11 +382,19 @@ class StreamMoEFunc(torch.autograd.Function):
                 T_recv, dtype=torch.int64, device=device
             )
 
-        with torch.cuda.stream(streams.compute_y):
+        # dW1_local / dW2_local live on the dedicated grads stream — see
+        # below. They're zero-init here on grads (no in-stream-allocator
+        # entanglement with compute_a/compute_y) so the grouped GEMM's
+        # write reaches a known-zero buffer.
+        with torch.cuda.stream(streams.grads):
+            dW1_local = torch.zeros_like(w1_local)
             dW2_local = torch.zeros_like(w2_local)
-            # kernel_y_bwd's mD output, also consumed by kernel_a_bwd and dW1
-            # GEMM on streams.compute_a. Bf16 (M, 2I); fp32-view applied
-            # internally by the kernel host wrapper.
+
+        with torch.cuda.stream(streams.compute_y):
+            # kernel_y_bwd's mD output, consumed by kernel_a_bwd on
+            # streams.compute_a and by dW1's grouped GEMM on streams.grads.
+            # Bf16 (M, 2I); fp32-view applied internally by the kernel host
+            # wrapper.
             dL_dswiglu_in = torch.empty(
                 total_tiles, tile_m, two_I, dtype=dtype, device=device
             )
@@ -402,6 +422,7 @@ class StreamMoEFunc(torch.autograd.Function):
         streams.compute_a.wait_stream(caller_stream)
         streams.compute_y.wait_stream(caller_stream)
         streams.combine.wait_stream(caller_stream)
+        streams.grads.wait_stream(caller_stream)
 
         # ── Caller-dependent setup op ──────────────────────────────────────
         # handle.k_local_count was written on streams.dispatch in fwd; visible
@@ -468,43 +489,15 @@ class StreamMoEFunc(torch.autograd.Function):
                 tile_n=tile_n_a,
                 num_sms=num_sms_a,
             )
-            # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
-            #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
-            # postact_a_for_dW2 is the weighted postact (postact * pool_topk_weight)
-            # already materialised in bf16 by kernel_y_bwd's mPostAct path —
-            # NO orchestrator-side recompute. Chain rule on
-            #   o[t] = Σ_k topk_weights[t, k] · y_for_(t, k)
-            # gives dW2[e] = Σ_{slot in e} pool_topk_weight[slot] *
-            #               dL_do_pool[slot] outer postact_a[slot] — the
-            # weight factor now rides ON the postact via the in-kernel multiply.
-            #
-            # quack.gemm with cu_seqlens_k expects A: (M, total_K) m-major
-            # (stride(-2)=1) and B: (N, total_K) n-major (stride(-2)=1); output
-            # D: (L, M, N). For dW2: M=H, N=I, L=E_local, total_K=TK_padded.
-            #   A = dL_do_pool.t()             shape (H, TK_padded), strides (1, H) → m-major ✓
-            #   B = postact_a_for_dW2_flat.t() shape (I, TK_padded), strides (1, I) → n-major ✓
-            #   D = dW2_local                  (E_local, H, I) ← matches w2_local layout ✓
-            postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
-            cu_seqlens_k_y = (
-                handle.expert_pool_block_offset.to(torch.int32) * tile_m
-            ).contiguous()
-            gemm(
-                dL_do_pool.t(),
-                postact_a_for_dW2_flat.t(),
-                dW2_local,
-                None,
-                None,
-                tile_M=tile_m,
-                tile_N=tile_n_a,
-                cluster_M=1,
-                cluster_N=1,
-                cu_seqlens_k=cu_seqlens_k_y,
-            )
 
-        # bwd_a_ready / dL_dswiglu_in are written on compute_y, consumed on
-        # compute_a (kernel_a_bwd + dW1 GEMM).
+        # bwd_a_ready / dL_dswiglu_in are written on compute_y; consumed on
+        # compute_a (kernel_a_bwd) and grads (dW1 GEMM).
         bwd_a_ready.record_stream(streams.compute_a)
         dL_dswiglu_in.record_stream(streams.compute_a)
+        dL_dswiglu_in.record_stream(streams.grads)
+        postact_a_for_dW2.record_stream(streams.grads)
+        dL_do_pool.record_stream(streams.grads)
+        pool.record_stream(streams.grads)
         # dL_dweight is read by combine_grads on streams.combine. The
         # cross-stream visibility is carried by the per-tile bwd_a_ready
         # release-store's threadfence_system (kernel_y_bwd) → kernel_a_bwd's
@@ -536,31 +529,6 @@ class StreamMoEFunc(torch.autograd.Function):
                 tile_n=tile_n_y,
                 num_sms=num_sms_y,
             )
-            # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
-            #   → (E_local, 2I, H) — same shape as w1_local, varlen-K grouped GEMM.
-            #
-            # quack.gemm cu_seqlens_k expects A: (M, total_K) m-major and
-            # B: (N, total_K) n-major. For dW1: M=2I, N=H, L=E_local,
-            # total_K=TK_padded.
-            #   A = dL_dswiglu_in_flat.t() shape (2I, TK_padded), strides (1, 2I) → m-major ✓
-            #   B = pool.t()               shape (H,  TK_padded), strides (1, H)  → n-major ✓
-            #   D = dW1_local              (E_local, 2I, H) ← matches w1_local layout ✓
-            dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
-            cu_seqlens_k_a = (
-                handle.expert_pool_block_offset.to(torch.int32) * tile_m
-            ).contiguous()
-            gemm(
-                dL_dswiglu_in_flat.t(),
-                pool.t(),
-                dW1_local,
-                None,
-                None,
-                tile_M=tile_m,
-                tile_N=tile_n_a,
-                cluster_M=1,
-                cluster_N=1,
-                cu_seqlens_k=cu_seqlens_k_a,
-            )
 
         # dL_dx_per_r / bwd_compute_done_per_token are written on compute_a,
         # consumed by combine_grads on streams.combine.
@@ -590,11 +558,79 @@ class StreamMoEFunc(torch.autograd.Function):
                 dispatch_seq=handle.dispatch_seq,
             )
 
+        # ── Stage 5 — dW1 / dW2 grouped GEMMs on streams.grads ─────────────
+        # Both grads are LOCAL (each rank holds its E_local slice; never
+        # crosses ranks via combine_grads), so they can run on a side stream
+        # that doesn't block combine_grads. They consume kernel_y_bwd's
+        # outputs (postact_a_for_dW2 / dL_dswiglu_in) plus pool / dL_do_pool
+        # — no dependency on kernel_a_bwd. A single
+        # ``wait_stream(streams.compute_y)`` captures the kernel_y_bwd
+        # completion edge (compute_y has nothing else queued at this point).
+        # On a 132-SM H100 dW1 + dW2 each want a full grid, so they queue
+        # serially on grads — but during their run, combine_grads's sender
+        # (which uses few SMs for IPC ring + cross-rank packets) overlaps
+        # naturally; previously dW1 / dW2 sat in compute_a / compute_y's
+        # tails and competed with kernel_a_bwd / kernel_y_bwd for SMs,
+        # stretching both.
+        streams.grads.wait_stream(streams.compute_y)
+        with torch.cuda.stream(streams.grads):
+            # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
+            #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
+            # postact_a_for_dW2 is the weighted postact (postact *
+            # pool_topk_weight) already materialised in bf16 by kernel_y_bwd's
+            # mPostAct path — no orchestrator-side recompute. Chain rule on
+            #   o[t] = Σ_k topk_weights[t, k] · y_for_(t, k)
+            # gives dW2[e] = Σ_{slot in e} pool_topk_weight[slot] *
+            #               dL_do_pool[slot] outer postact_a[slot] — the
+            # weight factor rides ON postact via the in-kernel multiply.
+            #
+            # quack.gemm with cu_seqlens_k expects A: (M, total_K) m-major
+            # and B: (N, total_K) n-major. For dW2: M=H, N=I, L=E_local,
+            # total_K=TK_padded.
+            #   A = dL_do_pool.t()             (H, TK_padded), m-major
+            #   B = postact_a_for_dW2_flat.t() (I, TK_padded), n-major
+            #   D = dW2_local                  (E_local, H, I)
+            postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
+            cu_seqlens_k = (
+                handle.expert_pool_block_offset.to(torch.int32) * tile_m
+            ).contiguous()
+            gemm(
+                dL_do_pool.t(),
+                postact_a_for_dW2_flat.t(),
+                dW2_local,
+                None,
+                None,
+                tile_M=tile_m,
+                tile_N=tile_n_a,
+                cluster_M=1,
+                cluster_N=1,
+                cu_seqlens_k=cu_seqlens_k,
+            )
+            # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
+            # quack.gemm cu_seqlens_k: A m-major, B n-major.
+            #   A = dL_dswiglu_in_flat.t() (2I, TK_padded), m-major
+            #   B = pool.t()               (H,  TK_padded), n-major
+            #   D = dW1_local              (E_local, 2I, H)
+            dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
+            gemm(
+                dL_dswiglu_in_flat.t(),
+                pool.t(),
+                dW1_local,
+                None,
+                None,
+                tile_M=tile_m,
+                tile_N=tile_n_a,
+                cluster_M=1,
+                cluster_N=1,
+                cu_seqlens_k=cu_seqlens_k,
+            )
+
         # ── Exit chain back to caller_stream ───────────────────────────────
         caller_stream.wait_stream(streams.dispatch)
         caller_stream.wait_stream(streams.compute_y)
         caller_stream.wait_stream(streams.compute_a)
         caller_stream.wait_stream(streams.combine)
+        caller_stream.wait_stream(streams.grads)
 
         # Outputs of combine_grads were allocated on streams.combine; record
         # their use on caller_stream so they're not freed before the upstream
