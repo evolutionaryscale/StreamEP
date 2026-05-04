@@ -11,7 +11,7 @@ consumes it on a separate stream — its per-warp send loop spins on
 before pushing ``o[r]`` back to ``r``'s origin rank.
 
 Within a layer the four streams overlap (intra-layer); across layers they
-serialize via the layer-start ``comm_stream.wait_stream(caller)`` and layer-end
+serialize via the layer-start ``dispatch_stream.wait_stream(caller)`` and layer-end
 ``caller.wait_stream(...)`` back-edges. See design.md §"Cross-stream sync
 chain per layer".
 
@@ -50,10 +50,10 @@ def streaming_moe_layer(
     w1_local: torch.Tensor,
     w2_local: torch.Tensor,
     *,
-    comm_stream: torch.cuda.Stream,
+    dispatch_stream: torch.cuda.Stream,
     compute_a_stream: torch.cuda.Stream,
     compute_y_stream: torch.cuda.Stream,
-    combine_send_stream: torch.cuda.Stream,
+    combine_stream: torch.cuda.Stream,
     num_experts: int,
     dispatch_seq: int,
     tile_m: int = 128,
@@ -74,12 +74,12 @@ def streaming_moe_layer(
     # Layer-start back-edge — see design.md §"Cross-stream sync chain per
     # layer". Without this, iter N's persistent kernel A / kernel Y CTAs (and
     # the combine sender's per-channel CTAs) starve iter N+1's dispatch_main
-    # on shared SMs. We only need to gate ``comm_stream`` here; the other
+    # on shared SMs. We only need to gate ``dispatch_stream`` here; the other
     # three consumer streams are gated by ``metadata_done`` below, which is
-    # recorded downstream of caller_stream → comm_stream's serialization.
-    comm_stream.wait_stream(caller_stream)
+    # recorded downstream of caller_stream → dispatch_stream's serialization.
+    dispatch_stream.wait_stream(caller_stream)
 
-    with torch.cuda.stream(comm_stream):
+    with torch.cuda.stream(dispatch_stream):
         pool, handle, metadata_done = buffer.dispatch(
             x,
             topk_idx,
@@ -168,17 +168,17 @@ def streaming_moe_layer(
     #
     # Cross-stream visibility on ``compute_done_per_token`` is carried by the
     # per-token ``.sys``-scope release/acquire pair the kernels themselves
-    # issue; ``combine_send_stream``'s only cross-stream sync is the
+    # issue; ``combine_stream``'s only cross-stream sync is the
     # ``metadata_done`` event (one-shot, before dispatch main).
-    combine_send_stream.wait_event(metadata_done)
-    handle.compute_done_per_token.record_stream(combine_send_stream)
-    handle.o.record_stream(combine_send_stream)
-    handle.recv_src_idx.record_stream(combine_send_stream)
-    handle.rank_prefix_matrix.record_stream(combine_send_stream)
-    handle.channel_prefix_matrix.record_stream(combine_send_stream)
-    handle.send_head.record_stream(combine_send_stream)
-    handle.recv_topk_weights.record_stream(combine_send_stream)
-    with torch.cuda.stream(combine_send_stream):
+    combine_stream.wait_event(metadata_done)
+    handle.compute_done_per_token.record_stream(combine_stream)
+    handle.o.record_stream(combine_stream)
+    handle.recv_src_idx.record_stream(combine_stream)
+    handle.rank_prefix_matrix.record_stream(combine_stream)
+    handle.channel_prefix_matrix.record_stream(combine_stream)
+    handle.send_head.record_stream(combine_stream)
+    handle.recv_topk_weights.record_stream(combine_stream)
+    with torch.cuda.stream(combine_stream):
         out, _ = buffer.combine(
             handle.o,
             handle,
@@ -187,8 +187,8 @@ def streaming_moe_layer(
         )
 
     # Layer-end back-edges — see design.md §"Cross-stream sync chain per layer".
-    caller_stream.wait_stream(comm_stream)
+    caller_stream.wait_stream(dispatch_stream)
     caller_stream.wait_stream(compute_a_stream)
     caller_stream.wait_stream(compute_y_stream)
-    caller_stream.wait_stream(combine_send_stream)
+    caller_stream.wait_stream(combine_stream)
     return out, handle

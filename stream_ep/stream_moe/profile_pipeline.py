@@ -7,7 +7,7 @@ CTAs should overlap with the tail of kernel A (per-tile a_ready firing).
 
 What you should see in the resulting chrome trace
 -------------------------------------------------
-- `comm_stream`: streaming_dispatch_metadata → host poll → tile_arrays_init
+- `dispatch_stream`: streaming_dispatch_metadata → host poll → tile_arrays_init
   → dispatch main kernel. The dispatch kernel's receiver does Pass 1
   (per-batch slot allocation + data copy into pool) and Pass 2
   (substream-end expert-major tile_ready firing) inline.
@@ -38,6 +38,13 @@ import torch.profiler
 from deep_ep import Buffer as DeepEPBuffer
 
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.utils.distributed import (
+    barrier,
+    get_global_rank,
+    get_world_size,
+    init_distributed,
+    rank_zero_print,
+)
 
 H = 2048
 I = 2048
@@ -98,14 +105,9 @@ def main():
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
     args = p.parse_args()
 
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    torch.cuda.set_device(local_rank)
-    torch_dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    device = init_distributed()
+    rank, world_size = get_global_rank(), get_world_size()
     group = torch_dist.group.WORLD
-
-    device = torch.device(f"cuda:{local_rank}")
     local_E = NUM_EXPERTS // world_size
 
     buffer = make_buffer(group, args.num_sms)
@@ -136,10 +138,10 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    comm_stream = torch.cuda.Stream()
+    dispatch_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
     compute_y_stream = torch.cuda.Stream()
-    combine_send_stream = torch.cuda.Stream()
+    combine_stream = torch.cuda.Stream()
 
     os.makedirs(args.out_dir, exist_ok=True)
     if rank == 0:
@@ -161,10 +163,10 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            comm_stream=comm_stream,
+            dispatch_stream=dispatch_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
-            combine_send_stream=combine_send_stream,
+            combine_stream=combine_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=args.tile_m,
@@ -174,7 +176,7 @@ def main():
             num_sms_y=args.num_sms_y,
         )
     torch.cuda.synchronize()
-    torch_dist.barrier(group=group)
+    barrier(group)
 
     schedule = torch.profiler.schedule(wait=1, warmup=2, active=5, repeat=1)
     with torch.profiler.profile(
@@ -201,10 +203,10 @@ def main():
                     is_token_in_rank,
                     w1_local,
                     w2_local,
-                    comm_stream=comm_stream,
+                    dispatch_stream=dispatch_stream,
                     compute_a_stream=compute_a_stream,
                     compute_y_stream=compute_y_stream,
-                    combine_send_stream=combine_send_stream,
+                    combine_stream=combine_stream,
                     num_experts=NUM_EXPERTS,
                     dispatch_seq=seq + step,
                     tile_m=args.tile_m,
@@ -216,9 +218,8 @@ def main():
             prof.step()
 
     torch.cuda.synchronize()
-    torch_dist.barrier(group=group)
-    if rank == 0:
-        print("done; trace files (one per rank) in:", args.out_dir, flush=True)
+    barrier(group)
+    rank_zero_print("done; trace files (one per rank) in:", args.out_dir, flush=True)
     torch_dist.destroy_process_group()
 
 

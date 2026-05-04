@@ -27,7 +27,6 @@ Outputs PASS / FAIL per iter on rank 0.
 """
 
 import argparse
-import os
 
 import torch
 import torch.distributed as torch_dist
@@ -48,6 +47,13 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     make_uniform_topk_idx,
 )
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.utils.distributed import (
+    barrier,
+    get_global_rank,
+    get_world_size,
+    init_distributed,
+    rank_zero_print,
+)
 
 
 def torch_reference_full_moe(
@@ -116,23 +122,18 @@ def main():
     p.add_argument("--atol", type=float, default=5e-2)
     args = p.parse_args()
 
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    torch.cuda.set_device(local_rank)
-    torch_dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    device = init_distributed()
+    rank, world_size = get_global_rank(), get_world_size()
     group = torch_dist.group.WORLD
-    device = torch.device(f"cuda:{local_rank}")
     local_E = NUM_EXPERTS // world_size
 
-    if rank == 0:
-        print(
-            f"[validate] world={world_size} num_sms={args.num_sms} "
-            f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-            f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
-            f"rtol={args.rtol} atol={args.atol}",
-            flush=True,
-        )
+    rank_zero_print(
+        f"[validate] world={world_size} num_sms={args.num_sms} "
+        f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
+        f"rtol={args.rtol} atol={args.atol}",
+        flush=True,
+    )
 
     buffer = make_buffer(group, args.num_sms)
 
@@ -168,11 +169,11 @@ def main():
     # Compute the eager full-MoE reference once (inputs are fixed across iters).
     out_ref = torch_reference_full_moe(x, topk_idx, topk_weights, w1_full, w2_full)
 
-    comm_stream = torch.cuda.Stream()
+    dispatch_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
     compute_y_stream = torch.cuda.Stream()
-    combine_send_stream = torch.cuda.Stream()
-    torch_dist.barrier(group=group)
+    combine_stream = torch.cuda.Stream()
+    barrier(group)
 
     # Warmup (no validation).
     for warm_seq in range(1, args.n_warmup + 1):
@@ -184,10 +185,10 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            comm_stream=comm_stream,
+            dispatch_stream=dispatch_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
-            combine_send_stream=combine_send_stream,
+            combine_stream=combine_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=TILE_M,
@@ -195,7 +196,7 @@ def main():
             tile_n_y=TILE_N_Y,
         )
     torch.cuda.synchronize()
-    torch_dist.barrier(group=group)
+    barrier(group)
 
     # Validated iters.
     fail_count = 0
@@ -209,10 +210,10 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            comm_stream=comm_stream,
+            dispatch_stream=dispatch_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
-            combine_send_stream=combine_send_stream,
+            combine_stream=combine_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=seq,
             tile_m=TILE_M,
@@ -236,18 +237,17 @@ def main():
         torch_dist.all_reduce(ok_t, op=torch_dist.ReduceOp.MIN)
         all_ok = ok_t.item() == 1
 
-        if rank == 0:
-            tag = "PASS" if all_ok else "FAIL"
-            print(
-                f"[validate] iter {step:3d} seq={seq}: {tag}  "
-                f"max_abs={max_abs:.4f} max_rel={max_rel:.4f} "
-                f"n_bad={n_bad} (this rank)",
-                flush=True,
-            )
+        tag = "PASS" if all_ok else "FAIL"
+        rank_zero_print(
+            f"[validate] iter {step:3d} seq={seq}: {tag}  "
+            f"max_abs={max_abs:.4f} max_rel={max_rel:.4f} "
+            f"n_bad={n_bad} (this rank)",
+            flush=True,
+        )
         if not all_ok:
             fail_count += 1
 
-    torch_dist.barrier(group=group)
+    barrier(group)
     if rank == 0:
         if fail_count == 0:
             print(f"[validate] ALL {args.n_iter} ITERS OK", flush=True)

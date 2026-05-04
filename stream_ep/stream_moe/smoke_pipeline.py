@@ -12,7 +12,6 @@ Launch:
 """
 
 import argparse
-import os
 import time
 
 import torch
@@ -33,6 +32,13 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     make_uniform_topk_idx,
 )
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.utils.distributed import (
+    barrier,
+    get_global_rank,
+    get_world_size,
+    init_distributed,
+    rank_zero_print,
+)
 
 
 def main():
@@ -43,28 +49,21 @@ def main():
     p.add_argument("--n_iter", type=int, default=5)
     args = p.parse_args()
 
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    torch.cuda.set_device(local_rank)
-    torch_dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    device = init_distributed()
+    rank, world_size = get_global_rank(), get_world_size()
     group = torch_dist.group.WORLD
-
-    device = torch.device(f"cuda:{local_rank}")
     local_E = NUM_EXPERTS // world_size
 
-    if rank == 0:
-        print(
-            f"[smoke] config: world={world_size} num_sms={args.num_sms} "
-            f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-            f"n_warmup={args.n_warmup} n_iter={args.n_iter}",
-            flush=True,
-        )
+    rank_zero_print(
+        f"[smoke] config: world={world_size} num_sms={args.num_sms} "
+        f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter}",
+        flush=True,
+    )
 
     t0 = time.time()
     buffer = make_buffer(group, args.num_sms)
-    if rank == 0:
-        print(f"[smoke] buffer init: {time.time() - t0:.2f}s", flush=True)
+    rank_zero_print(f"[smoke] buffer init: {time.time() - t0:.2f}s", flush=True)
 
     g = torch.Generator(device=device).manual_seed(42)
     w1_full = (
@@ -91,11 +90,11 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    comm_stream = torch.cuda.Stream()
+    dispatch_stream = torch.cuda.Stream()
     compute_a_stream = torch.cuda.Stream()
     compute_y_stream = torch.cuda.Stream()
-    combine_send_stream = torch.cuda.Stream()
-    torch_dist.barrier(group=group)
+    combine_stream = torch.cuda.Stream()
+    barrier(group)
 
     t0 = time.time()
     for warm_seq in range(1, args.n_warmup + 1):
@@ -107,10 +106,10 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            comm_stream=comm_stream,
+            dispatch_stream=dispatch_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
-            combine_send_stream=combine_send_stream,
+            combine_stream=combine_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=TILE_M,
@@ -118,14 +117,13 @@ def main():
             tile_n_y=TILE_N_Y,
         )
     torch.cuda.synchronize()
-    torch_dist.barrier(group=group)
+    barrier(group)
     t_warmup = time.time() - t0
-    if rank == 0:
-        print(
-            f"[smoke] warmup ({args.n_warmup} iters, includes JIT): "
-            f"{t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)",
-            flush=True,
-        )
+    rank_zero_print(
+        f"[smoke] warmup ({args.n_warmup} iters, includes JIT): "
+        f"{t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)",
+        flush=True,
+    )
 
     t0 = time.time()
     for step in range(args.n_iter):
@@ -137,10 +135,10 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            comm_stream=comm_stream,
+            dispatch_stream=dispatch_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
-            combine_send_stream=combine_send_stream,
+            combine_stream=combine_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=100 + step,
             tile_m=TILE_M,
@@ -148,15 +146,14 @@ def main():
             tile_n_y=TILE_N_Y,
         )
     torch.cuda.synchronize()
-    torch_dist.barrier(group=group)
+    barrier(group)
     t_iter = time.time() - t0
-    if rank == 0:
-        print(
-            f"[smoke] timed   ({args.n_iter} iters):              "
-            f"{t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)",
-            flush=True,
-        )
-        print("[smoke] OK", flush=True)
+    rank_zero_print(
+        f"[smoke] timed   ({args.n_iter} iters):              "
+        f"{t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)",
+        flush=True,
+    )
+    rank_zero_print("[smoke] OK", flush=True)
 
     torch_dist.destroy_process_group()
 

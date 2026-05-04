@@ -35,13 +35,20 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 def st_release_sys_global(
     gmem_ptr: cute.Pointer, val: cutlass.Int64, *, loc=None, ip=None
 ) -> None:
-    """Release-store an int64 value to a global pointer with .sys scope."""
+    """Release-store an int64 value to a global pointer with .sys scope.
+
+    The ``~{memory}`` clobber tells the LLVM optimizer this asm reads/writes
+    arbitrary memory, preventing it from sinking earlier writes to AFTER
+    this release-store. Without it the release fence is correct in PTX but
+    the source-level ordering can be silently broken by the optimizer.
+    Zero runtime cost — purely a compiler-barrier annotation.
+    """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
         [gmem_ptr_i64, cutlass.Int64(val).ir_value(loc=loc, ip=ip)],
         "st.release.sys.global.b64 [$0], $1;",
-        "l,l",
+        "l,l,~{memory}",
         has_side_effects=True,
         is_align_stack=False,
     )
@@ -51,14 +58,21 @@ def st_release_sys_global(
 def ld_acquire_sys_global(
     gmem_ptr: cute.Pointer, *, loc=None, ip=None
 ) -> cutlass.Int64:
-    """Acquire-load an int64 value from a global pointer with .sys scope."""
+    """Acquire-load an int64 value from a global pointer with .sys scope.
+
+    The ``~{memory}`` clobber prevents the LLVM optimizer from hoisting
+    surrounding loads ABOVE this acquire-load. Without it, source-level
+    ``val = pool[slot]`` after a spin-on-acquire can be reordered to
+    fetch ``pool[slot]`` once before the spin even starts, defeating the
+    synchronizes-with edge. Zero runtime cost.
+    """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     return cutlass.Int64(
         llvm.inline_asm(
             T.i64(),
             [gmem_ptr_i64],
             "ld.acquire.sys.global.b64 $0, [$1];",
-            "=l,l",
+            "=l,l,~{memory}",
             has_side_effects=True,
             is_align_stack=False,
         )

@@ -8,7 +8,7 @@ Setup
   (gemm_gated) and kernel Y (gemm + atomic-scatter into o[T_recv, H]) read
   from the pool via the standard varlen_m strided TMA path.
 - Time three things, all on a single GPU:
-    * dispatch only (comm_stream)
+    * dispatch only (dispatch_stream)
     * each kernel in isolation with its ready signal pre-set (compute_a/y stream)
     * end-to-end pipeline (3 streams, real producer-consumer release/acquire)
 - Reference baselines:
@@ -25,7 +25,6 @@ Launch:
 """
 
 import argparse
-import os
 
 import torch
 import torch.distributed as torch_dist
@@ -40,6 +39,14 @@ from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
     streaming_moe_y,
 )
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.utils.distributed import (
+    barrier,
+    get_global_rank,
+    get_world_size,
+    init_distributed,
+    rank_zero_only,
+    rank_zero_print,
+)
 
 H = 2048
 I = 2048
@@ -55,6 +62,13 @@ NUM_SMS = 132  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
 # dispatch speedup just enlarges an already-overlapping gap;
 # the critical path is kernel A. Default to the ceiling rather
 # than picking a mid-range sweet spot that's within noise.
+# Note: requires CUDA_DEVICE_MAX_CONNECTIONS=1 in the env to
+# avoid the dispatch_main↔kernel_A SM-residency deadlock
+# documented in bug.md. Production code sets this in
+# `evolutionaryscale.utils.distributed.init_distributed`; the
+# bench scripts here bypass that helper, so set it in your
+# shell before running, e.g. `CUDA_DEVICE_MAX_CONNECTIONS=1
+# torchrun ...`.
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128
@@ -127,14 +141,9 @@ def main():
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
     args, _ = p.parse_known_args()
 
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    torch.cuda.set_device(local_rank)
-    torch_dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    device = init_distributed()
+    rank, world_size = get_global_rank(), get_world_size()
     group = torch_dist.group.WORLD
-
-    device = torch.device(f"cuda:{local_rank}")
     local_E = NUM_EXPERTS // world_size
 
     buffer = make_buffer(group, args.num_sms_dispatch)
@@ -165,19 +174,19 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    # Four caller-managed streams. `comm_stream` for dispatch; `compute_a_stream`
-    # for kernel A; `compute_y_stream` for kernel Y; `combine_send_stream` for
+    # Four caller-managed streams. `dispatch_stream` for dispatch; `compute_a_stream`
+    # for kernel A; `compute_y_stream` for kernel Y; `combine_stream` for
     # the combine sender. The metadata-done event records between the metadata
     # kernel and the dispatch main kernel — consumer streams `wait_event` on it
     # to safely read metadata tensors without serializing against dispatch main.
-    comm_stream = torch.cuda.Stream(device=device)
+    dispatch_stream = torch.cuda.Stream(device=device)
     compute_a_stream = torch.cuda.Stream(device=device)
     compute_y_stream = torch.cuda.Stream(device=device)
-    combine_send_stream = torch.cuda.Stream(device=device)
+    combine_stream = torch.cuda.Stream(device=device)
 
     # Run dispatch once to get a StreamingHandle. Reuse this for all isolated
     # kernel timing runs (kernel A / kernel Y individually).
-    with torch.cuda.stream(comm_stream):
+    with torch.cuda.stream(dispatch_stream):
         pool, handle, metadata_done = buffer.dispatch(
             x,
             topk_idx,
@@ -188,9 +197,9 @@ def main():
             dispatch_seq=1,
         )
     # For isolated kernel timing below we need dispatch fully done; sync the
-    # default stream against comm_stream so subsequent default-stream work
+    # default stream against dispatch_stream so subsequent default-stream work
     # (the isolated runs) sees dispatch's writes.
-    torch.cuda.current_stream().wait_stream(comm_stream)
+    torch.cuda.current_stream().wait_stream(dispatch_stream)
     torch.cuda.synchronize()
     total_tiles = handle.total_tiles
     TK_padded = pool.shape[0]
@@ -352,18 +361,16 @@ def main():
     run_gemm_y_ref()
     run_combine_only()
     torch.cuda.synchronize()
-    torch_dist.barrier(group=group)
+    barrier(group)
 
-    if rank == 0:
-        print("=== per-stage isolated timing ===")
-        print(
-            f"{'kernel':>26s}  {'tile_M':>6s}  {'tile_N':>6s}  {'time (μs)':>10s}  {'TFLOPs/s':>10s}"
-        )
-        print(f"{'-' * 26}  {'-' * 6}  {'-' * 6}  {'-' * 10}  {'-' * 10}")
+    rank_zero_print("=== per-stage isolated timing ===")
+    rank_zero_print(
+        f"{'kernel':>26s}  {'tile_M':>6s}  {'tile_N':>6s}  {'time (μs)':>10s}  {'TFLOPs/s':>10s}"
+    )
+    rank_zero_print(f"{'-' * 26}  {'-' * 6}  {'-' * 6}  {'-' * 10}  {'-' * 10}")
 
+    @rank_zero_only
     def fmt_row(name, tm, tn, t_us, flops):
-        if rank != 0:
-            return
         tflops = flops / (t_us * 1e-6) / 1e12
         print(f"{name:>26s}  {tm:>6d}  {tn:>6d}  {t_us:>10.1f}  {tflops:>10.2f}")
 
@@ -398,15 +405,14 @@ def main():
             f"{'buffer.combine':>26s}  {'-':>6s}  {'-':>6s}  {combine_us:>10.1f}  {'-':>10s}"
         )
 
-    if rank == 0:
-        print()
+    rank_zero_print()
 
     # ────────────────────────────────────────────────────────────────────
     # End-to-end pipeline timing: dispatch + A + Y + combine on four streams.
     # ────────────────────────────────────────────────────────────────────
     # Each iteration runs a fresh dispatch (so DeepEP allocates fresh per-token
     # state) followed by kernel A on compute_a_stream, kernel Y on
-    # compute_y_stream, and combine sender on combine_send_stream.
+    # compute_y_stream, and combine sender on combine_stream.
     # Cross-stream visibility:
     # (a) `metadata_done` event recorded by dispatch between the metadata
     #     kernel and the dispatch main kernel — consumer streams wait_event on
@@ -424,10 +430,10 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            comm_stream=comm_stream,
+            dispatch_stream=dispatch_stream,
             compute_a_stream=compute_a_stream,
             compute_y_stream=compute_y_stream,
-            combine_send_stream=combine_send_stream,
+            combine_stream=combine_stream,
             num_experts=NUM_EXPERTS,
             dispatch_seq=seq,
             tile_m=args.tile_m,
@@ -453,7 +459,7 @@ def main():
     def dispatch_only():
         nonlocal_seq = seq_counter[0]
         seq_counter[0] += 1
-        with torch.cuda.stream(comm_stream):
+        with torch.cuda.stream(dispatch_stream):
             buffer.dispatch(
                 x,
                 topk_idx,
@@ -463,14 +469,14 @@ def main():
                 tile_m=args.tile_m,
                 dispatch_seq=nonlocal_seq,
             )
-        # Layer-end barrier: default stream waits on comm_stream.
-        torch.cuda.current_stream().wait_stream(comm_stream)
+        # Layer-end barrier: default stream waits on dispatch_stream.
+        torch.cuda.current_stream().wait_stream(dispatch_stream)
 
     dispatch_us = time_kernel(dispatch_only, warmup=pipe_warmup, iters=pipe_iters)
 
     if rank == 0:
         print("=== end-to-end pipeline (dispatch + A + Y + combine, 4 streams) ===")
-        print(f"  dispatch (alone, comm_stream):           {dispatch_us:7.1f} μs")
+        print(f"  dispatch (alone, dispatch_stream):           {dispatch_us:7.1f} μs")
         print(f"  streaming_moe_a (alone, compute_a):      {streaming_a_us:7.1f} μs")
         print(f"  streaming_moe_y (alone, compute_y):      {streaming_y_us:7.1f} μs")
         print(f"  buffer.combine (alone, combine_send):    {combine_us:7.1f} μs")
