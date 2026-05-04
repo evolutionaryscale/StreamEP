@@ -44,6 +44,7 @@ class StreamingHandle:
     expert_frequency: torch.Tensor             # [E_local] int32
     expert_pool_block_offset: torch.Tensor     # [E_local + 1] int32 — pool-block prefix-sum (BLOCK_M-tile units)
     base_pool: torch.Tensor                    # [num_channels, num_ranks, E_local] int32
+    seen_per_substream: torch.Tensor           # [num_channels, num_ranks, E_local] int32 — bwd Pass 2 input (substream's per-expert recv count)
 
     # ── Per-tile arrays.
     tile_id_to_expert: torch.Tensor            # [total_tiles] int32 — per-tile expert lookup
@@ -451,6 +452,7 @@ class Buffer:
             expert_frequency=out.expert_frequency,
             expert_pool_block_offset=out.expert_pool_block_offset,
             base_pool=out.base_pool,
+            seen_per_substream=out.seen_per_substream,
             tile_id_to_expert=out.tile_id_to_expert,
             pool_arrival_target=out.pool_arrival_target,
             tile_ready=out.tile_ready,

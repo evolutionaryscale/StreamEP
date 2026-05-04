@@ -230,6 +230,21 @@ def main():
         "k_local_count should equal per_token_remaining (both = K_local(r) pre-decrement)"
     )
 
+    # seen_per_substream[c, src, e] = my_e_inbox[c, src, e] from the metadata
+    # kernel's IPC count exchange. Invariant: summing over (c, src) gives the
+    # per-expert totals, i.e. expert_frequency[e].
+    sps = handle.seen_per_substream.cpu()
+    expected_sps_shape = (sps.shape[0], world_size, num_local_experts)
+    assert sps.shape == expected_sps_shape, (
+        f"seen_per_substream shape {sps.shape} != {expected_sps_shape}"
+    )
+    sps_per_expert = sps.sum(dim=(0, 1))
+    expected_sps_per_expert = handle.expert_frequency.cpu()
+    assert torch.equal(sps_per_expert, expected_sps_per_expert), (
+        f"sum_(c, src) seen_per_substream[c, src, :] should equal expert_frequency; "
+        f"got {sps_per_expert} vs {expected_sps_per_expert}"
+    )
+
     # ─── (7) Bit-determinism — re-run with same inputs, expect identical pool layout.
     pool2, handle2, _ = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,
@@ -244,6 +259,8 @@ def main():
         "recv_token_to_slots not deterministic"
     assert torch.equal(handle.k_local_count.cpu(), handle2.k_local_count.cpu()), \
         "k_local_count not deterministic"
+    assert torch.equal(handle.seen_per_substream.cpu(), handle2.seen_per_substream.cpu()), \
+        "seen_per_substream not deterministic"
     # `pool` padding rows are now left uninitialized (kernel Y's pool_recv_token
     # predicate is the actual safety mechanism). Compare valid rows only.
     valid = (handle.pool_recv_token.cpu() >= 0)

@@ -92,6 +92,7 @@ struct StreamingDispatchOutputs {
     torch::Tensor expert_frequency;
     torch::Tensor expert_pool_block_offset;
     torch::Tensor base_pool;
+    torch::Tensor seen_per_substream;
 
     torch::Tensor tile_id_to_expert;
     torch::Tensor pool_arrival_target;

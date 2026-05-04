@@ -552,6 +552,7 @@ struct PrePollBundle {
     torch::Tensor expert_frequency;          // [E_local]
     torch::Tensor expert_pool_block_offset;  // [E_local + 1]
     torch::Tensor base_pool;                 // [num_channels, R, E_local]
+    torch::Tensor seen_per_substream;        // [num_channels, R, E_local] — bwd Pass 2 input
     torch::Tensor rank_prefix_matrix;        // [R, R]
     torch::Tensor total_tiles_device;        // [1]
     torch::Tensor tile_id_to_expert;         // [total_tiles_max] (caller narrows)
@@ -571,6 +572,7 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
     int64_t off_expert_frequency         = b.reserve<int>(num_local_experts);
     int64_t off_expert_pool_block_offset = b.reserve<int>(num_local_experts + 1);
     int64_t off_base_pool                = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    int64_t off_seen_per_substream       = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
     int64_t off_rank_prefix_matrix       = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
     int64_t off_total_tiles_device       = b.reserve<int>(1);
     int64_t off_tile_id_to_expert        = b.reserve<int>(total_tiles_max);
@@ -591,6 +593,7 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
         .expert_frequency         = at::from_blob(base + off_expert_frequency,         {num_local_experts},                                  keep, i32_opts),
         .expert_pool_block_offset = at::from_blob(base + off_expert_pool_block_offset, {num_local_experts + 1},                              keep, i32_opts),
         .base_pool                = at::from_blob(base + off_base_pool,                {num_channels, num_ranks, num_local_experts},         keep, i32_opts),
+        .seen_per_substream       = at::from_blob(base + off_seen_per_substream,       {num_channels, num_ranks, num_local_experts},         keep, i32_opts),
         .rank_prefix_matrix       = at::from_blob(base + off_rank_prefix_matrix,       {num_ranks, num_ranks},                               keep, i32_opts),
         .total_tiles_device       = at::from_blob(base + off_total_tiles_device,       {1},                                                  keep, i32_opts),
         .tile_id_to_expert        = at::from_blob(base + off_tile_id_to_expert,        {total_tiles_max},                                    keep, i32_opts),
@@ -823,6 +826,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
                                            pre.expert_frequency.data_ptr<int>(),
                                            pre.expert_pool_block_offset.data_ptr<int>(),
                                            pre.base_pool.data_ptr<int>(),
+                                           pre.seen_per_substream.data_ptr<int>(),
                                            pre.rank_prefix_matrix.data_ptr<int>(),
                                            pre.tile_id_to_expert.data_ptr<int>(),
                                            pre.pool_arrival_target.data_ptr<int>(),
@@ -965,6 +969,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .expert_frequency           = pre.expert_frequency,
         .expert_pool_block_offset   = pre.expert_pool_block_offset,
         .base_pool                  = pre.base_pool,
+        .seen_per_substream         = pre.seen_per_substream,
         .tile_id_to_expert          = tile_id_to_expert,
         .pool_arrival_target        = pool_arrival_target,
         .tile_ready                 = post.tile_ready,
@@ -1927,6 +1932,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("expert_frequency",           &deep_ep::StreamingDispatchOutputs::expert_frequency)
         .def_readonly("expert_pool_block_offset",   &deep_ep::StreamingDispatchOutputs::expert_pool_block_offset)
         .def_readonly("base_pool",                  &deep_ep::StreamingDispatchOutputs::base_pool)
+        .def_readonly("seen_per_substream",         &deep_ep::StreamingDispatchOutputs::seen_per_substream)
         .def_readonly("tile_id_to_expert",          &deep_ep::StreamingDispatchOutputs::tile_id_to_expert)
         .def_readonly("pool_arrival_target",        &deep_ep::StreamingDispatchOutputs::pool_arrival_target)
         .def_readonly("tile_ready",                 &deep_ep::StreamingDispatchOutputs::tile_ready)

@@ -109,6 +109,7 @@ __global__ void streaming_dispatch_metadata_kernel(
         int* expert_frequency,
         int* expert_pool_block_offset,
         int* base_pool,
+        int* seen_per_substream,
         int* rank_prefix_matrix,
         int* tile_id_to_expert,
         int* pool_arrival_target,
@@ -254,11 +255,22 @@ __global__ void streaming_dispatch_metadata_kernel(
     //   base_pool[c, src, e] = smem_pool_blk[e] * tile_m
     //                          + Σ over (c', src') < (c, src) lex of e_inbox[c', src', e].
     // E ≤ NUM_MAX_LOCAL_EXPERTS so we can run one thread per expert in parallel.
+    //
+    // Also persist seen_per_substream[c, src, e] = my_e_inbox[c, src, e]
+    // (the per-substream-per-expert recv count) for the backward path. The
+    // bwd dispatch_grads receiver doesn't run Pass A — it gathers slots from
+    // recv_token_to_slots — so it can't reconstruct fwd's SMEM seen_substream
+    // counter. Persisting it here lets bwd Pass 2 reuse fwd's per-block atomic
+    // accounting verbatim: walk experts, atomic-add seen_per_substream[cs, e]
+    // worth of writes, fire bwd_y_ready when count == tile_m.
+    // Cost: ~17 KB int32 at production (66 channels × 8 ranks × 8 experts).
     for (int e = thread_id; e < E; e += num_threads) {
         int acc = smem_pool_blk[e] * tile_m;
         for (int cs = 0; cs < num_channels * kNumRanks; ++cs) {
             base_pool[cs * E + e] = acc;
-            acc += my_e_inbox[cs * E + e];
+            int n = my_e_inbox[cs * E + e];
+            seen_per_substream[cs * E + e] = n;
+            acc += n;
         }
     }
 
@@ -287,6 +299,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* expert_frequency,
                                  int* expert_pool_block_offset,
                                  int* base_pool,
+                                 int* seen_per_substream,
                                  int* rank_prefix_matrix,
                                  int* tile_id_to_expert,
                                  int* pool_arrival_target,
@@ -313,6 +326,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                   expert_frequency,                                                          \
                   expert_pool_block_offset,                                                  \
                   base_pool,                                                                 \
+                  seen_per_substream,                                                        \
                   rank_prefix_matrix,                                                        \
                   tile_id_to_expert,                                                         \
                   pool_arrival_target,                                                       \
