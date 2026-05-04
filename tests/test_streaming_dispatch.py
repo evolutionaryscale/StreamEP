@@ -114,7 +114,6 @@ def main():
     tile_id_to_expert = handle.tile_id_to_expert.cpu()
     pool_arrival_target = handle.pool_arrival_target.cpu()
     expert_frequency = handle.expert_frequency.cpu()
-    recv_src_idx = handle.recv_src_idx.cpu()
 
     # ─── (1) Per-pool-slot validation. For every slot s with pool_recv_token[s] >= 0:
     #         (a) the slot lies in the right expert's pool region,
@@ -150,9 +149,6 @@ def main():
     assert torch.equal(seen_rk, expected_seen), (
         f"pool covers {seen_rk.sum()} (rt, k) pairs but expected {expected_seen.sum()}"
     )
-
-    # ─── (2) recv_src_idx matches the gathered source-token-index list.
-    assert torch.equal(recv_src_idx, expected_recv_token_src_idx), "recv_src_idx mismatch"
 
     # ─── (3) tile_ready[tile_id] == dispatch_seq for all tile_id.
     ready = handle.tile_ready[:total_tiles].cpu()

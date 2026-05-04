@@ -383,7 +383,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
     EP_DEVICE_ASSERT(num_experts_per_rank <= kMaxLocalExpertsPerRank);
     EP_DEVICE_ASSERT(shape.num_topk <= kMaxTopK);
     EP_DEVICE_ASSERT((inputs.topk_idx == nullptr) == (inputs.topk_weights == nullptr));
-    EP_DEVICE_ASSERT(per_token_out.recv_topk_weights != nullptr);
 
     // Calculate pointers by the specific layout
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
@@ -770,13 +769,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                         }
                     }
 
-                    // Per-recv-token writes (combine consumes recv_src_idx + recv_topk_weights).
-                    if (lane_id == 0)
-                        per_token_out.recv_src_idx[recv_token_id] = ld_nc_global(channel_src_idx_buffers.buffer() + token_idx_in_buffer);
-                    if (lane_id < shape.num_topk) {
-                        per_token_out.recv_topk_weights[static_cast<int64_t>(recv_token_id) * shape.num_topk + lane_id] =
-                            ld_nc_global(channel_topk_weights_buffers.buffer() + token_idx_in_buffer * shape.num_topk + lane_id);
-                    }
                 }
 
                 asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
@@ -1287,7 +1279,6 @@ void cached_notify_combine(void** buffer_ptrs,
 //   │ x                       │ handle.o[T_recv, H]                      │ dL/dx_per_r[T_recv, H]                 │
 //   │ per_slot_weights        │ pool_topk_weight[TK_padded] fp32         │ weight_grads[TK_padded] fp32           │
 //   │ recv_token_to_slots     │ same — populated by fwd dispatch Pass B  │ same                                   │
-//   │ bias_0 / bias_1         │ optional bias inputs                     │ nullptr                                │
 //   │ compute_done_per_token  │ kernel_y forward release stamp           │ kernel_a_bwd release stamp             │
 //   │ combine_seq             │ dispatch_seq (fwd's value)               │ dispatch_seq (bwd uses same int)       │
 //   └─────────────────────────┴──────────────────────────────────────────┴────────────────────────────────────────┘
@@ -1304,9 +1295,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                                           const dtype_t* x,
                                                           const float* per_slot_weights,
                                                           const int* recv_token_to_slots,
-                                                          const dtype_t* bias_0,
-                                                          const dtype_t* bias_1,
-                                                          const int* src_idx,
                                                           const int* rank_prefix_matrix,
                                                           const int* channel_prefix_matrix,
                                                           int* send_head,
@@ -1332,8 +1320,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
     int hidden_int4 = hidden * sizeof(dtype_t) / sizeof(int4);
     int hidden_int4_aligned = align_down(hidden_int4, 32);
     auto x_int4 = reinterpret_cast<const int4*>(x);
-    auto bias_0_int4 = reinterpret_cast<const int4*>(bias_0);
-    auto bias_1_int4 = reinterpret_cast<const int4*>(bias_1);
     auto recv_int4 = reinterpret_cast<int4*>(recv_x);
 
     // TMA stuffs
@@ -1363,14 +1349,16 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
         // `head_idx`: kNumChannels * kNumRanks * sizeof(int)
         // `tail_idx`: kNumChannels * kNumRanks * sizeof(int)
         // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
-        // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
+        // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)   ← skipped (unused by combine; populated by dispatch only)
         // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
         auto channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
         auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
         auto channel_x_buffers = Buffer<int4>(
             ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
-        auto channel_src_idx_buffers =
-            Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
+        // Skip past src_idx region (slab layout fixed by dispatch; combine
+        // doesn't write or read it).
+        ptr = reinterpret_cast<void*>(static_cast<int8_t*>(ptr) +
+                                      num_channels_total * num_recv_buffer_tokens * sizeof(int));
         auto channel_topk_weights_buffers = Buffer<float>(
             ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
 
@@ -1425,10 +1413,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x = x_int4 + my_token * hidden_int4;
                 UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
-
-                // Send source index
-                if (elect_one_sync())
-                    channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + my_token);
 
                 // Send the per-(my_token, k) weight via slot lookup. Fwd:
                 // pool_topk_weight[slot] = topk_weights[t, k]; bwd:
@@ -1571,28 +1555,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 EP_STATIC_ASSERT(kNumStages * 32 * sizeof(int4) <= kNumTMABytesPerWarp, "Invalid count");
                 #pragma unroll
                 for (int i = lane_id; i < hidden_int4; i += 32) {
-                    // Read bias
-                    // TODO: make it as a template
-                    int4 bias_0_value_int4 =
-                        bias_0_int4 != nullptr ? __ldg(bias_0_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
-                    int4 bias_1_value_int4 =
-                        bias_1_int4 != nullptr ? __ldg(bias_1_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
-
                     // Read buffers
                     int4 recv_value_int4[kNumRanks];
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++j)
                         recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
 
-                    // Reduce bias
-                    float values[kDtypePerInt4];
-                    auto bias_0_values = reinterpret_cast<const dtype_t*>(&bias_0_value_int4);
-                    auto bias_1_values = reinterpret_cast<const dtype_t*>(&bias_1_value_int4);
-                    #pragma unroll
-                    for (int j = 0; j < kDtypePerInt4; ++j)
-                        values[j] = static_cast<float>(bias_0_values[j]) + static_cast<float>(bias_1_values[j]);
-
-                    // Reduce all-to-all results
+                    // Reduce all-to-all results into fp32 accumulator.
+                    float values[kDtypePerInt4] = {};
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++j) {
                         auto recv_value_dtypes = reinterpret_cast<const dtype_t*>(&recv_value_int4[j]);
@@ -1666,9 +1636,6 @@ void launch_combine_main(cudaDataType_t type,
              const void* x,
              const float* per_slot_weights,
              const int* recv_token_to_slots,
-             const void* bias_0,
-             const void* bias_1,
-             const int* src_idx,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
              int* send_head,
@@ -1702,9 +1669,6 @@ void launch_combine_main(cudaDataType_t type,
                       reinterpret_cast<const dtype*>(x),                       \
                       per_slot_weights,                                        \
                       recv_token_to_slots,                                     \
-                      reinterpret_cast<const dtype*>(bias_0),                  \
-                      reinterpret_cast<const dtype*>(bias_1),                  \
-                      src_idx,                                                 \
                       rank_prefix_matrix,                                      \
                       channel_prefix_matrix,                                   \
                       send_head,                                               \

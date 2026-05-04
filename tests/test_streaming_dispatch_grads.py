@@ -5,8 +5,9 @@ as ``Buffer.dispatch`` — the kernel ships ``dL/dy[t]`` from origin → expert
 ranks, K-fans into pool slots looked up from ``handle.recv_token_to_slots``.
 Verifies:
 
-  1. dL_do_pool[slot] equals the source rank's dL_dy[recv_src_idx[r]] for
-     every (recv_token r, k_local k) pair with slot >= 0.
+  1. dL_do_pool[slot] equals the source rank's dL_dy[t_src] for every
+     (recv_token r, k_local k) pair with slot >= 0, where (sender_rank, t_src)
+     is derived locally from rank-major recv layout + is_token_in_rank.
   2. bwd_y_ready[tile_id] == dispatch_seq for every tile_id in [0, total_tiles).
   3. Bit-determinism across re-runs.
 
@@ -95,28 +96,33 @@ def main():
         f"bwd_y_ready shape {bwd_y_ready.shape} != ({total_tiles},)"
     assert bwd_y_ready.dtype == torch.int64
 
-    # Build expected: for each rank S, gather S's dL_dy. Then for each pool slot
-    # with pool_recv_token[s] >= 0, determine sender_rank from recv-token's
-    # position in the rank-major recv layout, and check
-    # dL_do_pool[s] == all_dL_dy[sender_rank][recv_src_idx[s_recv]].
+    # Build expected: for each rank S, gather S's dL_dy + is_token_in_rank.
+    # Then construct per-rank's local recv-token → source-token-id mapping
+    # (no longer surfaced as `recv_src_idx`), and verify dL_do_pool[s] equals
+    # the source rank's dL_dy[t_src] for the slot's recv-token.
     all_dL_dy = [torch.empty_like(dL_dy) for _ in range(world_size)]
     dist.all_gather(all_dL_dy, dL_dy, group=group)
     all_is_in_rank = [torch.empty_like(is_token_in_rank) for _ in range(world_size)]
     dist.all_gather(all_is_in_rank, is_token_in_rank, group=group)
 
-    # For each recv-token r ∈ [0, T_recv), determine sender rank via the same
-    # rank-major layout fwd uses (rank 0's tokens-to-me first, then rank 1's, ...).
+    # For each recv-token r ∈ [0, T_recv), determine (sender_rank, source_token_idx)
+    # via the same rank-major layout fwd uses (rank 0's tokens-to-me first, then
+    # rank 1's, ...). Source-token order within each rank's slice is
+    # is_token_in_rank-True order.
     recv_token_src_rank = torch.empty((T_recv,), dtype=torch.int32, device="cpu")
+    recv_token_src_idx = torch.empty((T_recv,), dtype=torch.int32, device="cpu")
     cur = 0
     for src in range(world_size):
-        n = int(all_is_in_rank[src][:, rank].sum().item())
+        src_in = all_is_in_rank[src][:, rank].cpu()
+        idx_in_src = torch.nonzero(src_in, as_tuple=False).flatten().to(torch.int32)
+        n = idx_in_src.numel()
         recv_token_src_rank[cur:cur + n] = src
+        recv_token_src_idx[cur:cur + n] = idx_in_src
         cur += n
     assert cur == T_recv
 
     pool_recv_token = handle.pool_recv_token.cpu()
     pool_k_slot = handle.pool_k_slot.cpu()
-    recv_src_idx = handle.recv_src_idx.cpu()
     dL_do_pool_cpu = dL_do_pool.cpu()
     all_dL_dy_cpu = [t.cpu() for t in all_dL_dy]
 
@@ -126,7 +132,7 @@ def main():
         if r < 0:
             continue  # padding
         src = int(recv_token_src_rank[r].item())
-        t_src = int(recv_src_idx[r].item())
+        t_src = int(recv_token_src_idx[r].item())
         expected = all_dL_dy_cpu[src][t_src]
         got = dL_do_pool_cpu[s]
         if not torch.equal(expected, got):

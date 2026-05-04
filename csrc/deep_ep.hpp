@@ -79,11 +79,7 @@ struct StreamingDispatchOutputs {
     torch::Tensor pool_recv_token;
     torch::Tensor pool_k_slot;
 
-    torch::Tensor recv_topk_weights;
-    torch::Tensor recv_src_idx;
     torch::Tensor send_head;
-
-    std::vector<int> num_recv_tokens_per_expert;
 
     torch::Tensor rank_prefix_matrix;
     torch::Tensor channel_prefix_matrix;
@@ -281,9 +277,6 @@ public:
         const torch::Tensor& x,
         const torch::Tensor& per_slot_weights,
         const torch::Tensor& recv_token_to_slots,
-        const std::optional<torch::Tensor>& bias_0,
-        const std::optional<torch::Tensor>& bias_1,
-        const torch::Tensor& src_idx,
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
         const torch::Tensor& send_head,

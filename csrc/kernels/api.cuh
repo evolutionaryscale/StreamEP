@@ -98,8 +98,6 @@ struct DispatchPoolOut {
 };
 
 struct DispatchPerTokenOut {
-    int* recv_src_idx;             // [T_recv]              recv-token → source token idx
-    float* recv_topk_weights;      // [T_recv, num_topk]
     int* recv_channel_prefix_matrix;  // [num_ranks, num_channels]  receiver-side cumulative
     int* send_head;                // [num_tokens, num_ranks]
     int* per_token_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs to 0
@@ -205,17 +203,14 @@ void cached_notify_combine(void** buffer_ptrs,
 
 // combine_main_kernel — used by both forward combine and backward combine_grads.
 // Per-direction differences are entirely in args (per_slot_weights tensor,
-// gate variable, output destinations, optional biases). See the kernel header
-// comment in intranode.cu for the full args table.
+// gate variable, output destinations). See the kernel header comment in
+// intranode.cu for the full args table.
 void launch_combine_main(cudaDataType_t type,
              void* recv_x,
              float* recv_topk_weights_out,
              const void* x,
              const float* per_slot_weights,
              const int* recv_token_to_slots,
-             const void* bias_0,
-             const void* bias_1,
-             const int* src_idx,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
              int* send_head,

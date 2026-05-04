@@ -604,7 +604,6 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
 struct HostPollResult {
     int num_recv_tokens;
     int total_tiles;
-    std::vector<int> num_recv_tokens_per_expert;
 };
 
 HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
@@ -624,8 +623,6 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
                 std::chrono::high_resolution_clock::now() - start_time).count() > NUM_CPU_TIMEOUT_SECS)
             throw std::runtime_error("DeepEP error: CPU recv timeout");
     }
-    r.num_recv_tokens_per_expert = std::vector<int>(
-        moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
     return r;
 }
 
@@ -641,9 +638,8 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
 // So we split the Z region into two halves around the event:
 //
 //   Z_pre (zeroed BEFORE event — kernel A / Y read these via tile_ready chain):
-//     pool_topk_weight, recv_src_idx, recv_topk_weights,
-//     recv_channel_prefix_matrix, send_head, pool_arrival_count,
-//     tile_ready, a_ready
+//     pool_topk_weight, recv_channel_prefix_matrix, send_head,
+//     pool_arrival_count, tile_ready, a_ready
 //
 //   N (0xFF = -1, BEFORE event — kernel Y reads via predicate):
 //     pool_recv_token, pool_k_slot
@@ -663,8 +659,6 @@ struct PostPollBundle {
 
     // Z_pre + N region views.
     torch::Tensor pool_topk_weight;
-    torch::Tensor recv_src_idx;
-    torch::Tensor recv_topk_weights;
     torch::Tensor recv_channel_prefix_matrix;
     torch::Tensor send_head;
     torch::Tensor pool_arrival_count;
@@ -699,7 +693,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
                                          const std::optional<torch::Tensor>& x_scales,
                                          int num_scales,
                                          const torch::TensorOptions& x_options,
-                                         const torch::TensorOptions& topk_weights_options,
                                          at::cuda::CUDAStream stream) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
@@ -719,8 +712,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     SlabBuilder b;
     // Z_pre region (zeroed before metadata_done event).
     int64_t off_pool_topk_weight    = b.reserve<float>(TK_padded);
-    int64_t off_recv_src_idx        = b.reserve<int>(num_recv_tokens);
-    int64_t off_recv_topk_weights   = b.reserve<float>(static_cast<int64_t>(num_recv_tokens) * num_topk);
     int64_t off_recv_channel_prefix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
     int64_t off_send_head           = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_ranks);
     int64_t off_pool_arrival_count  = b.reserve<int>(total_tiles);
@@ -750,8 +741,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     auto keep = [bundle](void*) {};
 
     out.pool_topk_weight           = at::from_blob(base + off_pool_topk_weight,    {TK_padded},                          keep, f32_opts);
-    out.recv_src_idx               = at::from_blob(base + off_recv_src_idx,        {num_recv_tokens},                    keep, i32_opts);
-    out.recv_topk_weights          = at::from_blob(base + off_recv_topk_weights,   {num_recv_tokens, num_topk},          keep, topk_weights_options);
     out.recv_channel_prefix_matrix = at::from_blob(base + off_recv_channel_prefix, {num_ranks, num_channels},            keep, i32_opts);
     out.send_head                  = at::from_blob(base + off_send_head,           {num_tokens, num_ranks},              keep, i32_opts);
     out.pool_arrival_count         = at::from_blob(base + off_pool_arrival_count,  {total_tiles},                        keep, i32_opts);
@@ -879,7 +868,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     auto post = allocate_post_poll_bundle(
         TK_padded, hidden, poll.num_recv_tokens, num_topk,
         num_ranks, num_channels, num_tokens, poll.total_tiles,
-        x_scales, xs.num_scales, x.options(), topk_weights.options(), stream);
+        x_scales, xs.num_scales, x.options(), stream);
 
     // Narrow the per-tile arrays from total_tiles_max → total_tiles for the
     // returned views. `narrow` on a from_blob'd tensor returns a view sharing
@@ -909,8 +898,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .pool_k_slot      = post.pool_k_slot.data_ptr<int>(),
     };
     intranode::DispatchPerTokenOut dispatch_per_token_out{
-        .recv_src_idx               = post.recv_src_idx.data_ptr<int>(),
-        .recv_topk_weights          = post.recv_topk_weights.data_ptr<float>(),
         .recv_channel_prefix_matrix = post.recv_channel_prefix_matrix.data_ptr<int>(),
         .send_head                  = post.send_head.data_ptr<int>(),
         .per_token_remaining        = post.per_token_remaining.data_ptr<int>(),
@@ -959,10 +946,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .pool_topk_weight           = post.pool_topk_weight,
         .pool_recv_token            = post.pool_recv_token,
         .pool_k_slot                = post.pool_k_slot,
-        .recv_topk_weights          = post.recv_topk_weights,
-        .recv_src_idx               = post.recv_src_idx,
         .send_head                  = post.send_head,
-        .num_recv_tokens_per_expert = poll.num_recv_tokens_per_expert,
         .rank_prefix_matrix         = pre.rank_prefix_matrix,
         .channel_prefix_matrix      = pre.channel_prefix_matrix,
         .recv_channel_prefix_matrix = post.recv_channel_prefix_matrix,
@@ -1088,9 +1072,6 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
     const torch::Tensor& x,
     const torch::Tensor& per_slot_weights,
     const torch::Tensor& recv_token_to_slots,
-    const std::optional<torch::Tensor>& bias_0,
-    const std::optional<torch::Tensor>& bias_1,
-    const torch::Tensor& src_idx,
     const torch::Tensor& rank_prefix_matrix,
     const torch::Tensor& channel_prefix_matrix,
     const torch::Tensor& send_head,
@@ -1102,7 +1083,6 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                    per_slot_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(recv_token_to_slots.dim() == 2 and recv_token_to_slots.is_contiguous() and
                    recv_token_to_slots.scalar_type() == torch::kInt32);
-    EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(rank_prefix_matrix.dim() == 2 and rank_prefix_matrix.is_contiguous() and
                    rank_prefix_matrix.scalar_type() == torch::kInt32);
@@ -1121,7 +1101,6 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_recv_tokens = static_cast<int>(send_head.size(0));
-    EP_HOST_ASSERT(src_idx.size(0) == num_tokens);
     EP_HOST_ASSERT(send_head.size(1) == num_ranks);
     EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
     EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
@@ -1154,18 +1133,6 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                                      num_ranks,
                                      stream);
 
-    // Assign bias pointers
-    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
-    void* bias_ptrs[2] = {nullptr, nullptr};
-    for (int i = 0; i < 2; ++i)
-        if (bias_opts[i].has_value()) {
-            auto bias = bias_opts[i].value();
-            EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
-            EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
-            EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
-            bias_ptrs[i] = bias.data_ptr();
-        }
-
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
@@ -1179,9 +1146,6 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                        x.data_ptr(),
                        per_slot_weights.data_ptr<float>(),
                        recv_token_to_slots.data_ptr<int>(),
-                       bias_ptrs[0],
-                       bias_ptrs[1],
-                       src_idx.data_ptr<int>(),
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
                        send_head.data_ptr<int>(),
@@ -2020,10 +1984,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("pool_topk_weight",           &deep_ep::StreamingDispatchOutputs::pool_topk_weight)
         .def_readonly("pool_recv_token",            &deep_ep::StreamingDispatchOutputs::pool_recv_token)
         .def_readonly("pool_k_slot",                &deep_ep::StreamingDispatchOutputs::pool_k_slot)
-        .def_readonly("recv_topk_weights",          &deep_ep::StreamingDispatchOutputs::recv_topk_weights)
-        .def_readonly("recv_src_idx",               &deep_ep::StreamingDispatchOutputs::recv_src_idx)
         .def_readonly("send_head",                  &deep_ep::StreamingDispatchOutputs::send_head)
-        .def_readonly("num_recv_tokens_per_expert", &deep_ep::StreamingDispatchOutputs::num_recv_tokens_per_expert)
         .def_readonly("rank_prefix_matrix",         &deep_ep::StreamingDispatchOutputs::rank_prefix_matrix)
         .def_readonly("channel_prefix_matrix",      &deep_ep::StreamingDispatchOutputs::channel_prefix_matrix)
         .def_readonly("recv_channel_prefix_matrix", &deep_ep::StreamingDispatchOutputs::recv_channel_prefix_matrix)

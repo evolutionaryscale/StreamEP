@@ -32,8 +32,6 @@ class StreamingHandle:
     pool_k_slot: torch.Tensor                  # [TK_padded] int32, slot → k (-1 = padding)
 
     # ── Combine inputs (per-recv-token; combine sender forwards these back to source).
-    recv_topk_weights: torch.Tensor            # [T_recv, num_topk] float32
-    recv_src_idx: torch.Tensor                 # [T_recv] int32
     send_head: torch.Tensor                    # [num_tokens, num_ranks] int32
     is_token_in_rank: torch.Tensor             # [num_tokens, num_ranks] bool
     rank_prefix_matrix: torch.Tensor           # [num_ranks, num_ranks] int32 (this rank's column populated)
@@ -75,10 +73,6 @@ class StreamingHandle:
     total_tiles: int
     tile_m: int
     dispatch_seq: int
-
-    # Per-expert recv counts (aligned to expert_alignment), for interop with
-    # reference (non-streaming) MoE code paths.
-    num_recv_tokens_per_expert: List[int] = None
 
 
 class Buffer:
@@ -442,8 +436,6 @@ class Buffer:
             pool_topk_weight=out.pool_topk_weight,
             pool_recv_token=out.pool_recv_token,
             pool_k_slot=out.pool_k_slot,
-            recv_topk_weights=out.recv_topk_weights,
-            recv_src_idx=out.recv_src_idx,
             send_head=out.send_head,
             is_token_in_rank=is_token_in_rank,
             rank_prefix_matrix=out.rank_prefix_matrix,
@@ -465,7 +457,6 @@ class Buffer:
             total_tiles=out.total_tiles,
             tile_m=tile_m,
             dispatch_seq=dispatch_seq,
-            num_recv_tokens_per_expert=out.num_recv_tokens_per_expert,
         )
 
         recv = (out.pool, out.pool_x_scales) if x_scales is not None else out.pool
@@ -512,7 +503,6 @@ class Buffer:
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
-                bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 *,
                 combine_seq: int = 1,
                 config: Optional[Config] = None) -> \
@@ -540,11 +530,9 @@ class Buffer:
         config = self.get_combine_config(self.group_size) if config is None else config
         self._assert_intranode_only()
 
-        bias_0, bias_1 = Buffer._unpack_bias(bias)
         return self.runtime.intranode_combine(
             x, handle.pool_topk_weight, handle.recv_token_to_slots,
-            bias_0, bias_1,
-            handle.recv_src_idx, handle.rank_prefix_matrix,
+            handle.rank_prefix_matrix,
             handle.recv_channel_prefix_matrix, handle.send_head,
             handle.compute_done_per_token, combine_seq,
             config)
@@ -591,8 +579,7 @@ class Buffer:
 
         return self.runtime.intranode_combine(
             dL_dx_per_r, weight_grads, handle.recv_token_to_slots,
-            None, None,  # no biases for backward
-            handle.recv_src_idx, handle.rank_prefix_matrix,
+            handle.rank_prefix_matrix,
             handle.recv_channel_prefix_matrix, handle.send_head,
             bwd_compute_done_per_token, seq,
             config)
