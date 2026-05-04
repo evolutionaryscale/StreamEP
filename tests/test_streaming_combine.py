@@ -103,7 +103,6 @@ def run_one_dispatch_combine(buf, x, topk_idx, topk_weights, is_token_in_rank,
     # production layer wrapper.
     out, _recv_topk = buf.combine(
         handle.o, handle,
-        topk_weights=handle.recv_topk_weights,
         combine_seq=dispatch_seq,
     )
     torch.cuda.synchronize()

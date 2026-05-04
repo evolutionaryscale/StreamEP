@@ -203,11 +203,16 @@ void cached_notify_combine(void** buffer_ptrs,
                            int num_ranks,
                            cudaStream_t stream);
 
+// combine_main_kernel — used by both forward combine and backward combine_grads.
+// Per-direction differences are entirely in args (per_slot_weights tensor,
+// gate variable, output destinations, optional biases). See the kernel header
+// comment in intranode.cu for the full args table.
 void launch_combine_main(cudaDataType_t type,
              void* recv_x,
-             float* recv_topk_weights,
+             float* recv_topk_weights_out,
              const void* x,
-             const float* topk_weights,
+             const float* per_slot_weights,
+             const int* recv_token_to_slots,
              const void* bias_0,
              const void* bias_1,
              const int* src_idx,

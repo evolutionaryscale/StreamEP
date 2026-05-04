@@ -266,9 +266,21 @@ public:
         int64_t dispatch_seq,
         const Config& config);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>> intranode_combine(
+    // Combine: reduces per-recv-token x[r] back to source ranks. Used for both
+    // forward (sums weighted x → out) and backward combine_grads (sums per-recv-token
+    // dL/dx → per-source-token dL/dx). Per-direction differences are entirely in
+    // args; same kernel underlies both. See `combine_main_kernel` in intranode.cu.
+    //
+    //   per_slot_weights      fwd: handle.pool_topk_weight    bwd: weight_grads
+    //   recv_token_to_slots   handle.recv_token_to_slots (same for both directions)
+    //   x                     fwd: handle.o                   bwd: dL/dx_per_r
+    //   bias_0 / bias_1       optional (fwd only)             nullopt for bwd
+    //   compute_done_per_token  fwd: kernel_y release stamp   bwd: kernel_a_bwd release stamp
+    //   combine_seq           caller's monotonic int (`dispatch_seq`)
+    std::tuple<torch::Tensor, torch::Tensor> intranode_combine(
         const torch::Tensor& x,
-        const std::optional<torch::Tensor>& topk_weights,
+        const torch::Tensor& per_slot_weights,
+        const torch::Tensor& recv_token_to_slots,
         const std::optional<torch::Tensor>& bias_0,
         const std::optional<torch::Tensor>& bias_1,
         const torch::Tensor& src_idx,

@@ -512,14 +512,13 @@ class Buffer:
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
-                topk_weights: Optional[torch.Tensor] = None,
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 *,
                 combine_seq: int = 1,
                 config: Optional[Config] = None) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            Tuple[torch.Tensor, torch.Tensor]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
-        returned by ``Buffer.dispatch``. Intranode only; internode is not yet implemented.
+        returned by ``Buffer.dispatch``. Intranode only.
 
         Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
 
@@ -532,23 +531,70 @@ class Buffer:
         (``dispatch_seq``), kernel A / Y (``compute_seq``, ``combine_seq``),
         and this call so all four release/acquire pairs key off one layer-
         monotonic ID.
+
+        The per-(r, k) topk-weight payload is loaded via
+        ``recv_token_to_slots[r, k] → pool_topk_weight[slot]`` (with 0 for
+        non-local k). Same wire format as backward ``combine_grads``; the
+        underlying kernel is shared.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
         self._assert_intranode_only()
 
         bias_0, bias_1 = Buffer._unpack_bias(bias)
-        # Combine sender on rank R, for warp targeting send_rank_id=S, iterates
-        # R's recv-tokens that originated from S (so it can ship back the locally-
-        # accumulated o[r] to S). The per-channel sub-partition needs the count
-        # # of R's recv-tokens-from-S in channels 0..c — that's the *receiver*-
-        # side cumulative `recv_channel_prefix_matrix[S, c]` (R's view), NOT
-        # `channel_prefix_matrix[S, c]` which is sender-side (R's tokens going
-        # to S). Different traffic; different count.
         return self.runtime.intranode_combine(
-            x, topk_weights, bias_0, bias_1,
+            x, handle.pool_topk_weight, handle.recv_token_to_slots,
+            bias_0, bias_1,
             handle.recv_src_idx, handle.rank_prefix_matrix,
             handle.recv_channel_prefix_matrix, handle.send_head,
             handle.compute_done_per_token, combine_seq,
+            config)
+
+    # noinspection PyTypeChecker
+    def combine_grads(self, dL_dx_per_r: torch.Tensor, handle: 'StreamingHandle',
+                      weight_grads: torch.Tensor,
+                      bwd_compute_done_per_token: torch.Tensor,
+                      *,
+                      dispatch_seq: Optional[int] = None,
+                      config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Backward combine_grads: ship ``dL/dx_per_r[r, :H]`` expert → origin and
+        reduce K contributions per source token into ``dL/dx[t, :H]``, plus
+        scatter weight grads into ``dL/dtopk_weights[t, :K]``.
+
+        Underlying kernel is the same `combine_main_kernel` used by fwd
+        ``Buffer.combine``; per-direction differences are entirely in args
+        (different per-slot weight tensor, different gate variable, different
+        outputs, no biases).
+
+        Runs on ``torch.cuda.current_stream()``.
+
+        Args:
+            dL_dx_per_r: ``[T_recv, H]`` bf16 — per-recv-token gradient produced
+                by ``streaming_kernel_a_bwd``'s atomic-scatter epilogue.
+            handle: the ``StreamingHandle`` from ``Buffer.dispatch``.
+            weight_grads: ``[TK_padded]`` fp32 — per-pool-slot weight gradient
+                produced by ``streaming_kernel_y_bwd``'s ``dL/dweight``
+                dot-product epilogue.
+            bwd_compute_done_per_token: ``[T_recv]`` int64 release-stamp
+                array fired by ``streaming_kernel_a_bwd``'s per-token
+                "stripe-done" epilogue.
+            dispatch_seq: monotonic int the entire layer threads through;
+                defaults to ``handle.dispatch_seq``.
+
+        Returns:
+            (dL_dx, dL_dtopk_weights):
+                dL_dx: ``[num_tokens, H]`` bf16
+                dL_dtopk_weights: ``[num_tokens, num_topk]`` fp32
+        """
+        config = self.get_combine_config(self.group_size) if config is None else config
+        self._assert_intranode_only()
+        seq = handle.dispatch_seq if dispatch_seq is None else dispatch_seq
+
+        return self.runtime.intranode_combine(
+            dL_dx_per_r, weight_grads, handle.recv_token_to_slots,
+            None, None,  # no biases for backward
+            handle.recv_src_idx, handle.rank_prefix_matrix,
+            handle.recv_channel_prefix_matrix, handle.send_head,
+            bwd_compute_done_per_token, seq,
             config)
 
     # noinspection PyTypeChecker

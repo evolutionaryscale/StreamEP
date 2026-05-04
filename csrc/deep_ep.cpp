@@ -1084,9 +1084,10 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     return std::make_tuple(dL_do_pool, bwd_y_ready);
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combine(
+std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
     const torch::Tensor& x,
-    const std::optional<torch::Tensor>& topk_weights,
+    const torch::Tensor& per_slot_weights,
+    const torch::Tensor& recv_token_to_slots,
     const std::optional<torch::Tensor>& bias_0,
     const std::optional<torch::Tensor>& bias_1,
     const torch::Tensor& src_idx,
@@ -1097,16 +1098,20 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
     int64_t combine_seq,
     const Config& config) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and
+                   per_slot_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(recv_token_to_slots.dim() == 2 and recv_token_to_slots.is_contiguous() and
+                   recv_token_to_slots.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(rank_prefix_matrix.dim() == 2 and rank_prefix_matrix.is_contiguous() and
                    rank_prefix_matrix.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(channel_prefix_matrix.dim() == 2 and channel_prefix_matrix.is_contiguous() and
                    channel_prefix_matrix.scalar_type() == torch::kInt32);
-    // Phase-D per-token gate: kernel Y release-stores `combine_seq` into
-    // compute_done_per_token[r] once per_token_remaining[r] hits zero. The
-    // combine sender's per-warp send loop spins on the same address before its
-    // data copy of o[r], pairing with kernel Y's `.sys`-scope release.
+    // Phase-D per-token gate: kernel_y forward (fwd combine) or kernel_a_bwd
+    // (bwd combine_grads) release-stores `combine_seq` into
+    // compute_done_per_token[r] once the per-recv-token stripe is fully
+    // assembled. Sender's per-warp send loop spins on this before reading x[r].
     EP_HOST_ASSERT(compute_done_per_token.dim() == 1 and compute_done_per_token.is_contiguous() and
                    compute_done_per_token.scalar_type() == torch::kInt64);
 
@@ -1127,23 +1132,15 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
     // source-token count (output rows of combine), NOT the size of the gate.
     EP_HOST_ASSERT(compute_done_per_token.size(0) == num_tokens);
     EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
+    EP_HOST_ASSERT(recv_token_to_slots.size(0) == num_tokens);
+
+    int num_topk = static_cast<int>(recv_token_to_slots.size(1));
 
     // All kernels + allocations run on the caller's current stream.
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    int num_topk = 0;
-    auto recv_topk_weights = std::optional<torch::Tensor>();
-    float* topk_weights_ptr = nullptr;
-    float* recv_topk_weights_ptr = nullptr;
-    if (topk_weights.has_value()) {
-        EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
-        EP_HOST_ASSERT(topk_weights->size(0) == num_tokens);
-        EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
-        num_topk = static_cast<int>(topk_weights->size(1));
-        topk_weights_ptr = topk_weights->data_ptr<float>();
-        recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
-        recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
-    }
+    auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
+    auto recv_topk_weights_out = torch::empty({num_recv_tokens, num_topk}, f32_opts);
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
@@ -1178,9 +1175,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
                    <= num_nvl_bytes);
     intranode::launch_combine_main(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
-                       recv_topk_weights_ptr,
+                       recv_topk_weights_out.data_ptr<float>(),
                        x.data_ptr(),
-                       topk_weights_ptr,
+                       per_slot_weights.data_ptr<float>(),
+                       recv_token_to_slots.data_ptr<int>(),
                        bias_ptrs[0],
                        bias_ptrs[1],
                        src_idx.data_ptr<int>(),
@@ -1201,7 +1199,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combin
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens);
 
-    return {recv_x, recv_topk_weights};
+    return {recv_x, recv_topk_weights_out};
 }
 
 std::tuple<torch::Tensor,

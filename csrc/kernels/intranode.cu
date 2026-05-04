@@ -1278,11 +1278,32 @@ void cached_notify_combine(void** buffer_ptrs,
 #undef CACHED_NOTIFY_COMBINE
 }
 
+// Combine kernel — used by BOTH forward combine and backward combine_grads.
+// The per-direction differences are all in args:
+//
+//   ┌─────────────────────────┬────────────────── fwd ──────────────────┬────────────────── bwd ─────────────────┐
+//   │ recv_x                  │ out[num_tokens, H] bf16                  │ dL/dx[num_tokens, H] bf16              │
+//   │ recv_topk_weights_out   │ recv_topk_weights[num_tokens, K] fp32    │ dL/dtopk_weights[num_tokens, K] fp32   │
+//   │ x                       │ handle.o[T_recv, H]                      │ dL/dx_per_r[T_recv, H]                 │
+//   │ per_slot_weights        │ pool_topk_weight[TK_padded] fp32         │ weight_grads[TK_padded] fp32           │
+//   │ recv_token_to_slots     │ same — populated by fwd dispatch Pass B  │ same                                   │
+//   │ bias_0 / bias_1         │ optional bias inputs                     │ nullptr                                │
+//   │ compute_done_per_token  │ kernel_y forward release stamp           │ kernel_a_bwd release stamp             │
+//   │ combine_seq             │ dispatch_seq (fwd's value)               │ dispatch_seq (bwd uses same int)       │
+//   └─────────────────────────┴──────────────────────────────────────────┴────────────────────────────────────────┘
+//
+// The wire format and reduction logic are direction-independent: each sender
+// ships one packet per recv-token (bf16 H values + num_topk fp32 weights with
+// 0 in non-local slots); the receiver gathers K_dst_ranks packets per source
+// token and sums both halves. For bwd weight-grads, only one sender's packet
+// has the actual non-zero weight for each (t, k) — the sum reduces correctly
+// since the rest are zero.
 template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* recv_x,
-                                                          float* recv_topk_weights,
+                                                          float* recv_topk_weights_out,
                                                           const dtype_t* x,
-                                                          const float* topk_weights,
+                                                          const float* per_slot_weights,
+                                                          const int* recv_token_to_slots,
                                                           const dtype_t* bias_0,
                                                           const dtype_t* bias_1,
                                                           const int* src_idx,
@@ -1409,10 +1430,17 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 if (elect_one_sync())
                     channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + my_token);
 
-                // Send `topk_weights`
-                if (num_topk > 0 and lane_id < num_topk)
-                    channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-                        __ldg(topk_weights + my_token * num_topk + lane_id);
+                // Send the per-(my_token, k) weight via slot lookup. Fwd:
+                // pool_topk_weight[slot] = topk_weights[t, k]; bwd:
+                // weight_grads[slot] = dL/dweight at that (r, k_local). For
+                // non-local k (slot == -1) we ship 0 — receiver's K-way sum
+                // then yields the correct (t, k) value, since exactly one
+                // sender has the non-zero contribution per (t, k).
+                if (num_topk > 0 and lane_id < num_topk) {
+                    int slot = recv_token_to_slots[my_token * num_topk + lane_id];
+                    float w = (slot >= 0) ? __ldg(per_slot_weights + slot) : 0.0f;
+                    channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = w;
+                }
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
@@ -1609,13 +1637,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
 #endif
                 }
 
-                // Reduce `topk_weights`
+                // Reduce `topk_weights` (fwd: combined topk_weights output;
+                // bwd: dL/dtopk_weights output — same code, different sink).
                 if (lane_id < num_topk) {
                     float value = 0;
                     #pragma unroll
                     for (int i = 0; i < num_topk_ranks; ++i)
                         value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
-                    recv_topk_weights[token_idx * num_topk + lane_id] = value;
+                    recv_topk_weights_out[token_idx * num_topk + lane_id] = value;
                 }
 
                 // Update head
@@ -1633,9 +1662,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
 
 void launch_combine_main(cudaDataType_t type,
              void* recv_x,
-             float* recv_topk_weights,
+             float* recv_topk_weights_out,
              const void* x,
-             const float* topk_weights,
+             const float* per_slot_weights,
+             const int* recv_token_to_slots,
              const void* bias_0,
              const void* bias_1,
              const int* src_idx,
@@ -1668,9 +1698,10 @@ void launch_combine_main(cudaDataType_t type,
         LAUNCH_KERNEL(&cfg,                                                    \
                       kernel,                                                  \
                       reinterpret_cast<dtype*>(recv_x),                        \
-                      recv_topk_weights,                                       \
+                      recv_topk_weights_out,                                   \
                       reinterpret_cast<const dtype*>(x),                       \
-                      topk_weights,                                            \
+                      per_slot_weights,                                        \
+                      recv_token_to_slots,                                     \
                       reinterpret_cast<const dtype*>(bias_0),                  \
                       reinterpret_cast<const dtype*>(bias_1),                  \
                       src_idx,                                                 \
