@@ -215,12 +215,7 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.send_head.record_stream(streams.combine)
         handle.recv_topk_weights.record_stream(streams.combine)
         with torch.cuda.stream(streams.combine):
-            out, _ = buffer.combine(
-                handle.o,
-                handle,
-                topk_weights=handle.recv_topk_weights,
-                combine_seq=dispatch_seq,
-            )
+            out, _ = buffer.combine(handle.o, handle, combine_seq=dispatch_seq)
 
         # Layer-end back-edges — see design.md §"Cross-stream sync chain per layer".
         caller_stream.wait_stream(streams.dispatch)

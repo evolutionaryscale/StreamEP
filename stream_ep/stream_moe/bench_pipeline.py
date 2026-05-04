@@ -315,12 +315,7 @@ def main():
         # fire (it doesn't, but the explicit fill_ keeps the isolated timing
         # decoupled from kernel-Y call ordering).
         handle.compute_done_per_token.fill_(handle.dispatch_seq)
-        buffer.combine(
-            handle.o,
-            handle,
-            topk_weights=handle.recv_topk_weights,
-            combine_seq=handle.dispatch_seq,
-        )
+        buffer.combine(handle.o, handle, combine_seq=handle.dispatch_seq)
 
     # Capture initial per_token_remaining so isolated y timing can reset it.
     _per_token_remaining_init = handle.per_token_remaining.clone()
