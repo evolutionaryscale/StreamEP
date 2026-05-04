@@ -13,13 +13,19 @@ reuses `handle.dispatch_seq` end-to-end. So tests pre-set
 `bwd_a_ready == seq` — same value end-to-end. Mismatched values (the trap
 this comment is here to flag) deadlock the kernel's per-tile acquire-spin.
 
-Reference math: `dL_dpostact_a[slot, :] = pool_topk_weight[slot] *
-(dL_do_pool[slot, :] @ W2[expert_for_slot])`. The kernel runs an NN GEMM
-(`dL_do_pool @ W2`) by passing W2 permuted to (I, H, E_local) with I
-contiguous (n-major B); the reference computes the same product in plain
-torch using `W2[e]` directly (the bf16 → fp32 → matmul → bf16 round-trip
-matches what the kernel's Float32 accumulator + bf16 epi_convert produces up
-to the standard MMA-ordering tolerance).
+Reference math (SwiGLU bwd folded into the epilogue):
+  g[slot, :]                = dL_do_pool[slot] @ W2[e]            (unweighted)
+  dpostact[slot, :I]        = pool_topk_weight[slot] * g[slot, :]
+  (dgate, dup, postact)     = dswiglu(gate, up, dpostact)
+  dL_dswiglu_in[slot, 2n]   = dgate;  dL_dswiglu_in[slot, 2n+1] = dup
+  dL_dweight[slot]          = Σ_n postact[slot, n] * g[slot, n]   (UNWEIGHTED g)
+
+The kernel runs an NN GEMM (`dL_do_pool @ W2`) by passing W2 permuted to
+(I, H, E_local) with I contiguous (n-major B); the reference computes the
+same product in plain torch using `W2[e]` directly. The bf16 → fp32 → matmul
+→ bf16 round-trip matches what the kernel's Float32 accumulator + bf16
+recast (via the f32-recast trick on mD) produces up to the standard
+MMA-ordering tolerance.
 """
 
 from __future__ import annotations
@@ -63,28 +69,48 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
     return tile_id_to_expert, expert_pool_block_offset
 
 
-def _ref_dL_dpostact_a(
+def _ref_dL_dswiglu_in(
     dL_do_pool: torch.Tensor,  # (TK_padded, H) bf16
     W2: torch.Tensor,  # (E_local, H, I) bf16
     pool_topk_weight: torch.Tensor,  # (TK_padded,) fp32
+    preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16
     tile_to_expert_list: list[int],
     tile_m: int,
 ) -> torch.Tensor:
-    """Eager torch reference: per-tile NN matmul `dL_do_pool[tile] @ W2[e]`,
-    then per-row weight multiply. Returns bf16 (total_tiles, tile_m, I)."""
+    """Eager torch reference for `dL_dswiglu_in`:
+
+      g          = dL_do_pool @ W2[e]                       (unweighted)
+      dpostact   = pool_topk_weight * g                     (per-row scale)
+      dgate      = silu_grad(gate) * up * dpostact
+      dup        = silu(gate) * dpostact
+      dL_dswiglu_in[slot, 2n]   = dgate
+      dL_dswiglu_in[slot, 2n+1] = dup
+
+    Returns bf16 (total_tiles, tile_m, 2*I) — same shape as preact_a.
+    """
     total_tiles = len(tile_to_expert_list)
     I = W2.shape[2]
+    two_I = 2 * I
     out = torch.zeros(
-        total_tiles, tile_m, I, dtype=dL_do_pool.dtype, device=dL_do_pool.device
+        total_tiles, tile_m, two_I, dtype=dL_do_pool.dtype, device=dL_do_pool.device
     )
     for t in range(total_tiles):
         e = tile_to_expert_list[t]
         rows = slice(t * tile_m, (t + 1) * tile_m)
         # NN matmul in fp32 to match the kernel's Float32 accumulator.
-        g = dL_do_pool[rows].float() @ W2[e].float()
-        # Per-row weight broadcast (fp32 multiply, bf16 output).
+        g = dL_do_pool[rows].float() @ W2[e].float()  # (tile_m, I)
         w = pool_topk_weight[rows].view(tile_m, 1)
-        out[t] = (g * w).to(dL_do_pool.dtype)
+        dpostact = w * g  # (tile_m, I)
+        gate = preact_a[t, :, 0::2].float()
+        up = preact_a[t, :, 1::2].float()
+        # SwiGLU bwd: same formulas as quack.activation.dswiglu.
+        sigmoid_x = torch.sigmoid(gate)
+        silu_x = gate * sigmoid_x
+        d_silu_x_dout = (sigmoid_x - silu_x * sigmoid_x) * dpostact + silu_x * dpostact
+        dgate = d_silu_x_dout * up
+        dup = silu_x * dpostact
+        out[t, :, 0::2] = dgate.to(dL_do_pool.dtype)
+        out[t, :, 1::2] = dup.to(dL_do_pool.dtype)
     return out
 
 
@@ -156,7 +182,7 @@ def test_streaming_moe_y_bwd_compiles(device):
     dtype = torch.bfloat16
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
-    dL_dpostact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     pool_topk_weight = torch.ones(TK_padded, dtype=torch.float32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
     dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
@@ -175,7 +201,7 @@ def test_streaming_moe_y_bwd_compiles(device):
         streaming_moe_y_bwd(
             dL_do_pool,
             W2,
-            dL_dpostact_a,
+            dL_dswiglu_in,
             pool_topk_weight,
             preact_a,
             dL_dweight_per_stripe,
@@ -212,7 +238,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     torch.manual_seed(0)
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
-    dL_dpostact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     # Mix of weights (some negative, some > 1) to exercise the multiplicative
     # ColVec broadcast — `*=` vs `+=` would silently pass under all-ones.
     pool_topk_weight = torch.linspace(
@@ -231,7 +257,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     streaming_moe_y_bwd(
         dL_do_pool,
         W2,
-        dL_dpostact_a,
+        dL_dswiglu_in,
         pool_topk_weight,
         preact_a,
         dL_dweight_per_stripe,
@@ -245,15 +271,13 @@ def test_streaming_moe_y_bwd_single_tile(device):
     )
     torch.cuda.synchronize()
 
-    ref = _ref_dL_dpostact_a(
-        dL_do_pool, W2, pool_topk_weight, tile_to_expert_list, tile_m
+    ref = _ref_dL_dswiglu_in(
+        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
     )
-    # bf16 GEMM ordering noise + bf16 cast on the per-row weight multiply.
-    # Achieved at this shape: max_abs ≈ 0, max_rel ≈ 0 (bit-identical for
-    # single-tile). Use the same "fail iff BOTH atol AND rtol violated"
-    # pattern fwd kernel Y uses for room around the few-ULP outliers
-    # multi-tile pulls in.
-    diff = (dL_dpostact_a.float() - ref.float()).abs()
+    # bf16 GEMM ordering noise + bf16 cast through dswiglu's intermediate
+    # fp32 ops + bf16x2 packing on output. Use the same "fail iff BOTH atol
+    # AND rtol violated" pattern fwd kernel Y uses.
+    diff = (dL_dswiglu_in.float() - ref.float()).abs()
     rel = diff / (ref.float().abs() + 1e-3)
     abs_thresh, rel_thresh = 1e-2, 5e-2
     bad = (diff > abs_thresh) & (rel > rel_thresh)
@@ -286,6 +310,21 @@ def test_streaming_moe_y_bwd_single_tile(device):
     )
 
 
+def _assert_dL_dswiglu_in_per_tile(
+    dL_dswiglu_in, ref, tile_to_expert_list, abs_thresh=1e-2, rel_thresh=5e-2
+):
+    for t in range(len(tile_to_expert_list)):
+        diff = (dL_dswiglu_in[t].float() - ref[t].float()).abs()
+        rel = diff / (ref[t].float().abs() + 1e-3)
+        bad = (diff > abs_thresh) & (rel > rel_thresh)
+        assert not bad.any(), (
+            f"tile {t}: expert={tile_to_expert_list[t]}, "
+            f"{bad.sum().item()} elements exceed both rtol={rel_thresh} and "
+            f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
+            f"max rel diff {rel.max().item():.4f}"
+        )
+
+
 def test_streaming_moe_y_bwd_multi_tile_static(device):
     """total_tiles=N>1 spread across multiple experts. Validates per-tile
     expert selection (W2[expert_id] varies via tile_id_to_expert) and
@@ -306,7 +345,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     torch.manual_seed(7)
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
-    dL_dpostact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
@@ -322,7 +361,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     streaming_moe_y_bwd(
         dL_do_pool,
         W2,
-        dL_dpostact_a,
+        dL_dswiglu_in,
         pool_topk_weight,
         preact_a,
         dL_dweight_per_stripe,
@@ -336,20 +375,10 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     )
     torch.cuda.synchronize()
 
-    ref = _ref_dL_dpostact_a(
-        dL_do_pool, W2, pool_topk_weight, tile_to_expert_list, tile_m
+    ref = _ref_dL_dswiglu_in(
+        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
     )
-    abs_thresh, rel_thresh = 1e-2, 5e-2
-    for t in range(total_tiles):
-        diff = (dL_dpostact_a[t].float() - ref[t].float()).abs()
-        rel = diff / (ref[t].float().abs() + 1e-3)
-        bad = (diff > abs_thresh) & (rel > rel_thresh)
-        assert not bad.any(), (
-            f"tile {t}: expert={tile_to_expert_list[t]}, "
-            f"{bad.sum().item()} elements exceed both rtol={rel_thresh} and "
-            f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
-            f"max rel diff {rel.max().item():.4f}"
-        )
+    _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list)
 
     # dL/dweight: per-stripe partials summed across the n-stripe dim.
     dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
@@ -396,7 +425,7 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     torch.manual_seed(11)
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
-    dL_dpostact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
@@ -423,7 +452,7 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
         streaming_moe_y_bwd(
             dL_do_pool,
             W2,
-            dL_dpostact_a,
+            dL_dswiglu_in,
             pool_topk_weight,
             preact_a,
             dL_dweight_per_stripe,
@@ -440,20 +469,10 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
 
     torch.cuda.synchronize()
 
-    ref = _ref_dL_dpostact_a(
-        dL_do_pool, W2, pool_topk_weight, tile_to_expert_list, tile_m
+    ref = _ref_dL_dswiglu_in(
+        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
     )
-    abs_thresh, rel_thresh = 1e-2, 5e-2
-    for t in range(total_tiles):
-        diff = (dL_dpostact_a[t].float() - ref[t].float()).abs()
-        rel = diff / (ref[t].float().abs() + 1e-3)
-        bad = (diff > abs_thresh) & (rel > rel_thresh)
-        assert not bad.any(), (
-            f"tile {t}: expert={tile_to_expert_list[t]}, "
-            f"{bad.sum().item()} elements exceed both rtol={rel_thresh} and "
-            f"atol={abs_thresh}; max abs diff {diff.max().item():.4f}, "
-            f"max rel diff {rel.max().item():.4f}"
-        )
+    _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list)
 
     dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
     dL_dweight_ref = _ref_dL_dweight(

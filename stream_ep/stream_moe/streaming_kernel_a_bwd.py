@@ -1,0 +1,486 @@
+"""Streaming-MoE kernel A bwd (CuTeDSL, SM90, pool layout — fused scatter).
+
+Backward of fwd kernel A. Per the chain rule on `preact = pool @ W1[e].T`:
+  dL/dpool[slot, :H] = dL/dswiglu_in[slot, :2I] @ W1[expert_for_slot]
+
+`dL/dswiglu_in` is produced directly by `kernel_y_bwd`'s mD TMA-store
+(SwiGLU bwd folded into kernel_y_bwd's epilogue — see
+`streaming_kernel_y_bwd.py`). Per-tile gating on
+`bwd_a_ready[tile_id] >= dispatch_seq` (the same release-store kernel_y_bwd
+fires when its tile drain completes) ensures the kernel only consumes a
+tile's row range once dL/dswiglu_in for that tile has landed.
+
+Per tile:
+  * Streaming scheduler acquire-spins on `bwd_a_ready[tile_id] >= dispatch_seq`.
+  * Standard varlen_m strided TMA load of
+    `dL_dswiglu_in[tile_id * tile_M : ..., :]` (the row offset
+    `cu_seqlens_m[expert_id] + pid_m * tile_m` lands on the right pool-major
+    row by construction — same path fwd kernel A uses on pool).
+  * NN GEMM against `W1[expert_id]`. mB is W1 permuted to (H, 2I, E_local)
+    with H contiguous (n-major, leading_dim=0). The kernel-internal
+    contraction `Σ_k A[m, k] * B[n, k]` evaluates to
+      dL/dpool[m, h] = Σ_2I_idx dL/dswiglu_in[m, 2I_idx] * W1[e, 2I_idx, h]
+    i.e. the (M, H) data-grad in registers.
+  * R2S into a kernel-owned bf16 SMEM staging buffer, then per-warp coalesced
+    atomic-scatter from SMEM into `dL_dx_per_r[r, :H]` via packed
+    `red.global.add.bf16x2`. Per-slot `pool_recv_token` gating skips r=-1
+    padding rows via PTX-level predication.
+  * Per-tile end (last N-stripe gates): `bwd_per_token_remaining[r]` atomicSub
+    by 1; on hit-zero `bwd_compute_done_per_token[r]` release-stores
+    `dispatch_seq` so the combine_grads sender (on its own stream) can pick
+    up `dL_dx_per_r[r]` for RDMA push.
+
+Strict subset of fwd kernel_y's epilogue — no weight multiply (the per-slot
+pool_topk_weight was already absorbed into dL/dpostact_a upstream by
+kernel_y_bwd's `weight[slot] * g[slot]`). All atomic-scatter mechanics
+(predicated v4 bf16x2 issue, multi-pid_n bookkeeping gate, per-row last-stripe
+release) are inherited verbatim from `streaming_kernel_y.py`.
+
+Shares streaming machinery with fwd kernels:
+  * `StreamingTileScheduler` for linear-claim + per-tile ready spin.
+    Substitutions: `tile_ready` → `bwd_a_ready`, `dispatch_seq` from saved
+    handle.
+  * Pool-layout `StreamingHandle` carries `pool_recv_token`,
+    `bwd_per_token_remaining` (initialized from saved `K_local_count` per
+    `bwd.md`), `bwd_compute_done_per_token`, `dL_dx_per_r`,
+    `tile_id_to_expert`, `expert_pool_block_offset`.
+"""
+
+from typing import NamedTuple, Optional, Type
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass import Int32, Int64
+from quack.cache_utils import COMPILE_ONLY, jit_cache
+from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.cute_dsl_utils import (
+    get_device_capacity,
+    get_max_active_clusters,
+    mlir_namedtuple,
+    torch2cute_dtype_map,
+)
+from quack.gemm_sm90 import GemmSm90
+from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
+from quack.tile_scheduler import PersistenceMode
+from quack.varlen_utils import VarlenArguments
+
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    StreamingTileSchedulerOptions,
+)
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+    AtomicScatterStore,
+    ScatterParams,
+    StreamingMoeYSm90,
+)
+from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import (
+    StreamingTileScheduler,
+    StreamingTileSchedulerArguments,
+)
+
+
+# ---------------------------------------------------------------------------
+# Streaming kernel A bwd class.
+# ---------------------------------------------------------------------------
+class StreamingMoeABwdSm90(StreamingMoeYSm90):
+    """Streaming-MoE kernel A bwd: NN GEMM `dL/dswiglu_in @ W1` with fused
+    atomic-scatter epilogue into `dL_dx_per_r`.
+
+    Strict subset of fwd kernel_y — no per-slot weight multiply, otherwise
+    structurally identical. Inherits the AtomicScatterStore EpiOp,
+    `epi_subtile_store` (per-warp coalesced predicated v4 bf16x2 atomic-add),
+    `epi_setup_postact`, and `epi_convert_postact` unchanged.
+
+    Overrides:
+      - `_epi_ops`: drop ColVecLoad — bwd has no per-slot weighting (the
+        forward pool_topk_weight was absorbed into dL/dpostact_a upstream
+        by kernel_y_bwd).
+      - `EpilogueArguments`: drop `mColVecBroadcast`.
+      - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
+        analogue here.
+      - `__call__` + `get_scheduler_arguments`: use
+        `StreamingTileSchedulerOptions` (streaming_kernel_a's NamedTuple,
+        also reused by kernel_y_bwd) so the scheduler acquires
+        `bwd_a_ready` and uses the saved handle's `dispatch_seq`.
+    """
+
+    _epi_ops = (AtomicScatterStore("scatter"),)
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        scatter: ScatterParams
+
+    # `epi_to_underlying_arguments` inherited (the parent's version uses
+    # `self._epi_ops_to_params_dict(args)`, which respects our narrower
+    # `_epi_ops` tuple).
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        """No weight multiply — strict subset of fwd kernel_y's epilogue.
+
+        kernel_y_bwd already produced `dL/dpostact_a = pool_topk_weight[slot] *
+        g[slot]` upstream, which feeds into kernel_a_bwd's SwiGLU bwd to make
+        `dL/dswiglu_in`. By the time we run this kernel, the per-slot scaling
+        is already baked in, so the data-grad GEMM result `dL/dpool` lands
+        unweighted in `dL_dx_per_r`.
+        """
+        return None
+
+    # -- scheduler hooks -----------------------------------------------------
+
+    def get_scheduler_class(self, varlen_m: bool = False):
+        return StreamingTileScheduler
+
+    def get_scheduler_arguments(
+        self,
+        mA: cute.Tensor,  # dL_dswiglu_in: (TK_padded, 2I), k-major
+        mB: cute.Tensor,  # W1 permuted: (H, 2I, E_local), n-major
+        mD: Optional[cute.Tensor],  # None — output via atomic-scatter
+        scheduler_args: StreamingTileSchedulerOptions,
+        varlen_args: VarlenArguments,
+        epilogue_args,
+    ):
+        # mB shape is (n=H, k=2I, l=E_local); n-dim tile count = ceil(H / tile_N).
+        num_pid_n = cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1])
+        E_local = cute.size(mB, mode=[2])
+        return StreamingTileSchedulerArguments(
+            problem_shape_ntile_mnl=(None, num_pid_n, E_local),
+            consumer_head=scheduler_args.consumer_head,
+            tile_ready=scheduler_args.tile_ready,
+            tile_id_to_expert=scheduler_args.tile_id_to_expert,
+            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
+            dispatch_seq=scheduler_args.dispatch_seq,
+            total_tiles=scheduler_args.total_tiles,
+            tile_shape_mn=self.cta_tile_shape_mnk[:2],
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            persistence_mode=PersistenceMode.STREAMING,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mD: Optional[cute.Tensor],
+        mC: Optional[cute.Tensor],
+        epilogue_args,
+        scheduler_args: StreamingTileSchedulerOptions,
+        varlen_args: Optional[VarlenArguments],
+        stream: cuda.CUstream,
+        trace_ptr: Optional[Int64] = None,
+    ):
+        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
+        as the scheduler_args type. Body delegates to GemmSm90.__call__.
+        """
+        GemmSm90.__call__(
+            self,
+            mA,
+            mB,
+            mD,
+            mC,
+            epilogue_args,
+            scheduler_args,
+            varlen_args,
+            stream,
+            trace_ptr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# JIT compile factory.
+# ---------------------------------------------------------------------------
+@jit_cache
+def _compile_streaming_moe_a_bwd(
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    o_dtype: Type[cutlass.Numeric],
+    tile_m: int,
+    tile_n: int,
+    cluster_m: int,
+    cluster_n: int,
+    device_capacity,
+):
+    assert device_capacity[0] == 9, "Streaming MoE kernel A bwd is SM90-only for now"
+
+    H_sym = cute.sym_int()
+    I2_sym = cute.sym_int()
+    E_sym = cute.sym_int()
+    TK_padded_sym = cute.sym_int()
+    Trecv_sym = cute.sym_int()
+    total_tiles_sym = cute.sym_int()
+    cu_seqlens_len_sym = cute.sym_int()  # = E_local + 1
+
+    # A: dL_dswiglu_in flat (TK_padded, 2I), k-major (2I contracted along K,
+    # contiguous in storage). Same pool-major flattening fwd kernel A applies
+    # to pool.
+    mA = fake_tensor(a_dtype, (TK_padded_sym, I2_sym), leading_dim=1, divisibility=8)
+    # B: W1 permuted to (H, 2I, E_local), n-major (H contiguous along the
+    # leading axis after `W1.permute(2, 1, 0)` on the host). With this layout
+    # the kernel's contraction `Σ_k B[n, k]` evaluates `W1[k, n] = W1[2I_idx,
+    # h]`, i.e. the NN GEMM `dL_dswiglu_in @ W1` we want.
+    mB = fake_tensor(b_dtype, (H_sym, I2_sym, E_sym), leading_dim=0, divisibility=8)
+    # No D / C — streaming kernel A bwd outputs via predicated atomic-scatter
+    # into `dL_dx_per_r[T_recv, H]` (no trash row).
+    mD = None
+    mC = None
+
+    # Scatter destination: (T_recv, H), n-major.
+    mO = fake_tensor(o_dtype, (Trecv_sym, H_sym), leading_dim=1, divisibility=8)
+    pool_recv_token = fake_tensor(
+        cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
+    )
+    bwd_per_token_remaining = fake_tensor(
+        cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1
+    )
+    bwd_compute_done_per_token = fake_tensor(
+        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
+    )
+
+    tile_n_stripes_done = fake_tensor(
+        cutlass.Int32, (total_tiles_sym,), leading_dim=0, divisibility=1
+    )
+    expert_pool_block_offset_scatter = fake_tensor(
+        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
+    )
+    scatter = ScatterParams(
+        mO=mO,
+        pool_recv_token=pool_recv_token,
+        per_token_remaining=bwd_per_token_remaining,
+        compute_done_per_token=bwd_compute_done_per_token,
+        tile_n_stripes_done=tile_n_stripes_done,
+        expert_pool_block_offset=expert_pool_block_offset_scatter,
+        T_recv=Int32(0),
+        combine_seq=Int64(0),
+        num_pid_n=Int32(0),
+    )
+
+    # cu_seqlens_m drives the standard varlen_m m-offset for mA's pool read.
+    # Length E_local + 1, each entry = expert_pool_block_offset[e] * tile_m.
+    mCuSeqlensM = fake_tensor(
+        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
+    )
+
+    consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
+    bwd_a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    tile_id_to_expert = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    expert_pool_block_offset = fake_tensor(
+        cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
+    )
+
+    scheduler_args = StreamingTileSchedulerOptions(
+        max_active_clusters=Int32(0),
+        consumer_head=consumer_head,
+        tile_ready=bwd_a_ready,
+        tile_id_to_expert=tile_id_to_expert,
+        expert_pool_block_offset=expert_pool_block_offset,
+        dispatch_seq=Int64(0),
+        total_tiles=Int32(0),
+    )
+
+    epi_args = StreamingMoeABwdSm90.EpilogueArguments(scatter=scatter)
+
+    varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
+
+    return compile_gemm_kernel(
+        StreamingMoeABwdSm90,
+        a_dtype,
+        (tile_m, tile_n),
+        (cluster_m, cluster_n, 1),
+        pingpong=False,
+        persistent=True,
+        gather_A=False,
+        is_dynamic_persistent=False,
+        device_capacity=device_capacity,
+        mA=mA,
+        mB=mB,
+        mD=mD,
+        mC=mC,
+        epi_args=epi_args,
+        scheduler_args=scheduler_args,
+        varlen_args=varlen_args,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Host wrapper.
+# ---------------------------------------------------------------------------
+def streaming_moe_a_bwd(
+    dL_dswiglu_in: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16
+    W1: torch.Tensor,  # (E_local, 2*I, H) bf16 — k-major per expert
+    dL_dx_per_r: torch.Tensor,  # (T_recv, H) bf16 — atomic-scatter destination
+    pool_recv_token: torch.Tensor,  # (TK_padded,) int32
+    bwd_per_token_remaining: torch.Tensor,  # (T_recv,) int32 — initialised from K_local_count
+    bwd_compute_done_per_token: torch.Tensor,  # (T_recv,) int64 — zero-init
+    tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
+    expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
+    bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps
+    dispatch_seq: int,
+    *,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    cluster_m: int = 1,
+    cluster_n: int = 1,
+    num_sms: int | None = None,
+) -> None:
+    """Launch streaming-MoE kernel A bwd on the caller's current CUDA stream.
+
+    Computes the data-grad ``dL/dpool = dL_dswiglu_in @ W1`` per tile and
+    atomic-scatters into ``dL_dx_per_r[r, :H]`` (one logical recv-token row
+    per pool slot via ``pool_recv_token[slot]``). Per-token bookkeeping
+    (atomicSub on ``bwd_per_token_remaining`` + hit-zero release-store on
+    ``bwd_compute_done_per_token``) mirrors fwd kernel_y exactly so the
+    combine_grads sender's per-token gate fires once kernel_a_bwd's last
+    contributor for each recv-token has scattered.
+
+    Streamed via per-tile acquire-spin on ``bwd_a_ready[tile_id] >=
+    dispatch_seq`` (input gate fired by kernel_y_bwd when each tile's
+    ``dL_dswiglu_in`` rows have drained their TMA stores) and per-token
+    release-store on ``bwd_compute_done_per_token`` (consumed by
+    combine_grads on a different stream).
+
+    ``num_sms`` caps the persistent-grid CTA count. ``None`` (default) fills
+    the GPU; smaller caps leave SMs available for the other backward
+    kernels to overlap.
+
+    Caller is responsible for:
+      - allocating ``dL_dx_per_r`` zero-init ON THE SAME STREAM this
+        function runs on (so the kernel's first atomic-add lands on a
+        known-zero buffer; otherwise stale memory leaks through).
+      - allocating ``bwd_per_token_remaining`` initialised to
+        ``K_local_count[r]`` for each recv-token (the bwd orchestrator
+        ``cudaMemcpyAsync``'s this from the saved handle).
+      - allocating ``bwd_compute_done_per_token`` zero-init.
+      - ensuring ``bwd_a_ready`` is populated by the upstream producer
+        (the SwiGLU bwd materialisation pre-step or a test stub) on a
+        stream that release-stores ``bwd_a_ready[tile_id] = dispatch_seq``
+        once the tile's ``dL_dswiglu_in`` rows are ready. The per-tile
+        acquire-spin handles cross-stream visibility.
+
+    The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
+    allocated on the calling stream so their zero-init is naturally ordered
+    with the kernel.
+    """
+    assert dL_dswiglu_in.is_cuda and W1.is_cuda and dL_dx_per_r.is_cuda
+    assert dL_dswiglu_in.dim() == 3
+    assert W1.dim() == 3
+    assert dL_dx_per_r.dim() == 2
+    total_tiles, in_tile_m, two_I = dL_dswiglu_in.shape
+    assert (
+        in_tile_m == tile_m
+    ), f"dL_dswiglu_in middle dim must equal tile_m={tile_m}; got {in_tile_m}"
+    T_recv, H = dL_dx_per_r.shape
+    E_local = W1.shape[0]
+    assert W1.shape == (
+        E_local,
+        two_I,
+        H,
+    ), f"W1 must be (E_local, 2*I, H) = {(E_local, two_I, H)}; got {tuple(W1.shape)}"
+    assert pool_recv_token.shape == (total_tiles * tile_m,)
+    assert pool_recv_token.dtype == torch.int32
+    assert bwd_per_token_remaining.shape == (T_recv,)
+    assert bwd_per_token_remaining.dtype == torch.int32
+    assert bwd_compute_done_per_token.shape == (T_recv,)
+    assert bwd_compute_done_per_token.dtype == torch.int64
+    assert tile_id_to_expert.shape == (total_tiles,)
+    assert expert_pool_block_offset.shape == (E_local + 1,)
+    assert bwd_a_ready.shape == (total_tiles,)
+    assert bwd_a_ready.dtype == torch.int64
+
+    # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
+    # slab has H contiguous along the last axis — same layout fwd kernel A
+    # consumes). For the bwd's NN GEMM we need the kernel-side tensor to be
+    # (n=H, k=2I, l=E_local) with H contiguous (n-major), so the mainloop's
+    # `Σ_k B[n, k]` evaluates `W1[2I_idx, h]`. `permute(2, 1, 0)` gives this
+    # layout WITHOUT a copy: strides go (2I*H, H, 1) → (1, H, 2I*H).
+    W1_p = W1.permute(2, 1, 0)
+    assert W1_p.stride(0) == 1, (
+        "W1.permute(2,1,0) must have H (axis 0) contiguous (n-major B); caller "
+        "must pass W1 as (E_local, 2*I, H) k-major"
+    )
+    assert W1_p.shape == (H, two_I, E_local)
+
+    # Flatten dL_dswiglu_in's leading two dims to (total_tiles * tile_m, 2I)
+    # so the kernel sees a single varlen_m M dimension.
+    dL_dswiglu_in_flat = dL_dswiglu_in.view(total_tiles * tile_m, two_I)
+
+    # cu_seqlens_m = expert_pool_block_offset * tile_m drives the standard
+    # varlen_m m-offset for mA's pool-major read:
+    #   m_offset(tile) = cu_seqlens_m[batch_idx] + pid_m * tile_m = tile_id * tile_m
+    cu_seqlens_m = (expert_pool_block_offset.to(torch.int32) * tile_m).contiguous()
+
+    device_capacity = get_device_capacity(dL_dswiglu_in.device)
+    assert device_capacity[0] == 9, "Streaming MoE kernel A bwd is SM90-only for now"
+
+    a_dtype = torch2cute_dtype_map[dL_dswiglu_in.dtype]
+    b_dtype = torch2cute_dtype_map[W1.dtype]
+    o_dtype = torch2cute_dtype_map[dL_dx_per_r.dtype]
+
+    compiled_fn = _compile_streaming_moe_a_bwd(
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        o_dtype=o_dtype,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
+        device_capacity=device_capacity,
+    )
+
+    if COMPILE_ONLY:
+        return
+
+    max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
+    if num_sms is not None:
+        max_active_clusters = min(
+            max_active_clusters, num_sms // (cluster_m * cluster_n)
+        )
+
+    # Internal scheduler counter — allocate on the calling stream so the
+    # zero-init is naturally ordered with the kernel's first atomic-claim.
+    consumer_head = torch.zeros(1, dtype=torch.int32, device=dL_dswiglu_in.device)
+
+    # Multi-pid_n N-stripe arrival counter. The CTA whose atomic-add returns
+    # `num_pid_n - 1` is the last N-stripe to complete for its tile_id and
+    # owns the per-row bookkeeping (atomicSub bwd_per_token_remaining +
+    # hit-zero release-store on bwd_compute_done_per_token).
+    num_pid_n = (H + tile_n - 1) // tile_n
+    tile_n_stripes_done = torch.zeros(
+        total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device
+    )
+
+    scatter = ScatterParams(
+        mO=dL_dx_per_r,
+        pool_recv_token=pool_recv_token,
+        per_token_remaining=bwd_per_token_remaining,
+        compute_done_per_token=bwd_compute_done_per_token,
+        tile_n_stripes_done=tile_n_stripes_done,
+        expert_pool_block_offset=expert_pool_block_offset,
+        T_recv=Int32(T_recv),
+        combine_seq=Int64(dispatch_seq),
+        num_pid_n=Int32(num_pid_n),
+    )
+    epi_args = StreamingMoeABwdSm90.EpilogueArguments(scatter=scatter)
+    scheduler_args = StreamingTileSchedulerOptions(
+        max_active_clusters=Int32(max_active_clusters),
+        consumer_head=consumer_head,
+        tile_ready=bwd_a_ready,
+        tile_id_to_expert=tile_id_to_expert,
+        expert_pool_block_offset=expert_pool_block_offset,
+        dispatch_seq=Int64(dispatch_seq),
+        total_tiles=Int32(total_tiles),
+    )
+    varlen_args = VarlenArguments(
+        mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
+    )
+
+    compiled_fn(
+        dL_dswiglu_in_flat,
+        W1_p,
+        None,
+        None,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        None,
+    )
