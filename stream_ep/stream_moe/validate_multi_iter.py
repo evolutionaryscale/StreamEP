@@ -1,6 +1,6 @@
 """End-to-end correctness check for the streaming pipeline (dispatch + A + Y + combine).
 
-Runs `streaming_moe_layer` for N iterations with the SAME inputs and asserts
+Runs `stream_moe_func` for N iterations with the SAME inputs and asserts
 each iteration's output matches a torch-eager full MoE forward reference. The
 reference is computed in plain torch using all ranks' weights (gathered across
 the group) so that for each source token ``t`` on this rank,
@@ -46,7 +46,10 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     make_buffer,
     make_uniform_topk_idx,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+    make_streams,
+    stream_moe_func,
+)
 from evolutionaryscale.utils.distributed import (
     barrier,
     get_global_rank,
@@ -67,7 +70,7 @@ def torch_reference_full_moe(
     sum of SwiGLU(x[t] @ W1[topk_idx[t, k]]) @ W2[topk_idx[t, k]] over k. Returns
     [T, H] in the same dtype as x.
 
-    This is the production-output target for ``streaming_moe_layer``: dispatch
+    This is the production-output target for ``stream_moe_func``: dispatch
     sends each (t, k) pair to its expert's rank, kernel A + Y compute the
     weighted contribution locally, and combine reduces them back into out[t]
     on the source rank.
@@ -169,15 +172,12 @@ def main():
     # Compute the eager full-MoE reference once (inputs are fixed across iters).
     out_ref = torch_reference_full_moe(x, topk_idx, topk_weights, w1_full, w2_full)
 
-    dispatch_stream = torch.cuda.Stream()
-    compute_a_stream = torch.cuda.Stream()
-    compute_y_stream = torch.cuda.Stream()
-    combine_stream = torch.cuda.Stream()
+    streams = make_streams()
     barrier(group)
 
     # Warmup (no validation).
     for warm_seq in range(1, args.n_warmup + 1):
-        streaming_moe_layer(
+        stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -185,10 +185,7 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            dispatch_stream=dispatch_stream,
-            compute_a_stream=compute_a_stream,
-            compute_y_stream=compute_y_stream,
-            combine_stream=combine_stream,
+            streams=streams,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=TILE_M,
@@ -202,7 +199,7 @@ def main():
     fail_count = 0
     for step in range(args.n_iter):
         seq = 100 + step
-        out_actual, _handle = streaming_moe_layer(
+        out_actual = stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -210,10 +207,7 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            dispatch_stream=dispatch_stream,
-            compute_a_stream=compute_a_stream,
-            compute_y_stream=compute_y_stream,
-            combine_stream=combine_stream,
+            streams=streams,
             num_experts=NUM_EXPERTS,
             dispatch_seq=seq,
             tile_m=TILE_M,

@@ -31,7 +31,10 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     make_buffer,
     make_uniform_topk_idx,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+    make_streams,
+    stream_moe_func,
+)
 from evolutionaryscale.utils.distributed import (
     barrier,
     get_global_rank,
@@ -89,15 +92,12 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    dispatch_stream = torch.cuda.Stream()
-    compute_a_stream = torch.cuda.Stream()
-    compute_y_stream = torch.cuda.Stream()
-    combine_stream = torch.cuda.Stream()
+    streams = make_streams()
     barrier(group)
 
     t0 = time.time()
     for warm_seq in range(1, args.n_warmup + 1):
-        streaming_moe_layer(
+        stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -105,10 +105,7 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            dispatch_stream=dispatch_stream,
-            compute_a_stream=compute_a_stream,
-            compute_y_stream=compute_y_stream,
-            combine_stream=combine_stream,
+            streams=streams,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=TILE_M,
@@ -125,7 +122,7 @@ def main():
 
     t0 = time.time()
     for step in range(args.n_iter):
-        streaming_moe_layer(
+        stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -133,10 +130,7 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            dispatch_stream=dispatch_stream,
-            compute_a_stream=compute_a_stream,
-            compute_y_stream=compute_y_stream,
-            combine_stream=combine_stream,
+            streams=streams,
             num_experts=NUM_EXPERTS,
             dispatch_seq=100 + step,
             tile_m=TILE_M,

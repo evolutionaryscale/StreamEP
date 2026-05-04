@@ -42,7 +42,10 @@ from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
     streaming_moe_y,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+    make_streams,
+    stream_moe_func,
+)
 from evolutionaryscale.utils.distributed import (
     barrier,
     get_global_rank,
@@ -146,19 +149,15 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    # Four caller-managed streams. `dispatch_stream` for dispatch; `compute_a_stream`
-    # for kernel A; `compute_y_stream` for kernel Y; `combine_stream` for
-    # the combine sender. The metadata-done event records between the metadata
-    # kernel and the dispatch main kernel — consumer streams `wait_event` on it
-    # to safely read metadata tensors without serializing against dispatch main.
-    dispatch_stream = torch.cuda.Stream(device=device)
-    compute_a_stream = torch.cuda.Stream(device=device)
-    compute_y_stream = torch.cuda.Stream(device=device)
-    combine_stream = torch.cuda.Stream(device=device)
+    # Four caller-managed streams. The metadata-done event records between the
+    # metadata kernel and the dispatch main kernel — consumer streams
+    # `wait_event` on it to safely read metadata tensors without serializing
+    # against dispatch main.
+    streams = make_streams(device)
 
     # Run dispatch once to get a StreamingHandle. Reuse this for all isolated
     # kernel timing runs (kernel A / kernel Y individually).
-    with torch.cuda.stream(dispatch_stream):
+    with torch.cuda.stream(streams.dispatch):
         pool, handle, metadata_done = buffer.dispatch(
             x,
             topk_idx,
@@ -169,9 +168,9 @@ def main():
             dispatch_seq=1,
         )
     # For isolated kernel timing below we need dispatch fully done; sync the
-    # default stream against dispatch_stream so subsequent default-stream work
+    # default stream against streams.dispatch so subsequent default-stream work
     # (the isolated runs) sees dispatch's writes.
-    torch.cuda.current_stream().wait_stream(dispatch_stream)
+    torch.cuda.current_stream().wait_stream(streams.dispatch)
     torch.cuda.synchronize()
     total_tiles = handle.total_tiles
     TK_padded = pool.shape[0]
@@ -394,7 +393,7 @@ def main():
     #     pairs and per-token `compute_done_per_token` (Y→combine sender) gate.
 
     def run_pipeline_step(seq):
-        streaming_moe_layer(
+        stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -402,10 +401,7 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            dispatch_stream=dispatch_stream,
-            compute_a_stream=compute_a_stream,
-            compute_y_stream=compute_y_stream,
-            combine_stream=combine_stream,
+            streams=streams,
             num_experts=NUM_EXPERTS,
             dispatch_seq=seq,
             tile_m=args.tile_m,
@@ -429,9 +425,9 @@ def main():
 
     # Dispatch-only timing for context (we already paid for it once above).
     def dispatch_only():
-        nonlocal_seq = seq_counter[0]
+        seq = seq_counter[0]
         seq_counter[0] += 1
-        with torch.cuda.stream(dispatch_stream):
+        with torch.cuda.stream(streams.dispatch):
             buffer.dispatch(
                 x,
                 topk_idx,
@@ -439,10 +435,10 @@ def main():
                 is_token_in_rank,
                 NUM_EXPERTS,
                 tile_m=args.tile_m,
-                dispatch_seq=nonlocal_seq,
+                dispatch_seq=seq,
             )
-        # Layer-end barrier: default stream waits on dispatch_stream.
-        torch.cuda.current_stream().wait_stream(dispatch_stream)
+        # Layer-end barrier: default stream waits on streams.dispatch.
+        torch.cuda.current_stream().wait_stream(streams.dispatch)
 
     dispatch_us = time_kernel(dispatch_only, warmup=pipe_warmup, iters=pipe_iters)
 

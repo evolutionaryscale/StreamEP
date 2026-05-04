@@ -37,7 +37,10 @@ import torch.distributed as torch_dist
 import torch.profiler
 from deep_ep import Buffer as DeepEPBuffer
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import streaming_moe_layer
+from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+    make_streams,
+    stream_moe_func,
+)
 from evolutionaryscale.utils.distributed import (
     barrier,
     get_global_rank,
@@ -138,10 +141,7 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    dispatch_stream = torch.cuda.Stream()
-    compute_a_stream = torch.cuda.Stream()
-    compute_y_stream = torch.cuda.Stream()
-    combine_stream = torch.cuda.Stream()
+    streams = make_streams()
 
     os.makedirs(args.out_dir, exist_ok=True)
     if rank == 0:
@@ -155,7 +155,7 @@ def main():
 
     # Warm: dispatch + kernel A + kernel Y + combine JIT, kernel cache, allocator.
     for warm_seq in range(1, 6):
-        _out, _handle = streaming_moe_layer(
+        stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -163,10 +163,7 @@ def main():
             is_token_in_rank,
             w1_local,
             w2_local,
-            dispatch_stream=dispatch_stream,
-            compute_a_stream=compute_a_stream,
-            compute_y_stream=compute_y_stream,
-            combine_stream=combine_stream,
+            streams=streams,
             num_experts=NUM_EXPERTS,
             dispatch_seq=warm_seq,
             tile_m=args.tile_m,
@@ -195,7 +192,7 @@ def main():
             with torch.profiler.record_function(
                 f"step_{step}_dispatch+kernelA+kernelY+combine"
             ):
-                _out, _handle = streaming_moe_layer(
+                stream_moe_func(
                     buffer,
                     x,
                     topk_idx,
@@ -203,10 +200,7 @@ def main():
                     is_token_in_rank,
                     w1_local,
                     w2_local,
-                    dispatch_stream=dispatch_stream,
-                    compute_a_stream=compute_a_stream,
-                    compute_y_stream=compute_y_stream,
-                    combine_stream=combine_stream,
+                    streams=streams,
                     num_experts=NUM_EXPERTS,
                     dispatch_seq=seq + step,
                     tile_m=args.tile_m,
