@@ -771,8 +771,19 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         tma_store_wait<0>();
 #endif
         asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+        // Every thread in the rank-group fences its own prior writes at system
+        // scope. ``pool_recv_token`` / ``pool_topk_weight`` / ``pool_k_slot`` are
+        // written by lane 0 of EVERY receiver warp during the batch loop;
+        // ``__threadfence_system()`` on a single thread (a thread-0-only fence)
+        // only covers that one thread's writes. Block-scope ``bar.sync`` makes
+        // other warps' writes visible WITHIN the block but doesn't propagate them
+        // to system scope. Cross-stream consumers (kernel A acquiring tile_ready,
+        // kernel Y acquiring a_ready) need system-scope visibility for those
+        // per-warp writes; without this fence they could read stale -1 from the
+        // pool's N memset init.
+        __threadfence_system();
+        asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
         if (recv_thread_id_in_rank == 0) {
-            __threadfence_system();
             for (int e = 0; e < E; ++e) {
                 int n_writes_for_e = seen_substream[e];
                 if (n_writes_for_e == 0) continue;
