@@ -31,8 +31,9 @@ Per tile:
     up `dL_dx_per_r[r]` for RDMA push.
 
 Strict subset of fwd kernel_y's epilogue — no weight multiply (the per-slot
-pool_topk_weight was already absorbed into dL/dpostact_a upstream by
-kernel_y_bwd's `weight[slot] * g[slot]`). All atomic-scatter mechanics
+pool_topk_weight was already absorbed into dL/dswiglu_in upstream by
+kernel_y_bwd's epilogue: `dswiglu(gate, up, w*g) → (w*dgate, w*dup, postact)`
+by chain-rule linearity in dpostact). All atomic-scatter mechanics
 (predicated v4 bf16x2 issue, multi-pid_n bookkeeping gate, per-row last-stripe
 release) are inherited verbatim from `streaming_kernel_y.py`.
 
@@ -94,8 +95,10 @@ class StreamingMoeABwdSm90(StreamingMoeYSm90):
 
     Overrides:
       - `_epi_ops`: drop ColVecLoad — bwd has no per-slot weighting (the
-        forward pool_topk_weight was absorbed into dL/dpostact_a upstream
-        by kernel_y_bwd).
+        forward pool_topk_weight was absorbed into dL/dswiglu_in upstream
+        by kernel_y_bwd's `dswiglu` + post-multiply on (dgate, dup);
+        chain-rule linearity in dpostact bakes the weight into the
+        dgate/dup pair we read here).
       - `EpilogueArguments`: drop `mColVecBroadcast`.
       - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
         analogue here.
@@ -119,11 +122,12 @@ class StreamingMoeABwdSm90(StreamingMoeYSm90):
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
         """No weight multiply — strict subset of fwd kernel_y's epilogue.
 
-        kernel_y_bwd already produced `dL/dpostact_a = pool_topk_weight[slot] *
-        g[slot]` upstream, which feeds into kernel_a_bwd's SwiGLU bwd to make
-        `dL/dswiglu_in`. By the time we run this kernel, the per-slot scaling
-        is already baked in, so the data-grad GEMM result `dL/dpool` lands
-        unweighted in `dL_dx_per_r`.
+        The per-slot `pool_topk_weight` was baked into `dL/dswiglu_in` upstream
+        by kernel_y_bwd's epilogue (which post-multiplied (dgate, dup) by the
+        weight after `dswiglu`, exploiting chain-rule linearity in dpostact).
+        By the time we run this kernel, the data-grad GEMM result
+        `dL/dpool = dL/dswiglu_in @ W1` lands ALREADY-weighted in
+        `tRS_rD`, so the atomic-scatter into `dL_dx_per_r` is a plain sum.
         """
         return None
 

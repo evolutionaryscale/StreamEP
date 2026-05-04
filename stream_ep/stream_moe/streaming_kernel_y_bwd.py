@@ -305,7 +305,7 @@ def _compile_streaming_moe_y_bwd(
     I_sym = cute.sym_int()
     E_sym = cute.sym_int()
     TK_padded_sym = cute.sym_int()
-    Mflat_sym = cute.sym_int()  # total_tiles * tile_m, in dL_dpostact_a's M dim
+    Mflat_sym = cute.sym_int()  # total_tiles * tile_m, in dL_dswiglu_in's M dim
     total_tiles_sym = cute.sym_int()
     cu_seqlens_len_sym = cute.sym_int()  # E_local + 1 at runtime
     n_tiles_sym = cute.sym_int()  # ceil(I / tile_n) — N-stripe count per tile
@@ -588,7 +588,7 @@ def streaming_moe_y_bwd(
     # Build cu_seqlens_m = expert_pool_block_offset * tile_m. The varlen_m
     # path's per-batch m-row offset becomes
     #   m_offset(tile) = cu_seqlens_m[batch_idx] + pid_m * tile_m = tile_id * tile_m
-    # which lands at the correct pool row (pool/dL_do_pool/dL_dpostact_a are
+    # which lands at the correct pool row (pool/dL_do_pool/dL_dswiglu_in are
     # all expert-major contiguous in tile_id order by construction).
     cu_seqlens_m = (expert_pool_block_offset.to(torch.int32) * tile_m).contiguous()
 
