@@ -15,6 +15,15 @@ namespace intranode {
 // them. Used both in the kernel and at the launch site for SMEM sizing.
 constexpr int kReceiverChunkSize = 32;
 
+// Compile-time bounds for the streaming dispatch path. All three derive from
+// "must fit in a 32-lane warp": E_local indexes per-(c, src, e) SMEM slots that
+// lane 0 walks unrolled; topk and ranks both index lane masks (uint32 dst_mask
+// in the metadata kernel, lane-as-rank patterns in the dispatch / combine
+// kernels). Increase only if the kernel logic is widened correspondingly.
+constexpr int kMaxLocalExpertsPerRank = 32;
+constexpr int kMaxTopK = 32;
+constexpr int kMaxRanks = 32;
+
 // Receiver-state SMEM layout, used by the dispatch kernel's receiver block. Sits
 // after the per-warp TMA buffer slabs in dynamic SMEM:
 //   smem_per_substream_seen [num_ranks][E_local]                       — per-(c, src, e) cumulative count
@@ -90,18 +99,18 @@ __global__ void streaming_dispatch_metadata_kernel(
 
     const int E = num_experts_per_rank;
     const int e_inbox_size = num_channels * kNumRanks * E;
-    const int slab_e_size = num_channels * E;       // per-dst slice of local_e
-    const int slab_u_size = num_channels;            // per-dst slice of local_u
+    const int slab_e_size = num_channels * E;       // per-dst slice of smem_local_e
+    const int slab_u_size = num_channels;            // per-dst slice of smem_local_u
 
     extern __shared__ int smem[];
-    int* local_e = smem;                                          // [kNumRanks * slab_e_size]
-    int* local_u = local_e + kNumRanks * slab_e_size;             // [kNumRanks * slab_u_size]
+    int* smem_local_e = smem;                                          // [kNumRanks * slab_e_size]
+    int* smem_local_u = smem_local_e + kNumRanks * slab_e_size;             // [kNumRanks * slab_u_size]
 
     // Phase 1: zero local histograms.
     for (int i = thread_id; i < kNumRanks * slab_e_size; i += num_threads)
-        local_e[i] = 0;
+        smem_local_e[i] = 0;
     for (int i = thread_id; i < kNumRanks * slab_u_size; i += num_threads)
-        local_u[i] = 0;
+        smem_local_u[i] = 0;
     __syncthreads();
 
     // Phase 2: cross-rank handshake.
@@ -118,11 +127,11 @@ __global__ void streaming_dispatch_metadata_kernel(
                 continue;
             int dst_rank = e_global / E;
             int e_local = e_global - dst_rank * E;
-            atomicAdd(&local_e[dst_rank * slab_e_size + channel_id * E + e_local], 1);
+            atomicAdd(&smem_local_e[dst_rank * slab_e_size + channel_id * E + e_local], 1);
             uint64_t bit = 1ULL << dst_rank;
             if (!(dst_mask & bit)) {
                 dst_mask |= bit;
-                atomicAdd(&local_u[dst_rank * slab_u_size + channel_id], 1);
+                atomicAdd(&smem_local_u[dst_rank * slab_u_size + channel_id], 1);
             }
         }
     }
@@ -136,10 +145,10 @@ __global__ void streaming_dispatch_metadata_kernel(
         for (int i = lane_id; i < slab_e_size; i += 32) {
             int c = i / E;
             int e = i - c * E;
-            peer_e[c * kNumRanks * E + rank * E + e] = local_e[dst * slab_e_size + i];
+            peer_e[c * kNumRanks * E + rank * E + e] = smem_local_e[dst * slab_e_size + i];
         }
         for (int c = lane_id; c < num_channels; c += 32)
-            peer_u[c * kNumRanks + rank] = local_u[dst * slab_u_size + c];
+            peer_u[c * kNumRanks + rank] = smem_local_u[dst * slab_u_size + c];
     }
     __syncthreads();
 
@@ -151,45 +160,45 @@ __global__ void streaming_dispatch_metadata_kernel(
         static_cast<uint8_t*>(buffer_ptrs[rank]) + streaming_section_offset);
     auto* my_u_inbox = my_e_inbox + e_inbox_size;
 
-    int* s_freq     = smem;                       // [E]
-    int* s_pool_blk = s_freq + E;                 // [E + 1]
-    int* s_per_src  = s_pool_blk + (E + 1);       // [kNumRanks]
+    int* smem_freq     = smem;                       // [E]
+    int* smem_pool_blk = smem_freq + E;                 // [E + 1]
+    int* smem_per_src  = smem_pool_blk + (E + 1);       // [kNumRanks]
 
     // expert_frequency[e] = sum over (c, src) of e_inbox[c, src, e].
     for (int e = thread_id; e < E; e += num_threads) {
         int sum = 0;
         for (int cs = 0; cs < num_channels * kNumRanks; ++cs)
             sum += my_e_inbox[cs * E + e];
-        s_freq[e] = sum;
+        smem_freq[e] = sum;
         expert_frequency[e] = sum;
     }
-    // s_per_src[src] = sum over c of u_inbox[c, src].
+    // smem_per_src[src] = sum over c of u_inbox[c, src].
     for (int src = thread_id; src < kNumRanks; src += num_threads) {
         int total = 0;
         for (int c = 0; c < num_channels; ++c)
             total += my_u_inbox[c * kNumRanks + src];
-        s_per_src[src] = total;
+        smem_per_src[src] = total;
     }
     __syncthreads();
 
     if (thread_id == 0) {
         int cum_blocks = 0;
-        s_pool_blk[0] = 0;
+        smem_pool_blk[0] = 0;
         for (int e = 0; e < E; ++e) {
-            int n_blocks_e = (s_freq[e] + tile_m - 1) / tile_m;
+            int n_blocks_e = (smem_freq[e] + tile_m - 1) / tile_m;
             cum_blocks += n_blocks_e;
-            s_pool_blk[e + 1] = cum_blocks;
+            smem_pool_blk[e + 1] = cum_blocks;
         }
         *total_tiles_out = cum_blocks;
         *total_tiles_mapped = cum_blocks;
 
         int total_unique = 0;
         for (int i = 0; i < kNumRanks; ++i)
-            total_unique += s_per_src[i];
+            total_unique += smem_per_src[i];
         *num_recv_mapped = total_unique;
 
         for (int e = 0; e < E; ++e) {
-            int aligned = (s_freq[e] + expert_alignment - 1) / expert_alignment * expert_alignment;
+            int aligned = (smem_freq[e] + expert_alignment - 1) / expert_alignment * expert_alignment;
             num_recv_per_expert_mapped[e] = aligned;
         }
 
@@ -197,21 +206,21 @@ __global__ void streaming_dispatch_metadata_kernel(
         // tokens from senders 0..i to this rank — read by combine on rank j.
         int cum_src = 0;
         for (int i = 0; i < kNumRanks; ++i) {
-            cum_src += s_per_src[i];
+            cum_src += smem_per_src[i];
             rank_prefix_matrix[i * kNumRanks + rank] = cum_src;
         }
     }
     __syncthreads();
     for (int e = thread_id; e < E + 1; e += num_threads)
-        expert_pool_block_offset[e] = s_pool_blk[e];
+        expert_pool_block_offset[e] = smem_pool_blk[e];
 
     // Phase 7: base_pool[c, src, e] = pool slot start (in pool-row units) for
     // substream (c, src) writes for expert e:
-    //   base_pool[c, src, e] = s_pool_blk[e] * tile_m
+    //   base_pool[c, src, e] = smem_pool_blk[e] * tile_m
     //                          + Σ over (c', src') < (c, src) lex of e_inbox[c', src', e].
     // E ≤ NUM_MAX_LOCAL_EXPERTS so we can run one thread per expert in parallel.
     for (int e = thread_id; e < E; e += num_threads) {
-        int acc = s_pool_blk[e] * tile_m;
+        int acc = smem_pool_blk[e] * tile_m;
         for (int cs = 0; cs < num_channels * kNumRanks; ++cs) {
             base_pool[cs * E + e] = acc;
             acc += my_e_inbox[cs * E + e];
@@ -219,18 +228,18 @@ __global__ void streaming_dispatch_metadata_kernel(
     }
 
     // Phase 8: per-tile arrays for the dispatch hot path. Each thread owns one
-    // expert and walks its tile range [s_pool_blk[e], s_pool_blk[e+1]) writing
+    // expert and walks its tile range [smem_pool_blk[e], smem_pool_blk[e+1]) writing
     //   tile_id_to_expert[tile_id]   = e
     //   pool_arrival_target[tile_id] = tile_m for full tiles,
-    //                                  s_freq[e] - tile_in_e * tile_m for the
+    //                                  smem_freq[e] - tile_in_e * tile_m for the
     //                                  last (possibly partial) tile per expert.
     // No sync required vs. phase 7: writes target disjoint global regions and
-    // s_pool_blk / s_freq remain valid in SMEM since phase 6 (the only writers).
+    // smem_pool_blk / smem_freq remain valid in SMEM since phase 6 (the only writers).
     for (int e = thread_id; e < E; e += num_threads) {
-        int e_start = s_pool_blk[e];
-        int e_end = s_pool_blk[e + 1];
+        int e_start = smem_pool_blk[e];
+        int e_end = smem_pool_blk[e + 1];
         int n_tiles = e_end - e_start;
-        int n_e = s_freq[e];
+        int n_e = smem_freq[e];
         for (int t = 0; t < n_tiles; ++t) {
             int tile_id = e_start + t;
             tile_id_to_expert[tile_id] = e;
@@ -297,14 +306,14 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
-__global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
+__global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(int4* pool,
                                                            float* pool_x_scales,
                                                            float* pool_topk_weight,
                                                            int* pool_recv_token,
                                                            int* pool_k_slot,
                                                            int* recv_src_idx,
                                                            float* recv_topk_weights,
-                                                           int* recv_channel_offset,
+                                                           int* recv_channel_prefix_matrix,
                                                            int* send_head,
                                                            int* per_token_remaining,
                                                            const int4* x,
@@ -346,10 +355,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 and num_topk > 0);
     // Pool-layout SMEM scratch is sized by E_local at runtime; a compile-time
     // upper bound keeps the receiver-block per-(chunk, k) slot computation
-    // unrolled. 32 covers any practical MoE: even Mixtral-style routing has
-    // num_experts_per_rank well under 32 at world_size ≥ 8.
-    EP_DEVICE_ASSERT(num_experts_per_rank <= 32);
-    EP_DEVICE_ASSERT(num_topk <= 32);
+    // unrolled. The 32-lane bound covers any practical MoE: even Mixtral-style
+    // routing has num_experts_per_rank well under 32 at world_size ≥ 8.
+    EP_DEVICE_ASSERT(num_experts_per_rank <= kMaxLocalExpertsPerRank);
+    EP_DEVICE_ASSERT(num_topk <= kMaxTopK);
     EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_DEVICE_ASSERT(recv_topk_weights != nullptr);
 
@@ -413,7 +422,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
         const auto send_thread_id = thread_id;
         const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
-        EP_DEVICE_ASSERT(kNumRanks <= 32);
+        EP_DEVICE_ASSERT(kNumRanks <= kMaxRanks);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
         // Compute the channel-prefix locally over `is_token_in_rank`. One warp
@@ -549,7 +558,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
         const int E = num_experts_per_rank;
-        EP_DEVICE_ASSERT(kNumRanks <= 32);
+        EP_DEVICE_ASSERT(kNumRanks <= kMaxRanks);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // ── Receiver-state SMEM (sized by `receiver_state_smem_bytes` at the
@@ -561,16 +570,15 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
         //     k) slot for the current sub-batch; -1 = nonlocal. Computed by lane 0
         //     in Pass A; consumed by all warps in Pass B (data copy + per-slot writes).
 #ifndef DISABLE_SM90_FEATURES
-        int* recv_state = reinterpret_cast<int*>(
+        int* smem_per_substream_seen = reinterpret_cast<int*>(
             smem_buffer + kNumTMABytesPerWarp * num_recv_warps);
 #else
-        extern __shared__ int recv_state_no_tma[];
-        int* recv_state = recv_state_no_tma;
+        extern __shared__ int smem_recv_state[];
+        int* smem_per_substream_seen = smem_recv_state;
 #endif
         const int seen_stride = E;
         const int slot_stride = kReceiverChunkSize * num_topk;
-        int* smem_per_substream_seen = recv_state;
-        int* smem_batch_slot         = smem_per_substream_seen + kNumRanks * seen_stride;
+        int* smem_batch_slot = smem_per_substream_seen + kNumRanks * seen_stride;
         (void)num_max_send_tokens;
 
         // Initialize cumulative seen for this substream's local experts.
@@ -591,7 +599,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
                 ;
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
-                recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
+                recv_channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
         total_offset = __shfl_sync(0xffffffff, total_offset, 0);
@@ -807,14 +815,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* pool,
     }
 }
 
-void dispatch(void* pool,
+void launch_dispatch_main(void* pool,
               float* pool_x_scales,
               float* pool_topk_weight,
               int* pool_recv_token,
               int* pool_k_slot,
               int* recv_src_idx,
               float* recv_topk_weights,
-              int* recv_channel_offset,
+              int* recv_channel_prefix_matrix,
               int* send_head,
               int* per_token_remaining,
               const void* x,
@@ -859,7 +867,7 @@ void dispatch(void* pool,
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                      \
     {                                                                    \
-        auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>; \
+        auto kernel = dispatch_main_kernel<ranks, kNumThreads, kNumTMABytesPerWarp>; \
         SET_SHARED_MEMORY_FOR_TMA(kernel);                               \
         LAUNCH_KERNEL(&cfg,                                              \
                       kernel,                                            \
@@ -870,7 +878,7 @@ void dispatch(void* pool,
                       pool_k_slot,                                       \
                       recv_src_idx,                                      \
                       recv_topk_weights,                                 \
-                      recv_channel_offset,                               \
+                      recv_channel_prefix_matrix,                               \
                       send_head,                                         \
                       per_token_remaining,                               \
                       reinterpret_cast<const int4*>(x),                  \
@@ -1012,7 +1020,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
     const int responsible_channel = sm_id / 2;
-    EP_DEVICE_ASSERT(num_topk <= 32);
+    EP_DEVICE_ASSERT(num_topk <= kMaxTopK);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
     int hidden_int4 = hidden * sizeof(dtype_t) / sizeof(int4);
@@ -1145,7 +1153,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         // One warp for moving the queue head, others for reduction
         constexpr int num_recv_warps = kNumThreads / 32;
         const auto recv_warp_id = thread_id / 32;
-        EP_DEVICE_ASSERT(kNumRanks <= 32 and kNumThreads > 32);
+        EP_DEVICE_ASSERT(kNumRanks <= kMaxRanks and kNumThreads > 32);
         EP_DEVICE_ASSERT(thread_id >= 0 and kNumThreads % 32 == 0);
 
         // Shared head, tail and retired flags for receiver warps

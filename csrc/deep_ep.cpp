@@ -794,7 +794,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales
         <= num_nvl_bytes);
 
-    intranode::dispatch(pool.data_ptr(),
+    intranode::launch_dispatch_main(pool.data_ptr(),
                         pool_x_scales_ptr,
                         pool_topk_weight.data_ptr<float>(),
                         pool_recv_token.data_ptr<int>(),

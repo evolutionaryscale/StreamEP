@@ -301,6 +301,13 @@ class Buffer:
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]
 
+    def _assert_intranode_only(self) -> None:
+        """Streaming dispatch / combine are intranode-only today."""
+        if self.runtime.get_num_rdma_ranks() > 1:
+            raise NotImplementedError(
+                "Internode streaming path is not yet implemented."
+            )
+
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
         """
@@ -378,19 +385,14 @@ class Buffer:
         etc.) without serializing against the dispatch main kernel — preserving
         the per-tile dispatch→A streaming overlap.
 
-        Two kernel launches + one host sync per layer:
-          1. ``streaming_dispatch_metadata`` — fused cross-rank count exchange +
-             receiver-side metadata derivation (E_local + R sized outputs).
-          2. host poll on ``{moe_recv_counter, moe_recv_expert_counter,
-             streaming_total_tiles}``.
-          3. ``tile_arrays_init`` — per-tile (tile_id_to_expert, pool_arrival_target).
-          4. ``metadata_done_event`` recorded on the current stream.
-          5. ``dispatch`` — pool-layout receiver. Each landed (token, k) routing
-             to a local expert lands in a deterministic pool slot derived from
-             ``base_pool[c, src, e]`` plus a per-warp per-expert thread offset.
-             Pass 2 (substream end) walks experts in order and atomic-adds to
-             ``pool_arrival_count``; tile_ready[tile_id] is release-stored to
-             ``dispatch_seq`` once the tile's target write count is reached.
+        Two kernels + one host sync per layer: a fused metadata kernel
+        (``streaming_dispatch_metadata`` — cross-rank count exchange + receiver
+        metadata + per-tile arrays), a host poll on
+        ``{moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}``,
+        and the dispatch main kernel (pool-layout receiver). The returned
+        ``metadata_done_event`` is recorded between the two kernels so consumer
+        streams can read metadata tensors without serializing against dispatch
+        main. See ``csrc/deep_ep.cpp:intranode_dispatch`` for the full sequence.
 
         Arguments:
             x: tokens to dispatch, ``[num_tokens, hidden]`` bf16 (or a tuple
@@ -416,9 +418,7 @@ class Buffer:
                 serializing against dispatch main.
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
-
-        if self.runtime.get_num_rdma_ranks() > 1:
-            raise NotImplementedError("Internode streaming dispatch is out of scope (intranode-only).")
+        self._assert_intranode_only()
 
         x_tensor, x_scales = x if isinstance(x, tuple) else (x, None)
         outputs = self.runtime.intranode_dispatch(
@@ -492,9 +492,7 @@ class Buffer:
         monotonic ID.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
-
-        if self.runtime.get_num_rdma_ranks() > 1:
-            raise NotImplementedError("Internode streaming combine is not yet implemented.")
+        self._assert_intranode_only()
 
         bias_0, bias_1 = Buffer._unpack_bias(bias)
         # Combine sender on rank R, for warp targeting send_rank_id=S, iterates
