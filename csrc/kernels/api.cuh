@@ -165,6 +165,10 @@ struct DispatchGradsRouting {
     const int* recv_token_to_slots;   // [T_recv, num_topk]                     bwd Pass B slot lookup
     const int* base_pool;             // [num_channels, num_ranks, E_local]     Pass 2: per-substream slot start
     const int* seen_per_substream;    // [num_channels, num_ranks, E_local]     Pass 2: per-substream-per-expert recv count
+    // Passed explicitly (NOT read from IPC slab leading bytes) — fwd combine's
+    // `cached_notify_combine` zeros that region before bwd runs, so the IPC
+    // slab can't be the source. Persistent tensor lives on the StreamingHandle.
+    const int* rank_prefix_matrix;    // [num_ranks, num_ranks]                receiver: per-source-rank token offset
 };
 
 struct DispatchGradsTileSignal {

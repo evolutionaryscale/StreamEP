@@ -255,6 +255,7 @@ public:
         const torch::Tensor& base_pool,
         const torch::Tensor& seen_per_substream,
         const torch::Tensor& pool_arrival_target,
+        const torch::Tensor& rank_prefix_matrix,
         int num_experts,
         int num_topk,
         int tile_m,

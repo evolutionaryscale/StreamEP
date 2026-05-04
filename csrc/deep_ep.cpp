@@ -975,6 +975,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     const torch::Tensor& base_pool,
     const torch::Tensor& seen_per_substream,
     const torch::Tensor& pool_arrival_target,
+    const torch::Tensor& rank_prefix_matrix,
     int num_experts,
     int num_topk,
     int tile_m,
@@ -990,6 +991,10 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     EP_HOST_ASSERT(seen_per_substream.is_contiguous() and seen_per_substream.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(pool_arrival_target.dim() == 1 and pool_arrival_target.is_contiguous() and
                    pool_arrival_target.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(rank_prefix_matrix.dim() == 2 and rank_prefix_matrix.is_contiguous() and
+                   rank_prefix_matrix.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and
+                   rank_prefix_matrix.size(1) == num_ranks);
 
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -1042,6 +1047,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
         .recv_token_to_slots = recv_token_to_slots.data_ptr<int>(),
         .base_pool           = base_pool.data_ptr<int>(),
         .seen_per_substream  = seen_per_substream.data_ptr<int>(),
+        .rank_prefix_matrix  = rank_prefix_matrix.data_ptr<int>(),
     };
     intranode::DispatchGradsTileSignal tile_signal{
         .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),

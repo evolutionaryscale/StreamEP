@@ -492,6 +492,7 @@ class Buffer:
             handle.base_pool,
             handle.seen_per_substream,
             handle.pool_arrival_target,
+            handle.rank_prefix_matrix,
             num_experts,
             num_topk,
             handle.tile_m,

@@ -1031,8 +1031,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         EP_DEVICE_ASSERT(kNumRanks <= kMaxRanks);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
-        // Rank prefix (same source as fwd: leading region of own IPC slab).
-        auto rank_prefix_matrix = static_cast<int*>(env.buffer_ptrs[env.rank]);
+        // Rank prefix matrix is passed explicitly (NOT read from IPC slab):
+        // fwd combine's `cached_notify_combine` zeros the leading bytes of the
+        // slab before bwd runs, so the slab copy is gone by the time we need
+        // it. Persistent tensor lives on the StreamingHandle.
+        const int* rank_prefix_matrix = routing.rank_prefix_matrix;
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + env.rank] : 0;
 
         int total_offset, num_tokens_to_recv;
