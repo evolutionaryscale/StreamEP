@@ -54,10 +54,10 @@ class StreamingHandle:
     # order across substream blocks — preserves wave caching of W1[e].
     tile_ready: torch.Tensor                   # [total_tiles] int64
 
-    # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers (Phase C).
-    # All allocated on comm_stream; cross-stream visibility carried by the per-tile
-    # release/acquire pairs `tile_ready` (dispatch→A), `a_ready` (A→Y), and
-    # `compute_done_per_token` (Y→combine).
+    # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers.
+    # All allocated on dispatch_stream; cross-stream visibility carried by the
+    # per-tile release/acquire pairs `tile_ready` (dispatch→A), `a_ready` (A→Y),
+    # and `compute_done_per_token` (Y→combine).
     a_ready: torch.Tensor                      # [total_tiles] int64 — A→Y per-tile release stamp (zero-init)
     per_token_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
     compute_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
@@ -370,8 +370,8 @@ class Buffer:
         """Streaming-MoE pool-layout dispatch (intranode).
 
         Runs on ``torch.cuda.current_stream()``. The caller is expected to wrap
-        this call in ``with torch.cuda.stream(comm_stream):`` so dispatch's
-        kernels and allocations land on ``comm_stream``. Cross-stream
+        this call in ``with torch.cuda.stream(dispatch_stream):`` so dispatch's
+        kernels and allocations land on ``dispatch_stream``. Cross-stream
         consumers (kernel A, kernel Y, combine sender) wait on the returned
         ``metadata_done_event`` to safely read metadata tensors
         (``expert_pool_block_offset``, ``pool_recv_token``, ``pool_topk_weight``,
@@ -477,7 +477,7 @@ class Buffer:
                 config: Optional[Config] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
-        returned by ``Buffer.dispatch``. Intranode only for now (Phase E for internode).
+        returned by ``Buffer.dispatch``. Intranode only; internode is not yet implemented.
 
         Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
 
@@ -494,7 +494,7 @@ class Buffer:
         config = self.get_combine_config(self.group_size) if config is None else config
 
         if self.runtime.get_num_rdma_ranks() > 1:
-            raise NotImplementedError("Internode streaming combine lands in Phase E.")
+            raise NotImplementedError("Internode streaming combine is not yet implemented.")
 
         bias_0, bias_1 = Buffer._unpack_bias(bias)
         # Combine sender on rank R, for warp targeting send_rank_id=S, iterates

@@ -113,7 +113,7 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
-    // Streaming-MoE total_tiles host-mapped slot. Written by streaming_metadata_init,
+    // Streaming-MoE total_tiles host-mapped slot. Written by streaming_dispatch_metadata,
     // polled by the dispatch flow alongside moe_recv_counter / moe_recv_expert_counter
     // as the single sync point per layer.
     volatile int* streaming_total_tiles = nullptr;

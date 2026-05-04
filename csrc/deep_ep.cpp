@@ -519,8 +519,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
 
     // All kernels + allocations run on the caller's current stream. The caller
-    // is expected to have set its `comm_stream` as current via
-    // `with torch.cuda.stream(comm_stream)` before calling. PyTorch's caching
+    // is expected to have set its `dispatch_stream` as current via
+    // `with torch.cuda.stream(dispatch_stream)` before calling. PyTorch's caching
     // allocator uses `getCurrentCUDAStream`, so allocations land on this same
     // stream and are naturally ordered with the kernels we launch.
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -534,7 +534,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // ── Pre-host-poll consolidated allocation. ──────────────────────────────
     //
     // The metadata kernel's outputs + the dispatch sender's per-(rank,channel)
-    // prefix matrix all live on `comm_stream`. We bundle them into a single
+    // prefix matrix all live on `dispatch_stream`. We bundle them into a single
     // int8 slab and view typed sub-tensors via `narrow` + `view(dtype)`.
     //
     // Why one slab + one memset instead of 8 separate `torch::empty/zeros`:
@@ -685,7 +685,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     //   Z_post (zeroed AFTER metadata_done — kernel Y atomic-scatter
     //          destinations + combine sender state. Kernel Y waits on
     //          a_ready (kernel A's release), which serializes after this
-    //          memset on comm_stream → no race):
+    //          memset on dispatch_stream → no race):
     //     per_token_remaining, compute_done_per_token, o
     //
     // Kept separate (memory wall — too big to bundle without forcing a
@@ -774,7 +774,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // Z_post memset (queued AFTER metadata_done event recording — kernel A
     // doesn't depend on these tensors at start; kernel Y reaches them only
     // through the a_ready release-acquire chain which serializes after
-    // dispatch_main and kernel A on comm_stream / compute_a_stream).
+    // dispatch_main and kernel A on dispatch_stream / compute_a_stream).
     CUDA_CHECK(cudaMemsetAsync(post_base + n_end, 0x00, post_total_bytes - n_end, stream));
 
     // Z_post views.

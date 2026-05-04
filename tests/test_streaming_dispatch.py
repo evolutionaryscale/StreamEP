@@ -183,7 +183,7 @@ def main():
                 f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
             )
 
-    # ─── (6) Phase C buffer initialization. per_token_remaining[r] should equal
+    # ─── (6) Pipeline buffer initialization. per_token_remaining[r] should equal
     #         K_local(r) (the count of local-expert landings for recv-token r),
     #         which is also the count of pool slots for r. compute_done_per_token
     #         and o (and a_ready) should be zero-init.
