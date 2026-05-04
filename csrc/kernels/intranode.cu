@@ -879,6 +879,326 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 #undef DISPATCH_LAUNCH_CASE
 }
 
+// ── Backward: dispatch_grads_main_kernel ─────────────────────────────────
+// Ships dL/dy[t] rows from origin → expert ranks using the same routing as
+// fwd dispatch. Differences from fwd dispatch_main_kernel:
+//   - sender ships data only (no topk_idx / topk_weights / src_idx / x_scales).
+//   - receiver SKIPS Pass A — slots come from recv_token_to_slots[r, :K]
+//     (persisted by fwd Pass B). No SMEM batch_slot, no per-(c, src, e) seen
+//     counter — Pass 2 reads seen_per_substream[c, src, e] from the metadata
+//     kernel's persisted output.
+//   - receiver writes ONLY into dL_do_pool[slot] (K-fanout per packet).
+//     No scalar pool-slot writes (pool_topk_weight / pool_recv_token /
+//     pool_k_slot / per_token_remaining are already populated by fwd).
+//   - Pass 2 atomic-adds into bwd_dispatch_arrival_count and release-stores
+//     bwd_y_ready[block] = dispatch_seq when count == pool_arrival_target
+//     (the same target fwd uses; we re-fire it on the bwd ready signal).
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
+__global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
+        DispatchGradsIO io,
+        DispatchGradsRouting routing,
+        DispatchGradsTileSignal tile_signal,
+        DispatchGradsShape shape,
+        DispatchEnv env) {
+    const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
+    const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
+    const bool is_sender = sm_id % 2 == 0;
+    EP_DEVICE_ASSERT(num_sms % 2 == 0);
+
+    const auto num_threads_per_rank = kNumThreads / kNumRanks;
+    const auto num_channels = num_sms / 2;
+    const auto responsible_rank = thread_id / num_threads_per_rank;
+    const auto responsible_channel = sm_id / 2;
+
+    int num_experts_per_rank = shape.num_experts / kNumRanks;
+    EP_DEVICE_ASSERT(num_experts_per_rank > 0 and shape.num_topk > 0);
+    EP_DEVICE_ASSERT(num_experts_per_rank <= kMaxLocalExpertsPerRank);
+    EP_DEVICE_ASSERT(shape.num_topk <= kMaxTopK);
+
+    // Channel buffer pointers — same IPC slab layout as fwd dispatch (both
+    // share the dispatch ring). We only touch start_offset / end_offset / head
+    // / tail / x_buffers; topk_idx / topk_weights / src_idx / x_scales buffers
+    // exist in the slab but go untouched by bwd.
+    auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(env.buffer_ptrs[is_sender ? responsible_rank : env.rank]) +
+                                       kNumRanks * kNumRanks * sizeof(int));
+    int target_rank = is_sender ? env.rank : responsible_rank;
+    auto num_channels_total = num_channels * kNumRanks;
+    auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
+
+    auto channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_end_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+
+    auto channel_x_buffers = Buffer<int4>(
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.hidden_int4,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.hidden_int4);
+    // Skip past topk_idx / topk_weights / x_scales regions (untouched by bwd
+    // but they reserve space in the slab — pointer arithmetic must match fwd).
+    auto channel_src_idx_buffers = Buffer<int>(
+        ptr, num_channels_total * env.num_recv_buffer_tokens,
+        channel_rank_offset * env.num_recv_buffer_tokens);
+    (void)channel_src_idx_buffers;
+    auto channel_topk_idx_buffers = Buffer<topk_idx_t>(
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_topk,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.num_topk);
+    (void)channel_topk_idx_buffers;
+    auto channel_topk_weights_buffers = Buffer<float>(
+        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_topk,
+        channel_rank_offset * env.num_recv_buffer_tokens * shape.num_topk);
+    (void)channel_topk_weights_buffers;
+
+    // TMA stuffs (mirror fwd dispatch's setup).
+#ifndef DISABLE_SM90_FEATURES
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto half_hidden_int4 = shape.hidden_int4 / 2;
+    auto half_hidden_bytes = half_hidden_int4 * static_cast<int>(sizeof(int4));
+    auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
+    auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + half_hidden_bytes);
+    uint32_t tma_phase = 0;
+    if (elect_one_sync()) {
+        mbarrier_init(tma_mbarrier, 1);
+        fence_barrier_init();
+        EP_DEVICE_ASSERT(shape.hidden_int4 % 2 == 0 and half_hidden_bytes + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+    }
+    __syncwarp();
+#endif
+
+    if (is_sender) {
+        constexpr int num_send_warps = kNumThreads / 32;
+        constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
+        const auto send_thread_id = thread_id;
+        const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
+        EP_DEVICE_ASSERT(kNumRanks <= kMaxRanks);
+        EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
+
+        // Recompute channel_prefix locally (same as fwd dispatch sender).
+        // No need to re-write channel_prefix_matrix to global — fwd already
+        // populated it; bwd's only consumer here is start/end offset.
+        if (send_warp_id_in_rank == 0) {
+            int channel_start, channel_end;
+            get_channel_task_range(shape.num_tokens, num_channels, responsible_channel, channel_start, channel_end);
+            int start_count = 0, end_count = 0;
+            for (int i = lane_id; i < channel_end; i += 32) {
+                int v = io.is_token_in_rank[i * kNumRanks + responsible_rank];
+                if (i < channel_start) start_count += v;
+                else end_count += v;
+            }
+            start_count = warp_reduce_sum(start_count);
+            end_count = warp_reduce_sum(end_count) + start_count;
+
+            if (elect_one_sync()) {
+                st_relaxed_sys_global(channel_start_offset.buffer(), -start_count - 1);
+                st_relaxed_sys_global(channel_end_offset.buffer(), -end_count - 1);
+            }
+        }
+        __syncwarp();
+
+        int token_start_idx, token_end_idx;
+        get_channel_task_range(shape.num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+
+        int cached_channel_tail_idx = 0;
+        for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
+            sender_wait_for_queue_space(cached_channel_tail_idx,
+                                        channel_head_idx.buffer(),
+                                        env.num_recv_buffer_tokens,
+                                        env.num_max_send_tokens,
+                                        env.rank, responsible_channel,
+                                        "dispatch_grads senders");
+
+            int chunk_token_idx = 0;
+            while (chunk_token_idx < env.num_max_send_tokens and token_idx < token_end_idx) {
+                if (not io.is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
+                    token_idx++;
+                    continue;
+                }
+
+                int dst_slot_idx = (cached_channel_tail_idx++) % env.num_recv_buffer_tokens;
+                if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank) {
+                    auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * shape.hidden_int4;
+                    auto shifted_dL_dy = io.dL_dy + token_idx * shape.hidden_int4;
+                    UNROLLED_WARP_COPY(5, lane_id, shape.hidden_int4, shifted_channel_x_buffers, shifted_dL_dy, __ldg, st_na_global);
+                }
+
+                chunk_token_idx++, token_idx++;
+            }
+
+            asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+            if (send_warp_id_in_rank == 0 and elect_one_sync())
+                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+        }
+    } else {
+        // Receiver: gather K slots per packet from recv_token_to_slots, write
+        // dL_do_pool[slot] K times. No Pass A, no SMEM batch_slot.
+        constexpr int num_recv_warps = kNumThreads / 32;
+        constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
+        const auto recv_thread_id = thread_id;
+        const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
+        const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
+        const int E = num_experts_per_rank;
+        EP_DEVICE_ASSERT(kNumRanks <= kMaxRanks);
+        EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
+
+        // Rank prefix (same source as fwd: leading region of own IPC slab).
+        auto rank_prefix_matrix = static_cast<int*>(env.buffer_ptrs[env.rank]);
+        int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + env.rank] : 0;
+
+        int total_offset, num_tokens_to_recv;
+        if (elect_one_sync()) {
+            while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
+                ;
+            while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
+                ;
+            total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
+            num_tokens_to_recv -= total_offset;
+        }
+        total_offset = __shfl_sync(0xffffffff, total_offset, 0);
+        total_offset += rank_offset;
+        num_tokens_to_recv = __shfl_sync(0xffffffff, num_tokens_to_recv, 0);
+
+        __shared__ volatile int shared_channel_tail_idx[kNumRanks];
+
+        const int substream_csrc = responsible_channel * kNumRanks + responsible_rank;
+        const int* base_pool_substream = routing.base_pool + substream_csrc * E;
+        const int* seen_substream = routing.seen_per_substream + substream_csrc * E;
+
+        auto start_time = clock64();
+        int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
+        while (num_tokens_to_recv > 0) {
+            while (recv_thread_id_in_rank == 0) {
+                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
+                if (cached_channel_head_idx != cached_channel_tail_idx) {
+                    shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx;
+                    break;
+                }
+                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP timeout for dispatch_grads receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
+                           env.rank, responsible_channel, num_tokens_to_recv);
+                    trap();
+                }
+            }
+
+            asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+            cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
+            int batch_total = cached_channel_tail_idx - cached_channel_head_idx;
+
+            // Direct per-(chunk) processing — no inner sub-batch loop bounded
+            // by SMEM batch_slot (Pass A is gone). Each warp owns chunks where
+            // chunk_idx % num_recv_warps_per_rank == warp_id.
+            for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < batch_total;
+                 chunk_idx += num_recv_warps_per_rank) {
+                int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % env.num_recv_buffer_tokens;
+                int recv_token_id = total_offset + chunk_idx;
+
+                auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * shape.hidden_int4;
+#ifndef DISABLE_SM90_FEATURES
+                #pragma unroll
+                for (int piece = 0; piece < 2; ++piece) {
+                    tma_store_wait<0>();
+                    if (elect_one_sync()) {
+                        tma_load_1d(tma_buffer,
+                                    shifted_buffer_x_int4 + piece * half_hidden_int4,
+                                    tma_mbarrier, half_hidden_bytes);
+                        mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes);
+                        mbarrier_wait(tma_mbarrier, tma_phase);
+                        for (int k = 0; k < shape.num_topk; ++k) {
+                            int slot = routing.recv_token_to_slots[recv_token_id * shape.num_topk + k];
+                            if (slot < 0) continue;
+                            tma_store_1d(tma_buffer,
+                                         io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4
+                                              + piece * half_hidden_int4,
+                                         half_hidden_bytes, false);
+                        }
+                    }
+                    __syncwarp();
+                }
+#else
+                for (int k = 0; k < shape.num_topk; ++k) {
+                    int slot = routing.recv_token_to_slots[recv_token_id * shape.num_topk + k];
+                    if (slot < 0) continue;
+                    auto shifted_pool_int4 = io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4;
+                    UNROLLED_WARP_COPY(5, lane_id, shape.hidden_int4, shifted_pool_int4, shifted_buffer_x_int4,
+                                       ld_nc_global, st_na_global);
+                }
+#endif
+            }
+
+            asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+            cached_channel_head_idx += batch_total;
+            total_offset += batch_total;
+            asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+            if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
+                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+
+            num_tokens_to_recv -= batch_total;
+        }
+
+        // Pass 2 — same shape as fwd dispatch's Pass 2, but reads
+        // `seen_per_substream` from global (instead of fwd's SMEM
+        // `seen_substream`) and fires `bwd_y_ready` instead of `tile_ready`.
+#ifndef DISABLE_SM90_FEATURES
+        tma_store_wait<0>();
+#endif
+        asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+        __threadfence_system();
+        asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+        if (recv_thread_id_in_rank == 0) {
+            for (int e = 0; e < E; ++e) {
+                int n_writes_for_e = seen_substream[e];
+                if (n_writes_for_e == 0) continue;
+                int slot_start_e = base_pool_substream[e];
+                int slot_end_e = slot_start_e + n_writes_for_e;
+                int first_block = slot_start_e / shape.tile_m;
+                int last_block = (slot_end_e - 1) / shape.tile_m;
+                for (int block_id = first_block; block_id <= last_block; ++block_id) {
+                    int block_slot_start = block_id * shape.tile_m;
+                    int block_slot_end = block_slot_start + shape.tile_m;
+                    int writes_in_block =
+                        min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
+                    int cnt_before = atomicAdd(&tile_signal.bwd_dispatch_arrival_count[block_id], writes_in_block);
+                    if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
+                        memory_fence();
+                        st_release_sys_global(tile_signal.bwd_y_ready + block_id, tile_signal.dispatch_seq);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void launch_dispatch_grads_main(const DispatchGradsIO& io,
+                                const DispatchGradsRouting& routing,
+                                const DispatchGradsTileSignal& tile_signal,
+                                const DispatchGradsShape& shape,
+                                const DispatchEnv& env,
+                                int num_ranks,
+                                cudaStream_t stream,
+                                int num_sms) {
+    constexpr int kNumThreads = 768;
+    constexpr int kNumTMABytesPerWarp = 8192;
+    constexpr int kNumWarps = kNumThreads / 32;
+#ifndef DISABLE_SM90_FEATURES
+    int smem_size = kNumTMABytesPerWarp * kNumWarps;
+#else
+    int smem_size = 0;
+#endif
+
+#define DISPATCH_GRADS_LAUNCH_CASE(ranks)                                                  \
+    {                                                                                      \
+        auto kernel = dispatch_grads_main_kernel<ranks, kNumThreads, kNumTMABytesPerWarp>; \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                                 \
+        LAUNCH_KERNEL(&cfg, kernel,                                                        \
+                      io, routing, tile_signal, shape, env);                               \
+    }                                                                                      \
+    break
+
+    EP_HOST_ASSERT(num_sms % 2 == 0);
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    cfg.dynamicSmemBytes = smem_size;
+    SWITCH_RANKS(DISPATCH_GRADS_LAUNCH_CASE);
+#undef DISPATCH_GRADS_LAUNCH_CASE
+}
+
 template <int kNumRanks>
 __global__ void cached_notify_combine(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {

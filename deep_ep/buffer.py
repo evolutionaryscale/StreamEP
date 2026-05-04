@@ -472,6 +472,45 @@ class Buffer:
         return recv, handle, out.metadata_done_event
 
     # noinspection PyTypeChecker
+    def dispatch_grads(self, handle: 'StreamingHandle', dL_dy: torch.Tensor,
+                       *,
+                       dispatch_seq: Optional[int] = None,
+                       config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Backward dispatch: ship ``dL/dy[t]`` origin → expert ranks along the
+        same routing as forward dispatch, write K times into a pool-shaped
+        ``dL_do_pool`` using the slot lookup persisted in ``handle.recv_token_to_slots``.
+
+        No metadata kernel, no host poll — reuses the routing already captured
+        in ``handle``. Only the small channel-control memset + cross-rank
+        barrier (~µs) runs on the host side before the data-ship kernel
+        launches. Runs on ``torch.cuda.current_stream()``.
+        """
+        config = self.get_dispatch_config(self.group_size) if config is None else config
+        self._assert_intranode_only()
+        seq = handle.dispatch_seq if dispatch_seq is None else dispatch_seq
+
+        TK_padded = handle.pool.shape[0]
+        num_topk = handle.recv_token_to_slots.shape[1]
+        num_local_experts = handle.expert_frequency.shape[0]
+        num_experts = num_local_experts * self.group_size
+
+        dL_do_pool, bwd_y_ready = self.runtime.intranode_dispatch_grads(
+            dL_dy,
+            handle.is_token_in_rank,
+            handle.recv_token_to_slots,
+            handle.base_pool,
+            handle.seen_per_substream,
+            handle.pool_arrival_target,
+            num_experts,
+            num_topk,
+            handle.tile_m,
+            TK_padded,
+            seq,
+            config,
+        )
+        return dL_do_pool, bwd_y_ready
+
+    # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
                 topk_weights: Optional[torch.Tensor] = None,
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,

@@ -153,6 +153,46 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
                           cudaStream_t stream,
                           int num_sms);
 
+// Backward dispatch_grads: ships dL/dy from origin → expert ranks along the
+// same routing as forward dispatch (sender uses is_token_in_rank, receiver
+// looks up slots from recv_token_to_slots written by fwd Pass B). No Pass A
+// (slots are pre-computed), no scalar metadata writes (already populated).
+struct DispatchGradsIO {
+    int4* dL_do_pool;                 // [TK_padded, hidden_int4] receiver writes K times per recv-token
+    const int4* dL_dy;                // [num_tokens, hidden_int4]   sender reads
+    const bool* is_token_in_rank;     // [num_tokens, num_ranks]     same routing as fwd dispatch
+};
+
+struct DispatchGradsRouting {
+    const int* recv_token_to_slots;   // [T_recv, num_topk]                     bwd Pass B slot lookup
+    const int* base_pool;             // [num_channels, num_ranks, E_local]     Pass 2: per-substream slot start
+    const int* seen_per_substream;    // [num_channels, num_ranks, E_local]     Pass 2: per-substream-per-expert recv count
+};
+
+struct DispatchGradsTileSignal {
+    int* bwd_dispatch_arrival_count;  // [total_tiles] int32  atomic-add target during Pass 2
+    const int* pool_arrival_target;   // [total_tiles] int32  firing target (same as fwd's)
+    int64_t* bwd_y_ready;             // [total_tiles] int64  per-tile release stamp (consumed by kernel_y_bwd)
+    int64_t dispatch_seq;
+};
+
+struct DispatchGradsShape {
+    int num_tokens;
+    int hidden_int4;
+    int num_topk;
+    int num_experts;
+    int tile_m;
+};
+
+void launch_dispatch_grads_main(const DispatchGradsIO& io,
+                                const DispatchGradsRouting& routing,
+                                const DispatchGradsTileSignal& tile_signal,
+                                const DispatchGradsShape& shape,
+                                const DispatchEnv& env,
+                                int num_ranks,
+                                cudaStream_t stream,
+                                int num_sms);
+
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,
                            int num_channels,

@@ -984,6 +984,106 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     };
 }
 
+std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
+    const torch::Tensor& dL_dy,
+    const torch::Tensor& is_token_in_rank,
+    const torch::Tensor& recv_token_to_slots,
+    const torch::Tensor& base_pool,
+    const torch::Tensor& seen_per_substream,
+    const torch::Tensor& pool_arrival_target,
+    int num_experts,
+    int num_topk,
+    int tile_m,
+    int64_t TK_padded,
+    int64_t dispatch_seq,
+    const Config& config) {
+    EP_HOST_ASSERT(dL_dy.dim() == 2 and dL_dy.is_contiguous());
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous() and
+                   is_token_in_rank.scalar_type() == torch::kBool);
+    EP_HOST_ASSERT(recv_token_to_slots.dim() == 2 and recv_token_to_slots.is_contiguous() and
+                   recv_token_to_slots.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(base_pool.is_contiguous() and base_pool.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(seen_per_substream.is_contiguous() and seen_per_substream.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(pool_arrival_target.dim() == 1 and pool_arrival_target.is_contiguous() and
+                   pool_arrival_target.scalar_type() == torch::kInt32);
+
+    EP_HOST_ASSERT(config.num_sms % 2 == 0);
+    int num_channels = config.num_sms / 2;
+    int num_local_experts = num_experts / num_ranks;
+
+    int num_tokens = static_cast<int>(dL_dy.size(0));
+    int hidden = static_cast<int>(dL_dy.size(1));
+    EP_HOST_ASSERT((hidden * dL_dy.element_size()) % sizeof(int4) == 0);
+    int hidden_int4 = hidden * dL_dy.element_size() / sizeof(int4);
+
+    EP_HOST_ASSERT(is_token_in_rank.size(0) == num_tokens and is_token_in_rank.size(1) == num_ranks);
+    EP_HOST_ASSERT(recv_token_to_slots.size(1) == num_topk);
+    EP_HOST_ASSERT(base_pool.numel() == static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    EP_HOST_ASSERT(seen_per_substream.numel() == base_pool.numel());
+
+    int total_tiles = static_cast<int>(pool_arrival_target.size(0));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Output: pool-shaped dL_do_pool. Receiver overwrites every entry it
+    // touches; padding rows are left uninitialized (kernel_y_bwd's predicate
+    // skips them via pool_recv_token, same convention as fwd's `pool`).
+    auto dL_do_pool = torch::empty({TK_padded, hidden}, dL_dy.options());
+
+    // Per-tile signal arrays. Both zero-init: bwd_dispatch_arrival_count
+    // accumulates Pass 2 atomic-adds; bwd_y_ready holds the per-tile release
+    // stamp consumed by kernel_y_bwd's acquire-spin.
+    auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
+    auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
+    auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
+    auto bwd_y_ready                = torch::zeros({total_tiles}, i64_opts);
+
+    // Reset IPC ring control bytes (start_offset / end_offset / head_idx /
+    // tail_idx) — same 4×num_channels×num_ranks region fwd dispatch zeros at
+    // the start of each call (deep_ep.cpp:863-867). Cross-rank barrier ensures
+    // peer ranks finished their own memset before any sender writes begin.
+    int num_memset_int = num_channels * num_ranks * 4;
+    EP_HOST_ASSERT((num_ranks * num_ranks + num_memset_int) * sizeof(int) <= num_nvl_bytes);
+    CUDA_CHECK(cudaMemsetAsync(static_cast<int*>(buffer_ptrs[nvl_rank]) + num_ranks * num_ranks,
+                               0,
+                               num_memset_int * sizeof(int),
+                               stream));
+    intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_ranks, stream);
+
+    intranode::DispatchGradsIO io{
+        .dL_do_pool       = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
+        .dL_dy            = reinterpret_cast<const int4*>(dL_dy.data_ptr()),
+        .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
+    };
+    intranode::DispatchGradsRouting routing{
+        .recv_token_to_slots = recv_token_to_slots.data_ptr<int>(),
+        .base_pool           = base_pool.data_ptr<int>(),
+        .seen_per_substream  = seen_per_substream.data_ptr<int>(),
+    };
+    intranode::DispatchGradsTileSignal tile_signal{
+        .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),
+        .pool_arrival_target        = pool_arrival_target.data_ptr<int>(),
+        .bwd_y_ready                = bwd_y_ready.data_ptr<int64_t>(),
+        .dispatch_seq               = dispatch_seq,
+    };
+    intranode::DispatchGradsShape shape{
+        .num_tokens  = num_tokens,
+        .hidden_int4 = hidden_int4,
+        .num_topk    = num_topk,
+        .num_experts = num_experts,
+        .tile_m      = tile_m,
+    };
+    intranode::DispatchEnv env{
+        .buffer_ptrs            = buffer_ptrs_gpu,
+        .rank                   = rank,
+        .num_max_send_tokens    = config.num_max_nvl_chunked_send_tokens,
+        .num_recv_buffer_tokens = config.num_max_nvl_chunked_recv_tokens,
+    };
+    intranode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env,
+                                          num_ranks, stream, config.num_sms);
+
+    return std::make_tuple(dL_do_pool, bwd_y_ready);
+}
+
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combine(
     const torch::Tensor& x,
     const std::optional<torch::Tensor>& topk_weights,
@@ -1959,6 +2059,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
+        .def("intranode_dispatch_grads", &deep_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)

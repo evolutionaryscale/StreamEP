@@ -244,6 +244,28 @@ public:
         int64_t dispatch_seq,
         const Config& config);
 
+    // Backward dispatch_grads: ship dL/dy[t] origin → expert ranks along the
+    // same (t, dst_rank) routing as forward dispatch. Receiver writes K times
+    // into dL_do_pool[slot] for each landed packet, using `recv_token_to_slots`
+    // (populated by fwd Pass B) to look up slots without rerunning Pass A.
+    // No metadata kernel, no host poll, no IPC barrier on the metadata path —
+    // the only cross-rank sync is the small barrier between the channel-control
+    // memset and the kernel launch. Returns (dL_do_pool, bwd_y_ready); caller
+    // (orchestrator) holds bwd_y_ready for kernel_y_bwd to acquire-spin on.
+    std::tuple<torch::Tensor, torch::Tensor> intranode_dispatch_grads(
+        const torch::Tensor& dL_dy,
+        const torch::Tensor& is_token_in_rank,
+        const torch::Tensor& recv_token_to_slots,
+        const torch::Tensor& base_pool,
+        const torch::Tensor& seen_per_substream,
+        const torch::Tensor& pool_arrival_target,
+        int num_experts,
+        int num_topk,
+        int tile_m,
+        int64_t TK_padded,
+        int64_t dispatch_seq,
+        const Config& config);
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>> intranode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
