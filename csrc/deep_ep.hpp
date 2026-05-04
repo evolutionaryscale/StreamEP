@@ -51,6 +51,58 @@ private:
 
 namespace deep_ep {
 
+// All outputs of `Buffer::intranode_dispatch`. Bound to Python via pybind11
+// with attribute access (see PYBIND11_MODULE in deep_ep.cpp); the Python-side
+// `Buffer.dispatch` repacks these into the public `StreamingHandle` dataclass.
+//
+// Field grouping:
+//   pool_*                   pool data + per-pool-slot scalars (kernel A reads,
+//                            kernel Y / combine read via pool_recv_token).
+//   recv_*, send_head        per-recv-token combine inputs.
+//   *_prefix_matrix          per-(sender, channel) cumulative counts (sender +
+//                            receiver views).
+//   expert_*, base_pool      pool-shape metadata (kernel A scheduler).
+//   tile_id_to_expert,
+//   pool_arrival_target,
+//   tile_ready, a_ready      per-tile arrays (scheduler + cross-stream signals).
+//   per_token_remaining,
+//   compute_done_per_token,
+//   o                        kernel Y atomic-scatter destination + Y→combine gate.
+struct StreamingDispatchOutputs {
+    torch::Tensor pool;
+    std::optional<torch::Tensor> pool_x_scales;
+    torch::Tensor pool_topk_weight;
+    torch::Tensor pool_recv_token;
+    torch::Tensor pool_k_slot;
+
+    torch::Tensor recv_topk_weights;
+    torch::Tensor recv_src_idx;
+    torch::Tensor send_head;
+
+    std::vector<int> num_recv_tokens_per_expert;
+
+    torch::Tensor rank_prefix_matrix;
+    torch::Tensor channel_prefix_matrix;
+    torch::Tensor recv_channel_prefix_matrix;
+
+    torch::Tensor expert_frequency;
+    torch::Tensor expert_pool_block_offset;
+    torch::Tensor base_pool;
+
+    torch::Tensor tile_id_to_expert;
+    torch::Tensor pool_arrival_target;
+    torch::Tensor tile_ready;
+
+    torch::Tensor a_ready;
+    torch::Tensor per_token_remaining;
+    torch::Tensor compute_done_per_token;
+    torch::Tensor o;
+
+    int total_tiles;
+
+    EventHandle metadata_done_event;
+};
+
 struct Buffer {
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
@@ -161,79 +213,28 @@ public:
         const torch::Tensor& topk_idx,
         int num_experts);
 
-    // Streaming-MoE consolidated dispatch (intranode, pool layout). Single host
-    // call producing pool-shape outputs. Two kernel launches + one host sync:
-    //   1. streaming_dispatch_metadata: fused count_exchange + metadata derivation.
-    //   2. host poll on {moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}.
-    //   3. tile_arrays_init: per-tile (tile_id_to_expert, pool_arrival_target).
-    //   4. dispatch: pool-layout receiver writes pool[TK_padded, H], pool_x_scales,
-    //      pool_topk_weight, pool_recv_token, pool_k_slot. Pass 2 fires tile_ready
-    //      in expert-major order (preserves wave caching of W1[e]).
-    //
-    // Return tuple:
-    //   0  pool                  Tensor[TK_padded, hidden]   pool data (expert-major, BLOCK_M-padded)
-    //   1  pool_x_scales         optional<Tensor>            FP8 scales (pool-layout)
-    //   2  pool_topk_weight      Tensor[TK_padded]           per-pool-slot weight
-    //   3  pool_recv_token       Tensor[TK_padded]           per-pool-slot recv-token id (-1 = padding)
-    //   4  pool_k_slot           Tensor[TK_padded]           per-pool-slot k (-1 = padding)
-    //   5  recv_topk_weights     Tensor[T_recv, num_topk]    per-recv-token weights (combine input)
-    //   6  recv_src_idx          Tensor[T_recv]              recv-token → source token idx (combine input)
-    //   7  send_head             Tensor[T, R]                sender ring slot (combine input)
-    //   8  num_recv_tokens_per_expert_list  vector<int>      per-expert counts (host)
-    //   9  rank_prefix_matrix    Tensor[R, R]                cumulative recv-tokens per source rank
-    //   10 channel_prefix_matrix Tensor[R, num_channels]     sender-side per-(rank, channel) cum count
-    //   11 recv_channel_prefix_matrix  Tensor[R, num_channels]
-    //   12 expert_frequency      Tensor[E_local]             per-expert (token, k) pair count
-    //   13 expert_pool_block_offset    Tensor[E_local + 1]   pool-block prefix-sum (in BLOCK_M-tile units)
-    //   14 base_pool             Tensor[num_channels, R, E_local]  per-substream-per-expert pool slot start
-    //   15 tile_id_to_expert     Tensor[total_tiles]         per-tile expert lookup
-    //   16 pool_arrival_target   Tensor[total_tiles]         per-tile write count for tile_ready firing
-    //   17 tile_ready            Tensor[total_tiles] int64   per-tile release stamp
-    //   18 a_ready               Tensor[total_tiles] int64   per-tile kernel-A→Y release stamp (zero-init)
-    //   19 per_token_remaining   Tensor[T_recv] int32        K_local(r); kernel Y atomicSubs
-    //   20 compute_done_per_token  Tensor[T_recv] int64      per-token Y→combine release stamp (zero-init)
-    //   21 o                     Tensor[T_recv, hidden]      kernel Y atomic-scatter destination (zero-init)
-    //   22 total_tiles           int                         scalar count
-    //   23 metadata_done_event   EventHandle                 recorded between tile_arrays_init and dispatch main;
-    //                                                        consumer streams wait_event on this to safely read
-    //                                                        metadata tensors (expert_pool_block_offset, etc.)
-    //                                                        without serializing against dispatch main.
+    // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
+    // + one host sync per call: a fused metadata kernel (cross-rank count
+    // exchange + per-tile arrays), a host poll on
+    // {moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles}, and
+    // the dispatch main kernel (pool-layout receiver). Outputs returned as a
+    // `StreamingDispatchOutputs` struct with named fields (see top of header
+    // for field semantics). `metadata_done_event` is recorded between the two
+    // kernels — consumer streams `wait_event` on it to safely read metadata
+    // tensors without serializing against dispatch main.
     //
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()` — caller-managed.
-    std::tuple<torch::Tensor,
-               std::optional<torch::Tensor>,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               std::vector<int>,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               torch::Tensor,
-               int,
-               EventHandle>
-    intranode_dispatch(const torch::Tensor& x,
-                       const std::optional<torch::Tensor>& x_scales,
-                       const torch::Tensor& topk_idx,
-                       const torch::Tensor& topk_weights,
-                       const torch::Tensor& is_token_in_rank,
-                       int num_experts,
-                       int expert_alignment,
-                       int tile_m,
-                       int64_t dispatch_seq,
-                       const Config& config);
+    StreamingDispatchOutputs intranode_dispatch(
+        const torch::Tensor& x,
+        const std::optional<torch::Tensor>& x_scales,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& is_token_in_rank,
+        int num_experts,
+        int expert_alignment,
+        int tile_m,
+        int64_t dispatch_seq,
+        const Config& config);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>> intranode_combine(
         const torch::Tensor& x,

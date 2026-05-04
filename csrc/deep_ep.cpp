@@ -446,40 +446,17 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts) {
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank};
 }
 
-std::tuple<torch::Tensor,                  // 0  pool
-           std::optional<torch::Tensor>,   // 1  pool_x_scales
-           torch::Tensor,                  // 2  pool_topk_weight
-           torch::Tensor,                  // 3  pool_recv_token
-           torch::Tensor,                  // 4  pool_k_slot
-           torch::Tensor,                  // 5  recv_topk_weights
-           torch::Tensor,                  // 6  recv_src_idx
-           torch::Tensor,                  // 7  send_head
-           std::vector<int>,               // 8  num_recv_tokens_per_expert_list
-           torch::Tensor,                  // 9  rank_prefix_matrix
-           torch::Tensor,                  // 10 channel_prefix_matrix
-           torch::Tensor,                  // 11 recv_channel_prefix_matrix
-           torch::Tensor,                  // 12 expert_frequency
-           torch::Tensor,                  // 13 expert_pool_block_offset
-           torch::Tensor,                  // 14 base_pool
-           torch::Tensor,                  // 15 tile_id_to_expert
-           torch::Tensor,                  // 16 pool_arrival_target
-           torch::Tensor,                  // 17 tile_ready
-           torch::Tensor,                  // 18 a_ready
-           torch::Tensor,                  // 19 per_token_remaining
-           torch::Tensor,                  // 20 compute_done_per_token
-           torch::Tensor,                  // 21 o
-           int,                            // 22 total_tiles
-           EventHandle>                    // 23 metadata_done_event
-Buffer::intranode_dispatch(const torch::Tensor& x,
-                           const std::optional<torch::Tensor>& x_scales,
-                           const torch::Tensor& topk_idx,
-                           const torch::Tensor& topk_weights,
-                           const torch::Tensor& is_token_in_rank,
-                           int num_experts,
-                           int expert_alignment,
-                           int tile_m,
-                           int64_t dispatch_seq,
-                           const Config& config) {
+StreamingDispatchOutputs Buffer::intranode_dispatch(
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& x_scales,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& is_token_in_rank,
+    int num_experts,
+    int expert_alignment,
+    int tile_m,
+    int64_t dispatch_seq,
+    const Config& config) {
     // One channel uses two blocks (sender + receiver).
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -831,30 +808,32 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         config.num_max_nvl_chunked_recv_tokens,
                         tile_m);
 
-    return {pool,
-            pool_x_scales,
-            pool_topk_weight,
-            pool_recv_token,
-            pool_k_slot,
-            recv_topk_weights,
-            recv_src_idx,
-            send_head,
-            num_recv_tokens_per_expert_list,
-            rank_prefix_matrix,
-            channel_prefix_matrix,
-            recv_channel_prefix_matrix,
-            expert_frequency,
-            expert_pool_block_offset,
-            base_pool,
-            tile_id_to_expert,
-            pool_arrival_target,
-            tile_ready,
-            a_ready,
-            per_token_remaining,
-            compute_done_per_token,
-            o,
-            total_tiles,
-            metadata_done_event};
+    return StreamingDispatchOutputs{
+        .pool                       = pool,
+        .pool_x_scales              = pool_x_scales,
+        .pool_topk_weight           = pool_topk_weight,
+        .pool_recv_token            = pool_recv_token,
+        .pool_k_slot                = pool_k_slot,
+        .recv_topk_weights          = recv_topk_weights,
+        .recv_src_idx               = recv_src_idx,
+        .send_head                  = send_head,
+        .num_recv_tokens_per_expert = num_recv_tokens_per_expert_list,
+        .rank_prefix_matrix         = rank_prefix_matrix,
+        .channel_prefix_matrix      = channel_prefix_matrix,
+        .recv_channel_prefix_matrix = recv_channel_prefix_matrix,
+        .expert_frequency           = expert_frequency,
+        .expert_pool_block_offset   = expert_pool_block_offset,
+        .base_pool                  = base_pool,
+        .tile_id_to_expert          = tile_id_to_expert,
+        .pool_arrival_target        = pool_arrival_target,
+        .tile_ready                 = tile_ready,
+        .a_ready                    = a_ready,
+        .per_token_remaining        = per_token_remaining,
+        .compute_done_per_token     = compute_done_per_token,
+        .o                          = o,
+        .total_tiles                = total_tiles,
+        .metadata_done_event        = metadata_done_event,
+    };
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::intranode_combine(
@@ -1788,6 +1767,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
         .def("wait", &deep_ep::EventHandle::wait);
+
+    pybind11::class_<deep_ep::StreamingDispatchOutputs>(m, "StreamingDispatchOutputs")
+        .def_readonly("pool",                       &deep_ep::StreamingDispatchOutputs::pool)
+        .def_readonly("pool_x_scales",              &deep_ep::StreamingDispatchOutputs::pool_x_scales)
+        .def_readonly("pool_topk_weight",           &deep_ep::StreamingDispatchOutputs::pool_topk_weight)
+        .def_readonly("pool_recv_token",            &deep_ep::StreamingDispatchOutputs::pool_recv_token)
+        .def_readonly("pool_k_slot",                &deep_ep::StreamingDispatchOutputs::pool_k_slot)
+        .def_readonly("recv_topk_weights",          &deep_ep::StreamingDispatchOutputs::recv_topk_weights)
+        .def_readonly("recv_src_idx",               &deep_ep::StreamingDispatchOutputs::recv_src_idx)
+        .def_readonly("send_head",                  &deep_ep::StreamingDispatchOutputs::send_head)
+        .def_readonly("num_recv_tokens_per_expert", &deep_ep::StreamingDispatchOutputs::num_recv_tokens_per_expert)
+        .def_readonly("rank_prefix_matrix",         &deep_ep::StreamingDispatchOutputs::rank_prefix_matrix)
+        .def_readonly("channel_prefix_matrix",      &deep_ep::StreamingDispatchOutputs::channel_prefix_matrix)
+        .def_readonly("recv_channel_prefix_matrix", &deep_ep::StreamingDispatchOutputs::recv_channel_prefix_matrix)
+        .def_readonly("expert_frequency",           &deep_ep::StreamingDispatchOutputs::expert_frequency)
+        .def_readonly("expert_pool_block_offset",   &deep_ep::StreamingDispatchOutputs::expert_pool_block_offset)
+        .def_readonly("base_pool",                  &deep_ep::StreamingDispatchOutputs::base_pool)
+        .def_readonly("tile_id_to_expert",          &deep_ep::StreamingDispatchOutputs::tile_id_to_expert)
+        .def_readonly("pool_arrival_target",        &deep_ep::StreamingDispatchOutputs::pool_arrival_target)
+        .def_readonly("tile_ready",                 &deep_ep::StreamingDispatchOutputs::tile_ready)
+        .def_readonly("a_ready",                    &deep_ep::StreamingDispatchOutputs::a_ready)
+        .def_readonly("per_token_remaining",        &deep_ep::StreamingDispatchOutputs::per_token_remaining)
+        .def_readonly("compute_done_per_token",     &deep_ep::StreamingDispatchOutputs::compute_done_per_token)
+        .def_readonly("o",                          &deep_ep::StreamingDispatchOutputs::o)
+        .def_readonly("total_tiles",                &deep_ep::StreamingDispatchOutputs::total_tiles)
+        .def_readonly("metadata_done_event",        &deep_ep::StreamingDispatchOutputs::metadata_done_event);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())

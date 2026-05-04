@@ -421,52 +421,43 @@ class Buffer:
         self._assert_intranode_only()
 
         x_tensor, x_scales = x if isinstance(x, tuple) else (x, None)
-        outputs = self.runtime.intranode_dispatch(
+        out = self.runtime.intranode_dispatch(
             x_tensor, x_scales, topk_idx, topk_weights, is_token_in_rank,
             num_experts, expert_alignment, tile_m, dispatch_seq,
             config,
         )
-        (pool, pool_x_scales,
-         pool_topk_weight, pool_recv_token, pool_k_slot,
-         recv_topk_weights, recv_src_idx, send_head,
-         num_recv_tokens_per_expert_list,
-         rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix,
-         expert_frequency, expert_pool_block_offset, base_pool,
-         tile_id_to_expert, pool_arrival_target, tile_ready,
-         a_ready, per_token_remaining, compute_done_per_token, o,
-         total_tiles, metadata_done_event) = outputs
 
         handle = StreamingHandle(
-            pool=pool,
-            pool_x_scales=pool_x_scales,
-            pool_topk_weight=pool_topk_weight,
-            pool_recv_token=pool_recv_token,
-            pool_k_slot=pool_k_slot,
-            recv_topk_weights=recv_topk_weights,
-            recv_src_idx=recv_src_idx,
-            send_head=send_head,
+            pool=out.pool,
+            pool_x_scales=out.pool_x_scales,
+            pool_topk_weight=out.pool_topk_weight,
+            pool_recv_token=out.pool_recv_token,
+            pool_k_slot=out.pool_k_slot,
+            recv_topk_weights=out.recv_topk_weights,
+            recv_src_idx=out.recv_src_idx,
+            send_head=out.send_head,
             is_token_in_rank=is_token_in_rank,
-            rank_prefix_matrix=rank_prefix_matrix,
-            channel_prefix_matrix=channel_prefix_matrix,
-            recv_channel_prefix_matrix=recv_channel_prefix_matrix,
-            expert_frequency=expert_frequency,
-            expert_pool_block_offset=expert_pool_block_offset,
-            base_pool=base_pool,
-            tile_id_to_expert=tile_id_to_expert,
-            pool_arrival_target=pool_arrival_target,
-            tile_ready=tile_ready,
-            a_ready=a_ready,
-            per_token_remaining=per_token_remaining,
-            compute_done_per_token=compute_done_per_token,
-            o=o,
-            total_tiles=total_tiles,
+            rank_prefix_matrix=out.rank_prefix_matrix,
+            channel_prefix_matrix=out.channel_prefix_matrix,
+            recv_channel_prefix_matrix=out.recv_channel_prefix_matrix,
+            expert_frequency=out.expert_frequency,
+            expert_pool_block_offset=out.expert_pool_block_offset,
+            base_pool=out.base_pool,
+            tile_id_to_expert=out.tile_id_to_expert,
+            pool_arrival_target=out.pool_arrival_target,
+            tile_ready=out.tile_ready,
+            a_ready=out.a_ready,
+            per_token_remaining=out.per_token_remaining,
+            compute_done_per_token=out.compute_done_per_token,
+            o=out.o,
+            total_tiles=out.total_tiles,
             tile_m=tile_m,
             dispatch_seq=dispatch_seq,
-            num_recv_tokens_per_expert=num_recv_tokens_per_expert_list,
+            num_recv_tokens_per_expert=out.num_recv_tokens_per_expert,
         )
 
-        recv = (pool, pool_x_scales) if x_scales is not None else pool
-        return recv, handle, metadata_done_event
+        recv = (out.pool, out.pool_x_scales) if x_scales is not None else out.pool
+        return recv, handle, out.metadata_done_event
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
