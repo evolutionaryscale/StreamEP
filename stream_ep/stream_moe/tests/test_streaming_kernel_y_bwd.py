@@ -495,6 +495,146 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     )
 
 
+def _assert_dL_dweight_real_slots(
+    dL_dweight,
+    dL_dweight_ref,
+    real_mask,
+    *,
+    abs_thresh: float = 5e-2,
+    rel_thresh: float = 5e-2,
+    msg_prefix: str = "",
+):
+    """Compare per-slot dL/dweight ONLY at real (non-padding) slots."""
+    diff = (dL_dweight - dL_dweight_ref).abs()
+    rel = diff / (dL_dweight_ref.abs() + 1e-3)
+    bad = (diff > abs_thresh) & (rel > rel_thresh) & real_mask
+    assert not bad.any(), (
+        f"{msg_prefix}dL/dweight (real slots only): "
+        f"{bad.sum().item()} bad / {real_mask.sum().item()} real slots; "
+        f"max abs diff {diff[real_mask].max().item():.4f}, "
+        f"max rel diff {rel[real_mask].max().item():.4f}"
+    )
+
+
+def test_streaming_moe_y_bwd_dense_padding(device):
+    """Orchestrator-shaped config: dense layout (1 tile per expert across
+    E_local experts), tile_n=256 (matches `tile_n_a` orchestrator default),
+    production-shape H/I, and PADDING ROWS WITH GARBAGE preact / dL_do_pool —
+    mirrors what fwd kernel A and dispatch_grads leave for slots where
+    `pool_recv_token == -1`.
+
+    The reference dL/dweight is checked ONLY at real slots; padding-slot
+    values are unused downstream (combine_grads only reads
+    `weight_grads[recv_token_to_slots[r, k]]` which is always a real slot or
+    -1 → 0).
+
+    The pool_topk_weight is zero for padding (matching the C++ runtime's
+    Z_pre memset of the dispatch bundle); real slots get random nonzero
+    weights. This exercises the SAME numerical path the orchestrator hits.
+    """
+    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+        streaming_moe_y_bwd,
+    )
+
+    # Production-ish shape (matches profile_pipeline.py defaults that the
+    # orchestrator's validate_multi_iter exercises).
+    H, I, E_local = 2048, 2048, 8
+    tile_m, tile_n = 128, 256  # tile_n=256 matches tile_n_a default
+    tile_to_expert_list = list(range(E_local))  # dense: 1 tile per expert
+    total_tiles = len(tile_to_expert_list)
+    TK_padded = total_tiles * tile_m
+    real_per_tile = 32  # mirrors seq_len=64 single-hot routing on rank 0
+    seq = 17
+
+    dtype = torch.bfloat16
+    g = torch.Generator(device=device).manual_seed(123)
+
+    # Build a real-slot mask: first `real_per_tile` rows of each tile are real,
+    # the rest are padding. pool_recv_token = -1 for padding (matches fwd
+    # Pass B's N-region memset).
+    real_mask_3d = torch.zeros(total_tiles, tile_m, dtype=torch.bool, device=device)
+    real_mask_3d[:, :real_per_tile] = True
+    real_mask = real_mask_3d.reshape(TK_padded)
+
+    # Garbage data over the WHOLE pool (mirrors what fwd kernel A's mD store
+    # and dispatch_grads's TMA writes leave: real rows get valid values, padding
+    # rows are torch::empty() garbage). We populate ALL rows with random data —
+    # the kernel will compute on padding rows too, but real-slot output is the
+    # only thing we check.
+    dL_do_pool = (
+        torch.randn(TK_padded, H, dtype=dtype, device=device, generator=g) * 0.1
+    )
+    W2 = torch.randn(E_local, H, I, dtype=dtype, device=device, generator=g).mul_(0.02)
+    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
+    preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=124)
+
+    # pool_topk_weight: real-slot rows have nonzero values (matching Pass B),
+    # padding rows are 0 (matching the Z_pre memset in deep_ep.cpp).
+    pool_topk_weight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
+    pool_topk_weight[real_mask] = torch.linspace(
+        -0.5, 1.5, real_mask.sum().item(), dtype=torch.float32, device=device
+    )
+
+    dL_dweight_per_stripe = _alloc_dL_dweight_partials(TK_padded, tile_n, I, device)
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
+        tile_to_expert_list, E_local, device
+    )
+    bwd_y_ready = _make_ready(total_tiles, dispatch_seq=seq, device=device)
+    bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+
+    streaming_moe_y_bwd(
+        dL_do_pool,
+        W2,
+        dL_dswiglu_in,
+        pool_topk_weight,
+        preact_a,
+        dL_dweight_per_stripe,
+        tile_id_to_expert,
+        expert_pool_block_offset,
+        bwd_y_ready,
+        bwd_a_ready,
+        dispatch_seq=seq,
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+    torch.cuda.synchronize()
+
+    # Reference dL_dweight per slot (computed on ALL rows; we filter to real
+    # later). Uses the SAME garbage values the kernel sees, so any per-slot
+    # disagreement is a kernel bug, not a missing-input bug.
+    dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
+    dL_dweight_ref = _ref_dL_dweight(
+        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
+    )
+    _assert_dL_dweight_real_slots(
+        dL_dweight, dL_dweight_ref, real_mask, msg_prefix="dense_padding "
+    )
+
+    # dL/dswiglu_in for real slots — same dual-threshold rule as the
+    # multi-tile-static test, but iterate per tile and slice the real-row
+    # subrange.
+    ref_dswiglu = _ref_dL_dswiglu_in(
+        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
+    )
+    for t in range(total_tiles):
+        diff = (
+            dL_dswiglu_in[t, :real_per_tile].float()
+            - ref_dswiglu[t, :real_per_tile].float()
+        ).abs()
+        rel = diff / (ref_dswiglu[t, :real_per_tile].float().abs() + 1e-3)
+        bad = (diff > 1e-2) & (rel > 5e-2)
+        assert not bad.any(), (
+            f"dense_padding tile {t}: dL/dswiglu_in (real rows only) "
+            f"{bad.sum().item()} bad / {real_per_tile * 2 * I}; "
+            f"max_abs={diff.max().item():.4f} max_rel={rel.max().item():.4f}"
+        )
+
+    assert (bwd_a_ready == seq).all(), (
+        f"dense_padding bwd_a_ready not all set; bad indices "
+        f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
+    )
+
+
 if __name__ == "__main__":
     dev = torch.device("cuda")
     test_streaming_moe_y_bwd_compiles(dev)
@@ -505,3 +645,5 @@ if __name__ == "__main__":
     print("multi-tile-static PASS")
     test_streaming_moe_y_bwd_producer_consumer(dev)
     print("producer-consumer PASS")
+    test_streaming_moe_y_bwd_dense_padding(dev)
+    print("dense-padding PASS")

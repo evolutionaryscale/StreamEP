@@ -30,7 +30,9 @@ Public surface
 * :class:`StreamHolder` — dataclass holding the four caller-owned streams.
 * :func:`make_streams` — construct a ``StreamHolder`` for a given device.
 * :class:`StreamMoEFunc` — ``torch.autograd.Function`` running the layer
-  forward. ``backward`` returns all-``None`` (the layer is a no-grad boundary).
+  forward and backward. Backward orchestrates dispatch_grads → kernel_y_bwd
+  → kernel_a_bwd → combine_grads on the same four streams as forward, with
+  dW1 / dW2 grouped GEMMs in the compute_a / compute_y tails.
 * :func:`stream_moe_func` — thin wrapper around ``StreamMoEFunc.apply`` with
   the public keyword-arg API.
 """
@@ -40,13 +42,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from deep_ep import Buffer as DeepEPBuffer
+from quack.gemm import gemm
 
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
     streaming_moe_a,
 )
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    streaming_moe_a_bwd,
+)
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
     streaming_moe_y,
+)
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    streaming_moe_y_bwd,
 )
 
 
@@ -75,13 +85,24 @@ def make_streams(device: torch.device | int | None = None) -> StreamHolder:
 
 
 class StreamMoEFunc(torch.autograd.Function):
-    """Streaming-MoE forward as a no-grad autograd boundary.
+    """Streaming-MoE layer as a differentiable autograd boundary.
 
-    All inputs (token activations, routing, expert weights) are treated as
-    non-differentiable — ``backward`` returns ``None`` for every forward arg.
-    This is the right contract for inference and for the no-grad streaming
-    forward path. A separate Function will land alongside backward streaming
-    (Phase F) when that path becomes differentiable.
+    Forward: dispatch → kernel A → kernel Y → combine on the four caller-owned
+    streams. Backward orchestrates dispatch_grads → kernel_y_bwd → kernel_a_bwd
+    → combine_grads on the same four streams (per-stage stream role preserved
+    by comm direction; chronological order swaps compute_a / compute_y because
+    of the chain rule). dW1 / dW2 grouped GEMMs run as separate `quack.gemm`
+    calls in the tail of the streams that own each output:
+      - dW2 on streams.compute_y after kernel_y_bwd (consumes dL_do_pool).
+      - dW1 on streams.compute_a after kernel_a_bwd (consumes dL_dswiglu_in).
+
+    Cross-stage synchronization is per-tile / per-recv-token via system-scope
+    release/acquire stamps fired by each kernel — no `cudaStreamWaitEvent`
+    between bwd stages, no host syncs. The single cross-stream event in
+    backward is the small ``weight_grads_ready`` event that publishes the
+    post-hoc ``dL_dweight_per_stripe.sum(dim=-1)`` from streams.compute_y to
+    streams.combine (combine_grads's sender reads ``weight_grads`` directly,
+    not via a per-token kernel-fired release).
     """
 
     @staticmethod
@@ -242,23 +263,355 @@ class StreamMoEFunc(torch.autograd.Function):
         caller_stream.wait_stream(streams.combine)
 
         # Save tensors bwd will consume. The contract is "save preact, drop
-        # postact" — preact_a is the strictly more useful saved activation
-        # (kernel_a_bwd reads it directly for SwiGLU bwd, kernel_y_bwd's
-        # dL/dweight extension element-wise-recomputes postact from it via
-        # silu(gate)*up). Saving postact_a instead would force kernel_a_bwd to
-        # recompute preact via `pool @ W1[e].T` — same shape as fwd kernel A's
-        # main GEMM, ~370 µs/layer at production. The remainder of the bwd
-        # save set (pool / handle / W1 / W2 / topk_weights) lands with the
-        # bwd orchestrator PR.
-        ctx.save_for_backward(preact_a)
+        # postact" — preact_a is the strictly more useful saved activation:
+        # kernel_y_bwd reads it as mC for in-epilogue SwiGLU bwd (dswiglu's
+        # postact byproduct feeds the dL/dweight ColVecReduce dot product),
+        # and the orchestrator element-wise-recomputes postact_a from it
+        # (silu(gate)*up) into a transient buffer just before dW2's grouped
+        # GEMM. Saving postact_a instead would force kernel_y_bwd / kernel_a_bwd
+        # to recover preact via a `pool @ W1[e].T` recompute GEMM (~370 µs/layer
+        # at production) — save the expensive thing, recompute the cheap thing.
+        # `pool` and `w1_local` / `w2_local` go through save_for_backward too
+        # (autograd's standard activation-save plumbing); `handle`, `streams`,
+        # `buffer`, and the int knobs ride on `ctx` attributes since they are
+        # not Tensors. `dispatch_seq` lives on the handle already.
+        ctx.save_for_backward(preact_a, pool, w1_local, w2_local)
+        ctx.streams = streams
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.tile_m = tile_m
+        ctx.tile_n_a = tile_n_a
+        ctx.tile_n_y = tile_n_y
+        ctx.num_sms_a = num_sms_a
+        ctx.num_sms_y = num_sms_y
         return out
 
     @staticmethod
-    def backward(ctx, _grad_out):  # type: ignore[override]
-        # No-grad boundary: 15 forward args (after ctx) → 15 None gradients.
-        # The bwd PR replaces this with the four-stage backward orchestrator
-        # (dispatch_grads → kernel_y_bwd → kernel_a_bwd → combine_grads).
-        return (None,) * 15
+    def backward(ctx, dL_dy):  # type: ignore[override]
+        """Four-stage backward on the same four streams as fwd.
+
+        Stages by stream:
+          dispatch_grads   on streams.dispatch
+          kernel_y_bwd     on streams.compute_y  (+ dW2 grouped GEMM tail)
+          kernel_a_bwd     on streams.compute_a  (+ dW1 grouped GEMM tail)
+          combine_grads    on streams.combine
+
+        Inter-stage waits are per-tile / per-recv-token system-scope
+        release/acquire stamps embedded in the kernels (`bwd_y_ready` →
+        kernel_y_bwd, `bwd_a_ready` → kernel_a_bwd, `bwd_compute_done_per_token`
+        → combine_grads). No `cudaStreamWaitEvent` between bwd stages — the
+        per-tile acquire-spins inside each kernel handle cross-stream
+        visibility.
+
+        The one cross-stream event in bwd is `weight_grads_ready`: the post-hoc
+        `dL_dweight_per_stripe.sum(dim=-1)` runs as a torch op on
+        streams.compute_y after kernel_y_bwd, and combine_grads (on
+        streams.combine) reads `weight_grads` directly — there is no per-token
+        kernel-fired release for it, so we publish the sum's completion via
+        `Event.record()` / `wait_event`. Everything else flows via per-tile /
+        per-token gates.
+
+        Per-stream zero-init setup ops are issued BEFORE the
+        `wait_stream(caller_stream)` fan-out so they overlap with the upstream
+        layer's bwd tail running on caller_stream. Only the
+        `bwd_per_token_remaining.copy_(handle.k_local_count)` op is
+        caller-dependent (handle.k_local_count was last-written on
+        streams.dispatch in fwd → caller-visible after fwd's exit chain), so it
+        runs after streams.compute_a's wait_stream(caller_stream).
+
+        Returns gradients matching forward's 15 args:
+            (None, None, dL_dx, None, dL_dtopk_weights, None,
+             dW1_local, dW2_local, None, None, None, None, None, None, None)
+        """
+        preact_a, pool, w1_local, w2_local = ctx.saved_tensors
+        streams: StreamHolder = ctx.streams
+        buffer: DeepEPBuffer = ctx.buffer
+        handle = ctx.handle
+        tile_m: int = ctx.tile_m
+        tile_n_a: int = ctx.tile_n_a
+        tile_n_y: int = ctx.tile_n_y
+        num_sms_a: int | None = ctx.num_sms_a
+        num_sms_y: int | None = ctx.num_sms_y
+
+        caller_stream = torch.cuda.current_stream()
+        device = pool.device
+        dtype = pool.dtype
+
+        E_local, two_I, H = w1_local.shape
+        I = two_I // 2
+        total_tiles = handle.total_tiles
+        TK_padded = pool.shape[0]
+        T_recv = handle.k_local_count.shape[0]
+        # ColVecReduce stripe count matches kernel_y_bwd's N-tiling on the I dim.
+        num_pid_n_y_bwd = (I + tile_n_a - 1) // tile_n_a
+
+        # ── Per-stream setup, in parallel, before any wait_stream ──────────
+        # Fresh-tensor zero-inits + the `bwd_a_ready` cross-stream signal
+        # (zero-init on its consumer stream so the first kernel_a_bwd
+        # acquire-load sees an unfired counter). Nothing here references
+        # caller-resident state, so the allocator doesn't need caller_stream
+        # ordering — these ops can overlap with the upstream layer's bwd tail.
+
+        with torch.cuda.stream(streams.compute_a):
+            dW1_local = torch.zeros_like(w1_local)
+            dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
+            bwd_per_token_remaining = torch.empty(
+                T_recv, dtype=torch.int32, device=device
+            )
+            bwd_compute_done_per_token = torch.zeros(
+                T_recv, dtype=torch.int64, device=device
+            )
+
+        with torch.cuda.stream(streams.compute_y):
+            dW2_local = torch.zeros_like(w2_local)
+            # kernel_y_bwd's mD output, also consumed by kernel_a_bwd and dW1
+            # GEMM on streams.compute_a. Bf16 (M, 2I); fp32-view applied
+            # internally by the kernel host wrapper.
+            dL_dswiglu_in = torch.empty(
+                total_tiles, tile_m, two_I, dtype=dtype, device=device
+            )
+            # ColVecReduce destination — per-(slot, N-stripe) fp32 partials,
+            # collapsed to (TK_padded,) by the orchestrator after kernel_y_bwd.
+            dL_dweight_per_stripe = torch.zeros(
+                TK_padded, num_pid_n_y_bwd, dtype=torch.float32, device=device
+            )
+            # bwd_a_ready is produced by kernel_y_bwd on compute_y and acquired
+            # by kernel_a_bwd on compute_a. Allocate + zero-init on the
+            # producer stream so the kernel's first release-store is naturally
+            # ordered with the zero-init.
+            bwd_a_ready = torch.zeros(total_tiles, dtype=torch.int64, device=device)
+
+        # ── Single fan-out gate on caller_stream ───────────────────────────
+        streams.dispatch.wait_stream(caller_stream)
+        streams.compute_a.wait_stream(caller_stream)
+        streams.compute_y.wait_stream(caller_stream)
+        streams.combine.wait_stream(caller_stream)
+
+        # ── Caller-dependent setup op ──────────────────────────────────────
+        # handle.k_local_count was written on streams.dispatch in fwd; visible
+        # on caller_stream after fwd's exit chain. The copy onto compute_a must
+        # wait for caller_stream first.
+        with torch.cuda.stream(streams.compute_a):
+            bwd_per_token_remaining.copy_(handle.k_local_count, non_blocking=True)
+
+        # ── Cross-stream record_stream for handle tensors used on streams
+        # they were NOT recorded on during fwd. Held alive by ctx; ensures the
+        # caching allocator considers all relevant streams when the tensor is
+        # eventually freed.
+        dL_dy.record_stream(streams.dispatch)
+        handle.recv_token_to_slots.record_stream(streams.dispatch)
+        handle.is_token_in_rank.record_stream(streams.dispatch)
+        handle.base_pool.record_stream(streams.dispatch)
+        handle.seen_per_substream.record_stream(streams.dispatch)
+        handle.pool_arrival_target.record_stream(streams.dispatch)
+        handle.pool_recv_token.record_stream(streams.compute_a)
+        handle.k_local_count.record_stream(streams.compute_a)
+        pool.record_stream(streams.compute_a)
+
+        # ── Stage 1 — dispatch_grads on streams.dispatch ───────────────────
+        # Ships dL/dy origin → expert ranks along fwd's routing, K-fans into
+        # dL_do_pool[slot] via recv_token_to_slots[r, k]. Fires
+        # bwd_y_ready[tile] when each pool block's writes drain.
+        with torch.cuda.stream(streams.dispatch):
+            dL_do_pool, bwd_y_ready = buffer.dispatch_grads(
+                handle, dL_dy, dispatch_seq=handle.dispatch_seq
+            )
+
+        # dL_do_pool / bwd_y_ready were allocated on streams.dispatch by the
+        # runtime; mark cross-stream readers so the allocator doesn't recycle
+        # them prematurely.
+        dL_do_pool.record_stream(streams.compute_y)
+        bwd_y_ready.record_stream(streams.compute_y)
+
+        # ── Stage 2 — kernel_y_bwd on streams.compute_y ────────────────────
+        # Acquire-spins on bwd_y_ready[tile] internally; no cudaStreamWaitEvent
+        # between dispatch_grads and kernel_y_bwd. SwiGLU bwd is folded into
+        # the epilogue (dswiglu's postact byproduct → ColVecReduce for
+        # dL/dweight; per-row weight multiply on (dgate, dup) AFTER dswiglu so
+        # the ColVecReduce sees UNWEIGHTED g). mD is dL_dswiglu_in (bf16
+        # (M, 2I) viewed as fp32 (M, I) by the host wrapper).
+        with torch.cuda.stream(streams.compute_y):
+            streaming_moe_y_bwd(
+                dL_do_pool,
+                w2_local,
+                dL_dswiglu_in,
+                handle.pool_topk_weight,
+                preact_a,
+                dL_dweight_per_stripe,
+                handle.tile_id_to_expert,
+                handle.expert_pool_block_offset,
+                bwd_y_ready,
+                bwd_a_ready,
+                dispatch_seq=handle.dispatch_seq,
+                tile_m=tile_m,
+                tile_n=tile_n_a,
+                num_sms=num_sms_a,
+            )
+            # dW2[e] = postact_a[slot_range_e].T @ dL_do_pool[slot_range_e]
+            #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
+            # Recompute postact_a element-wise from preact_a into a transient
+            # bf16 buffer (~190 µs HBM round-trip at production); cheaper than
+            # ctx-saving postact_a (~130 MB/layer permanent).
+            #
+            # quack.gemm with cu_seqlens_k expects A: (M, total_K) m-major
+            # (stride(-2)=1) and B: (N, total_K) n-major (stride(-2)=1); output
+            # D: (L, M, N). For dW2: M=H, N=I, L=E_local, total_K=TK_padded.
+            #   A = dL_do_pool.t()   shape (H, TK_padded), strides (1, H) → m-major ✓
+            #   B = postact_flat.t() shape (I, TK_padded), strides (1, I) → n-major ✓
+            #   D = dW2_local        (E_local, H, I) ← matches w2_local layout ✓
+            # Weighted-postact for dW2: chain rule on
+            #   o[t] = Σ_k topk_weights[t, k] · y_for_(t, k)
+            # gives dW2[e] = Σ_{slot in e} pool_topk_weight[slot] *
+            #               dL_do_pool[slot] outer postact_a[slot]. The
+            # streaming pipeline ships UNWEIGHTED `dL_do_pool` via dispatch_grads
+            # (so kernel_y_bwd's ColVecReduce sees unweighted g for dL/dweight)
+            # — the missing pool_topk_weight factor has to enter somewhere
+            # before dW2's GEMM. Folding it into the postact recompute is the
+            # cheapest place: one extra fp32 mul per element on a tensor we're
+            # already materialising, no separate kernel.
+            ptw_reshaped = handle.pool_topk_weight.view(
+                preact_a.shape[0], preact_a.shape[1], 1
+            )
+            postact_a_for_dW2 = (
+                (
+                    F.silu(preact_a[..., 0::2].float())
+                    * preact_a[..., 1::2].float()
+                    * ptw_reshaped
+                )
+                .to(dtype)
+                .reshape(TK_padded, I)
+            )
+            cu_seqlens_k_y = (
+                handle.expert_pool_block_offset.to(torch.int32) * tile_m
+            ).contiguous()
+            gemm(
+                dL_do_pool.t(),
+                postact_a_for_dW2.t(),
+                dW2_local,
+                None,
+                None,
+                tile_M=tile_m,
+                tile_N=tile_n_a,
+                cluster_M=1,
+                cluster_N=1,
+                cu_seqlens_k=cu_seqlens_k_y,
+            )
+            # Collapse ColVecReduce N-stripe partials → per-slot dL/dweight,
+            # then publish to streams.combine via a single event (combine_grads
+            # has no per-token kernel-fired release on weight_grads).
+            dL_dweight = dL_dweight_per_stripe.sum(dim=-1)
+            weight_grads_ready = torch.cuda.Event()
+            weight_grads_ready.record()
+
+        # bwd_a_ready / dL_dswiglu_in are written on compute_y, consumed on
+        # compute_a (kernel_a_bwd + dW1 GEMM).
+        bwd_a_ready.record_stream(streams.compute_a)
+        dL_dswiglu_in.record_stream(streams.compute_a)
+        # dL_dweight is read by combine_grads on streams.combine.
+        dL_dweight.record_stream(streams.combine)
+
+        # ── Stage 3 — kernel_a_bwd on streams.compute_a ────────────────────
+        # Acquire-spins on bwd_a_ready[tile] internally. Vanilla streaming GEMM
+        # `dL/dpool = dL/dswiglu_in @ W1` + atomic-scatter into dL_dx_per_r;
+        # per-row stripe-done bookkeeping fires bwd_compute_done_per_token[r]
+        # on the last contributor.
+        with torch.cuda.stream(streams.compute_a):
+            streaming_moe_a_bwd(
+                dL_dswiglu_in,
+                w1_local,
+                dL_dx_per_r,
+                handle.pool_recv_token,
+                bwd_per_token_remaining,
+                bwd_compute_done_per_token,
+                handle.tile_id_to_expert,
+                handle.expert_pool_block_offset,
+                bwd_a_ready,
+                dispatch_seq=handle.dispatch_seq,
+                tile_m=tile_m,
+                tile_n=tile_n_y,
+                num_sms=num_sms_y,
+            )
+            # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
+            #   → (E_local, 2I, H) — same shape as w1_local, varlen-K grouped GEMM.
+            #
+            # quack.gemm cu_seqlens_k expects A: (M, total_K) m-major and
+            # B: (N, total_K) n-major. For dW1: M=2I, N=H, L=E_local,
+            # total_K=TK_padded.
+            #   A = dL_dswiglu_in_flat.t() shape (2I, TK_padded), strides (1, 2I) → m-major ✓
+            #   B = pool.t()               shape (H,  TK_padded), strides (1, H)  → n-major ✓
+            #   D = dW1_local              (E_local, 2I, H) ← matches w1_local layout ✓
+            dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
+            cu_seqlens_k_a = (
+                handle.expert_pool_block_offset.to(torch.int32) * tile_m
+            ).contiguous()
+            gemm(
+                dL_dswiglu_in_flat.t(),
+                pool.t(),
+                dW1_local,
+                None,
+                None,
+                tile_M=tile_m,
+                tile_N=tile_n_a,
+                cluster_M=1,
+                cluster_N=1,
+                cu_seqlens_k=cu_seqlens_k_a,
+            )
+
+        # dL_dx_per_r / bwd_compute_done_per_token are written on compute_a,
+        # consumed by combine_grads on streams.combine.
+        dL_dx_per_r.record_stream(streams.combine)
+        bwd_compute_done_per_token.record_stream(streams.combine)
+
+        # ── Stage 4 — combine_grads on streams.combine ─────────────────────
+        # Sender per-warp loop spins on bwd_compute_done_per_token[r] >=
+        # dispatch_seq before reading dL_dx_per_r[r]. Cross-stream visibility
+        # of dL_dweight (post-sum) is via the one-shot weight_grads_ready
+        # event recorded on compute_y above.
+        streams.combine.wait_event(weight_grads_ready)
+        with torch.cuda.stream(streams.combine):
+            dL_dx, dL_dtopk_weights = buffer.combine_grads(
+                dL_dx_per_r,
+                handle,
+                dL_dweight,
+                bwd_compute_done_per_token,
+                dispatch_seq=handle.dispatch_seq,
+            )
+
+        # ── Exit chain back to caller_stream ───────────────────────────────
+        caller_stream.wait_stream(streams.dispatch)
+        caller_stream.wait_stream(streams.compute_y)
+        caller_stream.wait_stream(streams.compute_a)
+        caller_stream.wait_stream(streams.combine)
+
+        # Outputs of combine_grads were allocated on streams.combine; record
+        # their use on caller_stream so they're not freed before the upstream
+        # backward consumes them.
+        dL_dx.record_stream(caller_stream)
+        dL_dtopk_weights.record_stream(caller_stream)
+        dW1_local.record_stream(caller_stream)
+        dW2_local.record_stream(caller_stream)
+
+        # Gradient tuple matches forward's 15 args, in order:
+        #   (streams, buffer, x, topk_idx, topk_weights, is_token_in_rank,
+        #    w1_local, w2_local, num_experts, dispatch_seq, tile_m, tile_n_a,
+        #    tile_n_y, num_sms_a, num_sms_y)
+        return (
+            None,  # streams
+            None,  # buffer
+            dL_dx,  # x
+            None,  # topk_idx
+            dL_dtopk_weights,  # topk_weights
+            None,  # is_token_in_rank
+            dW1_local,  # w1_local
+            dW2_local,  # w2_local
+            None,  # num_experts
+            None,  # dispatch_seq
+            None,  # tile_m
+            None,  # tile_n_a
+            None,  # tile_n_y
+            None,  # num_sms_a
+            None,  # num_sms_y
+        )
 
 
 def stream_moe_func(
