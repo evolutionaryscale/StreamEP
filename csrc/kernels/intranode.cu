@@ -715,19 +715,33 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                     // __threadfence_system + tile_ready release-store sequence
                     // after this make per_token_remaining[r] visible to kernel Y
                     // before kernel Y's first atomicSub on the same address.
+                    //
+                    // Phase F additions: recv_token_to_slots[r, :K] and
+                    // k_local_count[r] are persisted here as well — both are
+                    // consumed by the backward path (dispatch_grads receiver
+                    // gathers slots; bwd setup memcpy's k_local_count into
+                    // bwd_per_token_remaining). They share the lane-0 K-loop
+                    // since both `slot_row[k]` and `recv_token_id` are already
+                    // in scope. recv_token_to_slots gets a write for EVERY k
+                    // (the value is -1 for non-local k); k_local_count
+                    // duplicates per_token_remaining's value into a write-once
+                    // buffer that fwd never decrements.
                     if (lane_id == 0) {
-                        int k_local_count = 0;
+                        int k_local_count_val = 0;
                         for (int k = 0; k < shape.num_topk; ++k) {
                             int slot = slot_row[k];
+                            per_token_out.recv_token_to_slots[recv_token_id * shape.num_topk + k] = slot;
                             if (slot < 0) continue;
                             pool_out.pool_topk_weight[slot] = ld_nc_global(
                                 channel_topk_weights_buffers.buffer() + token_idx_in_buffer * shape.num_topk + k);
                             pool_out.pool_recv_token[slot] = recv_token_id;
                             pool_out.pool_k_slot[slot] = k;
-                            ++k_local_count;
+                            ++k_local_count_val;
                         }
-                        if (k_local_count > 0)
-                            per_token_out.per_token_remaining[recv_token_id] = k_local_count;
+                        if (k_local_count_val > 0) {
+                            per_token_out.per_token_remaining[recv_token_id] = k_local_count_val;
+                            per_token_out.k_local_count[recv_token_id] = k_local_count_val;
+                        }
                     }
 
                     // x_scales: per-(slot, scales_idx). Lanes split scales_idx within K.

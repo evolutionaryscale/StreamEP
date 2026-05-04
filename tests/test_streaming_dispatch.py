@@ -204,6 +204,32 @@ def main():
     assert o_t.shape == (T_recv, hidden), f"o shape {o_t.shape} != ({T_recv}, {hidden})"
     assert (o_t == 0).all(), "o should be zero-init"
 
+    # ─── (6.5) Backward scaffolding: recv_token_to_slots[r, k] should equal the
+    # slot for (r, k) when k routes to a local expert, and -1 otherwise. The
+    # expected mapping is the inverse of the existing per-slot writes:
+    # for every slot s with pool_recv_token[s] >= 0, recv_token_to_slots[
+    #   pool_recv_token[s], pool_k_slot[s]] == s. k_local_count[r] should
+    # equal per_token_remaining[r] (write-once mirror that fwd doesn't decrement).
+    rtts = handle.recv_token_to_slots.cpu()
+    assert rtts.shape == (T_recv, num_topk), (
+        f"recv_token_to_slots shape {rtts.shape} != ({T_recv}, {num_topk})"
+    )
+    expected_rtts = torch.full((T_recv, num_topk), -1, dtype=torch.int32)
+    valid_slots = pool_recv_token >= 0
+    for s in valid_slots.nonzero().flatten().tolist():
+        rt = int(pool_recv_token[s].item())
+        k = int(pool_k_slot[s].item())
+        expected_rtts[rt, k] = s
+    assert torch.equal(rtts, expected_rtts), (
+        f"recv_token_to_slots mismatch; first deviating (r, k): "
+        f"{(rtts != expected_rtts).nonzero()[:8]}"
+    )
+    klc = handle.k_local_count.cpu()
+    assert klc.shape == (T_recv,), f"k_local_count shape {klc.shape} != ({T_recv},)"
+    assert torch.equal(klc, per_token_remaining), (
+        "k_local_count should equal per_token_remaining (both = K_local(r) pre-decrement)"
+    )
+
     # ─── (7) Bit-determinism — re-run with same inputs, expect identical pool layout.
     pool2, handle2, _ = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,
@@ -214,6 +240,10 @@ def main():
         "pool_recv_token not deterministic"
     assert torch.equal(handle.pool_k_slot.cpu(), handle2.pool_k_slot.cpu()), \
         "pool_k_slot not deterministic"
+    assert torch.equal(handle.recv_token_to_slots.cpu(), handle2.recv_token_to_slots.cpu()), \
+        "recv_token_to_slots not deterministic"
+    assert torch.equal(handle.k_local_count.cpu(), handle2.k_local_count.cpu()), \
+        "k_local_count not deterministic"
     # `pool` padding rows are now left uninitialized (kernel Y's pool_recv_token
     # predicate is the actual safety mechanism). Compare valid rows only.
     valid = (handle.pool_recv_token.cpu() >= 0)

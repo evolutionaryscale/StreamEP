@@ -646,9 +646,12 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
 //     pool_recv_token, pool_k_slot
 //
 //   Z_post (zeroed AFTER event — kernel Y atomic-scatter destinations + combine
-//          sender state. Kernel Y waits on a_ready (kernel A's release), which
-//          serializes after this memset on dispatch_stream → no race):
-//     per_token_remaining, compute_done_per_token, o
+//          sender state + backward-only scaffolding. Kernel Y waits on a_ready
+//          (kernel A's release), which serializes after this memset on
+//          dispatch_stream → no race; backward consumers serialize via
+//          caller_stream's wait on dispatch_stream at fwd's exit):
+//     per_token_remaining, compute_done_per_token, o,
+//     recv_token_to_slots, k_local_count
 struct PostPollBundle {
     // Conditional FP8 pool-shape scales. Kept separate from the bundle since
     // it's conditional and FP8-specific.
@@ -671,6 +674,10 @@ struct PostPollBundle {
     torch::Tensor per_token_remaining;
     torch::Tensor compute_done_per_token;
     torch::Tensor o;
+
+    // Backward-pass scaffolding (Z_post; populated by fwd Pass B; read by bwd):
+    torch::Tensor recv_token_to_slots;  // [T_recv, num_topk] int32, -1 for non-local k
+    torch::Tensor k_local_count;        // [T_recv]            int32, write-once K_local mirror
 
     // Recorded between Z_pre/N memsets and Z_post memset. Consumer streams
     // wait_event on this to safely read metadata tensors without serializing
@@ -727,6 +734,8 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     int64_t off_per_token_remaining    = b.reserve<int>(num_recv_tokens);
     int64_t off_compute_done_per_token = b.reserve<int64_t>(num_recv_tokens);
     int64_t off_o                      = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
+    int64_t off_recv_token_to_slots    = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
+    int64_t off_k_local_count          = b.reserve<int>(num_recv_tokens);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
@@ -758,9 +767,11 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // Z_post memset (queued AFTER metadata_done event recording).
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
-    out.per_token_remaining    = at::from_blob(base + off_per_token_remaining,    {num_recv_tokens},          keep, i32_opts);
-    out.compute_done_per_token = at::from_blob(base + off_compute_done_per_token, {num_recv_tokens},          keep, i64_opts);
-    out.o                      = at::from_blob(base + off_o,                      {num_recv_tokens, hidden},  keep, x_options);
+    out.per_token_remaining    = at::from_blob(base + off_per_token_remaining,    {num_recv_tokens},                        keep, i32_opts);
+    out.compute_done_per_token = at::from_blob(base + off_compute_done_per_token, {num_recv_tokens},                        keep, i64_opts);
+    out.o                      = at::from_blob(base + off_o,                      {num_recv_tokens, hidden},                keep, x_options);
+    out.recv_token_to_slots    = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},              keep, i32_opts);
+    out.k_local_count          = at::from_blob(base + off_k_local_count,          {num_recv_tokens},                        keep, i32_opts);
 
     return out;
 }
@@ -899,6 +910,8 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .recv_channel_prefix_matrix = post.recv_channel_prefix_matrix.data_ptr<int>(),
         .send_head                  = post.send_head.data_ptr<int>(),
         .per_token_remaining        = post.per_token_remaining.data_ptr<int>(),
+        .recv_token_to_slots        = post.recv_token_to_slots.data_ptr<int>(),
+        .k_local_count              = post.k_local_count.data_ptr<int>(),
     };
     intranode::DispatchInputs dispatch_inputs{
         .x                = reinterpret_cast<const int4*>(x.data_ptr()),
@@ -959,6 +972,8 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .per_token_remaining        = post.per_token_remaining,
         .compute_done_per_token     = post.compute_done_per_token,
         .o                          = post.o,
+        .recv_token_to_slots        = post.recv_token_to_slots,
+        .k_local_count              = post.k_local_count,
         .total_tiles                = poll.total_tiles,
         .metadata_done_event        = post.metadata_done_event,
     };
@@ -1919,6 +1934,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("per_token_remaining",        &deep_ep::StreamingDispatchOutputs::per_token_remaining)
         .def_readonly("compute_done_per_token",     &deep_ep::StreamingDispatchOutputs::compute_done_per_token)
         .def_readonly("o",                          &deep_ep::StreamingDispatchOutputs::o)
+        .def_readonly("recv_token_to_slots",        &deep_ep::StreamingDispatchOutputs::recv_token_to_slots)
+        .def_readonly("k_local_count",              &deep_ep::StreamingDispatchOutputs::k_local_count)
         .def_readonly("total_tiles",                &deep_ep::StreamingDispatchOutputs::total_tiles)
         .def_readonly("metadata_done_event",        &deep_ep::StreamingDispatchOutputs::metadata_done_event);
 

@@ -63,6 +63,14 @@ class StreamingHandle:
     compute_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
     o: torch.Tensor                            # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
 
+    # ── Backward-pass scaffolding (Phase F).
+    # Both populated by fwd Pass B in the same lane-0 K-loop that writes
+    # pool_recv_token / pool_k_slot / per_token_remaining; consumed by the
+    # backward path (no fwd consumer). Cost: ~512 KB + ~128 KB at production
+    # (T_recv≈32K, K=4).
+    recv_token_to_slots: torch.Tensor          # [T_recv, num_topk] int32 — (r, k) → pool slot, -1 for non-local k
+    k_local_count: torch.Tensor                # [T_recv] int32 — write-once K_local mirror (per_token_remaining is decremented to 0 by kernel Y)
+
     total_tiles: int
     tile_m: int
     dispatch_seq: int
@@ -450,6 +458,8 @@ class Buffer:
             per_token_remaining=out.per_token_remaining,
             compute_done_per_token=out.compute_done_per_token,
             o=out.o,
+            recv_token_to_slots=out.recv_token_to_slots,
+            k_local_count=out.k_local_count,
             total_tiles=out.total_tiles,
             tile_m=tile_m,
             dispatch_seq=dispatch_seq,

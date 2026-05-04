@@ -68,6 +68,10 @@ namespace deep_ep {
 //   per_token_remaining,
 //   compute_done_per_token,
 //   o                        kernel Y atomic-scatter destination + Y→combine gate.
+//   recv_token_to_slots,
+//   k_local_count            backward-pass scaffolding written by fwd Pass B
+//                            (dispatch_grads receiver gathers slots; bwd setup
+//                            memcpy's k_local_count into bwd_per_token_remaining).
 struct StreamingDispatchOutputs {
     torch::Tensor pool;
     std::optional<torch::Tensor> pool_x_scales;
@@ -97,6 +101,9 @@ struct StreamingDispatchOutputs {
     torch::Tensor per_token_remaining;
     torch::Tensor compute_done_per_token;
     torch::Tensor o;
+
+    torch::Tensor recv_token_to_slots;
+    torch::Tensor k_local_count;
 
     int total_tiles;
 

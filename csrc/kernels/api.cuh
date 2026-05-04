@@ -101,7 +101,10 @@ struct DispatchPerTokenOut {
     float* recv_topk_weights;      // [T_recv, num_topk]
     int* recv_channel_prefix_matrix;  // [num_ranks, num_channels]  receiver-side cumulative
     int* send_head;                // [num_tokens, num_ranks]
-    int* per_token_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs
+    int* per_token_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs to 0
+    // Backward-pass scaffolding written by Pass B's per-recv-token lane-0 K-loop:
+    int* recv_token_to_slots;      // [T_recv, num_topk]    (r, k) → pool slot, -1 for non-local k
+    int* k_local_count;            // [T_recv]              K_local(r); write-once mirror of per_token_remaining
 };
 
 struct DispatchInputs {
