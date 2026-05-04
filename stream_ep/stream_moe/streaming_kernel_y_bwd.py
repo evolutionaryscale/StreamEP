@@ -34,10 +34,18 @@ Shares streaming machinery with fwd kernels:
     only the destination tensor changes (bwd_a_ready instead of a_ready).
 
 dL/dweight[slot] (the per-recv-slot dot product `postact_a[slot] · g[slot]`)
-is intentionally NOT computed here yet. It folds into the same tile by
-loading postact_a as mC and accumulating a ColVecReduce — additive change
-that doesn't disturb the structure above. Wired in once the surrounding
-combine_grads orchestration is ready to consume `weight_grads[slot]`.
+is intentionally NOT computed here yet. The plan: pick up `preact_a` (saved
+from fwd kernel A's mD TMA-store path) as a per-tile gmem load via a
+custom EpiOp, recompute postact_a in registers via the same paired-N
+silu·mul fwd kernel A uses (`postact[i] = silu(preact[2i]) * preact[2i+1]`
+— ~10 KFLOP/slot, element-wise, fully overlaps with the GEMM mainloop),
+then accumulate `Σ_n postact[m, n] * g[m, n]` into a ColVecReduce buffer
+for per-row dL/dweight. preact-based rather than postact-based because
+save-preact / recompute-postact is the strictly better trade (preact
+would otherwise require a full `pool @ W1.T` GEMM in kernel_a_bwd to
+recover; postact recomputes element-wise — see bwd.md §"Pre-SwiGLU save
+vs recompute"). Wired in once the surrounding combine_grads orchestration
+is ready to consume `weight_grads[slot]`.
 """
 
 from typing import NamedTuple, Optional, Type

@@ -145,6 +145,23 @@ class StreamMoEFunc(torch.autograd.Function):
                 dtype=x.dtype,
                 device=pool.device,
             )
+            # preact_a holds the [2I] pre-SwiGLU gate-up accumulator from kernel
+            # A's mD TMA-store path (opt-in via the ``preact_a`` kwarg below).
+            # Kept alive across fwd→bwd via ctx.save_for_backward; bwd consumes
+            # it for SwiGLU bwd in registers (kernel_a_bwd skips the recompute
+            # GEMM) and for postact_a recompute in dL/dweight (kernel_y_bwd's
+            # per-row dot product). postact_a stays as fwd-only scratch (kernel
+            # Y reads it then it's freed at the layer-end exit chain) — the
+            # cheap thing element-wise-recomputes from preact in bwd, the
+            # expensive thing (preact, would otherwise need a GEMM to recover)
+            # is the one we save.
+            preact_a = torch.empty(
+                handle.total_tiles,
+                tile_m,
+                2 * w2_local.shape[2],
+                dtype=x.dtype,
+                device=pool.device,
+            )
             streaming_moe_a(
                 pool,
                 w1_local,
@@ -155,6 +172,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.a_ready,
                 dispatch_seq=handle.dispatch_seq,
                 compute_seq=handle.dispatch_seq,
+                preact_a=preact_a,
                 tile_m=tile_m,
                 tile_n=tile_n_a,
                 num_sms=num_sms_a,
@@ -222,11 +240,24 @@ class StreamMoEFunc(torch.autograd.Function):
         caller_stream.wait_stream(streams.compute_a)
         caller_stream.wait_stream(streams.compute_y)
         caller_stream.wait_stream(streams.combine)
+
+        # Save tensors bwd will consume. The contract is "save preact, drop
+        # postact" — preact_a is the strictly more useful saved activation
+        # (kernel_a_bwd reads it directly for SwiGLU bwd, kernel_y_bwd's
+        # dL/dweight extension element-wise-recomputes postact from it via
+        # silu(gate)*up). Saving postact_a instead would force kernel_a_bwd to
+        # recompute preact via `pool @ W1[e].T` — same shape as fwd kernel A's
+        # main GEMM, ~370 µs/layer at production. The remainder of the bwd
+        # save set (pool / handle / W1 / W2 / topk_weights) lands with the
+        # bwd orchestrator PR.
+        ctx.save_for_backward(preact_a)
         return out
 
     @staticmethod
     def backward(ctx, _grad_out):  # type: ignore[override]
         # No-grad boundary: 15 forward args (after ctx) → 15 None gradients.
+        # The bwd PR replaces this with the four-stage backward orchestrator
+        # (dispatch_grads → kernel_y_bwd → kernel_a_bwd → combine_grads).
         return (None,) * 15
 
 
