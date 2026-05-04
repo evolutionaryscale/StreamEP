@@ -126,13 +126,17 @@ def main():
     ).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
+    w1_local.requires_grad_(True)
+    w2_local.requires_grad_(True)
 
     torch.manual_seed(100 + rank)
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
+    x.requires_grad_(True)
     topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
     topk_weights = torch.softmax(
         torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
     ).contiguous()
+    topk_weights.requires_grad_(True)
 
     rank_idx = topk_idx // local_E
     is_token_in_rank = torch.zeros(
@@ -154,8 +158,9 @@ def main():
         )
 
     # Warm: dispatch + kernel A + kernel Y + combine JIT, kernel cache, allocator.
+    # Includes the bwd path so its kernels JIT during warmup too.
     for warm_seq in range(1, 6):
-        stream_moe_func(
+        out = stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -172,6 +177,7 @@ def main():
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
         )
+        out.sum().backward()
     torch.cuda.synchronize()
     barrier(group)
 
@@ -189,10 +195,8 @@ def main():
     ) as prof:
         seq = 100  # bumped past warmup seqs so it's clearly distinct in the trace
         for step in range(1 + 2 + 5):
-            with torch.profiler.record_function(
-                f"step_{step}_dispatch+kernelA+kernelY+combine"
-            ):
-                stream_moe_func(
+            with torch.profiler.record_function(f"step_{step}_fwd"):
+                out = stream_moe_func(
                     buffer,
                     x,
                     topk_idx,
@@ -209,11 +213,13 @@ def main():
                     num_sms_a=args.num_sms_a,
                     num_sms_y=args.num_sms_y,
                 )
+            with torch.profiler.record_function(f"step_{step}_bwd"):
+                out.sum().backward()
             prof.step()
 
     torch.cuda.synchronize()
     barrier(group)
-    rank_zero_print("done; trace files (one per rank) in:", args.out_dir, flush=True)
+    rank_zero_print("done; trace files (one per rank) in:", args.out_dir)
     torch_dist.destroy_process_group()
 
 

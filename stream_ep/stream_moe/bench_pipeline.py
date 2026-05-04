@@ -39,8 +39,14 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
     streaming_moe_a,
 )
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    streaming_moe_a_bwd,
+)
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
     streaming_moe_y,
+)
+from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    streaming_moe_y_bwd,
 )
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
     make_streams,
@@ -191,6 +197,9 @@ def main():
 
     # Postact_a (kernel A → kernel Y intermediate). Sized for per-tile slabs.
     postact_a = torch.empty(total_tiles, args.tile_m, I, dtype=DTYPE, device=device)
+    # Preact_a (kernel A's pre-SwiGLU bf16 [2I] gate-up accumulator). Saved
+    # in fwd via ctx; bwd kernel_y_bwd reads it as mC (f32-recast).
+    preact_a = torch.zeros(total_tiles, args.tile_m, 2 * I, dtype=DTYPE, device=device)
     # Reference postact buffers for the gemm_gated baseline.
     postact_flat_ref = torch.empty(TK_padded, I, dtype=DTYPE, device=device)
     preact_flat_ref = torch.empty(TK_padded, 2 * I, dtype=DTYPE, device=device)
@@ -200,6 +209,37 @@ def main():
     # `o` is `handle.o` from DeepEP, sized [T_recv, H], zero-init. Kernel Y
     # writes via PTX-predicated atomic-scatter (no trash row).
     o_buf = handle.o
+
+    # ── Bwd-side buffers for isolated bwd-kernel timing ───────────────────
+    # The bwd path doesn't allocate via the same cached handle — each
+    # `dispatch_grads` call returns fresh `dL_do_pool` / `bwd_y_ready`.
+    # For isolated kernel_y_bwd / kernel_a_bwd / combine_grads timing we
+    # capture one set from a single dispatch_grads call below and reuse it
+    # across timed iters.
+    dL_dy_in = (torch.randn_like(x) * 0.01).contiguous()
+    num_pid_n_y_bwd = (I + args.tile_n_a - 1) // args.tile_n_a
+    dL_dswiglu_in = torch.empty(
+        total_tiles, args.tile_m, 2 * I, dtype=DTYPE, device=device
+    )
+    dL_dweight_per_stripe = torch.zeros(
+        TK_padded, num_pid_n_y_bwd, dtype=torch.float32, device=device
+    )
+    dL_dx_per_r = torch.zeros(T_recv, H, dtype=DTYPE, device=device)
+    weight_grads = torch.zeros(TK_padded, dtype=torch.float32, device=device)
+    # Pre-fired bwd ready signals so each bwd kernel can be timed in isolation.
+    bwd_y_ready_fired = torch.full(
+        (total_tiles,), handle.dispatch_seq, dtype=torch.int64, device=device
+    )
+    bwd_a_ready_fired = torch.full(
+        (total_tiles,), handle.dispatch_seq, dtype=torch.int64, device=device
+    )
+    # bwd_a_ready_for_y: kernel_y_bwd writes its release-store here. Must
+    # zero-init before each call so multi-pid_n stripe-done gating fires
+    # cleanly. Reset inside run_streaming_y_bwd.
+    bwd_a_ready_for_y = torch.zeros(total_tiles, dtype=torch.int64, device=device)
+    bwd_per_token_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
+    bwd_per_token_remaining_init = handle.k_local_count.to(torch.int32).clone()
+    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     if rank == 0:
         # MoE forward FLOPs (kernel A + kernel Y bf16 matmuls).
@@ -317,15 +357,187 @@ def main():
         handle.compute_done_per_token.fill_(handle.dispatch_seq)
         buffer.combine(handle.o, handle, combine_seq=handle.dispatch_seq)
 
+    # ── Bwd-side isolated runners ──────────────────────────────────────────
+    # `dispatch_grads` allocates a fresh `dL_do_pool` / `bwd_y_ready` each
+    # call; the kernel_y_bwd runner reuses one captured pair below.
+    _dL_do_pool_captured: torch.Tensor | None = None
+    _bwd_y_ready_captured: torch.Tensor | None = None
+
+    def run_dispatch_grads_only():
+        nonlocal _dL_do_pool_captured, _bwd_y_ready_captured
+        with torch.cuda.stream(streams.dispatch):
+            _dL_do_pool_captured, _bwd_y_ready_captured = buffer.dispatch_grads(
+                handle, dL_dy_in, dispatch_seq=handle.dispatch_seq
+            )
+        torch.cuda.current_stream().wait_stream(streams.dispatch)
+
+    def run_streaming_y_bwd():
+        # Reset bwd_a_ready (kernel_y_bwd's release target) so the multi-pid_n
+        # stripe-done gating sees zero on the first stripe, and zero the
+        # ColVecReduce accumulator (otherwise partials accumulate forever).
+        bwd_a_ready_for_y.zero_()
+        dL_dweight_per_stripe.zero_()
+        streaming_moe_y_bwd(
+            _dL_do_pool_captured,
+            w2_local,
+            dL_dswiglu_in,
+            handle.pool_topk_weight,
+            preact_a,
+            dL_dweight_per_stripe,
+            handle.tile_id_to_expert,
+            handle.expert_pool_block_offset,
+            bwd_y_ready_fired,
+            bwd_a_ready_for_y,
+            dispatch_seq=handle.dispatch_seq,
+            tile_m=args.tile_m,
+            tile_n=args.tile_n_a,
+            num_sms=args.num_sms_a,
+        )
+
+    # NN-form W2 / W1 for the bwd-ref GEMMs: kernel_y_bwd does
+    # `g = dL_do_pool @ W2`  (M=TK_padded varlen-m, K=H, N=I) — the ref needs
+    # an N-major (k-contig) B operand of shape (E_local, K=H, N=I), i.e.
+    # W2.permute(0, 2, 1). Same idea for W1: kernel_a_bwd does
+    # `dL/dpool = dL_dswiglu_in @ W1` (M=TK_padded, K=2I, N=H), N-major B is
+    # W1.permute(0, 2, 1). Materialised once outside the timing loop so the
+    # cost of the permute doesn't pollute the GEMM measurement.
+    w2_nmajor_ref = w2_local.permute(0, 2, 1).contiguous()
+    w1_nmajor_ref = w1_local.permute(0, 2, 1).contiguous()
+
+    def run_gemm_y_bwd_ref():
+        # Plain streaming GEMM mirroring kernel_y_bwd's data-grad shape:
+        # M=TK_padded varlen-m, K=H, N=I. (Kernel_y_bwd's full output is
+        # (M, 2I) bf16 = (M, I) fp32 view via the dswiglu pack trick; the
+        # GEMM mainloop itself is N=I — so the fair baseline is N=I.) No
+        # epilogue (no SwiGLU bwd, no ColVecReduce). Reuses postact_flat_ref
+        # as the output sink.
+        gemm(
+            _dL_do_pool_captured,
+            w2_nmajor_ref,
+            postact_flat_ref,
+            None,
+            None,
+            tile_M=args.tile_m,
+            tile_N=args.tile_n_a,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_m=cu_seqlens_m,
+        )
+
+    def run_streaming_a_bwd():
+        bwd_per_token_remaining.copy_(bwd_per_token_remaining_init)
+        bwd_compute_done_per_token.zero_()
+        dL_dx_per_r.zero_()
+        streaming_moe_a_bwd(
+            dL_dswiglu_in,
+            w1_local,
+            dL_dx_per_r,
+            handle.pool_recv_token,
+            bwd_per_token_remaining,
+            bwd_compute_done_per_token,
+            handle.tile_id_to_expert,
+            handle.expert_pool_block_offset,
+            bwd_a_ready_fired,
+            dispatch_seq=handle.dispatch_seq,
+            tile_m=args.tile_m,
+            tile_n=args.tile_n_y,
+            num_sms=args.num_sms_y,
+        )
+
+    def run_gemm_a_bwd_ref():
+        # Plain streaming GEMM mirroring kernel_a_bwd's data-grad shape:
+        # M=TK_padded varlen-m, K=2*I, N=H. No atomic-scatter epilogue.
+        dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, 2 * I)
+        gemm(
+            dL_dswiglu_in_flat,
+            w1_nmajor_ref,
+            y_ref,  # reuse: same (TK_padded, H) shape as kernel Y baseline
+            None,
+            None,
+            tile_M=args.tile_m,
+            tile_N=args.tile_n_y,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_m=cu_seqlens_m,
+        )
+
+    def run_combine_grads_only():
+        # combine_grads's sender gate is `bwd_compute_done_per_token`; pre-fire
+        # the same way run_combine_only fires `compute_done_per_token`. The
+        # kernel runs to completion using captured `dL_dx_per_r` / `weight_grads`.
+        bwd_compute_done_per_token.fill_(handle.dispatch_seq)
+        buffer.combine_grads(
+            dL_dx_per_r,
+            handle,
+            weight_grads,
+            bwd_compute_done_per_token,
+            dispatch_seq=handle.dispatch_seq,
+        )
+
+    # ── dW1 / dW2 grouped-GEMM tail timing (varlen-K). Same calls the bwd
+    # orchestrator runs after kernel_y_bwd / kernel_a_bwd. Quack `gemm` with
+    # `cu_seqlens_k`. ──
+    cu_seqlens_k = (
+        handle.expert_pool_block_offset.to(torch.int32) * args.tile_m
+    ).contiguous()
+    dW2_local_buf = torch.empty_like(w2_local)
+    dW1_local_buf = torch.empty_like(w1_local)
+    postact_a_for_dW2 = torch.empty(TK_padded, I, dtype=DTYPE, device=device)
+
+    def run_dW2_grouped_gemm():
+        # dW2[e] = postact_a[slot_range_e].T @ dL_do_pool[slot_range_e]
+        gemm(
+            _dL_do_pool_captured.t(),
+            postact_a_for_dW2.t(),
+            dW2_local_buf,
+            None,
+            None,
+            tile_M=args.tile_m,
+            tile_N=args.tile_n_a,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_k=cu_seqlens_k,
+        )
+
+    def run_dW1_grouped_gemm():
+        # dW1[e] = dL_dswiglu_in[slot_range_e].T @ pool[slot_range_e]
+        dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, 2 * I)
+        gemm(
+            dL_dswiglu_in_flat.t(),
+            pool.t(),
+            dW1_local_buf,
+            None,
+            None,
+            tile_M=args.tile_m,
+            tile_N=args.tile_n_a,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_k=cu_seqlens_k,
+        )
+
     # Capture initial per_token_remaining so isolated y timing can reset it.
     _per_token_remaining_init = handle.per_token_remaining.clone()
 
-    # Warm everything up: A, gemm_gated, Y, gemm, combine.
+    # Materialize one dispatch_grads result for kernel_y_bwd / a_bwd / combine_grads inputs.
+    run_dispatch_grads_only()
+    torch.cuda.synchronize()
+    assert _dL_do_pool_captured is not None
+
+    # Warm everything up: A, gemm_gated, Y, gemm, combine, and the bwd-side
+    # kernels (kernel_y_bwd / kernel_a_bwd / combine_grads + dW1/dW2 grouped
+    # GEMMs). dispatch_grads was already warmed by the capture above.
     run_streaming_a()
     run_gemm_gated_ref()
     run_streaming_y_only()
     run_gemm_y_ref()
     run_combine_only()
+    run_streaming_y_bwd()
+    run_gemm_y_bwd_ref()
+    run_streaming_a_bwd()
+    run_gemm_a_bwd_ref()
+    run_combine_grads_only()
+    run_dW2_grouped_gemm()
+    run_dW1_grouped_gemm()
     torch.cuda.synchronize()
     barrier(group)
 
@@ -370,6 +582,74 @@ def main():
         print(
             f"{'buffer.combine':>26s}  {'-':>6s}  {'-':>6s}  {combine_us:>10.1f}  {'-':>10s}"
         )
+
+    # ── Bwd-side isolated timing rows. FLOPs match the per-kernel data-grad
+    # GEMM (kernel_y_bwd: dL_do_pool @ W2 → 2*TK*H*I; kernel_a_bwd:
+    # dL_dswiglu_in @ W1 → 2*2*TK*H*I; dW2 / dW1 grouped GEMMs are the
+    # transposed varlen-K versions of the same arithmetic intensity). ──
+    dispatch_grads_us = time_kernel(run_dispatch_grads_only)
+    if rank == 0:
+        print(
+            f"{'buffer.dispatch_grads':>26s}  {'-':>6s}  {'-':>6s}  "
+            f"{dispatch_grads_us:>10.1f}  {'-':>10s}"
+        )
+
+    streaming_y_bwd_us = time_kernel(run_streaming_y_bwd)
+    fmt_row(
+        "streaming_moe_y_bwd",
+        args.tile_m,
+        args.tile_n_a,
+        streaming_y_bwd_us,
+        2 * TK * H * I,
+    )
+
+    gemm_y_bwd_us = time_kernel(run_gemm_y_bwd_ref)
+    fmt_row(
+        "gemm (ref, y_bwd shape)",
+        args.tile_m,
+        args.tile_n_a,
+        gemm_y_bwd_us,
+        2 * TK * H * I,
+    )
+
+    streaming_a_bwd_us = time_kernel(run_streaming_a_bwd)
+    fmt_row(
+        "streaming_moe_a_bwd",
+        args.tile_m,
+        args.tile_n_y,
+        streaming_a_bwd_us,
+        2 * 2 * TK * H * I,
+    )
+
+    gemm_a_bwd_us = time_kernel(run_gemm_a_bwd_ref)
+    fmt_row(
+        "gemm (ref, a_bwd shape)",
+        args.tile_m,
+        args.tile_n_y,
+        gemm_a_bwd_us,
+        2 * 2 * TK * H * I,
+    )
+
+    combine_grads_us = time_kernel(run_combine_grads_only)
+    if rank == 0:
+        print(
+            f"{'buffer.combine_grads':>26s}  {'-':>6s}  {'-':>6s}  "
+            f"{combine_grads_us:>10.1f}  {'-':>10s}"
+        )
+
+    dW2_us = time_kernel(run_dW2_grouped_gemm)
+    fmt_row(
+        "gemm_grouped dW2 (cu_K)", args.tile_m, args.tile_n_a, dW2_us, 2 * TK * H * I
+    )
+
+    dW1_us = time_kernel(run_dW1_grouped_gemm)
+    fmt_row(
+        "gemm_grouped dW1 (cu_K)",
+        args.tile_m,
+        args.tile_n_a,
+        dW1_us,
+        2 * 2 * TK * H * I,
+    )
 
     rank_zero_print()
 
@@ -437,6 +717,44 @@ def main():
 
     dispatch_us = time_kernel(dispatch_only, warmup=pipe_warmup, iters=pipe_iters)
 
+    # ── Fwd+bwd e2e (training-iter cost). Separate `step` because we need
+    # leaves with requires_grad=True for autograd to track. We toggle the
+    # flag here so the fwd-only run above stays representative of inference. ──
+    x.requires_grad_(True)
+    topk_weights.requires_grad_(True)
+    w1_local.requires_grad_(True)
+    w2_local.requires_grad_(True)
+
+    def step_fwd_bwd():
+        seq = seq_counter[0]
+        seq_counter[0] += 1
+        out = stream_moe_func(
+            buffer,
+            x,
+            topk_idx,
+            topk_weights,
+            is_token_in_rank,
+            w1_local,
+            w2_local,
+            streams=streams,
+            num_experts=NUM_EXPERTS,
+            dispatch_seq=seq,
+            tile_m=args.tile_m,
+            tile_n_a=args.tile_n_a,
+            tile_n_y=args.tile_n_y,
+            num_sms_a=args.num_sms_a,
+            num_sms_y=args.num_sms_y,
+        )
+        out.sum().backward()
+        x.grad = None
+        topk_weights.grad = None
+        w1_local.grad = None
+        w2_local.grad = None
+
+    pipeline_fwd_bwd_us = time_kernel(
+        step_fwd_bwd, warmup=pipe_warmup, iters=pipe_iters
+    )
+
     if rank == 0:
         print("=== end-to-end pipeline (dispatch + A + Y + combine, 4 streams) ===")
         print(f"  dispatch (alone, dispatch_stream):           {dispatch_us:7.1f} μs")
@@ -445,13 +763,42 @@ def main():
         print(f"  buffer.combine (alone, combine_send):    {combine_us:7.1f} μs")
         sequential_sum = dispatch_us + streaming_a_us + streaming_y_us + combine_us
         print(f"  serial sum of stages:                    {sequential_sum:7.1f} μs")
-        print(f"  pipeline end-to-end (4 streams, real overlap): {pipeline_us:7.1f} μs")
+        print(f"  fwd-only e2e (4 streams, real overlap):  {pipeline_us:7.1f} μs")
         if pipeline_us < sequential_sum:
             saved = sequential_sum - pipeline_us
             pct = 100.0 * saved / sequential_sum
-            print(f"  overlap saved: {saved:7.1f} μs ({pct:.1f}% of serial sum)")
+            print(f"  fwd overlap saved: {saved:7.1f} μs ({pct:.1f}% of serial sum)")
         else:
             print("  (no overlap savings observed; pipeline > serial sum)")
+        # Bwd serial budget: 4 bwd-stage isolated timings + 2 dW grouped GEMMs.
+        bwd_stages_sum = (
+            dispatch_grads_us
+            + streaming_y_bwd_us
+            + streaming_a_bwd_us
+            + combine_grads_us
+        )
+        bwd_grouped_sum = dW2_us + dW1_us
+        full_serial_sum = sequential_sum + bwd_stages_sum + bwd_grouped_sum
+        print(f"  dispatch_grads (alone):                  {dispatch_grads_us:7.1f} μs")
+        print(
+            f"  streaming_moe_y_bwd (alone):             {streaming_y_bwd_us:7.1f} μs"
+        )
+        print(
+            f"  streaming_moe_a_bwd (alone):             {streaming_a_bwd_us:7.1f} μs"
+        )
+        print(f"  buffer.combine_grads (alone):            {combine_grads_us:7.1f} μs")
+        print(f"  gemm_grouped dW2 (alone):                {dW2_us:7.1f} μs")
+        print(f"  gemm_grouped dW1 (alone):                {dW1_us:7.1f} μs")
+        print(f"  serial sum (fwd + bwd + dW1/dW2):        {full_serial_sum:7.1f} μs")
+        print(
+            f"  fwd+bwd e2e (training iter):             {pipeline_fwd_bwd_us:7.1f} μs"
+        )
+        if pipeline_fwd_bwd_us < full_serial_sum:
+            saved_fb = full_serial_sum - pipeline_fwd_bwd_us
+            pct_fb = 100.0 * saved_fb / full_serial_sum
+            print(
+                f"  fwd+bwd overlap saved: {saved_fb:7.1f} μs ({pct_fb:.1f}% of serial sum)"
+            )
 
         print()
         print("=== summary ===")
@@ -468,6 +815,24 @@ def main():
             print(
                 f"    streaming_y / gemm:       {ry:.3f}× "
                 f"(atomic-scatter overhead: {atomic_overhead_us:+.1f} μs)"
+            )
+        print(f"  streaming_moe_y_bwd:       {streaming_y_bwd_us:7.1f} μs")
+        print(f"  gemm (ref, y_bwd shape):   {gemm_y_bwd_us:7.1f} μs")
+        if streaming_y_bwd_us > 0 and gemm_y_bwd_us > 0:
+            ryb = streaming_y_bwd_us / gemm_y_bwd_us
+            yb_overhead = streaming_y_bwd_us - gemm_y_bwd_us
+            print(
+                f"    streaming_y_bwd / gemm:   {ryb:.3f}× "
+                f"(SwiGLU+ColVecReduce overhead: {yb_overhead:+.1f} μs)"
+            )
+        print(f"  streaming_moe_a_bwd:       {streaming_a_bwd_us:7.1f} μs")
+        print(f"  gemm (ref, a_bwd shape):   {gemm_a_bwd_us:7.1f} μs")
+        if streaming_a_bwd_us > 0 and gemm_a_bwd_us > 0:
+            rab = streaming_a_bwd_us / gemm_a_bwd_us
+            ab_overhead = streaming_a_bwd_us - gemm_a_bwd_us
+            print(
+                f"    streaming_a_bwd / gemm:   {rab:.3f}× "
+                f"(atomic-scatter overhead: {ab_overhead:+.1f} μs)"
             )
 
     torch_dist.destroy_process_group()

@@ -77,13 +77,17 @@ def main():
     ).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
+    w1_local.requires_grad_(True)
+    w2_local.requires_grad_(True)
 
     torch.manual_seed(100 + rank)
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
+    x.requires_grad_(True)
     topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
     topk_weights = torch.softmax(
         torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
     ).contiguous()
+    topk_weights.requires_grad_(True)
 
     rank_idx = topk_idx // local_E
     is_token_in_rank = torch.zeros(
@@ -97,7 +101,7 @@ def main():
 
     t0 = time.time()
     for warm_seq in range(1, args.n_warmup + 1):
-        stream_moe_func(
+        out = stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -112,6 +116,7 @@ def main():
             tile_n_a=TILE_N_A,
             tile_n_y=TILE_N_Y,
         )
+        out.sum().backward()
     torch.cuda.synchronize()
     barrier(group)
     t_warmup = time.time() - t0
@@ -122,7 +127,7 @@ def main():
 
     t0 = time.time()
     for step in range(args.n_iter):
-        stream_moe_func(
+        out = stream_moe_func(
             buffer,
             x,
             topk_idx,
@@ -137,6 +142,7 @@ def main():
             tile_n_a=TILE_N_A,
             tile_n_y=TILE_N_Y,
         )
+        out.sum().backward()
     torch.cuda.synchronize()
     barrier(group)
     t_iter = time.time() - t0

@@ -333,6 +333,11 @@ class StreamMoEFunc(torch.autograd.Function):
         num_sms_a: int | None = ctx.num_sms_a
         num_sms_y: int | None = ctx.num_sms_y
 
+        # Upstream may pass a non-contiguous grad (e.g. `out.sum().backward()`
+        # produces a stride-(0,0) broadcast view); `dispatch_grads` asserts
+        # contiguity, so normalise here.
+        dL_dy = dL_dy.contiguous()
+
         caller_stream = torch.cuda.current_stream()
         device = pool.device
         dtype = pool.dtype
