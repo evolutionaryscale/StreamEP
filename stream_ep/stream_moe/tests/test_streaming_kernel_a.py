@@ -257,6 +257,89 @@ def test_streaming_moe_a_multi_tile_static(device):
     )
 
 
+def test_streaming_moe_a_with_preact(device):
+    """``preact_a`` opt-in path: kernel A's standard mD TMA-store writes the
+    pre-SwiGLU [2I] gate-up accumulator alongside the postact_a [I] postact
+    write. This is the bwd-savings path — saving preact lets ``kernel_a_bwd``
+    skip a recompute GEMM (~370 µs/layer at production) in exchange for the
+    extra TMA-store traffic (overlaps with the GEMM mainloop).
+
+    Multi-tile spread across multiple experts (mirrors the no-preact
+    multi_tile test) so we hit per-expert W1 slabs and validate that the
+    preact write lands at the right pool row for each tile_id.
+    """
+    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+        streaming_moe_a,
+    )
+
+    H, I, E_local = 128, 256, 4
+    tile_m, tile_n = 128, 256
+    tile_to_expert_list = [0, 0, 1, 2, 2, 3]
+    total_tiles = len(tile_to_expert_list)
+    TK_padded = total_tiles * tile_m
+
+    dtype = torch.bfloat16
+    torch.manual_seed(13)
+    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
+    W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
+    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    preact_a = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
+
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
+        tile_to_expert_list, E_local, device
+    )
+    tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    a_ready = _make_a_ready(total_tiles, device)
+
+    streaming_moe_a(
+        pool,
+        W1,
+        postact_a,
+        tile_id_to_expert,
+        expert_pool_block_offset,
+        tile_ready,
+        a_ready,
+        dispatch_seq=1,
+        compute_seq=17,
+        preact_a=preact_a,
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+    torch.cuda.synchronize()
+
+    # Per-tile postact + preact references.
+    for t in range(total_tiles):
+        e = tile_to_expert_list[t]
+        x_tile = pool[t * tile_m : (t + 1) * tile_m, :]
+        h_ref = (x_tile.float() @ W1[e].float().t()).to(dtype)  # [tile_m, 2I]
+        a_ref = _swiglu_ref(h_ref).to(dtype)  # [tile_m, I]
+
+        # Postact: same as the no-preact path — sanity check the SwiGLU output
+        # didn't change just because we added the mD store.
+        diff_a = (postact_a[t].float() - a_ref.float()).abs()
+        rel_a = diff_a / (a_ref.float().abs() + 1e-3)
+        assert (
+            rel_a.max().item() < 5e-2
+        ), f"tile {t}: postact mismatch, max rel diff {rel_a.max().item():.4f}"
+
+        # Preact: the [2I] pre-SwiGLU accumulator. The eager reference is the
+        # raw `pool @ W1[e].T` GEMM in fp32 cast to bf16 — exactly what kernel
+        # A's mD TMA-store should land (no alpha/beta/RowVec/ColVec applied
+        # since callers don't pass them).
+        diff_h = (preact_a[t].float() - h_ref.float()).abs()
+        rel_h = diff_h / (h_ref.float().abs() + 1e-3)
+        assert rel_h.max().item() < 5e-2, (
+            f"tile {t}: preact mismatch, expert={e}, "
+            f"max rel diff {rel_h.max().item():.4f}, "
+            f"max abs diff {diff_h.max().item():.4f}"
+        )
+
+    assert (a_ready == 17).all(), (
+        f"a_ready not all set with preact path; bad indices "
+        f"{(a_ready != 17).nonzero().squeeze().tolist()}"
+    )
+
+
 def test_streaming_moe_a_producer_consumer(device):
     """Kernel A on compute_a_stream spins on tile_ready while a producer
     kernel on a separate stream release-stores dispatch_seq slot by slot
@@ -341,5 +424,7 @@ if __name__ == "__main__":
     print("single-tile PASS")
     test_streaming_moe_a_multi_tile_static(dev)
     print("multi-tile-static PASS")
+    test_streaming_moe_a_with_preact(dev)
+    print("with-preact PASS")
     test_streaming_moe_a_producer_consumer(dev)
     print("producer-consumer PASS")

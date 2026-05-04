@@ -293,6 +293,8 @@ def _compile_streaming_moe_a(
     cluster_n: int,
     activation: str,
     device_capacity,
+    *,
+    store_preact: bool = False,
 ):
     assert device_capacity[0] == 9, "Streaming MoE kernel A is SM90-only for now"
     assert activation in gate_fn_map, f"Need a gated activation; got {activation}"
@@ -310,8 +312,21 @@ def _compile_streaming_moe_a(
     mA = fake_tensor(a_dtype, (TK_padded_sym, H_sym), leading_dim=1, divisibility=8)
     # B: W1 (2I, H, E_local), k-major per expert (H contiguous), batch dim = E_local.
     mB = fake_tensor(b_dtype, (I2_sym, H_sym, E_sym), leading_dim=1, divisibility=8)
-    # No D output — streaming kernel A goes pool → SwiGLU → postact_a directly.
-    mD = None
+    # mD: optional pre-SwiGLU output. When `store_preact=True`, kernel A's
+    # standard mD TMA-store path (inherited from GemmDefaultEpiMixin via
+    # GemmGatedMixin) writes the [2I] accumulator (post-alpha/beta/RowVec/
+    # ColVec, pre-act-fn) to gmem alongside the postact_a [I] write.
+    # Bwd consumes preact via `kernel_a_bwd`'s SwiGLU-bwd in registers
+    # (skipping the otherwise-required `pool @ W1.T` recompute GEMM); fwd
+    # paths that don't need bwd activations leave it None.
+    if store_preact:
+        # Same pool layout as postact_a (Mflat = total_tiles * tile_m), but
+        # full N=2I instead of half-N=I. n-major (2I contiguous), bf16.
+        mD = fake_tensor(
+            postact_dtype, (Mflat_sym, I2_sym), leading_dim=1, divisibility=8
+        )
+    else:
+        mD = None
     mC = None
     # mPostAct: flat (total_tiles * tile_m, I), n-major (I contiguous).
     mPostAct = fake_tensor(
@@ -471,6 +486,7 @@ def streaming_moe_a(
     dispatch_seq: int,
     compute_seq: int,
     *,
+    preact_a: torch.Tensor | None = None,
     tile_m: int = 128,
     tile_n: int = 256,
     cluster_m: int = 1,
@@ -506,6 +522,16 @@ def streaming_moe_a(
     tile's postact_a slab. Multi-pid_n gating via an atomic-add to
     ``tile_n_stripes_done[tile_id]`` ensures the release fires once per tile,
     not once per N-stripe.
+
+    Optional ``preact_a`` ``(total_tiles, tile_M, 2*I) bf16`` is the pre-SwiGLU
+    accumulator destination for bwd. When passed, kernel A's standard mD
+    TMA-store path (inherited from ``GemmGatedMixin → GemmDefaultEpiMixin``)
+    writes the [2I] gate-up values to gmem alongside the postact_a [I] write.
+    Saving preact lets ``kernel_a_bwd`` apply SwiGLU bwd in registers without
+    a recompute GEMM (~370 µs/layer perf win at production); fwd-only paths
+    leave ``preact_a=None`` to skip the extra TMA-store traffic. The two
+    cases compile to separate kernels (different mD signature), keyed on
+    ``store_preact`` in ``_compile_streaming_moe_a``'s jit_cache.
     """
     assert pool.is_cuda and W1.is_cuda and postact_a.is_cuda
     assert pool.dim() == 2 and pool.is_contiguous()
@@ -526,6 +552,16 @@ def streaming_moe_a(
         W1.shape[2] == H
     ), f"W1 dim 2 (H) must match pool dim 1; got W1.shape={tuple(W1.shape)}, H={H}"
     two_I = W1.shape[1]
+    if preact_a is not None:
+        assert preact_a.is_cuda and preact_a.dim() == 3
+        assert preact_a.shape == (total_tiles, tile_m, two_I), (
+            f"preact_a must be (total_tiles, tile_m, 2*I) = "
+            f"{(total_tiles, tile_m, two_I)}; got {tuple(preact_a.shape)}"
+        )
+        assert preact_a.dtype == postact_a.dtype, (
+            f"preact_a dtype must match postact_a's; got {preact_a.dtype} vs "
+            f"{postact_a.dtype}"
+        )
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
     # slab has H contiguous). We need the kernel to see shape (2I, H, E_local)
     # with leading_dim=1 (H is contiguous along K). torch.permute(1, 2, 0)
@@ -538,6 +574,10 @@ def streaming_moe_a(
 
     # Flatten postact_a's leading two dims to (total_tiles * tile_m, I).
     postact_flat = postact_a.view(total_tiles * tile_m, I)
+    # Flatten preact_a similarly when present — same Mflat dim, but full N=2I.
+    preact_flat = (
+        preact_a.view(total_tiles * tile_m, two_I) if preact_a is not None else None
+    )
 
     # Build cu_seqlens_m = expert_pool_block_offset * tile_m. The standard
     # varlen_m path inside the GEMM uses this as the per-batch m-row offset:
@@ -565,6 +605,7 @@ def streaming_moe_a(
         cluster_n=cluster_n,
         activation=activation,
         device_capacity=device_capacity,
+        store_preact=preact_a is not None,
     )
 
     if COMPILE_ONLY:
@@ -618,4 +659,6 @@ def streaming_moe_a(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
     )
 
-    compiled_fn(pool, W1_p, None, None, epi_args, scheduler_args, varlen_args, None)
+    compiled_fn(
+        pool, W1_p, preact_flat, None, epi_args, scheduler_args, varlen_args, None
+    )
