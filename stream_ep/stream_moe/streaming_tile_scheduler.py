@@ -54,8 +54,7 @@ class StreamingTileSchedulerArguments:
         order — kernel A's linear-claim CTAs naturally converge on the same
         expert at the same time.
       * consumer_head is a single [1] int32 — one global atomic-add counter.
-        Linear claim order = tile_id order = expert-major order. No window, no
-        work-stealing, no per-CTA home expert.
+        Linear claim order = tile_id order = expert-major order.
 
     Pool layout: kernel A reads `pool` (expert-major, BLOCK_M-padded) via
     standard strided TMA — no per-tile gather indirection. Each tile's m-row
@@ -96,8 +95,7 @@ class StreamingTileScheduler(TileScheduler):
     Wave behavior for free: dispatch's Pass 2 fires tile_ready in expert-major
     order at substream end. Linear claim order == tile_id order == expert-major
     order, so 80 CTAs naturally converge on the same expert at the same time
-    and L2 holds 1-2 W1[e] slabs throughout. No active-expert window or
-    work-stealing logic in the scheduler.
+    and L2 holds 1-2 W1[e] slabs throughout.
 
     The work tile produced for the consumer warps carries the upstream-shape
     tuple `(pid_m, pid_n, None, batch_idx)`:

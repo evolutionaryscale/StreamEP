@@ -109,10 +109,10 @@ def red_add_bf16x2_v4_pred(
     needing a trash row).
 
     PTX-level predicated execution is **not** the same as a divergent C-level
-    branch around `red`: the latter caused non-deterministic atomic drops in
-    earlier kernel-Y attempts (Phase C scaffolding session, see logbook).
-    Predication is per-instruction at issue time and stress-tested to drop
-    zero atomics across 32 iters × 1M divergent-predicate threads on H100.
+    branch around `red`: the latter drops atomics non-deterministically when
+    threads in a warp diverge around the instruction. Predication is per-
+    instruction at issue time and stress-tested to drop zero atomics across
+    32 iters × 1M divergent-predicate threads on H100.
 
     Each Int32 payload is one bf16x2 packed pair (lo bits 0-15, hi bits
     16-31). Pointer must be **16-byte aligned**; targets the contiguous

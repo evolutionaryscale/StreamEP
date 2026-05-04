@@ -10,7 +10,8 @@ Setup
 - Time three things, all on a single GPU:
     * dispatch only (dispatch_stream)
     * each kernel in isolation with its ready signal pre-set (compute_a/y stream)
-    * end-to-end pipeline (3 streams, real producer-consumer release/acquire)
+    * end-to-end pipeline (4 streams: dispatch, kernel A, kernel Y, combine —
+      real producer-consumer release/acquire across them)
 - Reference baselines:
     * kernel A vs `quack.gemm_act.gemm_gated` (same per-tile compute, no
       streaming scheduler).
@@ -28,10 +29,13 @@ import argparse
 
 import torch
 import torch.distributed as torch_dist
-from deep_ep import Buffer as DeepEPBuffer
 from quack.gemm import gemm
 from quack.gemm_act import gemm_act
 
+from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
+    make_buffer,
+    make_uniform_topk_idx,
+)
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
     streaming_moe_a,
 )
@@ -62,41 +66,9 @@ NUM_SMS = 132  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
 # dispatch speedup just enlarges an already-overlapping gap;
 # the critical path is kernel A. Default to the ceiling rather
 # than picking a mid-range sweet spot that's within noise.
-# Note: requires CUDA_DEVICE_MAX_CONNECTIONS=1 in the env to
-# avoid the dispatch_main↔kernel_A SM-residency deadlock
-# documented in bug.md. Production code sets this in
-# `evolutionaryscale.utils.distributed.init_distributed`; the
-# bench scripts here bypass that helper, so set it in your
-# shell before running, e.g. `CUDA_DEVICE_MAX_CONNECTIONS=1
-# torchrun ...`.
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128
-
-
-def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
-    base = (torch.arange(n_tokens, device=device) + rank * n_tokens) * topk
-    offsets = torch.arange(topk, device=device).unsqueeze(0)
-    return ((base.unsqueeze(1) + offsets) % num_experts).to(torch.int64)
-
-
-def make_buffer(group, num_sms):
-    DeepEPBuffer.set_num_sms(num_sms)
-    hidden_bytes = H * 2
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (
-        DeepEPBuffer.get_dispatch_config(group.size()),
-        DeepEPBuffer.get_combine_config(group.size()),
-    ):
-        nvl_bytes = max(
-            cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes
-        )
-        rdma_bytes = max(
-            cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes
-        )
-    return DeepEPBuffer(
-        group, nvl_bytes, rdma_bytes, num_qps_per_rank=DeepEPBuffer.num_sms
-    )
 
 
 def time_kernel(fn, *, warmup=10, iters=50) -> float:

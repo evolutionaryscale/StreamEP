@@ -7,7 +7,7 @@ intermediate allocations: ``postact_a`` is sized by ``total_tiles × tile_M × I
 inside ``Buffer.dispatch`` at ``[T_recv, hidden]`` zero-init; kernel Y
 atomic-scatters into it via PTX-predicated atomics, and the combine sender
 consumes it on a separate stream — its per-warp send loop spins on
-``handle.compute_done_per_token[r] >= dispatch_seq`` (Phase D's per-token gate)
+``handle.compute_done_per_token[r] >= dispatch_seq`` (the per-token gate)
 before pushing ``o[r]`` back to ``r``'s origin rank.
 
 Within a layer the four streams overlap (intra-layer); across layers they

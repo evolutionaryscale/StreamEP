@@ -17,18 +17,17 @@ Forward kernel Y of the streaming pipeline:
   * On per-tile end, lane 0 of each warp atomicSubs `per_token_remaining[r]`
     for its rows; on hit-zero (the recv-token's last contribution landed),
     release-stores `compute_done_per_token[r] = combine_seq` so the combine
-    sender (Phase D, on its own stream) can pick up `o[r]` for RDMA push.
+    sender (on its own stream) can pick up `o[r]` for RDMA push.
 
 The atomic-scatter staging SMEM is owned by `AtomicScatterStore` (an EpiOp,
 declared here) — the framework's `sD` stays `None` (because `mD = None`).
-This sidesteps both prior failure modes:
-  - Option 4 (register-only): non-deterministic atomic drops from divergent
-    branches around `red.global.add.bf16x2`. The SMEM staging gives every
-    warp warp-uniform row selection — no within-warp divergence around `red`.
-  - Option 5 (fork-edited `sD`): JIT compile timeout from threading
-    `sD: Optional[cute.Tensor]` through the framework. Owning our own SMEM
-    via the standard EpiOp `smem_struct_field` mechanism (mirrors `TileStore`,
-    `RowVecLoad`, `ColVecLoad`, `ColVecReduce`) avoids fighting the framework.
+Routing the staging through SMEM gives every warp warp-uniform row selection,
+so the per-warp `red.global.add.bf16x2` is issued from convergent threads (no
+within-warp divergence around `red` — divergent branches around the atomic
+drop contributions non-deterministically). Owning the SMEM via the standard
+EpiOp `smem_struct_field` mechanism (mirrors `TileStore`, `RowVecLoad`,
+`ColVecLoad`, `ColVecReduce`) keeps the framework's `sD: Optional[cute.Tensor]`
+plumbing untouched.
 
 Streaming machinery is shared with kernel A:
   * `StreamingTileScheduler` for linear-claim + per-tile ready spin.
@@ -307,9 +306,7 @@ class AtomicScatterStore(EpiOp):
                 rem_ptr = utils.elem_pointer(param.per_token_remaining, (r,))
                 prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
                 if prev == Int32(1):
-                    done_ptr = utils.elem_pointer(
-                        param.compute_done_per_token, (r,)
-                    )
+                    done_ptr = utils.elem_pointer(param.compute_done_per_token, (r,))
                     st_release_sys_global(done_ptr, combine_seq)
 
 
