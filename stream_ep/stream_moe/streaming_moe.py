@@ -165,9 +165,10 @@ class StreamMoEFunc(torch.autograd.Function):
 
         # ── Kernel A path (queued FIRST so its launch hits the GPU before
         # dispatch_main's persistent CTAs have all exited). dispatch_main runs
-        # ~190 µs at production num_sms=132; its CTAs exit gradually as their
-        # per-channel work drains, freeing SMs for kernel A's persistent grid
-        # to land on. Bunching combine-side host setup before kernel A would
+        # ~210 µs at production num_sms=80; its CTAs exit gradually as their
+        # per-channel work drains AND the 80-CTA grid leaves ~52 SMs free for
+        # kernel A's persistent grid to land on while dispatch is still
+        # running. Bunching combine-side host setup before kernel A would
         # push its launch ~50 µs later and collapse the overlap window.
         streams.compute_a.wait_event(metadata_done)
         pool.record_stream(streams.compute_a)

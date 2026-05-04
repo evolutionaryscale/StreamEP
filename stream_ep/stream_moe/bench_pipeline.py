@@ -67,14 +67,18 @@ NUM_EXPERTS = 64
 SEQ_LEN_PER_RANK = 8192
 TOPK = 4
 DTYPE = torch.bfloat16
-NUM_SMS = 132  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
-# i.e. 132 on H100). Sweep (logs/sweep/) shows pipeline e2e
-# plateaus past num_sms=64 at ~1645–1665 µs (vs 1816 µs at the
-# old 24 default). Past the plateau the dispatch tail finishes
-# well before kernel A (~376 µs vs ~794 µs), so any further
-# dispatch speedup just enlarges an already-overlapping gap;
-# the critical path is kernel A. Default to the ceiling rather
-# than picking a mid-range sweet spot that's within noise.
+NUM_SMS = 80  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
+# i.e. 132 on H100). Sweep at the current pipeline's full
+# fwd+bwd footprint (kernel-bounded measurement, profile traces,
+# 8×H100 production shape) shows fwd_e2e and fwd+bwd_e2e cluster
+# within ~20 µs across {80, 96, 112}, with 80 the slight winner
+# (-52 µs fwd, -70 µs fwd+bwd vs the 132 ceiling). Below 80,
+# bwd combine_grads bloats faster than fwd improves; above 80,
+# the dispatch grid is too wide to leave SMs for kernel A's
+# CTAs to land mid-dispatch (gap_dispatch_to_a +6 µs at 132
+# vs −22 µs at 80 — i.e. kernel A overlaps 22 µs of dispatch's
+# tail). 80 is the sweet spot that maximises streaming overlap
+# without starving combine_grads of channels.
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128

@@ -55,7 +55,7 @@ NUM_EXPERTS = 64
 SEQ_LEN_PER_RANK = 8192
 TOPK = 4
 DTYPE = torch.bfloat16
-NUM_SMS = 132  # See bench_pipeline.py for sweep justification.
+NUM_SMS = 80  # See bench_pipeline.py for sweep justification.
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128
@@ -65,6 +65,27 @@ def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
     base = (torch.arange(n_tokens, device=device) + rank * n_tokens) * topk
     offsets = torch.arange(topk, device=device).unsqueeze(0)
     return ((base.unsqueeze(1) + offsets) % num_experts).to(torch.int64)
+
+
+def make_skewed_topk_idx(
+    n_tokens, topk, num_experts, hot_frac, hot_weight, device, generator
+):
+    """Biased multinomial routing: the first ``hot_frac`` of experts get
+    ``hot_weight`` × the per-token sampling weight of the rest, sampled without
+    replacement so each token still gets ``topk`` distinct experts. Used to
+    exercise the heavy-comm regime — under hot_frac=0.25, hot_weight=4.0 the
+    expected token share for the hot 25% of experts is ~57% (vs the 25%
+    uniform), which roughly doubles dispatch / combine traffic on the
+    hot ranks and surfaces the streaming-overlap behavior that's invisible
+    at uniform routing.
+    """
+    n_hot = max(1, int(num_experts * hot_frac))
+    weights = torch.ones(num_experts, device=device)
+    weights[:n_hot] *= hot_weight
+    probs = weights.expand(n_tokens, -1).contiguous()
+    return torch.multinomial(probs, topk, replacement=False, generator=generator).to(
+        torch.int64
+    )
 
 
 def make_buffer(group, num_sms):
@@ -106,6 +127,14 @@ def main():
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
+    p.add_argument(
+        "--skew_hot_frac",
+        type=float,
+        default=0.0,
+        help="If >0, use biased routing instead of uniform: the first hot_frac "
+        "of experts get hot_weight× sampling weight. 0 (default) = uniform.",
+    )
+    p.add_argument("--skew_hot_weight", type=float, default=4.0)
     args = p.parse_args()
 
     device = init_distributed()
@@ -132,7 +161,19 @@ def main():
     torch.manual_seed(100 + rank)
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
     x.requires_grad_(True)
-    topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
+    if args.skew_hot_frac > 0:
+        skew_gen = torch.Generator(device=device).manual_seed(7000 + rank)
+        topk_idx = make_skewed_topk_idx(
+            args.seq_len,
+            TOPK,
+            NUM_EXPERTS,
+            hot_frac=args.skew_hot_frac,
+            hot_weight=args.skew_hot_weight,
+            device=device,
+            generator=skew_gen,
+        )
+    else:
+        topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
     topk_weights = torch.softmax(
         torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
     ).contiguous()
