@@ -138,6 +138,7 @@ class StreamMoEFunc(torch.autograd.Function):
         tile_m: int,
         tile_n_a: int,
         tile_n_y: int,
+        tile_n_y_bwd: int,
         num_sms_a: int | None,
         num_sms_y: int | None,
     ) -> torch.Tensor:
@@ -300,6 +301,7 @@ class StreamMoEFunc(torch.autograd.Function):
         ctx.tile_m = tile_m
         ctx.tile_n_a = tile_n_a
         ctx.tile_n_y = tile_n_y
+        ctx.tile_n_y_bwd = tile_n_y_bwd
         ctx.num_sms_a = num_sms_a
         ctx.num_sms_y = num_sms_y
         return out
@@ -349,6 +351,7 @@ class StreamMoEFunc(torch.autograd.Function):
         tile_m: int = ctx.tile_m
         tile_n_a: int = ctx.tile_n_a
         tile_n_y: int = ctx.tile_n_y
+        tile_n_y_bwd: int = ctx.tile_n_y_bwd
         num_sms_a: int | None = ctx.num_sms_a
         num_sms_y: int | None = ctx.num_sms_y
 
@@ -498,7 +501,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 bwd_a_ready,
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=tile_m,
-                tile_n=tile_n_a,
+                tile_n=tile_n_y_bwd,
                 num_sms=num_sms_a,
             )
 
@@ -680,6 +683,7 @@ class StreamMoEFunc(torch.autograd.Function):
             None,  # tile_m
             None,  # tile_n_a
             None,  # tile_n_y
+            None,  # tile_n_y_bwd
             None,  # num_sms_a
             None,  # num_sms_y
         )
@@ -700,6 +704,7 @@ def stream_moe_func(
     tile_m: int = 128,
     tile_n_a: int = 256,
     tile_n_y: int = 128,
+    tile_n_y_bwd: int = 128,
     num_sms_a: int | None = None,
     num_sms_y: int | None = None,
 ) -> torch.Tensor:
@@ -723,6 +728,7 @@ def stream_moe_func(
         tile_m,
         tile_n_a,
         tile_n_y,
+        tile_n_y_bwd,
         num_sms_a,
         num_sms_y,
     )

@@ -82,6 +82,8 @@ NUM_SMS = 80  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
 TILE_M = 128
 TILE_N_A = 256
 TILE_N_Y = 128
+TILE_N_Y_BWD = 128  # Decoupled from TILE_N_A: kernel_y_bwd is faster at smaller
+# tile_n (epilogue ColVecReduceAtomic + dswiglu pressure) than fwd kernel A.
 
 
 def time_kernel(fn, *, warmup=10, iters=50) -> float:
@@ -124,6 +126,7 @@ def main():
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
+    p.add_argument("--tile_n_y_bwd", type=int, default=TILE_N_Y_BWD)
     args, _ = p.parse_known_args()
 
     device = init_distributed()
@@ -399,7 +402,7 @@ def main():
             bwd_a_ready_for_y,
             dispatch_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
-            tile_n=args.tile_n_a,
+            tile_n=args.tile_n_y_bwd,
             num_sms=args.num_sms_a,
         )
 
@@ -427,7 +430,7 @@ def main():
             None,
             None,
             tile_M=args.tile_m,
-            tile_N=args.tile_n_a,
+            tile_N=args.tile_n_y_bwd,
             cluster_M=1,
             cluster_N=1,
             cu_seqlens_m=cu_seqlens_m,
@@ -607,7 +610,7 @@ def main():
     fmt_row(
         "streaming_moe_y_bwd",
         args.tile_m,
-        args.tile_n_a,
+        args.tile_n_y_bwd,
         streaming_y_bwd_us,
         2 * TK * H * I,
     )
@@ -616,7 +619,7 @@ def main():
     fmt_row(
         "gemm (ref, y_bwd shape)",
         args.tile_m,
-        args.tile_n_a,
+        args.tile_n_y_bwd,
         gemm_y_bwd_us,
         2 * TK * H * I,
     )
@@ -691,6 +694,7 @@ def main():
             tile_m=args.tile_m,
             tile_n_a=args.tile_n_a,
             tile_n_y=args.tile_n_y,
+            tile_n_y_bwd=args.tile_n_y_bwd,
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
         )
@@ -751,6 +755,7 @@ def main():
             tile_m=args.tile_m,
             tile_n_a=args.tile_n_a,
             tile_n_y=args.tile_n_y,
+            tile_n_y_bwd=args.tile_n_y_bwd,
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
         )
