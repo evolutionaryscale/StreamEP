@@ -311,29 +311,6 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
-    def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """
-        Calculate the layout required for later communication.
-
-        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement
-        via ``with torch.cuda.stream(...)``.
-
-        Arguments:
-            topk_idx: `[num_tokens, num_topk]`, dtype must be `stream_ep.topk_idx_t` (typically `torch.int64`), the expert
-                indices selected by each token, `-1` means no selections.
-            num_experts: the number of experts.
-
-        Returns:
-            num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
-            num_tokens_per_rdma_rank: `[num_rdma_ranks]` with `torch.int`, the number of tokens to be sent to each RDMA
-                rank (with the same GPU index), return `None` for intranode settings.
-            num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
-            is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
-        """
-        return self.runtime.get_dispatch_layout(topk_idx, num_experts)
-
-    # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  topk_idx: torch.Tensor,
                  topk_weights: torch.Tensor,

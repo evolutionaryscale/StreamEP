@@ -207,10 +207,6 @@ public:
 
     void destroy();
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor> get_dispatch_layout(
-        const torch::Tensor& topk_idx,
-        int num_experts);
-
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
     // + one host sync per call: a fused metadata kernel (cross-rank count
     // exchange + per-tile arrays), a host poll on

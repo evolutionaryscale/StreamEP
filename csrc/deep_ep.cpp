@@ -412,38 +412,6 @@ void Buffer::sync(const std::vector<int>& device_ids,
     available = true;
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
-Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts) {
-    EP_HOST_ASSERT(topk_idx.dim() == 2);
-    EP_HOST_ASSERT(topk_idx.is_contiguous());
-    EP_HOST_ASSERT(num_experts > 0);
-
-    // All kernels run on the caller's stream. Allocations naturally land here
-    // because PyTorch's caching allocator uses `getCurrentCUDAStream`.
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
-    auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-    auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
-    auto num_tokens_per_expert = torch::empty({num_experts}, dtype(torch::kInt32).device(torch::kCUDA));
-    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
-    if (is_internode_available())
-        num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-
-    layout::get_dispatch_layout(topk_idx.data_ptr<topk_idx_t>(),
-                                num_tokens_per_rank.data_ptr<int>(),
-                                num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
-                                num_tokens_per_expert.data_ptr<int>(),
-                                is_token_in_rank.data_ptr<bool>(),
-                                num_tokens,
-                                num_topk,
-                                num_ranks,
-                                num_experts,
-                                stream);
-
-    return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank};
-}
-
 // Helpers for `Buffer::intranode_dispatch`. Hidden from the public surface
 // (anonymous namespace); see the corresponding section of intranode_dispatch
 // where each is called for the rationale.
@@ -1639,7 +1607,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
-        .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &deep_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
