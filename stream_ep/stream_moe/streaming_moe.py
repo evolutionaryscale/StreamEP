@@ -388,8 +388,12 @@ class StreamMoEFunc(torch.autograd.Function):
         # entanglement with compute_a/compute_y) so the grouped GEMM's
         # write reaches a known-zero buffer.
         with torch.cuda.stream(streams.grads):
-            dW1_local = torch.zeros_like(w1_local)
-            dW2_local = torch.zeros_like(w2_local)
+            # quack.gemm with default `add_to_output=False` overwrites D, so
+            # the dW1 / dW2 destinations don't need zero-init — saves ~225
+            # MB / layer of memset bandwidth (~150 MB dW1 + ~75 MB dW2 at
+            # production) without changing the GEMM result.
+            dW1_local = torch.empty_like(w1_local)
+            dW2_local = torch.empty_like(w2_local)
 
         with torch.cuda.stream(streams.compute_y):
             # kernel_y_bwd's mD output, consumed by kernel_a_bwd on
