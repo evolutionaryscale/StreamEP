@@ -89,7 +89,7 @@ def _make_a_ready(total_tiles: int, device) -> torch.Tensor:
 
 def test_streaming_moe_a_compiles(device):
     """JIT-compile only (no launch) for a representative production-shape config."""
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         streaming_moe_a,
     )
 
@@ -137,7 +137,7 @@ def test_streaming_moe_a_single_tile(device):
     linear claim, scheduler 5-int payload, strided pool read, per-tile postact,
     expert lookup via tile_id_to_expert.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         streaming_moe_a,
     )
 
@@ -199,7 +199,7 @@ def test_streaming_moe_a_multi_tile_static(device):
     tile_id_to_expert) and persistent kernel termination via the linear-claim
     bounds check.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         streaming_moe_a,
     )
 
@@ -268,7 +268,7 @@ def test_streaming_moe_a_with_preact(device):
     multi_tile test) so we hit per-expert W1 slabs and validate that the
     preact write lands at the right pool row for each tile_id.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         streaming_moe_a,
     )
 
@@ -345,7 +345,7 @@ def test_streaming_moe_a_producer_consumer(device):
     kernel on a separate stream release-stores dispatch_seq slot by slot
     with delays between fires.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         fire_tiles_with_delay,
         streaming_moe_a,
     )

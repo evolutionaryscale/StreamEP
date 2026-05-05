@@ -5,7 +5,7 @@ Backward of fwd kernel A. Per the chain rule on `preact = pool @ W1[e].T`:
 
 `dL/dswiglu_in` is produced directly by `kernel_y_bwd`'s mD TMA-store
 (SwiGLU bwd folded into kernel_y_bwd's epilogue — see
-`streaming_kernel_y_bwd.py`). Per-tile gating on
+`kernel_y_bwd.py`). Per-tile gating on
 `bwd_a_ready[tile_id] >= dispatch_seq` (the same release-store kernel_y_bwd
 fires when its tile drain completes) ensures the kernel only consumes a
 tile's row range once dL/dswiglu_in for that tile has landed.
@@ -35,7 +35,7 @@ pool_topk_weight was already absorbed into dL/dswiglu_in upstream by
 kernel_y_bwd's epilogue: `dswiglu(gate, up, w*g) → (w*dgate, w*dup, postact)`
 by chain-rule linearity in dpostact). All atomic-scatter mechanics
 (predicated v4 bf16x2 issue, multi-pid_n bookkeeping gate, per-row last-stripe
-release) are inherited verbatim from `streaming_kernel_y.py`.
+release) are inherited verbatim from `kernel_y.py`.
 
 Shares streaming machinery with fwd kernels:
   * `StreamingTileScheduler` for linear-claim + per-tile ready spin.
@@ -67,15 +67,15 @@ from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+from stream_ep.stream_moe.kernel_a import (
     StreamingTileSchedulerOptions,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+from stream_ep.stream_moe.kernel_y import (
     AtomicScatterStore,
     ScatterParams,
     StreamingMoeYSm90,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import (
+from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -103,7 +103,7 @@ class StreamingMoeABwdSm90(StreamingMoeYSm90):
       - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
         analogue here.
       - `__call__` + `get_scheduler_arguments`: use
-        `StreamingTileSchedulerOptions` (streaming_kernel_a's NamedTuple,
+        `StreamingTileSchedulerOptions` (kernel_a's NamedTuple,
         also reused by kernel_y_bwd) so the scheduler acquires
         `bwd_a_ready` and uses the saved handle's `dispatch_seq`.
     """

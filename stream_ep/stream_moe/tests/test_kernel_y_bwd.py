@@ -1,6 +1,6 @@
 """Tests for the streaming-MoE kernel Y bwd (pool layout).
 
-Mirrors `test_streaming_kernel_a.py`'s structure since kernel_y_bwd uses the
+Mirrors `test_kernel_a.py`'s structure since kernel_y_bwd uses the
 same streaming machinery (linear-claim scheduler, per-tile acquire-spin,
 per-tile release-store after multi-pid_n gating).
 
@@ -207,7 +207,7 @@ def device():
 
 def test_streaming_moe_y_bwd_compiles(device):
     """JIT-compile only (no launch) for a representative production-shape config."""
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    from stream_ep.stream_moe.kernel_y_bwd import (
         streaming_moe_y_bwd,
     )
 
@@ -265,7 +265,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     pool_topk_weight multiply, pool-layout TMA store, per-tile bwd_a_ready
     release.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    from stream_ep.stream_moe.kernel_y_bwd import (
         streaming_moe_y_bwd,
     )
 
@@ -386,7 +386,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     expert selection (W2[expert_id] varies via tile_id_to_expert) and
     persistent kernel termination via the linear-claim bounds check.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    from stream_ep.stream_moe.kernel_y_bwd import (
         streaming_moe_y_bwd,
     )
 
@@ -466,10 +466,10 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     with delays between fires. Mirrors fwd kernel A's producer-consumer test;
     fire_tiles_with_delay is generic over int64 ready arrays so we reuse it.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         fire_tiles_with_delay,
     )
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    from stream_ep.stream_moe.kernel_y_bwd import (
         streaming_moe_y_bwd,
     )
 
@@ -594,7 +594,7 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     Z_pre memset of the dispatch bundle); real slots get random nonzero
     weights. This exercises the SAME numerical path the orchestrator hits.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+    from stream_ep.stream_moe.kernel_y_bwd import (
         streaming_moe_y_bwd,
     )
 

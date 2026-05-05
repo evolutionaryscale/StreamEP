@@ -8,7 +8,7 @@ runs end-to-end without hanging or producing invalid results.
 
 Launch:
     torchrun --nproc_per_node=8 \\
-        -m evolutionaryscale.models.moe.streaming_moe.smoke_pipeline
+        -m stream_ep.stream_moe.smoke_pipeline
 """
 
 import argparse
@@ -17,7 +17,7 @@ import time
 import torch
 import torch.distributed as torch_dist
 
-from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
+from stream_ep.stream_moe.profile_pipeline import (
     DTYPE,
     NUM_EXPERTS,
     NUM_SMS,
@@ -31,7 +31,7 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     make_buffer,
     make_uniform_topk_idx,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )

@@ -22,7 +22,7 @@ What you should see in the resulting chrome trace
 Launch
 ------
     torchrun --nproc_per_node=2 \\
-        -m evolutionaryscale.models.moe.streaming_moe.profile_pipeline \\
+        -m stream_ep.stream_moe.profile_pipeline \\
         [--out_dir /path/to/profiles]
 
 Trace files land per-rank in `{repo_root}/profiles/`. Open with
@@ -37,7 +37,7 @@ import torch.distributed as torch_dist
 import torch.profiler
 from stream_ep import Buffer as StreamEPBuffer
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )

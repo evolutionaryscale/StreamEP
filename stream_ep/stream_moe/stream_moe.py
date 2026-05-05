@@ -45,16 +45,16 @@ import torch
 from quack.gemm import gemm
 from stream_ep import Buffer as StreamEPBuffer
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+from stream_ep.stream_moe.kernel_a import (
     streaming_moe_a,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+from stream_ep.stream_moe.kernel_a_bwd import (
     streaming_moe_a_bwd,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+from stream_ep.stream_moe.kernel_y import (
     streaming_moe_y,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+from stream_ep.stream_moe.kernel_y_bwd import (
     streaming_moe_y_bwd,
 )
 

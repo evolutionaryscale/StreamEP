@@ -32,7 +32,7 @@ from torch.distributed.tensor.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+from stream_ep.stream_moe.stream_moe import (
     StreamHolder,
     make_streams,
     stream_moe_func,

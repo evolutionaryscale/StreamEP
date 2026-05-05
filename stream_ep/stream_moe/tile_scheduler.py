@@ -38,7 +38,7 @@ from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
 from quack.tile_scheduler import PersistenceMode, TileScheduler
 
-from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import ld_acquire_sys_global
+from stream_ep.stream_moe.ptx_helpers import ld_acquire_sys_global
 
 
 @dataclass

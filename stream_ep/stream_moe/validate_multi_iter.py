@@ -26,7 +26,7 @@ single iter.
 Launch
 ------
     torchrun --nproc_per_node=8 \\
-        -m evolutionaryscale.models.moe.streaming_moe.validate_multi_iter \\
+        -m stream_ep.stream_moe.validate_multi_iter \\
         [--n_iter 20] [--rtol 5e-2] [--atol 5e-2]
 
 Outputs PASS / FAIL per iter on rank 0, with per-tensor max-abs / max-rel
@@ -39,7 +39,7 @@ import torch
 import torch.distributed as torch_dist
 import torch.nn.functional as F
 
-from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
+from stream_ep.stream_moe.profile_pipeline import (
     DTYPE,
     NUM_EXPERTS,
     NUM_SMS,
@@ -53,7 +53,7 @@ from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
     make_buffer,
     make_uniform_topk_idx,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )

@@ -2,7 +2,7 @@
 
 Mirrors the kernel-Y suite — the bwd kernel is a strict subset of fwd
 kernel_y's epilogue (no per-slot weight multiply), so the test cases
-parallel `test_streaming_kernel_y.py` 1:1.
+parallel `test_kernel_y.py` 1:1.
 
   * test_compile: kernel compiles for a representative shape (compile-only).
   * test_single_tile: total_tiles=1, bwd_a_ready pre-set, no padding rows.
@@ -100,7 +100,7 @@ def device():
 
 def test_streaming_moe_a_bwd_compiles(device):
     """JIT-compile only (no launch) for a representative production-shape config."""
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    from stream_ep.stream_moe.kernel_a_bwd import (
         streaming_moe_a_bwd,
     )
 
@@ -151,7 +151,7 @@ def test_streaming_moe_a_bwd_single_tile(device):
     """total_tiles=1, all rows map to distinct recv-tokens (K_local=1).
     Validates GEMM + atomic-scatter into dL_dx_per_r[r].
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    from stream_ep.stream_moe.kernel_a_bwd import (
         streaming_moe_a_bwd,
     )
 
@@ -229,7 +229,7 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
     (K_local=3 for some recv-tokens). Validates per-token accumulation across
     tiles + bookkeeping decrement to zero.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    from stream_ep.stream_moe.kernel_a_bwd import (
         streaming_moe_a_bwd,
     )
 
@@ -323,7 +323,7 @@ def test_streaming_moe_a_bwd_padding_rows(device):
     skip `red.global.add.noftz.v4.bf16x2` at issue time, so no padding
     contribution lands in any valid dL_dx_per_r[r].
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    from stream_ep.stream_moe.kernel_a_bwd import (
         streaming_moe_a_bwd,
     )
 
@@ -408,10 +408,10 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
     helper (`fire_tiles_with_delay`) since the streaming-handshake shape is
     identical (per-tile int64 release-store with system scope).
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+    from stream_ep.stream_moe.kernel_a import (
         fire_tiles_with_delay,
     )
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+    from stream_ep.stream_moe.kernel_a_bwd import (
         streaming_moe_a_bwd,
     )
 

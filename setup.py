@@ -115,7 +115,7 @@ if __name__ == '__main__':
 
     setuptools.setup(name='stream_ep',
                      version='1.2.1' + revision,
-                     packages=setuptools.find_packages(include=['stream_ep']),
+                     packages=setuptools.find_packages(include=['stream_ep', 'stream_ep.*']),
                      ext_modules=[
                          CUDAExtension(name='stream_ep_cpp',
                                        include_dirs=include_dirs,

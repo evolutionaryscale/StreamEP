@@ -81,7 +81,7 @@ Shares streaming machinery with fwd kernels:
   * `StreamingTileScheduler` for linear-claim + per-tile ready spin
     (substitutions: `tile_ready` → `bwd_y_ready`, `dispatch_seq` from saved
     handle).
-  * `TileReadyRelease` EpiOp from `streaming_kernel_a.py` (per-tile drain +
+  * `TileReadyRelease` EpiOp from `kernel_a.py` (per-tile drain +
     multi-pid_n gating + system-scope release-store) — bwd reuses verbatim;
     only the destination tensor changes (bwd_a_ready instead of a_ready).
 """
@@ -111,15 +111,15 @@ from quack.rounding import RoundingMode
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from evolutionaryscale.models.moe.streaming_moe.streaming_epi_ops import (
+from stream_ep.stream_moe.epi_ops import (
     ColVecReduceAtomic,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+from stream_ep.stream_moe.kernel_a import (
     StreamingTileSchedulerOptions,
     TileReadyParams,
     TileReadyRelease,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import (
+from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )

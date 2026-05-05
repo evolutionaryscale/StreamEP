@@ -70,13 +70,13 @@ from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import (
+from stream_ep.stream_moe.ptx_helpers import (
     pack_bf16x2,
     red_add_bf16x2_v4_pred,
     st_release_sys_global,
     threadfence_system,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import (
+from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )

@@ -98,7 +98,7 @@ def device():
 
 def test_streaming_moe_y_compiles(device):
     """JIT-compile only (no launch) for a representative production-shape config."""
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+    from stream_ep.stream_moe.kernel_y import (
         streaming_moe_y,
     )
 
@@ -151,7 +151,7 @@ def test_streaming_moe_y_single_tile(device):
     """total_tiles=1, all rows map to distinct recv-tokens (K_local=1).
     Validates GEMM + weight multiply + atomic-scatter into o[r].
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+    from stream_ep.stream_moe.kernel_y import (
         streaming_moe_y,
     )
 
@@ -230,7 +230,7 @@ def test_streaming_moe_y_multi_tile_static(device):
     (K_local=3 for some recv-tokens). Validates per-token accumulation across
     tiles + bookkeeping decrement to zero.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+    from stream_ep.stream_moe.kernel_y import (
         streaming_moe_y,
     )
 
@@ -330,7 +330,7 @@ def test_streaming_moe_y_padding_rows(device):
     skip `red.global.add.noftz.v4.bf16x2` at issue time, so no padding
     contribution lands in any valid o[r, :].
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+    from stream_ep.stream_moe.kernel_y import (
         streaming_moe_y,
     )
 
@@ -419,7 +419,7 @@ def test_streaming_moe_y_producer_consumer(device):
     """Kernel Y on compute_y_stream spins on a_ready while a producer fires
     slot-by-slot from a separate stream.
     """
-    from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+    from stream_ep.stream_moe.kernel_y import (
         fire_a_ready_with_delay,
         streaming_moe_y,
     )

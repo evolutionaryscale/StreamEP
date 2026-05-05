@@ -22,7 +22,7 @@ Setup
 
 Launch:
     torchrun --nproc_per_node=2 \\
-        -m evolutionaryscale.models.moe.streaming_moe.bench_pipeline
+        -m stream_ep.stream_moe.bench_pipeline
 """
 
 import argparse
@@ -32,23 +32,23 @@ import torch.distributed as torch_dist
 from quack.gemm import gemm
 from quack.gemm_act import gemm_act
 
-from evolutionaryscale.models.moe.streaming_moe.profile_pipeline import (
+from stream_ep.stream_moe.profile_pipeline import (
     make_buffer,
     make_uniform_topk_idx,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
+from stream_ep.stream_moe.kernel_a import (
     streaming_moe_a,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a_bwd import (
+from stream_ep.stream_moe.kernel_a_bwd import (
     streaming_moe_a_bwd,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y import (
+from stream_ep.stream_moe.kernel_y import (
     streaming_moe_y,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_y_bwd import (
+from stream_ep.stream_moe.kernel_y_bwd import (
     streaming_moe_y_bwd,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
+from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )

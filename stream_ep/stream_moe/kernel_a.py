@@ -53,11 +53,11 @@ from quack.rounding import RoundingMode
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import (
+from stream_ep.stream_moe.ptx_helpers import (
     st_release_sys_global,
     threadfence_system,
 )
-from evolutionaryscale.models.moe.streaming_moe.streaming_tile_scheduler import (
+from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )

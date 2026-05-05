@@ -43,7 +43,7 @@ from quack.epi_ops import ColVecReduce, _get_lane_warp_layouts
 from quack.sm90_utils import partition_for_epilogue
 from quack.utils import elem_pointer
 
-from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import red_add_f32
+from stream_ep.stream_moe.ptx_helpers import red_add_f32
 
 
 class ColVecReduceAtomic(ColVecReduce):
