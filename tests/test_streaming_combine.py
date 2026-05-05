@@ -32,7 +32,7 @@ import os
 
 import torch
 import torch.distributed as dist
-from deep_ep import Buffer
+from stream_ep import Buffer
 
 
 def make_inputs(num_tokens, hidden, num_topk, num_experts, num_ranks, rank, device, seed=123):
@@ -57,7 +57,7 @@ def make_buffer(group, num_sms, hidden_bytes):
     for cfg in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
         nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes)
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes)
-    return Buffer(group, nvl_bytes, rdma_bytes, num_qps_per_rank=Buffer.num_sms)
+    return Buffer(group, nvl_bytes, rdma_bytes)
 
 
 def expected_combine_output(is_token_in_rank, num_tokens, hidden, num_ranks, dtype, device):

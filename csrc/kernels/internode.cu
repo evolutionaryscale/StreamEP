@@ -371,11 +371,10 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
-                     int64_t num_nvl_bytes,
-                     bool low_latency_mode) {
+                     int64_t num_nvl_bytes) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                    \
     {                                                                                                                                  \
-        auto notify_dispatch_func = low_latency_mode ? notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
+        auto notify_dispatch_func = notify_dispatch<false, num_rdma_ranks>;                                                            \
         LAUNCH_KERNEL(&cfg,                                                                                                            \
                       notify_dispatch_func,                                                                                            \
                       num_tokens_per_rank,                                                                                             \
@@ -1243,8 +1242,7 @@ void dispatch(void* recv_x,
               int num_ranks,
               bool is_cached_dispatch,
               cudaStream_t stream,
-              int num_channels,
-              bool low_latency_mode) {
+              int num_channels) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
@@ -1254,11 +1252,9 @@ void dispatch(void* recv_x,
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                   \
     {                                                                                                                          \
-        auto dispatch_func = low_latency_mode                                                                                  \
-            ? (is_cached_dispatch ? dispatch<true, num_rdma_ranks, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>     \
-                                  : dispatch<true, num_rdma_ranks, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>)   \
-            : (is_cached_dispatch ? dispatch<false, num_rdma_ranks, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>    \
-                                  : dispatch<false, num_rdma_ranks, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>); \
+        auto dispatch_func = is_cached_dispatch                                                                                \
+            ? dispatch<false, num_rdma_ranks, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>                          \
+            : dispatch<false, num_rdma_ranks, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>;                        \
         SET_SHARED_MEMORY_FOR_TMA(dispatch_func);                                                                              \
         LAUNCH_KERNEL(&cfg,                                                                                                    \
                       dispatch_func,                                                                                           \
@@ -1487,8 +1483,7 @@ void cached_notify(int hidden_int4,
                    cudaStream_t stream,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
-                   bool is_cached_dispatch,
-                   bool low_latency_mode) {
+                   bool is_cached_dispatch) {
     const int num_threads = std::max(128, 32 * num_channels);
     const int num_warps = num_threads / 32;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
@@ -1514,7 +1509,7 @@ void cached_notify(int hidden_int4,
     EP_HOST_ASSERT(num_channels * 2 > 3);
 
     // Launch kernel
-    auto cached_notify_func = low_latency_mode ? cached_notify<true, kNumTMABytesPerWarp> : cached_notify<false, kNumTMABytesPerWarp>;
+    auto cached_notify_func = cached_notify<false, kNumTMABytesPerWarp>;
     SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
     SET_SHARED_MEMORY_FOR_TMA(cached_notify_func);
     LAUNCH_KERNEL(&cfg,
@@ -2302,8 +2297,7 @@ void combine(cudaDataType_t type,
              int rank,
              int num_ranks,
              cudaStream_t stream,
-             int num_channels,
-             bool low_latency_mode) {
+             int num_channels) {
     constexpr int kNumCombineForwarderWarps = 24;
     constexpr int kNumTMABytesPerSenderWarp = 16384;
     constexpr int kNumTMABytesPerForwarderWarp = 9248;
@@ -2312,18 +2306,12 @@ void combine(cudaDataType_t type,
 
 #define COMBINE_LAUNCH_CASE(num_rdma_ranks)                                           \
     {                                                                                 \
-        auto combine_func = low_latency_mode ? combine<true,                          \
-                                                       num_rdma_ranks,                \
-                                                       nv_bfloat16,                   \
-                                                       kNumCombineForwarderWarps,     \
-                                                       kNumTMABytesPerSenderWarp,     \
-                                                       kNumTMABytesPerForwarderWarp>  \
-                                             : combine<false,                         \
-                                                       num_rdma_ranks,                \
-                                                       nv_bfloat16,                   \
-                                                       kNumCombineForwarderWarps,     \
-                                                       kNumTMABytesPerSenderWarp,     \
-                                                       kNumTMABytesPerForwarderWarp>; \
+        auto combine_func = combine<false,                                            \
+                                    num_rdma_ranks,                                   \
+                                    nv_bfloat16,                                      \
+                                    kNumCombineForwarderWarps,                        \
+                                    kNumTMABytesPerSenderWarp,                        \
+                                    kNumTMABytesPerForwarderWarp>;                    \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                      \
         LAUNCH_KERNEL(&cfg,                                                           \
                       combine_func,                                                   \

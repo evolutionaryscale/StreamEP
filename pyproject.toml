@@ -35,5 +35,5 @@ ignore = [
     "E902",
 ]
 exclude = [
-    "deep_ep/__init__.py"
+    "stream_ep/__init__.py"
 ]

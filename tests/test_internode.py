@@ -5,11 +5,8 @@ import torch
 import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
-import deep_ep
+import stream_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor
-
-# Test compatibility with low latency functions
-import test_low_latency
 
 
 # noinspection PyShadowingNames
@@ -20,7 +17,7 @@ def test_main(args: argparse.Namespace,
               num_ranks: int,
               num_nodes: int,
               rank: int,
-              buffer: deep_ep.Buffer,
+              buffer: stream_ep.Buffer,
               group: dist.ProcessGroup,
               skip_benchmark: bool = False):
     # Settings
@@ -42,7 +39,7 @@ def test_main(args: argparse.Namespace,
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    topk_idx = topk_idx.to(stream_ep.topk_idx_t)
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
     rank_idx = topk_idx // (num_experts // num_ranks)
@@ -100,7 +97,7 @@ def test_main(args: argparse.Namespace,
 
     # Config
     rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
-    config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
+    config = stream_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -228,7 +225,7 @@ def test_main(args: argparse.Namespace,
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
         for nvl_chunk_size in range(4, 45, 4):
             for rdma_chunk_size in range(4, 33, 4):
-                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
+                config = stream_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
                 t, notify_t = bench_kineto(
                     lambda: buffer.dispatch(**tune_args),  # noqa: B023
@@ -256,7 +253,7 @@ def test_main(args: argparse.Namespace,
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
-    dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2],
+    dispatch_config = stream_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2],
                                      rdma_buffer_size)
 
     dispatch_args = {
@@ -273,7 +270,7 @@ def test_main(args: argparse.Namespace,
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 8, 1):
         for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
+            config = stream_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
             t, notify_t = bench_kineto(
                 lambda: buffer.combine(**tune_args),  # noqa: B023
@@ -303,17 +300,12 @@ def test_main(args: argparse.Namespace,
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    if args.test_ll_compatibility:
-        ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
-    buffer = deep_ep.Buffer(group,
+    buffer = stream_ep.Buffer(group,
                             int(2e9),
                             int(1e9),
-                            low_latency_mode=args.test_ll_compatibility,
-                            num_qps_per_rank=num_qps_per_rank,
                             explicitly_destroy=True)
     assert num_local_ranks == 8 and num_ranks > 8
 
@@ -344,11 +336,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     print('', flush=True)
             assert current_hash == ref_hash
 
-    # Test compatibility with low latency functions
-    if args.test_ll_compatibility:
-        buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
-        test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
-
     # Destroy the buffer runtime and communication group
     buffer.destroy()
     dist.barrier()
@@ -368,7 +355,6 @@ if __name__ == '__main__':
         default=0,
         help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
     parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256')
-    parser.add_argument('--test-ll-compatibility', action='store_true', help='whether to test compatibility with low-latency kernels')
     args = parser.parse_args()
 
     # Set default `num_topk_groups` if not provided

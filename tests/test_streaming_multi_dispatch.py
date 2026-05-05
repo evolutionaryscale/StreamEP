@@ -21,7 +21,7 @@ import os
 
 import torch
 import torch.distributed as dist
-from deep_ep import Buffer
+from stream_ep import Buffer
 
 
 def make_inputs(num_tokens, hidden, num_topk, num_experts, num_ranks, rank, device, seed):
@@ -149,7 +149,7 @@ def main():
     for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
         nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes, num_qps_per_rank=Buffer.num_sms)
+    buf = Buffer(group, nvl_bytes, rdma_bytes)
 
     seeds = [123, 456, 789]
     for i, seed in enumerate(seeds):

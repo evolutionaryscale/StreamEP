@@ -26,7 +26,7 @@ if __name__ == '__main__':
             import nvidia.nvshmem as nvshmem  # noqa: F401
         except (ModuleNotFoundError, AttributeError, IndexError):
             print(
-                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n'
+                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode features are disabled\n'
             )
             disable_nvshmem = True
     else:
@@ -48,7 +48,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
+        sources.append('csrc/kernels/internode.cu')
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
@@ -62,7 +62,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
-        # Disable internode and low-latency kernels
+        # Disable internode kernels
         assert disable_nvshmem
     else:
         # Prefer H800 series
@@ -113,11 +113,11 @@ if __name__ == '__main__':
     except Exception as _:
         revision = ''
 
-    setuptools.setup(name='deep_ep',
+    setuptools.setup(name='stream_ep',
                      version='1.2.1' + revision,
-                     packages=setuptools.find_packages(include=['deep_ep']),
+                     packages=setuptools.find_packages(include=['stream_ep']),
                      ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
+                         CUDAExtension(name='stream_ep_cpp',
                                        include_dirs=include_dirs,
                                        library_dirs=library_dirs,
                                        sources=sources,
