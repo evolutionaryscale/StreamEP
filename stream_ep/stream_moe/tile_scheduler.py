@@ -22,7 +22,7 @@ and postact path both hit the right pool rows via
 ``cu_seqlens_m[batch_idx] + pid_m * tile_m`` alone.
 
 This file lives outside the quack tree so the streaming-MoE additions can be
-maintained alongside the rest of the streaming-MoE pipeline in evolutionaryscale.
+maintained alongside the rest of the streaming-MoE pipeline in stream_ep.stream_moe.
 The base TileScheduler + supporting infrastructure (PipelineStateWAdvance,
 FastDivmod, the upstream PersistenceMode enum) are imported from quack as-is.
 """

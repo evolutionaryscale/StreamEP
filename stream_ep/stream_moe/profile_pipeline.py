@@ -41,13 +41,45 @@ from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )
-from evolutionaryscale.utils.distributed import (
-    barrier,
-    get_global_rank,
-    get_world_size,
-    init_distributed,
-    rank_zero_print,
-)
+
+
+# torchrun-driven distributed helpers. Kept here so smoke_pipeline /
+# validate_multi_iter / bench_pipeline can reuse them by importing from
+# profile_pipeline.
+def init_distributed() -> torch.device:
+    """Init NCCL process group from torchrun env vars; return the local cuda device."""
+    if not torch_dist.is_initialized():
+        torch_dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return torch.device(f"cuda:{local_rank}")
+
+
+def get_global_rank() -> int:
+    return torch_dist.get_rank()
+
+
+def get_world_size() -> int:
+    return torch_dist.get_world_size()
+
+
+def barrier(group=None) -> None:
+    torch_dist.barrier(group=group)
+
+
+def rank_zero_print(*args, **kwargs) -> None:
+    if torch_dist.is_initialized() and torch_dist.get_rank() != 0:
+        return
+    print(*args, **kwargs)
+
+
+def rank_zero_only(fn):
+    """Decorator: only rank 0 actually executes; other ranks return None."""
+    def wrapper(*args, **kwargs):
+        if torch_dist.is_initialized() and torch_dist.get_rank() != 0:
+            return None
+        return fn(*args, **kwargs)
+    return wrapper
 
 H = 2048
 I = 2048

@@ -35,7 +35,7 @@ from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )
-from evolutionaryscale.utils.distributed import (
+from stream_ep.stream_moe.profile_pipeline import (
     barrier,
     get_global_rank,
     get_world_size,
