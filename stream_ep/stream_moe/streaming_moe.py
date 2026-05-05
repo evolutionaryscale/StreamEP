@@ -42,8 +42,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from deep_ep import Buffer as DeepEPBuffer
 from quack.gemm import gemm
+from stream_ep import Buffer as StreamEPBuffer
 
 from evolutionaryscale.models.moe.streaming_moe.streaming_kernel_a import (
     streaming_moe_a,
@@ -126,7 +126,7 @@ class StreamMoEFunc(torch.autograd.Function):
     def forward(  # type: ignore[override]
         ctx,
         streams: StreamHolder,
-        buffer: DeepEPBuffer,
+        buffer: StreamEPBuffer,
         x: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -344,7 +344,7 @@ class StreamMoEFunc(torch.autograd.Function):
         """
         preact_a, pool, w1_local, w2_local = ctx.saved_tensors
         streams: StreamHolder = ctx.streams
-        buffer: DeepEPBuffer = ctx.buffer
+        buffer: StreamEPBuffer = ctx.buffer
         handle = ctx.handle
         tile_m: int = ctx.tile_m
         tile_n_a: int = ctx.tile_n_a
@@ -686,7 +686,7 @@ class StreamMoEFunc(torch.autograd.Function):
 
 
 def stream_moe_func(
-    buffer: DeepEPBuffer,
+    buffer: StreamEPBuffer,
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,

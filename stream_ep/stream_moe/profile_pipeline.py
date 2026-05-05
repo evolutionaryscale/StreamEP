@@ -35,7 +35,7 @@ import os
 import torch
 import torch.distributed as torch_dist
 import torch.profiler
-from deep_ep import Buffer as DeepEPBuffer
+from stream_ep import Buffer as StreamEPBuffer
 
 from evolutionaryscale.models.moe.streaming_moe.streaming_moe import (
     make_streams,
@@ -89,12 +89,12 @@ def make_skewed_topk_idx(
 
 
 def make_buffer(group, num_sms):
-    DeepEPBuffer.set_num_sms(num_sms)
+    StreamEPBuffer.set_num_sms(num_sms)
     hidden_bytes = H * 2
     nvl_bytes, rdma_bytes = 0, 0
     for cfg in (
-        DeepEPBuffer.get_dispatch_config(group.size()),
-        DeepEPBuffer.get_combine_config(group.size()),
+        StreamEPBuffer.get_dispatch_config(group.size()),
+        StreamEPBuffer.get_combine_config(group.size()),
     ):
         nvl_bytes = max(
             cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes
@@ -102,9 +102,7 @@ def make_buffer(group, num_sms):
         rdma_bytes = max(
             cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes
         )
-    return DeepEPBuffer(
-        group, nvl_bytes, rdma_bytes, num_qps_per_rank=DeepEPBuffer.num_sms
-    )
+    return StreamEPBuffer(group, nvl_bytes, rdma_bytes)
 
 
 def main():

@@ -25,8 +25,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from deep_ep import Buffer as DeepEPBuffer
 from sonicmoe.functional import TC_Softmax_Topk_Router_Function
+from stream_ep import Buffer as StreamEPBuffer
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
@@ -55,15 +55,15 @@ NUM_SMS = 80
 
 # Process-global cache. The Buffer's IPC slabs are heavy and meant to be
 # shared across all streaming_moe layers in a model.
-_RUNTIME_CACHE: dict[int, tuple[DeepEPBuffer, StreamHolder]] = {}
+_RUNTIME_CACHE: dict[int, tuple[StreamEPBuffer, StreamHolder]] = {}
 
 
-def _make_buffer(group, num_sms: int, hidden_bytes: int) -> DeepEPBuffer:
-    DeepEPBuffer.set_num_sms(num_sms)
+def _make_buffer(group, num_sms: int, hidden_bytes: int) -> StreamEPBuffer:
+    StreamEPBuffer.set_num_sms(num_sms)
     nvl_bytes = rdma_bytes = 0
     for cfg in (
-        DeepEPBuffer.get_dispatch_config(group.size()),
-        DeepEPBuffer.get_combine_config(group.size()),
+        StreamEPBuffer.get_dispatch_config(group.size()),
+        StreamEPBuffer.get_combine_config(group.size()),
     ):
         nvl_bytes = max(
             cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes
@@ -71,9 +71,7 @@ def _make_buffer(group, num_sms: int, hidden_bytes: int) -> DeepEPBuffer:
         rdma_bytes = max(
             cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes
         )
-    return DeepEPBuffer(
-        group, nvl_bytes, rdma_bytes, num_qps_per_rank=DeepEPBuffer.num_sms
-    )
+    return StreamEPBuffer(group, nvl_bytes, rdma_bytes)
 
 
 class StreamingMoEWrapper(nn.Module):
@@ -141,7 +139,7 @@ class StreamingMoEWrapper(nn.Module):
         nn.init.normal_(self.w2_local, std=0.02)
 
         # Lazy runtime — built on first forward when the device is known.
-        self._buffer: DeepEPBuffer | None = None
+        self._buffer: StreamEPBuffer | None = None
         self._streams: StreamHolder | None = None
         self._router_logits: torch.Tensor | None = None
 
