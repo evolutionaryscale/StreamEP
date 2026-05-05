@@ -86,6 +86,11 @@ TILE_N_Y = 160  # 160 wins over 128/192 across BOTH consumers (fwd kernel Y
 # shape: 128→4951, 160→4905 (5-run mean), 192→4908.
 TILE_N_Y_BWD = 128  # Decoupled from TILE_N_A: kernel_y_bwd is faster at smaller
 # tile_n (epilogue ColVecReduceAtomic + dswiglu pressure) than fwd kernel A.
+TILE_N_A_BWD = 256  # Decoupled from TILE_N_Y: kernel_a_bwd does a much larger
+# data-grad GEMM than fwd kernel Y (M=TK, K=2I, N=H — same N=H but K=2I, double
+# the K-axis work) and saturates better at tile_N=256 than at fwd-Y's optimum
+# of 160. Sweep at production: 128→4884, 160→4832, 192→4939, 256→4800 (single
+# runs); 5-run mean at 256 is ~4757 vs 4905 at 160 → ~148 μs saved.
 
 
 def time_kernel(fn, *, warmup=10, iters=50) -> float:
@@ -129,6 +134,7 @@ def main():
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
     p.add_argument("--tile_n_y_bwd", type=int, default=TILE_N_Y_BWD)
+    p.add_argument("--tile_n_a_bwd", type=int, default=TILE_N_A_BWD)
     args, _ = p.parse_known_args()
 
     device = init_distributed()
@@ -454,7 +460,7 @@ def main():
             bwd_a_ready_fired,
             dispatch_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
-            tile_n=args.tile_n_y,
+            tile_n=args.tile_n_a_bwd,
             num_sms=args.num_sms_y,
         )
 
@@ -469,7 +475,7 @@ def main():
             None,
             None,
             tile_M=args.tile_m,
-            tile_N=args.tile_n_y,
+            tile_N=args.tile_n_a_bwd,
             cluster_M=1,
             cluster_N=1,
             cu_seqlens_m=cu_seqlens_m,
@@ -697,6 +703,7 @@ def main():
             tile_n_a=args.tile_n_a,
             tile_n_y=args.tile_n_y,
             tile_n_y_bwd=args.tile_n_y_bwd,
+            tile_n_a_bwd=args.tile_n_a_bwd,
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
         )
@@ -758,6 +765,7 @@ def main():
             tile_n_a=args.tile_n_a,
             tile_n_y=args.tile_n_y,
             tile_n_y_bwd=args.tile_n_y_bwd,
+            tile_n_a_bwd=args.tile_n_a_bwd,
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
         )
