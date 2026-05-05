@@ -61,35 +61,39 @@ from stream_ep.stream_moe.kernel_y_bwd import (
 
 @dataclass(frozen=True)
 class StreamHolder:
-    """The five caller-owned streams driving one streaming-MoE layer.
+    """The six caller-owned streams driving one streaming-MoE layer.
 
     Forward uses four (``dispatch`` / ``compute_a`` / ``compute_y`` /
-    ``combine``); backward adds a fifth ``grads`` stream so the two dW
-    grouped GEMMs can run on side streams without blocking combine_grads
-    or contending with kernel_a_bwd / kernel_y_bwd's tails for the
-    streaming-kernel critical path. The dW grads are purely LOCAL (each
-    rank holds its E_local slice of the expert weight grads — never
+    ``combine``); backward adds two dedicated dW streams (``w1`` and ``w2``)
+    so the two dW grouped GEMMs can run on side streams in parallel without
+    blocking combine_grads or contending with kernel_a_bwd / kernel_y_bwd
+    for the streaming-kernel critical path. The dW grads are purely LOCAL
+    (each rank holds its E_local slice of the expert weight grads — never
     crosses ranks).
 
     Stream layout in bwd:
+      - dispatch_grads on streams.dispatch
       - kernel_y_bwd  on streams.compute_y
       - kernel_a_bwd  on streams.compute_a
-      - dispatch_grads on streams.dispatch
       - combine_grads on streams.combine
-      - dW2 on streams.dispatch (idle after dispatch_grads — frees grads
-        from queueing both dWs serially)
-      - dW1 on streams.grads
+      - dW1           on streams.w1
+      - dW2           on streams.w2
+
+    Splitting the two dWs across separate streams lets the GPU's CTA
+    scheduler interleave them slightly better than back-to-back same-stream
+    launches; both still SM-contend with kernel_a_bwd at H100's full grid.
     """
 
     dispatch: torch.cuda.Stream
     compute_a: torch.cuda.Stream
     compute_y: torch.cuda.Stream
     combine: torch.cuda.Stream
-    grads: torch.cuda.Stream
+    w1: torch.cuda.Stream
+    w2: torch.cuda.Stream
 
 
 def make_streams(device: torch.device | int | None = None) -> StreamHolder:
-    """Allocate the five streams the layer expects.
+    """Allocate the six streams the layer expects.
 
     Caller creates this once (per training process) and reuses it across all
     layers and iterations — streams are not per-call state.
@@ -99,7 +103,8 @@ def make_streams(device: torch.device | int | None = None) -> StreamHolder:
         compute_a=torch.cuda.Stream(device=device),
         compute_y=torch.cuda.Stream(device=device),
         combine=torch.cuda.Stream(device=device),
-        grads=torch.cuda.Stream(device=device),
+        w1=torch.cuda.Stream(device=device),
+        w2=torch.cuda.Stream(device=device),
     )
 
 
@@ -111,9 +116,8 @@ class StreamMoEFunc(torch.autograd.Function):
     → combine_grads on the same four streams (per-stage stream role preserved
     by comm direction; chronological order swaps compute_a / compute_y because
     of the chain rule). dW1 / dW2 grouped GEMMs run as separate `quack.gemm`
-    calls split across the two side streams (see ``StreamHolder``):
-      - dW2 on streams.dispatch (idle since dispatch_grads finished early in bwd).
-      - dW1 on streams.grads.
+    calls on dedicated side streams `streams.w1` / `streams.w2` — see
+    ``StreamHolder``.
 
     Cross-stage synchronization is per-tile / per-recv-token via system-scope
     release/acquire stamps fired by each kernel — no `cudaStreamWaitEvent`
@@ -289,20 +293,24 @@ class StreamMoEFunc(torch.autograd.Function):
         # dW grouped GEMMs) on streams.dispatch where the source `handle`
         # tensors were last written by `buffer.dispatch` — no cross-stream
         # sync needed. Stashing on ctx removes 2 small int32 launches from
-        # the bwd critical path (~10-15 μs). bwd's stage 5 gates with
-        # `streams.grads.wait_stream(streams.dispatch)` for cross-stream
-        # visibility.
+        # the bwd critical path (~10-15 μs). bwd's stage 5 gates the dW
+        # streams on streams.dispatch for cross-stream visibility.
         with torch.cuda.stream(streams.dispatch):
             bwd_cu_seqlens_k = (
                 handle.expert_pool_block_offset.to(torch.int32) * tile_m
             ).contiguous()
             bwd_lens_k_dW = handle.expert_frequency.to(torch.int32)
 
-        # Layer-end back-edges — see design.md §"Cross-stream sync chain per layer".
+        # Layer-end back-edges — see design.md §"Cross-stream sync chain per
+        # layer". streams.w1 / w2 are unused in fwd but might still hold tail
+        # work from the previous layer's bwd; caller_stream waits on them too
+        # to preserve the layer-as-barrier invariant.
         caller_stream.wait_stream(streams.dispatch)
         caller_stream.wait_stream(streams.compute_a)
         caller_stream.wait_stream(streams.compute_y)
         caller_stream.wait_stream(streams.combine)
+        caller_stream.wait_stream(streams.w1)
+        caller_stream.wait_stream(streams.w2)
 
         # Save tensors bwd will consume. The contract is "save preact, drop
         # postact" — preact_a is the strictly more useful saved activation:
@@ -413,21 +421,19 @@ class StreamMoEFunc(torch.autograd.Function):
                 T_recv, dtype=torch.int64, device=device
             )
 
-        # dW1_local / dW2_local live on the dedicated grads stream — see
-        # below. They're zero-init here on grads (no in-stream-allocator
-        # entanglement with compute_a/compute_y) so the grouped GEMM's
-        # write reaches a known-zero buffer.
-        with torch.cuda.stream(streams.grads):
-            # quack.gemm with default `add_to_output=False` overwrites D, so
-            # the dW1 / dW2 destinations don't need zero-init — saves ~225
-            # MB / layer of memset bandwidth (~150 MB dW1 + ~75 MB dW2 at
-            # production) without changing the GEMM result.
+        # dW1_local / dW2_local each live on their own dedicated stream so
+        # the allocator doesn't entangle them with compute_a/compute_y. quack
+        # `gemm` with default `add_to_output=False` overwrites D, so neither
+        # dW destination needs zero-init — saves ~225 MB / layer of memset
+        # bandwidth (~150 MB dW1 + ~75 MB dW2 at production).
+        with torch.cuda.stream(streams.w1):
             dW1_local = torch.empty_like(w1_local)
+        with torch.cuda.stream(streams.w2):
             dW2_local = torch.empty_like(w2_local)
 
         with torch.cuda.stream(streams.compute_y):
             # kernel_y_bwd's mD output, consumed by kernel_a_bwd on
-            # streams.compute_a and by dW1's grouped GEMM on streams.grads.
+            # streams.compute_a and by dW1's grouped GEMM on streams.w1.
             # Bf16 (M, 2I); fp32-view applied internally by the kernel host
             # wrapper. `torch.empty` is safe: kernel_y_bwd's mPaddingMask
             # predicate (`pool_recv_token >= 0`) zeros (dgate, dup) BEFORE
@@ -462,7 +468,8 @@ class StreamMoEFunc(torch.autograd.Function):
         streams.compute_a.wait_stream(caller_stream)
         streams.compute_y.wait_stream(caller_stream)
         streams.combine.wait_stream(caller_stream)
-        streams.grads.wait_stream(caller_stream)
+        streams.w1.wait_stream(caller_stream)
+        streams.w2.wait_stream(caller_stream)
 
         # ── Caller-dependent setup op ──────────────────────────────────────
         # handle.k_local_count was written on streams.dispatch in fwd; visible
@@ -533,13 +540,14 @@ class StreamMoEFunc(torch.autograd.Function):
             )
 
         # bwd_a_ready / dL_dswiglu_in are written on compute_y; consumed on
-        # compute_a (kernel_a_bwd) and grads (dW1 GEMM).
+        # compute_a (kernel_a_bwd) and the dW streams (dW1 reads
+        # dL_dswiglu_in, dW2 reads dL_do_pool / postact_a_for_dW2).
         bwd_a_ready.record_stream(streams.compute_a)
         dL_dswiglu_in.record_stream(streams.compute_a)
-        dL_dswiglu_in.record_stream(streams.grads)
-        postact_a_for_dW2.record_stream(streams.grads)
-        dL_do_pool.record_stream(streams.grads)
-        pool.record_stream(streams.grads)
+        dL_dswiglu_in.record_stream(streams.w1)
+        pool.record_stream(streams.w1)
+        postact_a_for_dW2.record_stream(streams.w2)
+        dL_do_pool.record_stream(streams.w2)
         # dL_dweight is read by combine_grads on streams.combine. The
         # cross-stream visibility is carried by the per-tile bwd_a_ready
         # release-store's threadfence_system (kernel_y_bwd) → kernel_a_bwd's
@@ -600,30 +608,27 @@ class StreamMoEFunc(torch.autograd.Function):
                 dispatch_seq=handle.dispatch_seq,
             )
 
-        # ── Stage 5 — dW1 / dW2 grouped GEMMs on side streams ──────────────
+        # ── Stage 5 — dW1 / dW2 grouped GEMMs on streams.w1 / streams.w2 ──
         # Both dWs are LOCAL (each rank holds its E_local slice; never crosses
         # ranks via combine_grads), so they live off the streaming critical
         # path entirely. They consume kernel_y_bwd's outputs (postact_a_for_dW2
         # / dL_dswiglu_in) plus pool / dL_do_pool — no dependency on
-        # kernel_a_bwd.
-        #
-        # Split across TWO side streams so they don't serialize on one:
-        #   dW2 → streams.dispatch (idle since dispatch_grads finished ~215 μs
-        #         into bwd)
-        #   dW1 → streams.grads
-        # Both still SM-contend with kernel_a_bwd at H100's full grid, but the
+        # kernel_a_bwd. The two run in parallel on dedicated dW streams; both
+        # still SM-contend with kernel_a_bwd at H100's full grid, but the
         # 2-stream sourcing interleaves marginally better than back-to-back
-        # same-stream launches. (Prior layout — both on streams.grads queued
-        # serially — left dispatch idle for the whole bwd tail.)
-        streams.dispatch.wait_stream(streams.compute_y)
-        streams.grads.wait_stream(streams.compute_y)
-        # cu_seqlens_k / lens_k_dW were precomputed on streams.dispatch in fwd
-        # (see ctx setup). streams.grads needs visibility — gate on dispatch's
-        # tail (cheap; both are tiny int32 launches that finished in fwd).
-        streams.grads.wait_stream(streams.dispatch)
+        # same-stream launches.
+        #
+        # Sync gates: each dW stream waits on streams.compute_y for
+        # kernel_y_bwd's outputs, and on streams.dispatch for the precomputed
+        # cu_seqlens_k / lens_k_dW (allocated on streams.dispatch in fwd; see
+        # the precompute block in fwd's tail).
+        streams.w1.wait_stream(streams.compute_y)
+        streams.w1.wait_stream(streams.dispatch)
+        streams.w2.wait_stream(streams.compute_y)
+        streams.w2.wait_stream(streams.dispatch)
         cu_seqlens_k = ctx.bwd_cu_seqlens_k
         lens_k_dW = ctx.bwd_lens_k_dW
-        with torch.cuda.stream(streams.dispatch):
+        with torch.cuda.stream(streams.w2):
             # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
             #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
             # postact_a_for_dW2 is the weighted postact (postact *
@@ -654,10 +659,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 cu_seqlens_k=cu_seqlens_k,
                 lens_k=lens_k_dW,
             )
-        # dW1 on streams.grads — parallel to dW2 on streams.dispatch. Both
-        # share the precomputed cu_seqlens_k / lens_k_dW (see fwd's tail);
-        # the wait_stream(dispatch) above gates this stream's read.
-        with torch.cuda.stream(streams.grads):
+        with torch.cuda.stream(streams.w1):
             # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
             # quack.gemm cu_seqlens_k: A m-major, B n-major.
             #   A = dL_dswiglu_in_flat.t() (2I, TK_padded), m-major
@@ -683,7 +685,8 @@ class StreamMoEFunc(torch.autograd.Function):
         caller_stream.wait_stream(streams.compute_y)
         caller_stream.wait_stream(streams.compute_a)
         caller_stream.wait_stream(streams.combine)
-        caller_stream.wait_stream(streams.grads)
+        caller_stream.wait_stream(streams.w1)
+        caller_stream.wait_stream(streams.w2)
 
         # Outputs of combine_grads were allocated on streams.combine; record
         # their use on caller_stream so they're not freed before the upstream
