@@ -861,12 +861,13 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
 
     // pool[TK_padded, hidden] (~290 MB at production) lives outside the
     // post-poll bundle — too big to coalesce into the same caching-allocator
-    // size class as the small bundle. Padding rows must be zero because the
-    // dW1 grouped GEMM in bwd (`dL_dswiglu_in.t() @ pool`) reads padding
-    // rows as part of cu_seqlens_k; uninitialized garbage there can slip
-    // inf/NaN into dW1 and corrupt expert weights at step 1. Fwd kernels
-    // already predicate on pool_recv_token>=0 so the zero-init is wasted
-    // for them, but the bwd dW path doesn't.
+    // size class as the small bundle. Padding rows must be zero because dW1's
+    // grouped GEMM reads them as the K-operand (`pool.T @ dL_dswiglu_in`);
+    // kernel_y_bwd's mPaddingMask predicate zeros dL_dswiglu_in at padding
+    // rows, but `0 * NaN = NaN` would still propagate if pool[padding] held
+    // an allocator-garbage NaN bit-pattern. Until dW1's GEMM is itself
+    // predicated to skip padding K-rows, the zero-init here is the
+    // load-bearing safety net (~290 MB memset/layer at production).
     auto pool = torch::zeros({TK_padded, hidden}, x.options());
 
     auto post = allocate_post_poll_bundle(
@@ -1018,13 +1019,14 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     auto stream = at::cuda::getCurrentCUDAStream();
 
     // Output: pool-shaped dL_do_pool. Receiver overwrites only the valid
-    // (real) slots; padding rows are NOT touched by the receiver. Unlike
-    // kernel_a_bwd's atomic-scatter to dL_dx_per_r (which is predicated on
-    // pool_recv_token>=0), kernel_y_bwd's TMA-store of mD/mPostAct writes
-    // the whole tile, then the dW1/dW2 grouped GEMMs read the padding rows
-    // as part of cu_seqlens_k. Zero-init the padding so those rows
-    // contribute zeros to dW1/dW2 instead of allocator-garbage that can
-    // sporadically be inf/NaN and corrupt expert weights at step 1.
+    // (real) slots; padding rows are NOT touched by the receiver. Padding
+    // rows must be zero because dW2's grouped GEMM reads them as the
+    // K-operand (`postact_a_for_dW2.T @ dL_do_pool`); kernel_y_bwd's
+    // mPaddingMask predicate zeros postact_a_for_dW2 at padding rows, but
+    // `0 * NaN = NaN` would still propagate if dL_do_pool[padding] held
+    // an allocator-garbage NaN bit-pattern. Until dW2's GEMM is itself
+    // predicated to skip padding K-rows, the zero-init here is the
+    // load-bearing safety net (~290 MB memset/layer at production).
     auto dL_do_pool = torch::zeros({TK_padded, hidden}, dL_dy.options());
 
     // Per-tile signal arrays. Both zero-init: bwd_dispatch_arrival_count
