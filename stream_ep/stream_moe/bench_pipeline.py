@@ -80,17 +80,20 @@ NUM_SMS = 80  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
 # tail). 80 is the sweet spot that maximises streaming overlap
 # without starving combine_grads of channels.
 TILE_M = 128
+# Decoupled tile_N per kernel — each streaming kernel has a different optimum
+# despite sharing the same per-tile MMA shape:
+#   * kernel A (fwd, gemm_gated) saturates at 256 — large M (TK), HK=H, big N=I.
+#   * kernel Y (fwd, atomic-scatter) also peaks at 256 once tile_n_a_bwd was
+#     decoupled (was 128 in earlier code when shared with kernel_a_bwd).
+#   * kernel_y_bwd is bottlenecked by epilogue (SwiGLU bwd + ColVecReduce
+#     atomic + dual TMA store), not the GEMM mainloop — smaller tile_n=128
+#     shortens the per-tile epilogue critical path.
+#   * kernel_a_bwd is a vanilla data-grad GEMM (M=TK, K=2I, N=H) — 2× the
+#     K-axis work of fwd Y; tile_n=256 wins.
 TILE_N_A = 256
-TILE_N_Y = 256  # After tile_n_a_bwd was decoupled to 256, fwd kernel Y itself
-# also peaks at 256 — re-sweep at production: 128→4811, 160→4727, 192→4745,
-# 224→4766, 256→4687 (single runs); 6-run mean 4714 vs 4757 at 160 (-43 μs).
-TILE_N_Y_BWD = 128  # Decoupled from TILE_N_A: kernel_y_bwd is faster at smaller
-# tile_n (epilogue ColVecReduceAtomic + dswiglu pressure) than fwd kernel A.
-TILE_N_A_BWD = 256  # Decoupled from TILE_N_Y: kernel_a_bwd does a much larger
-# data-grad GEMM than fwd kernel Y (M=TK, K=2I, N=H — same N=H but K=2I, double
-# the K-axis work) and saturates better at tile_N=256 than at fwd-Y's optimum
-# of 160. Sweep at production: 128→4884, 160→4832, 192→4939, 256→4800 (single
-# runs); 5-run mean at 256 is ~4757 vs 4905 at 160 → ~148 μs saved.
+TILE_N_Y = 256
+TILE_N_Y_BWD = 128
+TILE_N_A_BWD = 256
 
 
 def time_kernel(fn, *, warmup=10, iters=50) -> float:
