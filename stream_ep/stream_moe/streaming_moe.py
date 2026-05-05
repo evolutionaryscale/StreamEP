@@ -602,6 +602,14 @@ class StreamMoEFunc(torch.autograd.Function):
             cu_seqlens_k = (
                 handle.expert_pool_block_offset.to(torch.int32) * tile_m
             ).contiguous()
+            # `lens_k` = per-expert REAL recv count; decoupled from
+            # cu_seqlens_k's tile-padded storage offsets. Quack passes lens_k
+            # as the OOB-fill bound on the K-axis (offset_ragged_tensor's
+            # `length` arg), so TMA reads beyond `expert_frequency[e]` in
+            # batch e's K-tile come back as hardware zeros — no need for
+            # dL_do_pool[padding] to be zero, allocator-garbage NaN bits at
+            # those rows are simply not read.
+            lens_k_dW = handle.expert_frequency.to(torch.int32)
             gemm(
                 dL_do_pool.t(),
                 postact_a_for_dW2_flat.t(),
@@ -613,6 +621,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 cluster_M=1,
                 cluster_N=1,
                 cu_seqlens_k=cu_seqlens_k,
+                lens_k=lens_k_dW,
             )
             # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
             # quack.gemm cu_seqlens_k: A m-major, B n-major.
@@ -631,6 +640,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 cluster_M=1,
                 cluster_N=1,
                 cu_seqlens_k=cu_seqlens_k,
+                lens_k=lens_k_dW,
             )
 
         # ── Exit chain back to caller_stream ───────────────────────────────
