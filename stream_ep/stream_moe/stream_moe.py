@@ -587,8 +587,16 @@ class StreamMoEFunc(torch.autograd.Function):
         # naturally; previously dW1 / dW2 sat in compute_a / compute_y's
         # tails and competed with kernel_a_bwd / kernel_y_bwd for SMs,
         # stretching both.
+        # Split dW1/dW2 across two side streams so they don't serialize on
+        # one stream. dW2 hosts on streams.dispatch (idle since dispatch_grads
+        # finished ~215 μs into bwd); dW1 hosts on streams.grads. Both wait on
+        # streams.compute_y for kernel_y_bwd's outputs (postact_a_for_dW2 /
+        # dL_dswiglu_in). They still SM-contend with kernel_a_bwd, but the
+        # GPU's CTA scheduler interleaves a 2-stream dW source slightly better
+        # than back-to-back same-stream launches.
+        streams.dispatch.wait_stream(streams.compute_y)
         streams.grads.wait_stream(streams.compute_y)
-        with torch.cuda.stream(streams.grads):
+        with torch.cuda.stream(streams.dispatch):
             # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
             #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
             # postact_a_for_dW2 is the weighted postact (postact *
@@ -630,12 +638,20 @@ class StreamMoEFunc(torch.autograd.Function):
                 cu_seqlens_k=cu_seqlens_k,
                 lens_k=lens_k_dW,
             )
+        # dW1 on streams.grads — parallel to dW2 on streams.dispatch.
+        # cu_seqlens_k / lens_k_dW are recomputed on this stream so dW1 doesn't
+        # need cross-stream sync against streams.dispatch's allocator.
+        with torch.cuda.stream(streams.grads):
             # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
             # quack.gemm cu_seqlens_k: A m-major, B n-major.
             #   A = dL_dswiglu_in_flat.t() (2I, TK_padded), m-major
             #   B = pool.t()               (H,  TK_padded), n-major
             #   D = dW1_local              (E_local, 2I, H)
             dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
+            cu_seqlens_k_dW1 = (
+                handle.expert_pool_block_offset.to(torch.int32) * tile_m
+            ).contiguous()
+            lens_k_dW1 = handle.expert_frequency.to(torch.int32)
             gemm(
                 dL_dswiglu_in_flat.t(),
                 pool.t(),
@@ -646,8 +662,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 tile_N=tile_n_a,
                 cluster_M=2,
                 cluster_N=1,
-                cu_seqlens_k=cu_seqlens_k,
-                lens_k=lens_k_dW,
+                cu_seqlens_k=cu_seqlens_k_dW1,
+                lens_k=lens_k_dW1,
             )
 
         # ── Exit chain back to caller_stream ───────────────────────────────
