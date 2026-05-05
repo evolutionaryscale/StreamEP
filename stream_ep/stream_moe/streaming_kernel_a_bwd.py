@@ -42,8 +42,8 @@ Shares streaming machinery with fwd kernels:
     Substitutions: `tile_ready` → `bwd_a_ready`, `dispatch_seq` from saved
     handle.
   * Pool-layout `StreamingHandle` carries `pool_recv_token`,
-    `bwd_per_token_remaining` (initialized from saved `K_local_count` per
-    `bwd.md`), `bwd_compute_done_per_token`, `dL_dx_per_r`,
+    `bwd_per_token_remaining` (initialized from saved `k_local_count`),
+    `bwd_compute_done_per_token`, `dL_dx_per_r`,
     `tile_id_to_expert`, `expert_pool_block_offset`.
 """
 

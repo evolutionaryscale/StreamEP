@@ -5,7 +5,7 @@ same streaming machinery (linear-claim scheduler, per-tile acquire-spin,
 per-tile release-store after multi-pid_n gating).
 
 **One sequence number, not two.** Backward shares a single `dispatch_seq`
-across acquire-and-release (per `bwd.md` § "Sequence counter") — fwd's
+across acquire-and-release — fwd's
 two-value pattern (`dispatch_seq=1` for the producer, `compute_seq=N` for the
 release) collapses to one `dispatch_seq` in bwd because the orchestrator
 reuses `handle.dispatch_seq` end-to-end. So tests pre-set
