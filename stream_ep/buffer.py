@@ -499,13 +499,13 @@ class Buffer:
 
         Args:
             dL_dx_per_r: ``[T_recv, H]`` bf16 — per-recv-token gradient produced
-                by ``streaming_kernel_a_bwd``'s atomic-scatter epilogue.
+                by ``kernel_a_bwd``'s atomic-scatter epilogue.
             handle: the ``StreamingHandle`` from ``Buffer.dispatch``.
             weight_grads: ``[TK_padded]`` fp32 — per-pool-slot weight gradient
-                produced by ``streaming_kernel_y_bwd``'s ``dL/dweight``
+                produced by ``kernel_y_bwd``'s ``dL/dweight``
                 dot-product epilogue.
             bwd_compute_done_per_token: ``[T_recv]`` int64 release-stamp
-                array fired by ``streaming_kernel_a_bwd``'s per-token
+                array fired by ``kernel_a_bwd``'s per-token
                 "stripe-done" epilogue.
             dispatch_seq: monotonic int the entire layer threads through;
                 defaults to ``handle.dispatch_seq``.
