@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from deep_ep import Buffer as DeepEPBuffer
+from sonicmoe.functional import TC_Softmax_Topk_Router_Function
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
@@ -164,6 +165,12 @@ class StreamingMoEWrapper(nn.Module):
         signature as `SonicMoEWrapper._compute_routing_weights` so the
         benchmark's `force_uniform_routing` monkey-patch can override it.
 
+        Uses sonicmoe's fused `TC_Softmax_Topk_Router_Function`, which fuses
+        softmax + topk + (optional) renorm into a single CUDA pass over
+        `router_logits` — avoids materialising the (T, E) fp32
+        `routing_weights` intermediate and replaces the eager
+        `F.softmax → torch.topk → renorm` chain with one kernel.
+
         For the Replicate router weight: pass ``grad_placements=[Partial()]``
         when localising so DTensor's autograd inserts the cross-EP all-reduce
         on dW_router in backward. Without it, each rank computes a different
@@ -176,16 +183,20 @@ class StreamingMoEWrapper(nn.Module):
             router_w = weight.to_local(grad_placements=grad_placements)
         else:
             router_w = weight
+        # Fused router expects rank-2 (T, H) input; the SparseMoEBlock caller
+        # already flattens (B, S, H) → (T, H) before invoking forward, so
+        # hidden_states is already 2D here. F.linear is kept separate from
+        # the fused softmax+topk path because the autograd boundary inside
+        # TC_Softmax_Topk_Router_Function expects router_logits as input
+        # (the linear's autograd is provided by F.linear itself).
         router_logits = F.linear(hidden_states.to(router_w.dtype), router_w)
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
+        routing_weights, selected_experts = TC_Softmax_Topk_Router_Function.apply(
+            router_logits,
+            self.num_experts,
+            self.top_k,
+            False,  # is_softmax_over_topk: False = standard softmax-then-topk
+            self.top_k > 1,  # norm_topk_probs: renorm topk to sum to 1
         )
-        if self.top_k > 1:
-            routing_weights = routing_weights / routing_weights.sum(
-                dim=-1, keepdim=True
-            )
-        routing_weights = routing_weights.to(hidden_states.dtype)
         return router_logits, routing_weights, selected_experts
 
     def reset_parameters(self) -> None:
