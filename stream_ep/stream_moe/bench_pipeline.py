@@ -506,7 +506,7 @@ def main():
             None,
             tile_M=args.tile_m,
             tile_N=args.tile_n_a,
-            cluster_M=1,
+            cluster_M=2,
             cluster_N=1,
             cu_seqlens_k=cu_seqlens_k,
         )
@@ -522,7 +522,7 @@ def main():
             None,
             tile_M=args.tile_m,
             tile_N=args.tile_n_a,
-            cluster_M=1,
+            cluster_M=2,
             cluster_N=1,
             cu_seqlens_k=cu_seqlens_k,
         )
