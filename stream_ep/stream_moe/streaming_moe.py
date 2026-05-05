@@ -395,21 +395,21 @@ class StreamMoEFunc(torch.autograd.Function):
             # kernel_y_bwd's mD output, consumed by kernel_a_bwd on
             # streams.compute_a and by dW1's grouped GEMM on streams.grads.
             # Bf16 (M, 2I); fp32-view applied internally by the kernel host
-            # wrapper. Zero-init: kernel_y_bwd's TMA-store writes the whole
-            # tile including padding M-positions (no pool_recv_token
-            # predicate, unlike fwd kernel Y), so padding rows would
-            # otherwise contain matmul-of-garbage that flows into the dW1
-            # grouped GEMM via cu_seqlens_k = padded counts.
-            dL_dswiglu_in = torch.zeros(
+            # wrapper. `torch.empty` is safe: kernel_y_bwd's mPaddingMask
+            # predicate (`pool_recv_token >= 0`) zeros (dgate, dup) BEFORE
+            # the mD TMA-store, so padding rows land as clean zero — dW1's
+            # grouped GEMM then contributes 0 at padding K-positions
+            # regardless of dL_do_pool's padding-row content.
+            dL_dswiglu_in = torch.empty(
                 total_tiles, tile_m, two_I, dtype=dtype, device=device
             )
             # postact_a_for_dW2: kernel_y_bwd's mPostAct output (weighted
             # postact, in-kernel ``postact * pool_topk_weight``). Direct
             # input to dW2's grouped GEMM — eliminates the orchestrator-side
             # 6-elementwise-kernel torch recompute path that cost ~1170 µs
-            # / iter on the production trace. Zero-init for the same reason
-            # as dL_dswiglu_in above.
-            postact_a_for_dW2 = torch.zeros(
+            # / iter on the production trace. Same predicate covers the
+            # mPostAct store, so `torch.empty` is safe here too.
+            postact_a_for_dW2 = torch.empty(
                 total_tiles, tile_m, I, dtype=dtype, device=device
             )
             # dL_dweight: kernel_y_bwd's per-pid_n fp32 atomic-add target.
@@ -448,6 +448,7 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.seen_per_substream.record_stream(streams.dispatch)
         handle.pool_arrival_target.record_stream(streams.dispatch)
         handle.pool_recv_token.record_stream(streams.compute_a)
+        handle.pool_recv_token.record_stream(streams.compute_y)
         handle.k_local_count.record_stream(streams.compute_a)
         pool.record_stream(streams.compute_a)
 
@@ -484,6 +485,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 dL_dswiglu_in,
                 postact_a_for_dW2,
                 handle.pool_topk_weight,
+                handle.pool_recv_token,
                 preact_a,
                 dL_dweight,
                 handle.tile_id_to_expert,

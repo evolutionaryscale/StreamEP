@@ -390,6 +390,7 @@ def main():
             dL_dswiglu_in,
             postact_a_for_dW2,
             handle.pool_topk_weight,
+            handle.pool_recv_token,
             preact_a,
             dL_dweight,
             handle.tile_id_to_expert,

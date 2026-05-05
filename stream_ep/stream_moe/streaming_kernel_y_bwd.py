@@ -21,6 +21,15 @@ Per tile:
     Σ_k A[m, k] * B[n, k] then evaluates to
       g[m, i] = Σ_h dL_do_pool[m, h] * W2[h, i]   = (dL_do_pool @ W2)[m, i]
     so g lands in registers as the unweighted gradient w.r.t. postact_a.
+  * **Padding predicate.** A second `ColVecLoad("mPaddingMask")` carries
+    `pool_recv_token` (int32 → fp32) per row; before the colvec_reduce_accumulate
+    and weight multiply, the epilogue conditionally assigns zero to (dgate, dup,
+    postact, g) wherever recv_token < 0. Conditional assignment (vs multiply by
+    zero) avoids `0 * inf = NaN` propagation from the matmul through padding-row
+    garbage in `dL_do_pool` and `preact_a`. Padding rows of `dL_dswiglu_in`,
+    `postact_a_for_dW2`, and the per-slot `dL_dweight` accumulator all land as
+    clean zero — the host-side zero-init of those four tensors is no longer
+    required.
   * **Epilogue: SwiGLU bwd + dL/dweight atomic + dL/dswiglu_in + postact_a_for_dW2 store**
     (all register-resident). mC is `preact_a[tile, :2I]` — the pre-SwiGLU gate-up
     accumulator saved by fwd kernel A's mD TMA-store path. Storage is
@@ -94,7 +103,7 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import colvec_reduce_accumulate
+from quack.epi_ops import ColVecLoad, colvec_reduce_accumulate
 from quack.gemm_act import GemmActMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
@@ -167,6 +176,17 @@ class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
 
     _epi_ops = (
         *GemmActMixin._epi_ops,
+        # Second ColVecLoad alongside the inherited "mColVecBroadcast" (used
+        # for `pool_topk_weight`). Carries `pool_recv_token` (int32, cast to
+        # fp32 by ColVecLoad's begin_loop) so `epi_visit_subtile` can detect
+        # padding rows (recv_token < 0) and conditionally zero (dgate, dup,
+        # postact, g) BEFORE colvec_reduce_accumulate / weight multiply /
+        # mD / mPostAct stores. Conditional ASSIGNMENT (not multiply) is
+        # required: matmul(garbage, W2) at padding rows can produce inf/NaN,
+        # and `0 * inf = NaN`. This eliminates the host-side zero-init of
+        # `pool` / `dL_do_pool` / `dL_dswiglu_in` / `postact_a_for_dW2` that
+        # was the MVP workaround.
+        ColVecLoad("mPaddingMask"),
         ColVecReduceAtomic("mColVecReduce"),
         TileReadyRelease("tile_ready"),
     )
@@ -181,6 +201,7 @@ class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        mPaddingMask: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
@@ -229,6 +250,7 @@ class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
               to convert and TMA-store via mPostAct (bf16 (M, I)).
         """
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrPadMask = epi_loop_tensors["mPaddingMask"]
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
         assert tRS_rC is not None, "kernel_y_bwd requires preact via mC"
 
@@ -247,6 +269,26 @@ class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
             tRS_rdXY_f32[2 * i], tRS_rdXY_f32[2 * i + 1], tRS_rPostAct[i] = dswiglu(
                 tRS_rXY_f32[2 * i], tRS_rXY_f32[2 * i + 1], tRS_rD[i]
             )
+
+        # (2.5) Padding-row predicate. `tDrPadMask` broadcasts pool_recv_token
+        # (int32 → fp32) along N, so all elements at the same row m share the
+        # same recv_token value. recv_token < 0 marks a padding slot; matmul
+        # through dL_do_pool[padding] @ W2 may produce inf/NaN there.
+        # Conditional ASSIGNMENT (not multiply) zeros the four register
+        # tensors so downstream consumers — colvec_reduce_accumulate (step 3),
+        # weight multiply (step 4), mD TMA-store (dL_dswiglu_in), and mPostAct
+        # TMA-store (postact_a_for_dW2) — see clean zeros at padding rows.
+        # `0 * inf = NaN` would slip through a multiply-based mask; the
+        # ternary compiles to PTX `select.f32`, no NaN propagation.
+        if const_expr(tDrPadMask is not None):
+            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+                is_active = tDrPadMask[i] >= Float32(0.0)
+                tRS_rD[i] = tRS_rD[i] if is_active else Float32(0.0)
+                tRS_rPostAct[i] = tRS_rPostAct[i] if is_active else Float32(0.0)
+                tRS_rdXY_f32[2 * i] = tRS_rdXY_f32[2 * i] if is_active else Float32(0.0)
+                tRS_rdXY_f32[2 * i + 1] = (
+                    tRS_rdXY_f32[2 * i + 1] if is_active else Float32(0.0)
+                )
 
         # (3) ColVecReduceAtomic on UNWEIGHTED g — chain rule for dL/dweight.
         # The intra-CTA reduction stays in-register here; the atomic-add
@@ -392,6 +434,13 @@ def _compile_streaming_moe_y_bwd(
         cutlass.Float32, (TK_padded_sym,), leading_dim=0, divisibility=1
     )
 
+    # Second ColVecLoad — pool_recv_token (int32, varlen_m via cu_seqlens_m).
+    # Cast to fp32 by ColVecLoad's begin_loop; epi_visit_subtile compares
+    # against 0 to detect padding rows (recv_token < 0). Shape (TK_padded,).
+    pool_recv_token = fake_tensor(
+        cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
+    )
+
     # ColVecReduceAtomic destination — flat per-slot fp32 buffer that all
     # pid_n CTAs atomic-add into via red.global.add.f32. Shape (Mflat,).
     # No num_pid_n dim — the atomic-add collapses across stripes in-kernel,
@@ -440,6 +489,7 @@ def _compile_streaming_moe_y_bwd(
         mPostAct=mPostAct,
         act_fn=None,
         mColVecBroadcast=pool_topk_weight,
+        mPaddingMask=pool_recv_token,
         mColVecReduce=mColVecReduce,
         rounding_mode=RoundingMode.RN,
     )
@@ -482,6 +532,7 @@ def streaming_moe_y_bwd(
     dL_dswiglu_in: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16 — pool-layout output
     postact_a_for_dW2: torch.Tensor,  # (total_tiles, tile_m, I) bf16 — weighted postact for dW2
     pool_topk_weight: torch.Tensor,  # (TK_padded,) fp32 — per-slot weight (from saved handle)
+    pool_recv_token: torch.Tensor,  # (TK_padded,) int32 — -1 marks padding (from saved handle)
     preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16 — saved from fwd kernel A's mD
     dL_dweight: torch.Tensor,  # (TK_padded,) fp32 — ZERO-INIT; per-pid_n atomic-add target
     tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
@@ -596,6 +647,11 @@ def streaming_moe_y_bwd(
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert pool_topk_weight.shape == (dL_do_pool.shape[0],)
     assert pool_topk_weight.dtype == torch.float32
+    assert pool_recv_token.shape == (dL_do_pool.shape[0],), (
+        f"pool_recv_token must be (TK_padded,) = ({dL_do_pool.shape[0]},); "
+        f"got {tuple(pool_recv_token.shape)}"
+    )
+    assert pool_recv_token.dtype == torch.int32
     assert tile_id_to_expert.shape == (total_tiles,)
     assert bwd_y_ready.shape == (total_tiles,) and bwd_y_ready.dtype == torch.int64
     assert bwd_a_ready.shape == (total_tiles,) and bwd_a_ready.dtype == torch.int64
@@ -745,6 +801,7 @@ def streaming_moe_y_bwd(
         mPostAct=postact_a_for_dW2_flat,
         act_fn=None,  # weighted-postact computed inline in epi_visit_subtile
         mColVecBroadcast=pool_topk_weight,
+        mPaddingMask=pool_recv_token,
         mColVecReduce=dL_dweight,
         rounding_mode=None,  # Constexpr; pass None at call time
     )

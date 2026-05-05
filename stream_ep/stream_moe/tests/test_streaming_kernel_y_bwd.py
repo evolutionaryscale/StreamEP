@@ -222,6 +222,7 @@ def test_streaming_moe_y_bwd_compiles(device):
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
     dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     pool_topk_weight = torch.ones(TK_padded, dtype=torch.float32, device=device)
+    pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
@@ -243,6 +244,7 @@ def test_streaming_moe_y_bwd_compiles(device):
             dL_dswiglu_in,
             postact_a_for_dW2,
             pool_topk_weight,
+            pool_recv_token,
             preact_a,
             dL_dweight,
             tile_id_to_expert,
@@ -284,6 +286,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
+    pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
@@ -301,6 +304,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
         dL_dswiglu_in,
         postact_a_for_dW2,
         pool_topk_weight,
+        pool_recv_token,
         preact_a,
         dL_dweight,
         tile_id_to_expert,
@@ -401,6 +405,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
+    pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=43)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
@@ -417,6 +422,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         dL_dswiglu_in,
         postact_a_for_dW2,
         pool_topk_weight,
+        pool_recv_token,
         preact_a,
         dL_dweight,
         tile_id_to_expert,
@@ -482,6 +488,7 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     pool_topk_weight = torch.linspace(
         -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
     )
+    pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=44)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
@@ -509,6 +516,7 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             dL_dswiglu_in,
             postact_a_for_dW2,
             pool_topk_weight,
+            pool_recv_token,
             preact_a,
             dL_dweight,
             tile_id_to_expert,
@@ -618,8 +626,20 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     dL_do_pool = (
         torch.randn(TK_padded, H, dtype=dtype, device=device, generator=g) * 0.1
     )
+    # Plant inf at padding rows of dL_do_pool so the GEMM through a padding row
+    # produces inf and dswiglu(*,*,inf) → NaN; if the mPaddingMask predicate is
+    # broken, the NaNs will leak into mD / mPostAct via the TMA store and the
+    # padding-row asserts below will fail.
+    dL_do_pool[~real_mask] = float("inf")
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device, generator=g).mul_(0.02)
-    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
+    # Pre-fill the kernel outputs with a sentinel so we can detect "kernel
+    # didn't write" (sentinel survives) vs "kernel wrote zero" (predicate
+    # fired) vs "kernel wrote garbage" (predicate broken). The TMA store
+    # overwrites the whole tile regardless, so any sentinel surviving means
+    # the kernel didn't run this row.
+    dL_dswiglu_in = torch.full(
+        (total_tiles, tile_m, 2 * I), float("nan"), dtype=dtype, device=device
+    )
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=124)
 
     # pool_topk_weight: real-slot rows have nonzero values (matching Pass B),
@@ -628,9 +648,22 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     pool_topk_weight[real_mask] = torch.linspace(
         -0.5, 1.5, real_mask.sum().item(), dtype=torch.float32, device=device
     )
+    # pool_recv_token: real slots get an arbitrary nonneg id; padding slots
+    # are -1 (matching fwd Pass B's N-region 0xFF memset). The kernel's
+    # mPaddingMask predicate keys on `recv_token < 0` to zero out (dgate, dup,
+    # postact, g) at padding rows BEFORE the colvec_reduce_accumulate / weight
+    # multiply / mD / mPostAct stores.
+    pool_recv_token = torch.full((TK_padded,), -1, dtype=torch.int32, device=device)
+    pool_recv_token[real_mask] = torch.arange(
+        real_mask.sum().item(), dtype=torch.int32, device=device
+    )
 
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
-    postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
+    # NaN sentinel so the post-kernel padding-row asserts can distinguish
+    # "predicate zeroed the padding rows" from "kernel skipped these rows".
+    postact_a_for_dW2 = torch.full(
+        (total_tiles, tile_m, I), float("nan"), dtype=dtype, device=device
+    )
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
@@ -643,6 +676,7 @@ def test_streaming_moe_y_bwd_dense_padding(device):
         dL_dswiglu_in,
         postact_a_for_dW2,
         pool_topk_weight,
+        pool_recv_token,
         preact_a,
         dL_dweight,
         tile_id_to_expert,
@@ -687,6 +721,27 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     assert (bwd_a_ready == seq).all(), (
         f"dense_padding bwd_a_ready not all set; bad indices "
         f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
+    )
+
+    # Padding-row predicate check: with the mPaddingMask predicate firing at
+    # `pool_recv_token < 0`, mD (`dL_dswiglu_in`) and mPostAct
+    # (`postact_a_for_dW2`) must be exactly zero at padding rows — even though
+    # `dL_do_pool[padding] = +inf` planted upstream would, without the
+    # predicate, drive `dswiglu(*,*,inf) → NaN` into both outputs via the TMA
+    # store. Both buffers were pre-filled with NaN so a kernel that skips these
+    # rows entirely (rather than writing zero) would still fail this check.
+    pad_mask = ~real_mask
+    pad_dswiglu = dL_dswiglu_in.view(TK_padded, 2 * I)[pad_mask]
+    assert (pad_dswiglu == 0).all(), (
+        f"dense_padding: dL_dswiglu_in not zero at padding rows — predicate "
+        f"didn't fire. {(pad_dswiglu != 0).sum().item()} nonzero / "
+        f"{pad_dswiglu.numel()}"
+    )
+    pad_postact = postact_a_for_dW2.view(TK_padded, I)[pad_mask]
+    assert (pad_postact == 0).all(), (
+        f"dense_padding: postact_a_for_dW2 not zero at padding rows — "
+        f"predicate didn't fire. {(pad_postact != 0).sum().item()} nonzero "
+        f"/ {pad_postact.numel()}"
     )
 
 
