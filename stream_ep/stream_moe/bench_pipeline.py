@@ -81,9 +81,9 @@ NUM_SMS = 80  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
 # without starving combine_grads of channels.
 TILE_M = 128
 TILE_N_A = 256
-TILE_N_Y = 160  # 160 wins over 128/192 across BOTH consumers (fwd kernel Y
-# and kernel_a_bwd, which currently share this knob). Sweep at production
-# shape: 128→4951, 160→4905 (5-run mean), 192→4908.
+TILE_N_Y = 256  # After tile_n_a_bwd was decoupled to 256, fwd kernel Y itself
+# also peaks at 256 — re-sweep at production: 128→4811, 160→4727, 192→4745,
+# 224→4766, 256→4687 (single runs); 6-run mean 4714 vs 4757 at 160 (-43 μs).
 TILE_N_Y_BWD = 128  # Decoupled from TILE_N_A: kernel_y_bwd is faster at smaller
 # tile_n (epilogue ColVecReduceAtomic + dswiglu pressure) than fwd kernel A.
 TILE_N_A_BWD = 256  # Decoupled from TILE_N_Y: kernel_a_bwd does a much larger
