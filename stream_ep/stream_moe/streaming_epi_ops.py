@@ -1,0 +1,176 @@
+"""Custom epilogue ops for the streaming-MoE pipeline.
+
+Currently houses ``ColVecReduceAtomic`` — a variant of quack's
+``ColVecReduce`` whose ``end()`` atomic-adds the cross-warp-reduced row sums
+into a flat per-row fp32 buffer instead of writing to a per-pid_n column of
+a (M, num_pid_n) staging tensor.
+
+Why a custom op: kernel_y_bwd's epilogue produces the dL/dtopk_weight
+contribution per slot via ``Σ_n postact[m,n] * g[m,n]``. Each pid_n CTA
+covers an N-stripe of the I dim; with the upstream ``ColVecReduce`` the
+per-stripe partials land in ``dL_dweight_per_stripe[slot, n_stripe]`` and the
+orchestrator collapses them post-hoc with a ``.sum(dim=-1)`` torch op. That
+post-hoc reduction is a SECOND kernel on streams.compute_y, which forces a
+``weight_grads_ready`` event into combine_grads's path and destroys the
+per-recv-token streaming the ``bwd_compute_done_per_token`` gate was
+designed for (combine has to wait for the .sum() to complete globally
+before its first packet ships).
+
+With per-pid_n fp32 atomic-add into a flat ``dL_dweight[slot]``, the
+per-tile ``bwd_a_ready`` release-store transitively publishes
+``dL_dweight`` along with the rest of the tile's writes (the
+``threadfence_system`` inside ``TileReadyRelease.end()`` is system-scope).
+Combine_grads's existing per-token gate
+(``bwd_compute_done_per_token[r]``, fired by kernel_a_bwd which acquires
+``bwd_a_ready``) then transitively makes ``dL_dweight`` visible to
+combine's sender — no explicit cross-stream event, per-token streaming
+restored.
+
+Atomic cost: TK_padded × num_pid_n_y_bwd ≈ 32K × 8 = 256K fp32 atomics
+per layer, all hot in L2. Throughput-trivial on H100 — the L2 atomic-add
+unit absorbs scatter patterns at near-DRAM-bandwidth rates and these are
+sparse (one fp32 per slot per stripe), not bandwidth-bound.
+"""
+
+import operator
+from functools import partial
+
+import cutlass
+import cutlass.cute as cute
+import quack.layout_utils as layout_utils
+from cutlass import Float32, const_expr
+from quack.epi_ops import ColVecReduce, _get_lane_warp_layouts
+from quack.sm90_utils import partition_for_epilogue
+from quack.utils import elem_pointer
+
+from evolutionaryscale.models.moe.streaming_moe.ptx_helpers import red_add_f32
+
+
+class ColVecReduceAtomic(ColVecReduce):
+    """``ColVecReduce`` variant that atomic-adds the per-row reduced sum
+    into a flat (M,) fp32 buffer instead of writing to ``param[m, pid_n]``.
+
+    The epilogue ``param`` is a 1D ``(M,)`` fp32 tensor (no per-pid_n
+    column dim, no per-batch dim — varlen_m is handled via the same
+    ``cu_seqlens_m`` domain offset ``ColVecReduce`` uses, just on a 1D
+    target). All pid_n CTAs for a given tile race-free atomic-add to the
+    same (M,) location; the shuffle + cross-warp reduction inside the CTA
+    still runs identically to the parent class.
+
+    Inherits ``begin``, ``begin_loop``, ``param_fields``, ``to_params``,
+    ``smem_bytes``, ``smem_struct_field``, ``get_smem_tensor`` from
+    ``ColVecReduce`` unchanged — the only behavioural change is in
+    ``end()``.
+    """
+
+    @cute.jit
+    def end(
+        self,
+        gemm,
+        param,
+        state,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """Intra-warp shuffle + optional inter-warp reduction → row sum →
+        ``red.global.add.f32`` into ``param[slot]``.
+
+        ``param`` shape contract: 1D ``(M,)`` fp32 in varlen_m mode (the
+        only mode kernel_y_bwd uses). The varlen_m batch offset is
+        applied via ``cute.domain_offset`` over ``cu_seqlens_m`` exactly
+        as in the parent class, just against a 1D target.
+        """
+        if const_expr(param is None):
+            return
+        tDrReduce, sDrReduce = state[0], state[1]
+        tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+        reference_src = tiled_copy_t2r is None
+
+        # ── Derive lane/warp layouts (same as parent) ──
+        lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(
+            tiled_copy, reference_src
+        )
+        lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+        is_lane_n_leader = cute.arch.lane_idx() % lanes_in_N == 0
+
+        # ── Intra-warp shuffle reduction across N lanes (same as parent) ──
+        if const_expr(lanes_in_N > 1):
+            assert lane_layout_MN.stride[1] == 1
+            tDrReduce_flt = cute.filter_zeros(tDrReduce)
+            for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
+                tDrReduce_flt[i] = cute.arch.warp_reduction(
+                    tDrReduce_flt[i], operator.add, threads_in_group=lanes_in_N
+                )
+
+        warp_N = warp_layout_MN[1]
+        warps_in_N = const_expr(cute.size(warp_N))
+        max_warps_in_n = const_expr(self.max_warps_in_n)
+        assert (
+            warps_in_N <= max_warps_in_n
+        ), "ColVecReduceAtomic warp_N exceeds smem staging"
+
+        partition_for_epilogue_fn = partial(
+            partition_for_epilogue,
+            epi_tile=epi_tile,
+            tiled_copy=tiled_copy,
+            tidx=tidx,
+            reference_src=tiled_copy_t2r is None,
+        )
+        tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+        epilogue_barrier = gemm.epilogue_barrier
+        batch_idx = tile_coord_mnkl[3]
+
+        # ── Param indexing for 1D (M,) target with varlen_m batch offset ──
+        # All pid_n CTAs for this tile_id atomic-add to the same (slot,)
+        # locations; race-free via red.global.add.f32.
+        assert varlen_manager.varlen_m, (
+            "ColVecReduceAtomic only supports varlen_m mode (the only mode "
+            "kernel_y_bwd uses)"
+        )
+        mColVec = cute.domain_offset(
+            (varlen_manager.params.cu_seqlens_m[batch_idx],), param
+        )
+        gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+        limit_m = min(
+            varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M
+        )
+
+        tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+        tDrReduce_m = layout_utils.convert_layout_zero_stride(
+            tDrReduce, tDrReduce.layout
+        )[None, 0]
+        tDcD_m = layout_utils.convert_layout_zero_stride(tDcD, tDrReduce.layout)[
+            None, 0
+        ]
+
+        if const_expr(warps_in_N == 1):
+            # Single warp covers the full tile_N — every is_lane_n_leader
+            # owns one row's final sum, atomic-add directly.
+            if is_lane_n_leader:
+                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                    row_idx = tDcD_m[m][0]
+                    if row_idx < limit_m:
+                        red_add_f32(elem_pointer(gColVec, (row_idx,)), tDrReduce_m[m])
+        else:
+            # Multi-warp tile — stage per-warp partials in SMEM, single
+            # warp_n_idx==0 reduces across warps and atomic-adds.
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
+            if is_lane_n_leader:
+                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                    row_idx = tDcD_m[m][0]
+                    if row_idx < limit_m:
+                        sDrReduce[row_idx, warp_n_idx] = tDrReduce_m[m]
+            epilogue_barrier.arrive_and_wait()
+            if warp_n_idx == 0 and is_lane_n_leader:
+                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                    row_idx = tDcD_m[m][0]
+                    if row_idx < limit_m:
+                        row_sum = Float32(0.0)
+                        for warp_n in cutlass.range_constexpr(warps_in_N):
+                            row_sum += sDrReduce[row_idx, warp_n]
+                        red_add_f32(elem_pointer(gColVec, (row_idx,)), row_sum)
