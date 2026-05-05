@@ -48,9 +48,10 @@ from stream_ep.stream_moe.stream_moe import (
 # profile_pipeline.
 def init_distributed() -> torch.device:
     """Init NCCL process group from torchrun env vars; return the local cuda device."""
-    if not torch_dist.is_initialized():
-        torch_dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
+
+    if not torch_dist.is_initialized():
+        torch_dist.init_process_group(backend="nccl", device_id=local_rank)
     torch.cuda.set_device(local_rank)
     return torch.device(f"cuda:{local_rank}")
 
@@ -145,7 +146,7 @@ def main():
         default=str(
             os.path.normpath(
                 os.path.join(
-                    os.path.dirname(__file__), "..", "..", "..", "..", "..", "profiles"
+                    os.path.dirname(__file__), "..", "..", "..", "profiles"
                 )
             )
         ),
