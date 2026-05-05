@@ -719,7 +719,7 @@ def stream_moe_func(
     dispatch_seq: int,
     tile_m: int = 128,
     tile_n_a: int = 256,
-    tile_n_y: int = 128,
+    tile_n_y: int = 160,
     tile_n_y_bwd: int = 128,
     num_sms_a: int | None = None,
     num_sms_y: int | None = None,
