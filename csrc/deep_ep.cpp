@@ -475,28 +475,6 @@ private:
     int64_t cursor_ = 0;
 };
 
-struct XScalesInfo {
-    float* ptr = nullptr;
-    int num_scales = 0;
-    int token_stride = 0;
-    int hidden_stride = 0;
-};
-
-XScalesInfo unpack_x_scales(const torch::Tensor& x,
-                            const std::optional<torch::Tensor>& x_scales) {
-    XScalesInfo info;
-    if (!x_scales.has_value()) return info;
-    EP_HOST_ASSERT(x.element_size() == 1);
-    EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
-    EP_HOST_ASSERT(x_scales->dim() == 2);
-    EP_HOST_ASSERT(x_scales->size(0) == x.size(0));
-    info.num_scales    = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
-    info.ptr           = static_cast<float*>(x_scales->data_ptr());
-    info.token_stride  = static_cast<int>(x_scales->stride(0));
-    info.hidden_stride = static_cast<int>(x_scales->stride(1));
-    return info;
-}
-
 void validate_dispatch_inputs(const torch::Tensor& x,
                               const torch::Tensor& topk_idx,
                               const torch::Tensor& topk_weights,
@@ -650,11 +628,6 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
 //     per_token_remaining, compute_done_per_token, o,
 //     recv_token_to_slots, k_local_count
 struct PostPollBundle {
-    // Conditional FP8 pool-shape scales. Kept separate from the bundle since
-    // it's conditional and FP8-specific.
-    std::optional<torch::Tensor> pool_x_scales;
-    float* pool_x_scales_ptr = nullptr;
-
     // Z_pre + N region views.
     torch::Tensor pool_topk_weight;
     torch::Tensor recv_channel_prefix_matrix;
@@ -688,8 +661,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
                                          int num_channels,
                                          int num_tokens,
                                          int total_tiles,
-                                         const std::optional<torch::Tensor>& x_scales,
-                                         int num_scales,
                                          const torch::TensorOptions& x_options,
                                          at::cuda::CUDAStream stream) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
@@ -698,12 +669,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
 
     PostPollBundle out;
-
-    // Pool-shape x_scales (FP8 only).
-    if (x_scales.has_value()) {
-        out.pool_x_scales = torch::zeros({TK_padded, num_scales}, x_scales->options());
-        out.pool_x_scales_ptr = static_cast<float*>(out.pool_x_scales->data_ptr());
-    }
 
     int64_t hidden_bytes_per_recv_token = static_cast<int64_t>(hidden) * x_options.dtype().itemsize();
 
@@ -770,7 +735,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
 
 StreamingDispatchOutputs Buffer::intranode_dispatch(
     const torch::Tensor& x,
-    const std::optional<torch::Tensor>& x_scales,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
     const torch::Tensor& is_token_in_rank,
@@ -790,7 +754,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     validate_dispatch_inputs(x, topk_idx, topk_weights, is_token_in_rank,
                              num_experts, num_ranks, num_local_experts,
                              expert_alignment, tile_m);
-    auto xs = unpack_x_scales(x, x_scales);
 
     // All kernels + allocations run on the caller's current stream. The caller
     // is expected to have set its `dispatch_stream` as current via
@@ -869,7 +832,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     auto post = allocate_post_poll_bundle(
         TK_padded, hidden, poll.num_recv_tokens, num_topk,
         num_ranks, num_channels, num_tokens, poll.total_tiles,
-        x_scales, xs.num_scales, x.options(), stream);
+        x.options(), stream);
 
     // Narrow the per-tile arrays from total_tiles_max → total_tiles for the
     // returned views. `narrow` on a from_blob'd tensor returns a view sharing
@@ -887,13 +850,11 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * pool.element_size() +
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * xs.num_scales
+            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)
         <= num_nvl_bytes);
 
     intranode::DispatchPoolOut dispatch_pool_out{
         .pool             = reinterpret_cast<int4*>(pool.data_ptr()),
-        .pool_x_scales    = post.pool_x_scales_ptr,
         .pool_topk_weight = post.pool_topk_weight.data_ptr<float>(),
         .pool_recv_token  = post.pool_recv_token.data_ptr<int>(),
         .pool_k_slot      = post.pool_k_slot.data_ptr<int>(),
@@ -907,7 +868,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     };
     intranode::DispatchInputs dispatch_inputs{
         .x                = reinterpret_cast<const int4*>(x.data_ptr()),
-        .x_scales         = xs.ptr,
         .topk_idx         = topk_idx.data_ptr<topk_idx_t>(),
         .topk_weights     = topk_weights.data_ptr<float>(),
         .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
@@ -925,9 +885,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .hidden_int4         = static_cast<int>(hidden * pool.element_size() / sizeof(int4)),
         .num_topk            = num_topk,
         .num_experts         = num_experts,
-        .num_scales          = xs.num_scales,
-        .scale_token_stride  = xs.token_stride,
-        .scale_hidden_stride = xs.hidden_stride,
         .tile_m              = tile_m,
     };
     intranode::DispatchEnv dispatch_env{
@@ -943,7 +900,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
 
     return StreamingDispatchOutputs{
         .pool                       = pool,
-        .pool_x_scales              = post.pool_x_scales,
         .pool_topk_weight           = post.pool_topk_weight,
         .pool_recv_token            = post.pool_recv_token,
         .pool_k_slot                = post.pool_k_slot,
@@ -1180,7 +1136,6 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
-           std::optional<torch::Tensor>,
            std::vector<int>,
            torch::Tensor,
            torch::Tensor,
@@ -1192,7 +1147,6 @@ std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>>
 Buffer::internode_dispatch(const torch::Tensor& x,
-                           const std::optional<torch::Tensor>& x_scales,
                            const std::optional<torch::Tensor>& topk_idx,
                            const std::optional<torch::Tensor>& topk_weights,
                            const std::optional<torch::Tensor>& num_tokens_per_rank,
@@ -1287,20 +1241,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         topk_weights_ptr = topk_weights->data_ptr<float>();
     }
 
-    // FP8 scales checks
-    float* x_scales_ptr = nullptr;
-    int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
-    if (x_scales.has_value()) {
-        EP_HOST_ASSERT(x.element_size() == 1);
-        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
-        EP_HOST_ASSERT(x_scales->dim() == 2);
-        EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
-        num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
-        x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
-        scale_token_stride = static_cast<int>(x_scales->stride(0));
-        scale_hidden_stride = static_cast<int>(x_scales->stride(1));
-    }
-
     // All kernels + allocations run on the caller's current stream.
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -1323,7 +1263,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
         // Just a barrier and clean flags
         internode::cached_notify(hidden_int4,
-                                 num_scales,
                                  num_topk,
                                  num_topk,
                                  num_ranks,
@@ -1366,7 +1305,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    num_worst_tokens,
                                    num_channels,
                                    hidden_int4,
-                                   num_scales,
                                    num_topk,
                                    expert_alignment,
                                    rdma_channel_prefix_matrix.data_ptr<int>(),
@@ -1417,8 +1355,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Allocate new tensors
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-    auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(),
-         recv_x_scales = std::optional<torch::Tensor>();
+    auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>();
     auto recv_src_meta = std::optional<torch::Tensor>();
     auto recv_rdma_channel_prefix_matrix = std::optional<torch::Tensor>();
     auto recv_gbl_channel_prefix_matrix = std::optional<torch::Tensor>();
@@ -1435,28 +1372,20 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     // Assign pointers
     topk_idx_t* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
-    float* recv_x_scales_ptr = nullptr;
     if (topk_idx.has_value()) {
         recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
         recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
-    if (x_scales.has_value()) {
-        recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
-                                             : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
-        recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
-    }
 
     // Launch data dispatch
     // NOTES: the buffer size checks are moved into the `.cu` file
     internode::dispatch(recv_x.data_ptr(),
-                        recv_x_scales_ptr,
                         recv_topk_idx_ptr,
                         recv_topk_weights_ptr,
                         cached_mode ? nullptr : recv_src_meta->data_ptr(),
                         x.data_ptr(),
-                        x_scales_ptr,
                         topk_idx_ptr,
                         topk_weights_ptr,
                         cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
@@ -1471,11 +1400,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         num_tokens,
                         num_worst_tokens,
                         hidden_int4,
-                        num_scales,
                         num_topk,
                         num_experts,
-                        scale_token_stride,
-                        scale_hidden_stride,
                         rdma_buffer_ptr,
                         config.num_max_rdma_chunked_send_tokens,
                         config.num_max_rdma_chunked_recv_tokens,
@@ -1490,7 +1416,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Return values
     return {recv_x,
-            recv_x_scales,
             recv_topk_idx,
             recv_topk_weights,
             num_recv_tokens_per_expert_list,
@@ -1578,7 +1503,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> Buffer::internode_combin
 
     // Launch barrier and reset queue head and tail
     internode::cached_notify(hidden_int4,
-                             0,
                              0,
                              num_topk,
                              num_ranks,
@@ -1680,7 +1604,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<deep_ep::StreamingDispatchOutputs>(m, "StreamingDispatchOutputs")
         .def_readonly("pool",                       &deep_ep::StreamingDispatchOutputs::pool)
-        .def_readonly("pool_x_scales",              &deep_ep::StreamingDispatchOutputs::pool_x_scales)
         .def_readonly("pool_topk_weight",           &deep_ep::StreamingDispatchOutputs::pool_topk_weight)
         .def_readonly("pool_recv_token",            &deep_ep::StreamingDispatchOutputs::pool_recv_token)
         .def_readonly("pool_k_slot",                &deep_ep::StreamingDispatchOutputs::pool_k_slot)

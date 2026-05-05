@@ -39,28 +39,26 @@ int get_source_meta_bytes() {
     return sizeof(SourceMeta);
 }
 
-__host__ __device__ __forceinline__ int get_num_bytes_per_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
-    return static_cast<int>(align_up(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) +
+__host__ __device__ __forceinline__ int get_num_bytes_per_token(int hidden_int4, int num_topk_idx, int num_topk_weights) {
+    return static_cast<int>(align_up(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) +
                                          num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float),
                                      sizeof(int4)));
 }
 
 __host__ __device__ __forceinline__ std::pair<int, int> get_rdma_clean_meta(int hidden_int4,
-                                                                            int num_scales,
                                                                             int num_topk_idx,
                                                                             int num_topk_weights,
                                                                             int num_rdma_ranks,
                                                                             int num_rdma_recv_buffer_tokens,
                                                                             int num_channels) {
     // Return `int32_t` offset and count to clean
-    return {(get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens *
+    return {(get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens *
              num_rdma_ranks * 2 * num_channels) /
                 sizeof(int),
             (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
 }
 
 __host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(int hidden_int4,
-                                                                           int num_scales,
                                                                            int num_topk_idx,
                                                                            int num_topk_weights,
                                                                            int num_rdma_ranks,
@@ -72,7 +70,7 @@ __host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(int h
     EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
 
     return {
-        (num_nvl_recv_buffer_tokens * get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_nvl_ranks *
+        (num_nvl_recv_buffer_tokens * get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) * num_nvl_ranks *
          num_channels) /
             sizeof(int),
         num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels,
@@ -356,7 +354,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int num_worst_tokens,
                      int num_channels,
                      int hidden_int4,
-                     int num_scales,
                      int num_topk,
                      int expert_alignment,
                      int* rdma_channel_prefix_matrix,
@@ -411,9 +408,8 @@ void notify_dispatch(const int* num_tokens_per_rank,
 
     // Get clean meta
     auto rdma_clean_meta =
-        get_rdma_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+        get_rdma_clean_meta(hidden_int4, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4,
-                                             num_scales,
                                              num_topk,
                                              num_topk,
                                              num_rdma_ranks,
@@ -445,12 +441,10 @@ template <bool kLowLatencyMode,
           int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
 __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
     dispatch(int4* recv_x,
-             float* recv_x_scales,
              topk_idx_t* recv_topk_idx,
              float* recv_topk_weights,
              SourceMeta* recv_src_meta,
              const int4* x,
-             const float* x_scales,
              const topk_idx_t* topk_idx,
              const float* topk_weights,
              int* send_rdma_head,
@@ -465,11 +459,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int num_tokens,
              int num_worst_tokens,
              int hidden_int4,
-             int num_scales,
              int num_topk,
              int num_experts,
-             int scale_token_stride,
-             int scale_hidden_stride,
              void* rdma_buffer_ptr,
              int num_max_rdma_chunked_send_tokens,
              int num_max_rdma_chunked_recv_tokens,
@@ -515,8 +506,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     // RDMA symmetric layout
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
-    auto scale_bytes = num_scales * sizeof(float);
-    auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
+    auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
     auto rdma_channel_data = SymBuffer<uint8_t>(
         rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
@@ -689,19 +679,6 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             #pragma unroll
             for (int i = 0; i < num_topk_ranks; ++i)
                 dst_send_buffers[i] = reinterpret_cast<int4*>(dst_send_buffers[i]) + hidden_int4;
-
-            // Copy `x_scales` into symmetric send buffer
-            #pragma unroll
-            for (int i = lane_id; i < num_scales; i += 32) {
-                auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                auto value = ld_nc_global(x_scales + offset);
-                #pragma unroll
-                for (int j = 0; j < num_topk_ranks; ++j)
-                    st_na_global(reinterpret_cast<float*>(dst_send_buffers[j]) + i, value);
-            }
-            #pragma unroll
-            for (int i = 0; i < num_topk_ranks; ++i)
-                dst_send_buffers[i] = reinterpret_cast<float*>(dst_send_buffers[i]) + num_scales;
 
             // Copy source metadata into symmetric send buffer
             if (lane_id < num_topk_ranks)
@@ -960,7 +937,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
                 auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
-                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
+                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
                 if (lane_id == src_rdma_rank) {
@@ -1124,12 +1101,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++chunk_idx, --num_tokens_to_recv) {
                 int token_idx_in_buffer = (cached_channel_head_idx++) % num_max_nvl_chunked_recv_tokens;
                 auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
-                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
+                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
-                bool scale_aligned = (scale_bytes % 16 == 0);
-                auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
+                auto tma_load_bytes = hidden_bytes;
 
                 // Copy data
                 if (elect_one_sync()) {
@@ -1140,24 +1116,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 mbarrier_wait(tma_mbarrier, tma_phase);
                 if (elect_one_sync()) {
                     tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
-                    if (scale_aligned)
-                        tma_store_1d(tma_buffer + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);
                 }
                 __syncwarp();
                 shifted += hidden_bytes;
-
-                // Copy scales
-                // TODO: make it as templated
-                if (not scale_aligned) {
-                    UNROLLED_WARP_COPY(1,
-                                       lane_id,
-                                       num_scales,
-                                       recv_x_scales + recv_token_idx * num_scales,
-                                       reinterpret_cast<float*>(shifted),
-                                       ld_nc_global,
-                                       st_na_global);
-                }
-                shifted += scale_bytes;
 
                 // Copy source meta
                 if (not kCachedMode and elect_one_sync())
@@ -1207,12 +1168,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 }
 
 void dispatch(void* recv_x,
-              float* recv_x_scales,
               topk_idx_t* recv_topk_idx,
               float* recv_topk_weights,
               void* recv_src_meta,
               const void* x,
-              const float* x_scales,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               int* send_rdma_head,
@@ -1227,11 +1186,8 @@ void dispatch(void* recv_x,
               int num_tokens,
               int num_worst_tokens,
               int hidden_int4,
-              int num_scales,
               int num_topk,
               int num_experts,
-              int scale_token_stride,
-              int scale_hidden_stride,
               void* rdma_buffer_ptr,
               int num_max_rdma_chunked_send_tokens,
               int num_max_rdma_chunked_recv_tokens,
@@ -1247,9 +1203,6 @@ void dispatch(void* recv_x,
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
 
-    // Make sure never OOB
-    EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
-
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                   \
     {                                                                                                                          \
         auto dispatch_func = is_cached_dispatch                                                                                \
@@ -1259,12 +1212,10 @@ void dispatch(void* recv_x,
         LAUNCH_KERNEL(&cfg,                                                                                                    \
                       dispatch_func,                                                                                           \
                       reinterpret_cast<int4*>(recv_x),                                                                         \
-                      recv_x_scales,                                                                                           \
                       recv_topk_idx,                                                                                           \
                       recv_topk_weights,                                                                                       \
                       reinterpret_cast<SourceMeta*>(recv_src_meta),                                                            \
                       reinterpret_cast<const int4*>(x),                                                                        \
-                      x_scales,                                                                                                \
                       topk_idx,                                                                                                \
                       topk_weights,                                                                                            \
                       send_rdma_head,                                                                                          \
@@ -1279,11 +1230,8 @@ void dispatch(void* recv_x,
                       num_tokens,                                                                                              \
                       num_worst_tokens,                                                                                        \
                       hidden_int4,                                                                                             \
-                      num_scales,                                                                                              \
                       num_topk,                                                                                                \
                       num_experts,                                                                                             \
-                      scale_token_stride,                                                                                      \
-                      scale_hidden_stride,                                                                                     \
                       rdma_buffer_ptr,                                                                                         \
                       num_max_rdma_chunked_send_tokens,                                                                        \
                       num_max_rdma_chunked_recv_tokens,                                                                        \
@@ -1464,7 +1412,6 @@ __global__ void cached_notify(const int rdma_clean_offset,
 }
 
 void cached_notify(int hidden_int4,
-                   int num_scales,
                    int num_topk_idx,
                    int num_topk_weights,
                    int num_ranks,
@@ -1492,9 +1439,8 @@ void cached_notify(int hidden_int4,
 
     // Get clean meta
     auto rdma_clean_meta = get_rdma_clean_meta(
-        hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+        hidden_int4, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4,
-                                             num_scales,
                                              num_topk_idx,
                                              num_topk_weights,
                                              num_rdma_ranks,
@@ -1745,7 +1691,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
     EP_DEVICE_ASSERT(hidden % (sizeof(int4) / sizeof(dtype_t)) == 0);
     const auto hidden_int4 = hidden / (sizeof(int4) / sizeof(dtype_t));
     const auto hidden_bytes = hidden_int4 * sizeof(int4);
-    const auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, 0, num_topk);
+    const auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, num_topk);
 
     // NOTES: we decouple a channel into 2 SMs
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;

@@ -91,7 +91,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
 // every signature copy.
 struct DispatchPoolOut {
     int4* pool;                    // [TK_padded, hidden]   data (int4-vector)
-    float* pool_x_scales;          // [TK_padded, num_scales] (FP8 only)
     float* pool_topk_weight;       // [TK_padded]           per-pool-slot weight
     int* pool_recv_token;          // [TK_padded]           slot → recv-token id (-1 = padding)
     int* pool_k_slot;              // [TK_padded]           slot → k (-1 = padding)
@@ -108,7 +107,6 @@ struct DispatchPerTokenOut {
 
 struct DispatchInputs {
     const int4* x;                 // [num_tokens, hidden]  (int4-vector)
-    const float* x_scales;         // [num_tokens, num_scales] (FP8 only)
     const topk_idx_t* topk_idx;    // [num_tokens, num_topk]
     const float* topk_weights;     // [num_tokens, num_topk]
     const bool* is_token_in_rank;  // [num_tokens, num_ranks]
@@ -128,9 +126,6 @@ struct DispatchShape {
     int hidden_int4;
     int num_topk;
     int num_experts;
-    int num_scales;
-    int scale_token_stride;
-    int scale_hidden_stride;
     int tile_m;
 };
 
@@ -252,7 +247,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int num_worst_tokens,
                      int num_channels,
                      int hidden_int4,
-                     int num_scales,
                      int num_topk,
                      int expert_alignment,
                      int* rdma_channel_prefix_matrix,
@@ -270,12 +264,10 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int64_t num_nvl_bytes);
 
 void dispatch(void* recv_x,
-              float* recv_x_scales,
               topk_idx_t* recv_topk_idx,
               float* recv_topk_weights,
               void* recv_src_meta,
               const void* x,
-              const float* x_scales,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               int* send_rdma_head,
@@ -290,11 +282,8 @@ void dispatch(void* recv_x,
               int num_tokens,
               int num_worst_tokens,
               int hidden_int4,
-              int num_scales,
               int num_topk,
               int num_experts,
-              int scale_token_stride,
-              int scale_hidden_stride,
               void* rdma_buffer_ptr,
               int num_max_rdma_chunked_send_tokens,
               int num_max_rdma_chunked_recv_tokens,
@@ -308,7 +297,6 @@ void dispatch(void* recv_x,
               int num_channels);
 
 void cached_notify(int hidden_int4,
-                   int num_scales,
                    int num_topk_idx,
                    int num_topk_weights,
                    int num_ranks,

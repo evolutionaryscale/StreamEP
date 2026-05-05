@@ -74,7 +74,6 @@ namespace deep_ep {
 //                            memcpy's k_local_count into bwd_per_token_remaining).
 struct StreamingDispatchOutputs {
     torch::Tensor pool;
-    std::optional<torch::Tensor> pool_x_scales;
     torch::Tensor pool_topk_weight;
     torch::Tensor pool_recv_token;
     torch::Tensor pool_k_slot;
@@ -225,7 +224,6 @@ public:
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()` — caller-managed.
     StreamingDispatchOutputs intranode_dispatch(
         const torch::Tensor& x,
-        const std::optional<torch::Tensor>& x_scales,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
         const torch::Tensor& is_token_in_rank,
@@ -283,7 +281,6 @@ public:
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>,
                std::vector<int>,
                torch::Tensor,
                torch::Tensor,
@@ -295,7 +292,6 @@ public:
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>>
     internode_dispatch(const torch::Tensor& x,
-                       const std::optional<torch::Tensor>& x_scales,
                        const std::optional<torch::Tensor>& topk_idx,
                        const std::optional<torch::Tensor>& topk_weights,
                        const std::optional<torch::Tensor>& num_tokens_per_rank,

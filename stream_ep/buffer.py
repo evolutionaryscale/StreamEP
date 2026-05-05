@@ -26,7 +26,6 @@ class StreamingHandle:
     # ── Pool data (kernel A reads with strided TMA; kernel Y / combine read via
     # pool_recv_token + pool_k_slot scatter-back).
     pool: torch.Tensor                         # [TK_padded, hidden] data
-    pool_x_scales: Optional[torch.Tensor]      # [TK_padded, num_scales] (FP8) or None
     pool_topk_weight: torch.Tensor             # [TK_padded] float32, per-pool-slot weight
     pool_recv_token: torch.Tensor              # [TK_padded] int32, slot → recv-token id (-1 = padding)
     pool_k_slot: torch.Tensor                  # [TK_padded] int32, slot → k (-1 = padding)
@@ -368,8 +367,7 @@ class Buffer:
         main. See ``csrc/deep_ep.cpp:intranode_dispatch`` for the full sequence.
 
         Arguments:
-            x: tokens to dispatch, ``[num_tokens, hidden]`` bf16 (or a tuple
-                ``(x_fp8, x_scales)`` for FP8).
+            x: tokens to dispatch, ``[num_tokens, hidden]`` bf16.
             topk_idx: ``[num_tokens, num_topk]`` int64 expert indices (-1 sentinel).
             topk_weights: ``[num_tokens, num_topk]`` float32 expert weights.
             is_token_in_rank: ``[num_tokens, num_ranks]`` bool routing bitmap.
@@ -379,8 +377,7 @@ class Buffer:
             dispatch_seq: monotonic int64 release-stamp on tile_ready.
 
         Returns:
-            recv: ``handle.pool`` (Tensor) or ``(handle.pool, handle.pool_x_scales)``
-                tuple for FP8.
+            recv: ``handle.pool`` (Tensor).
             handle: ``StreamingHandle`` carrying pool tensors + per-tile metadata
                 + recv-token-indexed combine inputs.
             metadata_done_event: ``EventHandle`` recorded between
@@ -393,16 +390,14 @@ class Buffer:
         config = self.get_dispatch_config(self.group_size) if config is None else config
         self._assert_intranode_only()
 
-        x_tensor, x_scales = x if isinstance(x, tuple) else (x, None)
         out = self.runtime.intranode_dispatch(
-            x_tensor, x_scales, topk_idx, topk_weights, is_token_in_rank,
+            x, topk_idx, topk_weights, is_token_in_rank,
             num_experts, expert_alignment, tile_m, dispatch_seq,
             config,
         )
 
         handle = StreamingHandle(
             pool=out.pool,
-            pool_x_scales=out.pool_x_scales,
             pool_topk_weight=out.pool_topk_weight,
             pool_recv_token=out.pool_recv_token,
             pool_k_slot=out.pool_k_slot,
@@ -429,8 +424,7 @@ class Buffer:
             dispatch_seq=dispatch_seq,
         )
 
-        recv = (out.pool, out.pool_x_scales) if x_scales is not None else out.pool
-        return recv, handle, out.metadata_done_event
+        return out.pool, handle, out.metadata_done_event
 
     # noinspection PyTypeChecker
     def dispatch_grads(self, handle: 'StreamingHandle', dL_dy: torch.Tensor,
@@ -573,7 +567,6 @@ class Buffer:
         assert config is not None
 
         # Launch the kernel with cached or non-cached mode
-        x, x_scales = x if isinstance(x, tuple) else (x, None)
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
@@ -582,28 +575,26 @@ class Buffer:
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _ = self.runtime.internode_dispatch(
-                x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
+            recv_x, _, _, _, _, _, _, _, _, _, _, _, _ = self.runtime.internode_dispatch(
+                x, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                 expert_alignment, num_worst_tokens, config)
-            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None
+            return recv_x, None, None, None, None
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
+            recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                 recv_src_meta, send_rdma_head, send_nvl_head = self.runtime.internode_dispatch(
-                x, x_scales, topk_idx, topk_weights,
+                x, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
                 expert_alignment, num_worst_tokens, config)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
-            return (
-                recv_x, recv_x_scales
-            ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
+            return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
 
     # noinspection PyTypeChecker
     def internode_combine(self, x: torch.Tensor, handle: Union[tuple, list],

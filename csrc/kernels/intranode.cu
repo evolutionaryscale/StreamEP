@@ -426,9 +426,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
     auto channel_topk_weights_buffers = Buffer<float>(
         ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_topk,
         channel_rank_offset * env.num_recv_buffer_tokens * shape.num_topk);
-    auto channel_x_scales_buffers = Buffer<float>(
-        ptr, num_channels_total * env.num_recv_buffer_tokens * shape.num_scales,
-        channel_rank_offset * env.num_recv_buffer_tokens * shape.num_scales);
 
     // TMA stuffs
 #ifndef DISABLE_SM90_FEATURES
@@ -537,12 +534,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                         channel_topk_weights_buffers[dst_slot_idx * shape.num_topk + lane_id] = weight_value;
                     }
 
-                    // Copy `x_scales`
-                    #pragma unroll
-                    for (int i = lane_id; i < shape.num_scales; i += 32) {
-                        auto offset = token_idx * shape.scale_token_stride + i * shape.scale_hidden_stride;
-                        channel_x_scales_buffers[dst_slot_idx * shape.num_scales + i] = __ldg(inputs.x_scales + offset);
-                    }
                 }
 
                 // Move token index
@@ -765,18 +756,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                         }
                     }
 
-                    // x_scales: per-(slot, scales_idx). Lanes split scales_idx within K.
-                    if (shape.num_scales > 0) {
-                        for (int k = 0; k < shape.num_topk; ++k) {
-                            int slot = slot_row[k];
-                            if (slot < 0) continue;
-                            for (int i = lane_id; i < shape.num_scales; i += 32) {
-                                pool_out.pool_x_scales[static_cast<int64_t>(slot) * shape.num_scales + i] =
-                                    ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * shape.num_scales + i);
-                            }
-                        }
-                    }
-
                 }
 
                 asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
@@ -860,8 +839,6 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
     int smem_size = receiver_state_bytes;
 #endif
 
-    EP_HOST_ASSERT(static_cast<int64_t>(shape.num_scales) * shape.scale_hidden_stride < std::numeric_limits<int>::max());
-
 #define DISPATCH_LAUNCH_CASE(ranks)                                                  \
     {                                                                                \
         auto kernel = dispatch_main_kernel<ranks, kNumThreads, kNumTMABytesPerWarp>; \
@@ -882,7 +859,7 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // ── Backward: dispatch_grads_main_kernel ─────────────────────────────────
 // Ships dL/dy[t] rows from origin → expert ranks using the same routing as
 // fwd dispatch. Differences from fwd dispatch_main_kernel:
-//   - sender ships data only (no topk_idx / topk_weights / src_idx / x_scales).
+//   - sender ships data only (no topk_idx / topk_weights / src_idx).
 //   - receiver SKIPS Pass A — slots come from recv_token_to_slots[r, :K]
 //     (persisted by fwd Pass B). No SMEM batch_slot, no per-(c, src, e) seen
 //     counter — Pass 2 reads seen_per_substream[c, src, e] from the metadata
@@ -917,8 +894,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
 
     // Channel buffer pointers — same IPC slab layout as fwd dispatch (both
     // share the dispatch ring). We only touch start_offset / end_offset / head
-    // / tail / x_buffers; topk_idx / topk_weights / src_idx / x_scales buffers
-    // exist in the slab but go untouched by bwd.
+    // / tail / x_buffers; topk_idx / topk_weights / src_idx buffers exist in
+    // the slab but go untouched by bwd.
     auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(env.buffer_ptrs[is_sender ? responsible_rank : env.rank]) +
                                        kNumRanks * kNumRanks * sizeof(int));
     int target_rank = is_sender ? env.rank : responsible_rank;
@@ -933,8 +910,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
     auto channel_x_buffers = Buffer<int4>(
         ptr, num_channels_total * env.num_recv_buffer_tokens * shape.hidden_int4,
         channel_rank_offset * env.num_recv_buffer_tokens * shape.hidden_int4);
-    // Skip past topk_idx / topk_weights / x_scales regions (untouched by bwd
-    // but they reserve space in the slab — pointer arithmetic must match fwd).
+    // Skip past topk_idx / topk_weights regions (untouched by bwd but they
+    // reserve space in the slab — pointer arithmetic must match fwd).
     auto channel_src_idx_buffers = Buffer<int>(
         ptr, num_channels_total * env.num_recv_buffer_tokens,
         channel_rank_offset * env.num_recv_buffer_tokens);
