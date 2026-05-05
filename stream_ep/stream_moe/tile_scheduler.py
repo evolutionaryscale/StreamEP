@@ -37,6 +37,7 @@ from cutlass import Boolean, Int32, const_expr
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
 from quack.tile_scheduler import PersistenceMode, TileScheduler
+from quack.utils import store_shared_remote_x4
 
 from stream_ep.stream_moe.ptx_helpers import ld_acquire_sys_global
 
@@ -274,7 +275,14 @@ class StreamingTileScheduler(TileScheduler):
         pid_m = Int32(0)
         expert_id = Int32(0)
         if is_valid_i32 != 0:
-            tile_id, pid_n = divmod(linear_idx, params.num_pid_n_fdd)
+            # Each linear_idx represents one CLUSTER's claim along the cluster-N
+            # axis. `params.num_pid_n` already divides total_pid_n by cluster_n,
+            # so the divmod gives a "cluster_pid_n" in [0, total_pid_n / cluster_n).
+            # We multiply by cluster_n to recover the leader-CTA pid_n; peer CTAs
+            # in the same cluster will add their own bidy_in_cluster offset on
+            # the receive side (see write_work_tile_to_smem).
+            tile_id, cluster_pid_n = divmod(linear_idx, params.num_pid_n_fdd)
+            pid_n = cluster_pid_n * Int32(params.cluster_shape_mnk[1])
             if cute.arch.lane_idx() == 0:
                 ready_ptr = utils.elem_pointer(params.tile_ready, (tile_id,))
                 while ld_acquire_sys_global(ready_ptr) < cutlass.Int64(
@@ -325,7 +333,20 @@ class StreamingTileScheduler(TileScheduler):
         self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
     ):
         """Write 4 ints to _sched_smem: (pid_m, pid_n, batch_idx=expert_id, is_valid).
-        Matches the upstream payload layout — no streaming-specific extension.
+
+        Single-cluster path: thread-local SMEM store + pipeline producer_commit
+        (matches the upstream cluster=1 fast path).
+
+        Multi-cluster path: scheduler-warp lanes 0..cluster_size-1 each
+        ``store_shared_remote_x4`` the 4-int payload to one peer CTA's SMEM,
+        adding `bidx_in_cluster` to pid_m and `bidy_in_cluster` to pid_n so
+        each peer sees its correct (pid_m, pid_n) tile coord.
+
+        For our streaming MoE pool layout cluster_M is currently constrained
+        to 1: pool tiles are bound to specific experts (via tile_id_to_expert),
+        so a cluster spanning two consecutive tile_ids could straddle an
+        expert boundary. cluster_N is the useful axis — multiple CTAs share
+        the same A operand (pool rows) and TMA-multicast it on the way in.
         """
         params = self.params
         if const_expr(self._sched_smem is not None):
@@ -337,23 +358,49 @@ class StreamingTileScheduler(TileScheduler):
             )
             self._scheduler_pipeline.producer_acquire(pipeline_state_producer)
             sched_data = [
-                work_tile_info.tile_idx[0],  # pid_m
-                work_tile_info.tile_idx[1],  # pid_n
+                work_tile_info.tile_idx[0],  # pid_m (leader-CTA value)
+                work_tile_info.tile_idx[1],  # pid_n (leader-CTA value, see _fetch)
                 work_tile_info.tile_idx[3],  # batch_idx = expert_id
                 Int32(work_tile_info.is_valid_tile),
             ]
             lane_idx = cute.arch.lane_idx()
-            # Streaming uses cluster_shape_mnk = (1, 1, 1); multi-cluster would
-            # need store_shared_remote_x4 across clusters, which is what
-            # upstream already implements for the 4-int payload.
+            # cluster_M==1 invariant for streaming pool layout (see docstring).
             assert (
-                cute.size(params.cluster_shape_mnk) == 1
-            ), "StreamingTileScheduler currently requires cluster_shape == (1,1,1)"
-            if lane_idx < cute.size(params.cluster_shape_mnk):
-                pipeline_idx = self._pipeline_state.index
-                for i in cutlass.range_constexpr(4):
-                    self._sched_smem[i, pipeline_idx] = sched_data[i]
-                self._scheduler_pipeline.producer_commit(self._pipeline_state)
+                params.cluster_shape_mnk[0] == 1
+            ), "StreamingTileScheduler requires cluster_shape_mnk[0] == 1 (cluster_M=1)"
+            pipeline_idx = self._pipeline_state.index
+            if const_expr(cute.size(params.cluster_shape_mnk) == 1):
+                # Single-CTA cluster — thread-local SMEM write.
+                if lane_idx == 0:
+                    for i in cutlass.range_constexpr(4):
+                        self._sched_smem[i, pipeline_idx] = sched_data[i]
+                    self._scheduler_pipeline.producer_commit(self._pipeline_state)
+            else:
+                # Multi-cluster: lanes 0..cluster_size-1 each push the 4-int
+                # payload to one peer CTA's SMEM via st.async.shared::cluster.
+                # The async store's mbarrier::complete_tx also serves as the
+                # producer-side commit (the consumer_wait on the matching
+                # pipeline stage will release once all peers' tx bytes land).
+                if lane_idx < cute.size(params.cluster_shape_mnk):
+                    peer_cta_rank_in_cluster = lane_idx
+                    # Cluster CTA ordering: x fastest, then y, then z. With
+                    # cluster_M==1 fixed, bidx_in_cluster is always 0.
+                    bidy_in_cluster = peer_cta_rank_in_cluster % params.cluster_shape_mnk[1]
+                    mbar_ptr = self._scheduler_pipeline.producer_get_barrier(
+                        self._pipeline_state
+                    )
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_ptr, 16, peer_cta_rank_in_cluster
+                    )
+                    store_shared_remote_x4(
+                        sched_data[0],
+                        sched_data[1] + bidy_in_cluster,
+                        sched_data[2],
+                        sched_data[3],
+                        smem_ptr=self._sched_smem[None, pipeline_idx].iterator,
+                        mbar_ptr=mbar_ptr,
+                        peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+                    )
 
     @cute.jit
     def setup_initial_work_tile(

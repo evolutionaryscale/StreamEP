@@ -297,6 +297,7 @@ def main():
             compute_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
             tile_n=args.tile_n_a,
+            cluster_n=2,
             num_sms=args.num_sms_a,
         )
 
@@ -339,6 +340,7 @@ def main():
             combine_seq=1,
             tile_m=args.tile_m,
             tile_n=args.tile_n_y,
+            cluster_n=2,
             num_sms=args.num_sms_y,
         )
 

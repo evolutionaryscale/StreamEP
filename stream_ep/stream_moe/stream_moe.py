@@ -216,6 +216,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 preact_a=preact_a,
                 tile_m=tile_m,
                 tile_n=tile_n_a,
+                cluster_n=2,
                 num_sms=num_sms_a,
             )
 
@@ -250,6 +251,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 combine_seq=dispatch_seq,
                 tile_m=tile_m,
                 tile_n=tile_n_y,
+                cluster_n=2,
                 num_sms=num_sms_y,
             )
 
