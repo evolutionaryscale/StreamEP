@@ -276,6 +276,23 @@ class StreamMoEFunc(torch.autograd.Function):
         with torch.cuda.stream(streams.combine):
             out, _ = buffer.combine(handle.o, handle, combine_seq=dispatch_seq)
 
+        # Pre-compute the bwd's `cu_seqlens_k` and `lens_k_dW` (consumed by the
+        # dW1 / dW2 grouped GEMMs) here on streams.dispatch — same stream where
+        # `handle.expert_pool_block_offset` and `handle.expert_frequency` were
+        # last written by `buffer.dispatch`, so no cross-stream sync is needed.
+        # In bwd, both dW1 (on streams.grads) and dW2 (on streams.dispatch)
+        # `wait_stream(streams.compute_y)` picks up the y_bwd edge; here we
+        # also need streams.dispatch's writes to be visible to streams.grads —
+        # the bwd's existing `streams.grads.wait_stream(streams.compute_y)` is
+        # not enough. We add `streams.grads.wait_stream(streams.dispatch)` in
+        # bwd's stage-5 to gate dW1's read of cu_seqlens_k. Saves 2 launches +
+        # ~10-15 μs in the bwd critical path.
+        with torch.cuda.stream(streams.dispatch):
+            bwd_cu_seqlens_k = (
+                handle.expert_pool_block_offset.to(torch.int32) * tile_m
+            ).contiguous()
+            bwd_lens_k_dW = handle.expert_frequency.to(torch.int32)
+
         # Layer-end back-edges — see design.md §"Cross-stream sync chain per layer".
         caller_stream.wait_stream(streams.dispatch)
         caller_stream.wait_stream(streams.compute_a)
@@ -306,6 +323,8 @@ class StreamMoEFunc(torch.autograd.Function):
         ctx.tile_n_a_bwd = tile_n_a_bwd
         ctx.num_sms_a = num_sms_a
         ctx.num_sms_y = num_sms_y
+        ctx.bwd_cu_seqlens_k = bwd_cu_seqlens_k
+        ctx.bwd_lens_k_dW = bwd_lens_k_dW
         return out
 
     @staticmethod
@@ -599,6 +618,12 @@ class StreamMoEFunc(torch.autograd.Function):
         # than back-to-back same-stream launches.
         streams.dispatch.wait_stream(streams.compute_y)
         streams.grads.wait_stream(streams.compute_y)
+        # cu_seqlens_k / lens_k_dW were precomputed on streams.dispatch in fwd;
+        # streams.grads also needs them, so gate on dispatch's tail (cheap —
+        # both prefix-sum tensors are tiny int32 launches that finished in fwd).
+        streams.grads.wait_stream(streams.dispatch)
+        cu_seqlens_k = ctx.bwd_cu_seqlens_k
+        lens_k_dW = ctx.bwd_lens_k_dW
         with torch.cuda.stream(streams.dispatch):
             # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
             #   → (E_local, H, I) — same shape as w2_local, varlen-K grouped GEMM.
@@ -617,17 +642,6 @@ class StreamMoEFunc(torch.autograd.Function):
             #   B = postact_a_for_dW2_flat.t() (I, TK_padded), n-major
             #   D = dW2_local                  (E_local, H, I)
             postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
-            cu_seqlens_k = (
-                handle.expert_pool_block_offset.to(torch.int32) * tile_m
-            ).contiguous()
-            # `lens_k` = per-expert REAL recv count; decoupled from
-            # cu_seqlens_k's tile-padded storage offsets. Quack passes lens_k
-            # as the OOB-fill bound on the K-axis (offset_ragged_tensor's
-            # `length` arg), so TMA reads beyond `expert_frequency[e]` in
-            # batch e's K-tile come back as hardware zeros — no need for
-            # dL_do_pool[padding] to be zero, allocator-garbage NaN bits at
-            # those rows are simply not read.
-            lens_k_dW = handle.expert_frequency.to(torch.int32)
             gemm(
                 dL_do_pool.t(),
                 postact_a_for_dW2_flat.t(),
@@ -651,10 +665,6 @@ class StreamMoEFunc(torch.autograd.Function):
             #   B = pool.t()               (H,  TK_padded), n-major
             #   D = dW1_local              (E_local, 2I, H)
             dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
-            cu_seqlens_k_dW1 = (
-                handle.expert_pool_block_offset.to(torch.int32) * tile_m
-            ).contiguous()
-            lens_k_dW1 = handle.expert_frequency.to(torch.int32)
             gemm(
                 dL_dswiglu_in_flat.t(),
                 pool.t(),
@@ -665,8 +675,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 tile_N=tile_n_a,
                 cluster_M=2,
                 cluster_N=1,
-                cu_seqlens_k=cu_seqlens_k_dW1,
-                lens_k=lens_k_dW1,
+                cu_seqlens_k=cu_seqlens_k,
+                lens_k=lens_k_dW,
             )
 
         # ── Exit chain back to caller_stream ───────────────────────────────
