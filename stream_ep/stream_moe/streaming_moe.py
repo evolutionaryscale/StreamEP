@@ -395,16 +395,21 @@ class StreamMoEFunc(torch.autograd.Function):
             # kernel_y_bwd's mD output, consumed by kernel_a_bwd on
             # streams.compute_a and by dW1's grouped GEMM on streams.grads.
             # Bf16 (M, 2I); fp32-view applied internally by the kernel host
-            # wrapper.
-            dL_dswiglu_in = torch.empty(
+            # wrapper. Zero-init: kernel_y_bwd's TMA-store writes the whole
+            # tile including padding M-positions (no pool_recv_token
+            # predicate, unlike fwd kernel Y), so padding rows would
+            # otherwise contain matmul-of-garbage that flows into the dW1
+            # grouped GEMM via cu_seqlens_k = padded counts.
+            dL_dswiglu_in = torch.zeros(
                 total_tiles, tile_m, two_I, dtype=dtype, device=device
             )
             # postact_a_for_dW2: kernel_y_bwd's mPostAct output (weighted
             # postact, in-kernel ``postact * pool_topk_weight``). Direct
             # input to dW2's grouped GEMM — eliminates the orchestrator-side
             # 6-elementwise-kernel torch recompute path that cost ~1170 µs
-            # / iter on the production trace.
-            postact_a_for_dW2 = torch.empty(
+            # / iter on the production trace. Zero-init for the same reason
+            # as dL_dswiglu_in above.
+            postact_a_for_dW2 = torch.zeros(
                 total_tiles, tile_m, I, dtype=dtype, device=device
             )
             # dL_dweight: kernel_y_bwd's per-pid_n fp32 atomic-add target.
