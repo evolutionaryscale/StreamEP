@@ -861,9 +861,13 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
 
     // pool[TK_padded, hidden] (~290 MB at production) lives outside the
     // post-poll bundle — too big to coalesce into the same caching-allocator
-    // size class as the small bundle. No init needed — kernel Y's predicate
-    // skips padding slots.
-    auto pool = torch::empty({TK_padded, hidden}, x.options());
+    // size class as the small bundle. Padding rows must be zero because the
+    // dW1 grouped GEMM in bwd (`dL_dswiglu_in.t() @ pool`) reads padding
+    // rows as part of cu_seqlens_k; uninitialized garbage there can slip
+    // inf/NaN into dW1 and corrupt expert weights at step 1. Fwd kernels
+    // already predicate on pool_recv_token>=0 so the zero-init is wasted
+    // for them, but the bwd dW path doesn't.
+    auto pool = torch::zeros({TK_padded, hidden}, x.options());
 
     auto post = allocate_post_poll_bundle(
         TK_padded, hidden, poll.num_recv_tokens, num_topk,
@@ -1013,10 +1017,15 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     int total_tiles = static_cast<int>(pool_arrival_target.size(0));
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Output: pool-shaped dL_do_pool. Receiver overwrites every entry it
-    // touches; padding rows are left uninitialized (kernel_y_bwd's predicate
-    // skips them via pool_recv_token, same convention as fwd's `pool`).
-    auto dL_do_pool = torch::empty({TK_padded, hidden}, dL_dy.options());
+    // Output: pool-shaped dL_do_pool. Receiver overwrites only the valid
+    // (real) slots; padding rows are NOT touched by the receiver. Unlike
+    // kernel_a_bwd's atomic-scatter to dL_dx_per_r (which is predicated on
+    // pool_recv_token>=0), kernel_y_bwd's TMA-store of mD/mPostAct writes
+    // the whole tile, then the dW1/dW2 grouped GEMMs read the padding rows
+    // as part of cu_seqlens_k. Zero-init the padding so those rows
+    // contribute zeros to dW1/dW2 instead of allocator-garbage that can
+    // sporadically be inf/NaN and corrupt expert weights at step 1.
+    auto dL_do_pool = torch::zeros({TK_padded, hidden}, dL_dy.options());
 
     // Per-tile signal arrays. Both zero-init: bwd_dispatch_arrival_count
     // accumulates Pass 2 atomic-adds; bwd_y_ready holds the per-tile release

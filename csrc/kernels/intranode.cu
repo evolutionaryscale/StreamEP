@@ -20,7 +20,7 @@ constexpr int kReceiverChunkSize = 32;
 // lane 0 walks unrolled; topk and ranks both index lane masks (uint32 dst_mask
 // in the metadata kernel, lane-as-rank patterns in the dispatch / combine
 // kernels). Increase only if the kernel logic is widened correspondingly.
-constexpr int kMaxLocalExpertsPerRank = 32;
+constexpr int kMaxLocalExpertsPerRank = 64;
 constexpr int kMaxTopK = 32;
 constexpr int kMaxRanks = 32;
 
@@ -320,6 +320,10 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int expert_alignment,
                                  cudaStream_t stream) {
 #define STREAMING_DISPATCH_METADATA_LAUNCH_CASE(ranks)                                       \
+    EP_HOST_ASSERT(cudaFuncSetAttribute(                                                     \
+                       streaming_dispatch_metadata_kernel<ranks>,                            \
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,                          \
+                       smem_bytes) == cudaSuccess);                                          \
     LAUNCH_KERNEL(&cfg,                                                                      \
                   streaming_dispatch_metadata_kernel<ranks>,                                 \
                   topk_idx,                                                                  \
@@ -348,6 +352,10 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
 
     SETUP_LAUNCH_CONFIG(1, 256, stream);
     // SMEM: phase-3 histograms dominate (kNumRanks × num_channels × (E + 1) ints).
+    // At production E=384, R=8, num_sms=80 this is ~62KB — above H100's default
+    // 48KB dynamic-SMEM cap, so we must opt up via cudaFuncSetAttribute before
+    // the launch (otherwise the launch fails with the misleading
+    // cudaErrorCooperativeLaunchTooLarge: "too many blocks in cooperative launch").
     int smem_bytes = num_ranks * num_channels * (num_experts_per_rank + 1) * sizeof(int);
     cfg.dynamicSmemBytes = smem_bytes;
     SWITCH_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
