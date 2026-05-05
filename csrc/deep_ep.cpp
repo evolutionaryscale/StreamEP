@@ -123,7 +123,7 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
 }
 }  // namespace shared_memory
 
-namespace deep_ep {
+namespace stream_ep {
 
 Buffer::Buffer(int rank,
                int num_ranks,
@@ -1550,70 +1550,70 @@ bool is_sm90_compiled() {
 #endif
 }
 
-}  // namespace deep_ep
+}  // namespace stream_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "DeepEP: an efficient expert-parallel communication library";
+    m.doc() = "StreamEP: streaming-tile expert-parallel dispatch / combine (fork of DeepEP)";
 
-    pybind11::class_<deep_ep::Config>(m, "Config")
+    pybind11::class_<stream_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(),
              py::arg("num_sms") = 20,
              py::arg("num_max_nvl_chunked_send_tokens") = 6,
              py::arg("num_max_nvl_chunked_recv_tokens") = 256,
              py::arg("num_max_rdma_chunked_send_tokens") = 6,
              py::arg("num_max_rdma_chunked_recv_tokens") = 256)
-        .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
-        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
+        .def("get_nvl_buffer_size_hint", &stream_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_rdma_buffer_size_hint", &stream_ep::Config::get_rdma_buffer_size_hint);
 
-    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
+    pybind11::class_<stream_ep::EventHandle>(m, "EventHandle")
         .def(pybind11::init<>())
-        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
-        .def("wait", &deep_ep::EventHandle::wait);
+        .def("current_stream_wait", &stream_ep::EventHandle::current_stream_wait)
+        .def("wait", &stream_ep::EventHandle::wait);
 
-    pybind11::class_<deep_ep::StreamingDispatchOutputs>(m, "StreamingDispatchOutputs")
-        .def_readonly("pool",                       &deep_ep::StreamingDispatchOutputs::pool)
-        .def_readonly("pool_topk_weight",           &deep_ep::StreamingDispatchOutputs::pool_topk_weight)
-        .def_readonly("pool_recv_token",            &deep_ep::StreamingDispatchOutputs::pool_recv_token)
-        .def_readonly("pool_k_slot",                &deep_ep::StreamingDispatchOutputs::pool_k_slot)
-        .def_readonly("send_head",                  &deep_ep::StreamingDispatchOutputs::send_head)
-        .def_readonly("rank_prefix_matrix",         &deep_ep::StreamingDispatchOutputs::rank_prefix_matrix)
-        .def_readonly("channel_prefix_matrix",      &deep_ep::StreamingDispatchOutputs::channel_prefix_matrix)
-        .def_readonly("recv_channel_prefix_matrix", &deep_ep::StreamingDispatchOutputs::recv_channel_prefix_matrix)
-        .def_readonly("expert_frequency",           &deep_ep::StreamingDispatchOutputs::expert_frequency)
-        .def_readonly("expert_pool_block_offset",   &deep_ep::StreamingDispatchOutputs::expert_pool_block_offset)
-        .def_readonly("base_pool",                  &deep_ep::StreamingDispatchOutputs::base_pool)
-        .def_readonly("seen_per_substream",         &deep_ep::StreamingDispatchOutputs::seen_per_substream)
-        .def_readonly("tile_id_to_expert",          &deep_ep::StreamingDispatchOutputs::tile_id_to_expert)
-        .def_readonly("pool_arrival_target",        &deep_ep::StreamingDispatchOutputs::pool_arrival_target)
-        .def_readonly("tile_ready",                 &deep_ep::StreamingDispatchOutputs::tile_ready)
-        .def_readonly("a_ready",                    &deep_ep::StreamingDispatchOutputs::a_ready)
-        .def_readonly("per_token_remaining",        &deep_ep::StreamingDispatchOutputs::per_token_remaining)
-        .def_readonly("compute_done_per_token",     &deep_ep::StreamingDispatchOutputs::compute_done_per_token)
-        .def_readonly("o",                          &deep_ep::StreamingDispatchOutputs::o)
-        .def_readonly("recv_token_to_slots",        &deep_ep::StreamingDispatchOutputs::recv_token_to_slots)
-        .def_readonly("k_local_count",              &deep_ep::StreamingDispatchOutputs::k_local_count)
-        .def_readonly("total_tiles",                &deep_ep::StreamingDispatchOutputs::total_tiles)
-        .def_readonly("metadata_done_event",        &deep_ep::StreamingDispatchOutputs::metadata_done_event);
+    pybind11::class_<stream_ep::StreamingDispatchOutputs>(m, "StreamingDispatchOutputs")
+        .def_readonly("pool",                       &stream_ep::StreamingDispatchOutputs::pool)
+        .def_readonly("pool_topk_weight",           &stream_ep::StreamingDispatchOutputs::pool_topk_weight)
+        .def_readonly("pool_recv_token",            &stream_ep::StreamingDispatchOutputs::pool_recv_token)
+        .def_readonly("pool_k_slot",                &stream_ep::StreamingDispatchOutputs::pool_k_slot)
+        .def_readonly("send_head",                  &stream_ep::StreamingDispatchOutputs::send_head)
+        .def_readonly("rank_prefix_matrix",         &stream_ep::StreamingDispatchOutputs::rank_prefix_matrix)
+        .def_readonly("channel_prefix_matrix",      &stream_ep::StreamingDispatchOutputs::channel_prefix_matrix)
+        .def_readonly("recv_channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::recv_channel_prefix_matrix)
+        .def_readonly("expert_frequency",           &stream_ep::StreamingDispatchOutputs::expert_frequency)
+        .def_readonly("expert_pool_block_offset",   &stream_ep::StreamingDispatchOutputs::expert_pool_block_offset)
+        .def_readonly("base_pool",                  &stream_ep::StreamingDispatchOutputs::base_pool)
+        .def_readonly("seen_per_substream",         &stream_ep::StreamingDispatchOutputs::seen_per_substream)
+        .def_readonly("tile_id_to_expert",          &stream_ep::StreamingDispatchOutputs::tile_id_to_expert)
+        .def_readonly("pool_arrival_target",        &stream_ep::StreamingDispatchOutputs::pool_arrival_target)
+        .def_readonly("tile_ready",                 &stream_ep::StreamingDispatchOutputs::tile_ready)
+        .def_readonly("a_ready",                    &stream_ep::StreamingDispatchOutputs::a_ready)
+        .def_readonly("per_token_remaining",        &stream_ep::StreamingDispatchOutputs::per_token_remaining)
+        .def_readonly("compute_done_per_token",     &stream_ep::StreamingDispatchOutputs::compute_done_per_token)
+        .def_readonly("o",                          &stream_ep::StreamingDispatchOutputs::o)
+        .def_readonly("recv_token_to_slots",        &stream_ep::StreamingDispatchOutputs::recv_token_to_slots)
+        .def_readonly("k_local_count",              &stream_ep::StreamingDispatchOutputs::k_local_count)
+        .def_readonly("total_tiles",                &stream_ep::StreamingDispatchOutputs::total_tiles)
+        .def_readonly("metadata_done_event",        &stream_ep::StreamingDispatchOutputs::metadata_done_event);
 
-    pybind11::class_<deep_ep::Buffer>(m, "Buffer")
+    pybind11::class_<stream_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
-        .def("is_available", &deep_ep::Buffer::is_available)
-        .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
-        .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
-        .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
-        .def("get_local_device_id", &deep_ep::Buffer::get_local_device_id)
-        .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
-        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
-        .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
-        .def("sync", &deep_ep::Buffer::sync)
-        .def("destroy", &deep_ep::Buffer::destroy)
-        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
-        .def("intranode_dispatch_grads", &deep_ep::Buffer::intranode_dispatch_grads)
-        .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
-        .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
-        .def("internode_combine", &deep_ep::Buffer::internode_combine);
+        .def("is_available", &stream_ep::Buffer::is_available)
+        .def("get_num_rdma_ranks", &stream_ep::Buffer::get_num_rdma_ranks)
+        .def("get_rdma_rank", &stream_ep::Buffer::get_rdma_rank)
+        .def("get_root_rdma_rank", &stream_ep::Buffer::get_root_rdma_rank)
+        .def("get_local_device_id", &stream_ep::Buffer::get_local_device_id)
+        .def("get_local_ipc_handle", &stream_ep::Buffer::get_local_ipc_handle)
+        .def("get_local_nvshmem_unique_id", &stream_ep::Buffer::get_local_nvshmem_unique_id)
+        .def("get_local_buffer_tensor", &stream_ep::Buffer::get_local_buffer_tensor)
+        .def("sync", &stream_ep::Buffer::sync)
+        .def("destroy", &stream_ep::Buffer::destroy)
+        .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
+        .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
+        .def("intranode_combine", &stream_ep::Buffer::intranode_combine)
+        .def("internode_dispatch", &stream_ep::Buffer::internode_dispatch)
+        .def("internode_combine", &stream_ep::Buffer::internode_combine);
 
-    m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
+    m.def("is_sm90_compiled", stream_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =
-        py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
+        py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<stream_ep::topk_idx_t>::value));
 }

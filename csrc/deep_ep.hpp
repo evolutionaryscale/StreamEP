@@ -49,7 +49,7 @@ private:
 };
 }  // namespace shared_memory
 
-namespace deep_ep {
+namespace stream_ep {
 
 // All outputs of `Buffer::intranode_dispatch`. Bound to Python via pybind11
 // with attribute access (see PYBIND11_MODULE in deep_ep.cpp); the Python-side
@@ -320,4 +320,4 @@ public:
 
 };
 
-}  // namespace deep_ep
+}  // namespace stream_ep

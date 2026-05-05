@@ -27,7 +27,7 @@
         }                                                                                                                             \
     }
 
-namespace deep_ep {
+namespace stream_ep {
 
 template <int kBytes>
 struct VecInt {};
@@ -647,4 +647,4 @@ __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
 }
 
-}  // namespace deep_ep
+}  // namespace stream_ep

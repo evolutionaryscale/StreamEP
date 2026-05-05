@@ -11,7 +11,7 @@
 #include "nvshmem.h"
 #endif
 
-namespace deep_ep {
+namespace stream_ep {
 
 namespace intranode {
 
@@ -94,4 +94,4 @@ void finalize() {
 
 }  // namespace internode
 
-}  // namespace deep_ep
+}  // namespace stream_ep

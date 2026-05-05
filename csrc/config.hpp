@@ -3,7 +3,7 @@
 #include "kernels/api.cuh"
 #include "kernels/exception.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 template <typename dtype_t>
 dtype_t ceil_div(dtype_t a, dtype_t b) {
@@ -104,4 +104,4 @@ struct Config {
     }
 };
 
-}  // namespace deep_ep
+}  // namespace stream_ep

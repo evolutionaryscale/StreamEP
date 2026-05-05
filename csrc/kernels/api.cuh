@@ -4,7 +4,7 @@
 
 #include "configs.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 // Intranode runtime
 namespace intranode {
@@ -332,4 +332,4 @@ void combine(cudaDataType_t type,
 
 }  // namespace internode
 
-}  // namespace deep_ep
+}  // namespace stream_ep

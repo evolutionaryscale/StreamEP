@@ -8,7 +8,7 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 namespace internode {
 
@@ -2308,4 +2308,4 @@ void combine(cudaDataType_t type,
 
 }  // namespace internode
 
-}  // namespace deep_ep
+}  // namespace stream_ep

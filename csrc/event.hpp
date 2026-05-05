@@ -4,7 +4,7 @@
 
 #include "kernels/exception.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 struct EventHandle {
     std::shared_ptr<torch::Event> event;
@@ -34,4 +34,4 @@ struct EventHandle {
     }
 };
 
-}  // namespace deep_ep
+}  // namespace stream_ep

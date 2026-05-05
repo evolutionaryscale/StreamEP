@@ -5,7 +5,7 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 namespace intranode {
 
@@ -1687,4 +1687,4 @@ void launch_combine_main(cudaDataType_t type,
 
 }  // namespace intranode
 
-}  // namespace deep_ep
+}  // namespace stream_ep
