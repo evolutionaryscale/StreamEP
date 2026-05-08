@@ -36,6 +36,15 @@ def init_dist(local_rank: int, num_local_ranks: int):
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 
+def cleanup_dist():
+    # Sync all ranks then tear down so the TCPStore client closes in lockstep.
+    # Without the barrier, rank 0 exits first and the others' heartbeat monitor
+    # logs a (harmless but loud) "recvBytes ... Connection was likely closed".
+    if dist.is_initialized():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+        dist.destroy_process_group()
+
+
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double() + 1, y.double() + 1
     denominator = (x * x + y * y).sum()

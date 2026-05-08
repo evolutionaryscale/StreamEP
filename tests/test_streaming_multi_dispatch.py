@@ -22,6 +22,7 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
+from utils import cleanup_dist
 
 
 def make_inputs(num_tokens, hidden, num_topk, num_experts, num_ranks, rank, device, seed):
@@ -175,6 +176,8 @@ def main():
 
     if rank == 0:
         print(f"PASS: all {len(seeds)} multi-dispatch validations on rank 0 (world={world_size})")
+
+    cleanup_dist()
 
 
 if __name__ == "__main__":

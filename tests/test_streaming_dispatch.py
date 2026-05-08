@@ -22,6 +22,7 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
+from utils import cleanup_dist
 
 
 def make_inputs(num_tokens, hidden, num_topk, num_experts, num_ranks, rank, device):
@@ -267,6 +268,8 @@ def main():
     if rank == 0:
         print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} "
               f"TK_padded={TK_padded} total_tiles={total_tiles}")
+
+    cleanup_dist()
 
 
 if __name__ == "__main__":
