@@ -893,6 +893,163 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     };
 }
 
+// Test-only wrapper for `internode::streaming_dispatch_metadata`. Drives
+// just the metadata kernel + host poll, returns every output as a tensor.
+// See `tests/test_streaming_metadata_internode.py` for the eager reference.
+StreamingMetadataTestOutputs Buffer::streaming_metadata_test(
+    const torch::Tensor& topk_idx,
+    int num_experts,
+    int expert_alignment,
+    int tile_m,
+    const Config& config) {
+#ifndef DISABLE_NVSHMEM
+    pybind11::gil_scoped_release release;
+
+    EP_HOST_ASSERT(num_rdma_ranks > 1 and "streaming_metadata_test requires multi-RDMA-rank world");
+    EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(config.num_sms % 2 == 0);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int num_tokens = static_cast<int>(topk_idx.size(0));
+    int num_topk = static_cast<int>(topk_idx.size(1));
+    int num_local_experts = num_experts / num_ranks;
+    int num_rdma_experts = num_experts / num_rdma_ranks;
+    int num_channels = config.num_sms / 2;
+
+    auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
+
+    // Output tensors at known shapes.
+    auto rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, i32_opts);
+    auto recv_rdma_rank_prefix_sum  = torch::empty({num_rdma_ranks},                i32_opts);
+    auto gbl_channel_prefix_matrix  = torch::empty({num_ranks, num_channels},       i32_opts);
+    auto recv_gbl_rank_prefix_sum   = torch::empty({num_ranks},                     i32_opts);
+    auto expert_frequency           = torch::empty({num_local_experts},             i32_opts);
+    auto expert_pool_block_offset   = torch::empty({num_local_experts + 1},         i32_opts);
+    auto base_pool                  = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
+    auto seen_per_substream         = torch::empty({num_channels, num_ranks, num_local_experts}, i32_opts);
+    auto rank_prefix_matrix         = torch::zeros({num_ranks, num_ranks},          i32_opts);
+
+    // Tile arrays at upper bound; narrow post-poll.
+    int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
+    auto tile_id_to_expert   = torch::empty({total_tiles_max}, i32_opts);
+    auto pool_arrival_target = torch::empty({total_tiles_max}, i32_opts);
+    auto total_tiles_device  = torch::empty({1},               i32_opts);
+
+    // Reset host-mapped sync slots — kernel writes block on these being -1.
+    *moe_recv_counter = -1;
+    *moe_recv_rdma_counter = -1;
+    *streaming_total_tiles = -1;
+    for (int i = 0; i < num_local_experts; ++i)
+        moe_recv_expert_counter[i] = -1;
+
+    // Streaming SymBuffer offset within rdma_buffer_ptr, post notify_dispatch's
+    // count payload (which would occupy the leading bytes of rdma_buffer_ptr
+    // when notify_dispatch is invoked from the same buffer; here it's not, but
+    // we keep the offset stable so the kernel's SymBuffer math is consistent).
+    int64_t streaming_rdma_offset =
+        2 * static_cast<int64_t>(num_rdma_ranks) *
+        (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int);
+
+    // Cleanup args: kernel asserts metadata payloads fit before clean offset;
+    // pass past-end and skip cleanup (no dispatch_main following this test).
+    int64_t streaming_rdma_total =
+        2 * static_cast<int64_t>(num_rdma_ranks) * num_channels *
+        NUM_MAX_NVL_PEERS * num_local_experts * sizeof(int);
+    int rdma_clean_offset =
+        static_cast<int>((streaming_rdma_offset + streaming_rdma_total) / sizeof(int));
+    int rdma_num_int_clean = 0;
+    int kNvlSlotInts = num_rdma_ranks * num_channels * num_local_experts;
+    int nvl_clean_offset = num_rdma_experts +
+        (num_rdma_ranks + num_local_experts + kNvlSlotInts) * NUM_MAX_NVL_PEERS;
+    int nvl_num_int_clean = 0;
+
+    EP_HOST_ASSERT(streaming_rdma_offset + streaming_rdma_total <= num_rdma_bytes);
+
+    // hidden_int4 unused inside the metadata kernel; placeholder.
+    int hidden_int4 = 1;
+
+    internode::streaming_dispatch_metadata(
+        topk_idx.data_ptr<topk_idx_t>(),
+        moe_recv_counter_mapped,
+        moe_recv_rdma_counter_mapped,
+        moe_recv_expert_counter_mapped,
+        streaming_total_tiles_mapped,
+        rdma_channel_prefix_matrix.data_ptr<int>(),
+        recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        gbl_channel_prefix_matrix.data_ptr<int>(),
+        recv_gbl_rank_prefix_sum.data_ptr<int>(),
+        expert_frequency.data_ptr<int>(),
+        expert_pool_block_offset.data_ptr<int>(),
+        base_pool.data_ptr<int>(),
+        seen_per_substream.data_ptr<int>(),
+        rank_prefix_matrix.data_ptr<int>(),
+        tile_id_to_expert.data_ptr<int>(),
+        pool_arrival_target.data_ptr<int>(),
+        total_tiles_device.data_ptr<int>(),
+        num_tokens, num_topk, num_experts, num_channels,
+        hidden_int4, expert_alignment, tile_m,
+        rdma_clean_offset, rdma_num_int_clean,
+        nvl_clean_offset, nvl_num_int_clean,
+        streaming_rdma_offset,
+        rdma_buffer_ptr,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        rank,
+        num_ranks,
+        stream,
+        num_rdma_bytes, num_nvl_bytes);
+
+    // Host-poll all four host-mapped counters.
+    int recv = -1, recv_rdma = -1, total_tiles = -1;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    while (true) {
+        recv        = static_cast<int>(*moe_recv_counter);
+        recv_rdma   = static_cast<int>(*moe_recv_rdma_counter);
+        total_tiles = static_cast<int>(*streaming_total_tiles);
+        bool ready = (recv >= 0) and (recv_rdma >= 0) and (total_tiles >= 0);
+        for (int i = 0; i < num_local_experts and ready; ++i)
+            ready &= moe_recv_expert_counter[i] >= 0;
+        if (ready) break;
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::high_resolution_clock::now() - t0).count() > NUM_CPU_TIMEOUT_SECS)
+            throw std::runtime_error("DeepEP error: streaming_metadata_test CPU timeout");
+    }
+
+    // Snapshot moe_recv_expert_counter into a torch tensor.
+    auto num_recv_per_expert = torch::empty({num_local_experts},
+                                             dtype(torch::kInt32).device(torch::kCPU));
+    auto* per_expert_ptr = num_recv_per_expert.data_ptr<int>();
+    for (int i = 0; i < num_local_experts; ++i)
+        per_expert_ptr[i] = moe_recv_expert_counter[i];
+
+    auto tile_id_to_expert_n   = tile_id_to_expert.narrow(0, 0, total_tiles);
+    auto pool_arrival_target_n = pool_arrival_target.narrow(0, 0, total_tiles);
+
+    return StreamingMetadataTestOutputs{
+        .expert_frequency           = expert_frequency,
+        .expert_pool_block_offset   = expert_pool_block_offset,
+        .base_pool                  = base_pool,
+        .seen_per_substream         = seen_per_substream,
+        .rank_prefix_matrix         = rank_prefix_matrix,
+        .tile_id_to_expert          = tile_id_to_expert_n,
+        .pool_arrival_target        = pool_arrival_target_n,
+        .rdma_channel_prefix_matrix = rdma_channel_prefix_matrix,
+        .gbl_channel_prefix_matrix  = gbl_channel_prefix_matrix,
+        .recv_rdma_rank_prefix_sum  = recv_rdma_rank_prefix_sum,
+        .recv_gbl_rank_prefix_sum   = recv_gbl_rank_prefix_sum,
+        .num_recv_per_expert        = num_recv_per_expert,
+        .num_recv                   = recv,
+        .num_recv_rdma              = recv_rdma,
+        .total_tiles                = total_tiles,
+    };
+#else
+    EP_HOST_ASSERT(false and "streaming_metadata_test requires NVSHMEM");
+    return {};
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     const torch::Tensor& dL_dy,
     const torch::Tensor& is_token_in_rank,
@@ -1595,6 +1752,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("total_tiles",                &stream_ep::StreamingDispatchOutputs::total_tiles)
         .def_readonly("metadata_done_event",        &stream_ep::StreamingDispatchOutputs::metadata_done_event);
 
+    pybind11::class_<stream_ep::StreamingMetadataTestOutputs>(m, "StreamingMetadataTestOutputs")
+        .def_readonly("expert_frequency",           &stream_ep::StreamingMetadataTestOutputs::expert_frequency)
+        .def_readonly("expert_pool_block_offset",   &stream_ep::StreamingMetadataTestOutputs::expert_pool_block_offset)
+        .def_readonly("base_pool",                  &stream_ep::StreamingMetadataTestOutputs::base_pool)
+        .def_readonly("seen_per_substream",         &stream_ep::StreamingMetadataTestOutputs::seen_per_substream)
+        .def_readonly("rank_prefix_matrix",         &stream_ep::StreamingMetadataTestOutputs::rank_prefix_matrix)
+        .def_readonly("tile_id_to_expert",          &stream_ep::StreamingMetadataTestOutputs::tile_id_to_expert)
+        .def_readonly("pool_arrival_target",        &stream_ep::StreamingMetadataTestOutputs::pool_arrival_target)
+        .def_readonly("rdma_channel_prefix_matrix", &stream_ep::StreamingMetadataTestOutputs::rdma_channel_prefix_matrix)
+        .def_readonly("gbl_channel_prefix_matrix",  &stream_ep::StreamingMetadataTestOutputs::gbl_channel_prefix_matrix)
+        .def_readonly("recv_rdma_rank_prefix_sum",  &stream_ep::StreamingMetadataTestOutputs::recv_rdma_rank_prefix_sum)
+        .def_readonly("recv_gbl_rank_prefix_sum",   &stream_ep::StreamingMetadataTestOutputs::recv_gbl_rank_prefix_sum)
+        .def_readonly("num_recv_per_expert",        &stream_ep::StreamingMetadataTestOutputs::num_recv_per_expert)
+        .def_readonly("num_recv",                   &stream_ep::StreamingMetadataTestOutputs::num_recv)
+        .def_readonly("num_recv_rdma",              &stream_ep::StreamingMetadataTestOutputs::num_recv_rdma)
+        .def_readonly("total_tiles",                &stream_ep::StreamingMetadataTestOutputs::total_tiles);
+
     pybind11::class_<stream_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
         .def("is_available", &stream_ep::Buffer::is_available)
@@ -1607,6 +1781,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_buffer_tensor", &stream_ep::Buffer::get_local_buffer_tensor)
         .def("sync", &stream_ep::Buffer::sync)
         .def("destroy", &stream_ep::Buffer::destroy)
+        .def("streaming_metadata_test", &stream_ep::Buffer::streaming_metadata_test)
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)

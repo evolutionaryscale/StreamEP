@@ -72,6 +72,36 @@ namespace stream_ep {
 //   k_local_count            backward-pass scaffolding written by fwd Pass B
 //                            (dispatch_grads receiver gathers slots; bwd setup
 //                            memcpy's k_local_count into bwd_per_token_remaining).
+// Test-harness outputs for `internode::streaming_dispatch_metadata`. Surface
+// every metadata-kernel output as a torch tensor so the python-side test can
+// assert against an eager reference. NOT a production-path return type — the
+// real internode dispatch path (when it lands) returns `StreamingDispatchOutputs`
+// like intranode does.
+struct StreamingMetadataTestOutputs {
+    // Streaming-superset tensors (kernel outputs).
+    torch::Tensor expert_frequency;          // [E_local]
+    torch::Tensor expert_pool_block_offset;  // [E_local + 1]
+    torch::Tensor base_pool;                 // [num_channels, num_world_ranks, E_local]
+    torch::Tensor seen_per_substream;        // [num_channels, num_world_ranks, E_local]
+    torch::Tensor rank_prefix_matrix;        // [num_world_ranks, num_world_ranks]
+    torch::Tensor tile_id_to_expert;         // [total_tiles]
+    torch::Tensor pool_arrival_target;       // [total_tiles]
+
+    // Channel prefix matrices (sender-side cumulative).
+    torch::Tensor rdma_channel_prefix_matrix;  // [num_rdma_ranks, num_channels]
+    torch::Tensor gbl_channel_prefix_matrix;   // [num_world_ranks, num_channels]
+    torch::Tensor recv_rdma_rank_prefix_sum;   // [num_rdma_ranks]
+    torch::Tensor recv_gbl_rank_prefix_sum;    // [num_world_ranks]
+
+    // Per-expert aligned recv counts (host-mapped, copied to a tensor here).
+    torch::Tensor num_recv_per_expert;       // [E_local]
+
+    // Host-mapped scalar counters.
+    int num_recv;
+    int num_recv_rdma;
+    int total_tiles;
+};
+
 struct StreamingDispatchOutputs {
     torch::Tensor pool;
     torch::Tensor pool_topk_weight;
@@ -206,6 +236,23 @@ public:
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
     void destroy();
+
+    // Drives `internode::streaming_dispatch_metadata` directly and returns
+    // every metadata-kernel output as a torch tensor. Test-only wrapper —
+    // exists so `tests/test_streaming_metadata_internode.py` can assert
+    // against an eager reference without the dispatch_main kernel rewrite
+    // landing first. Removed when streaming-internode dispatch lands and
+    // the metadata kernel becomes reachable through the standard
+    // `Buffer.dispatch` path. See deep_ep.cpp for the full launch sequence.
+    //
+    // Streams: kernel + tensor allocations run on
+    // `at::cuda::getCurrentCUDAStream()` — caller-managed.
+    StreamingMetadataTestOutputs streaming_metadata_test(
+        const torch::Tensor& topk_idx,
+        int num_experts,
+        int expert_alignment,
+        int tile_m,
+        const Config& config);
 
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
     // + one host sync per call: a fused metadata kernel (cross-rank count

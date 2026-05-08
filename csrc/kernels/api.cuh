@@ -218,6 +218,86 @@ namespace internode {
 
 int get_source_meta_bytes();
 
+// Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
+// Folded single-kernel architecture mirroring `intranode::streaming_dispatch_metadata`'s
+// shape phase-for-phase, with NVL primitives replaced by RDMA equivalents
+// where the topology demands it. Absorbs `notify_dispatch`'s count exchange
+// + channel prefix matrices + host-mapped recv counters, then runs the
+// streaming-superset phases at the end of the same launch.
+//
+// Outputs (per-rank, on the dispatch stream):
+//   - rdma_channel_prefix_matrix[num_rdma_ranks, num_channels]
+//   - gbl_channel_prefix_matrix[num_world_ranks, num_channels]
+//   - recv_rdma_rank_prefix_sum[num_rdma_ranks]
+//   - recv_gbl_rank_prefix_sum[num_world_ranks]
+//   - moe_recv_counter / moe_recv_rdma_counter / moe_recv_expert_counter[E_local]
+//     (host-mapped — drive the host poll for `pool[T_recv, hidden]` allocation)
+//   - streaming_total_tiles (host-mapped)
+//   - expert_frequency[E_local]
+//   - expert_pool_block_offset[E_local + 1]   (tile-unit prefix sum)
+//   - base_pool[num_channels, num_world_ranks, E_local]
+//   - seen_per_substream[num_channels, num_world_ranks, E_local]
+//   - rank_prefix_matrix[num_world_ranks, num_world_ranks] (this rank's column)
+//   - tile_id_to_expert[total_tiles_max]   (caller narrows post-poll)
+//   - pool_arrival_target[total_tiles_max] (caller narrows post-poll)
+//   - total_tiles_device[1]
+//
+// RDMA-payload layout for the streaming-superset histogram exchange (new
+// SymBuffer alongside notify_dispatch's count payload):
+//   per (src_world_rank → dst_rdma_rank) slab, contiguous as
+//     [num_channels][NUM_MAX_NVL_PEERS][E_local] int32
+//   Size per slab: num_channels * NUM_MAX_NVL_PEERS * E_local * 4 bytes.
+//   RDMA pairs same-NVL-slot ranks (dst rank == (dst_rdma, src_nvl)), so
+//   the dst rank's recv buffer holds one slab per (src_rdma, src_nvl=this_rank's_nvl)
+//   pair — the src_nvl axis is filled by the NVL aggregation phase that
+//   follows (each NVL rank within dst_rdma extracts its `dst_nvl` slice
+//   from the RDMA-received slabs and writes it to its 7 NVL peers).
+void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
+                                 // Counters (host-mapped, written)
+                                 int* moe_recv_counter_mapped,
+                                 int* moe_recv_rdma_counter_mapped,
+                                 int* moe_recv_expert_counter_mapped,
+                                 int* streaming_total_tiles_mapped,
+                                 // Channel prefix matrices (kept from notify_dispatch)
+                                 int* rdma_channel_prefix_matrix,
+                                 int* recv_rdma_rank_prefix_sum,
+                                 int* gbl_channel_prefix_matrix,
+                                 int* recv_gbl_rank_prefix_sum,
+                                 // Streaming-superset outputs
+                                 int* expert_frequency,
+                                 int* expert_pool_block_offset,
+                                 int* base_pool,
+                                 int* seen_per_substream,
+                                 int* rank_prefix_matrix,
+                                 int* tile_id_to_expert,
+                                 int* pool_arrival_target,
+                                 int* total_tiles_device,
+                                 // Shape
+                                 int num_tokens,
+                                 int num_topk,
+                                 int num_experts,
+                                 int num_channels,
+                                 int hidden_int4,
+                                 int expert_alignment,
+                                 int tile_m,
+                                 // Cleanup (mirrors notify_dispatch's args)
+                                 int rdma_clean_offset,
+                                 int rdma_num_int_clean,
+                                 int nvl_clean_offset,
+                                 int nvl_num_int_clean,
+                                 // Streaming SymBuffer offset within rdma_buffer_ptr
+                                 // (placed AFTER notify_dispatch's existing payload).
+                                 int64_t streaming_rdma_offset,
+                                 // Env
+                                 void* rdma_buffer_ptr,
+                                 void** buffer_ptrs,
+                                 int** barrier_signal_ptrs,
+                                 int rank,
+                                 int num_ranks,
+                                 cudaStream_t stream,
+                                 int64_t num_rdma_bytes,
+                                 int64_t num_nvl_bytes);
+
 void notify_dispatch(const int* num_tokens_per_rank,
                      int* moe_recv_counter_mapped,
                      int num_ranks,

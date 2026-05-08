@@ -428,6 +428,632 @@ void notify_dispatch(const int* num_tokens_per_rank,
 #undef NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
+//
+// Folded single-kernel architecture mirroring `intranode::streaming_dispatch_metadata`'s
+// shape phase-for-phase. Absorbs `notify_dispatch`'s count-exchange + channel
+// prefix matrix logic and adds the streaming-superset phases that emit the
+// pool-shape outputs the dispatch hot path consumes (everything sized by
+// E_local / num_world_ranks / num_channels / total_tiles, all known before
+// the host poll on `pool[T_recv, hidden]`).
+//
+// Block layout: (1 + kNumRDMARanks, kNumThreads):
+//   - Block 0: NVSHMEM cleanup + cross-rank handshake, local histograms from
+//     topk_idx, RDMA put + NVL peer writes, cross-rank barrier, derive
+//     metadata + write host-mapped counters + channel matrices, then the
+//     streaming-superset phases (build seen_per_substream / base_pool /
+//     expert_frequency / expert_pool_block_offset / rank_prefix_matrix /
+//     tile_id_to_expert / pool_arrival_target / streaming_total_tiles).
+//   - Blocks 1..kNumRDMARanks: per-(dst_rdma_rank) channel prefix matrix
+//     calculation, derives is_token_in_rank locally from topk_idx (same
+//     shape as notify_dispatch's blocks 1+ but sourced from topk_idx now
+//     that get_dispatch_layout has been deleted).
+//
+// Streaming SymBuffer layout (per (src_world → dst_rdma) slab):
+//     int32[num_channels][NUM_MAX_NVL_PEERS][E_local]
+//   RDMA pairs same-NVL-slot ranks (dst rank == (dst_rdma, src_nvl)), so
+//   each receiver's recv buffer holds one slab per (src_rdma, src_nvl=this_rank's_nvl).
+//   The src_nvl axis is filled by the NVL-aggregation phase that follows
+//   (each NVL rank within dst_rdma extracts its `dst_nvl` slice from the
+//   RDMA-received slabs and propagates to its 7 NVL peers via direct
+//   buffer_ptrs writes — same NVL-aggregation pattern notify_dispatch uses
+//   for its count payload).
+template <bool kLowLatencyMode, int kNumRDMARanks>
+__global__ void streaming_dispatch_metadata_kernel(
+        const topk_idx_t* topk_idx,
+        // Counters (host-mapped, written)
+        int* moe_recv_counter_mapped,
+        int* moe_recv_rdma_counter_mapped,
+        int* moe_recv_expert_counter_mapped,
+        int* streaming_total_tiles_mapped,
+        // Channel prefix matrices (sender-side cumulative)
+        int* rdma_channel_prefix_matrix,
+        int* recv_rdma_rank_prefix_sum,
+        int* gbl_channel_prefix_matrix,
+        int* recv_gbl_rank_prefix_sum,
+        // Streaming-superset outputs
+        int* expert_frequency,
+        int* expert_pool_block_offset,
+        int* base_pool,
+        int* seen_per_substream,
+        int* rank_prefix_matrix,
+        int* tile_id_to_expert,
+        int* pool_arrival_target,
+        int* total_tiles_device,
+        // Shape
+        int num_tokens,
+        int num_topk,
+        int num_experts,
+        int num_channels,
+        int expert_alignment,
+        int tile_m,
+        // Cleanup
+        int rdma_clean_offset,
+        int rdma_num_int_clean,
+        int nvl_clean_offset,
+        int nvl_num_int_clean,
+        // Streaming SymBuffer offset within rdma_buffer_ptr (post notify_dispatch's payload)
+        int64_t streaming_rdma_offset,
+        // Env
+        void* rdma_buffer_ptr,
+        void** buffer_ptrs,
+        int** barrier_signal_ptrs,
+        int rank,
+        const nvshmem_team_t rdma_team) {
+    auto sm_id = static_cast<int>(blockIdx.x);
+    auto thread_id = static_cast<int>(threadIdx.x);
+    auto warp_id = thread_id / 32;
+    auto lane_id = get_lane_id();
+    auto num_threads = static_cast<int>(blockDim.x);
+    auto num_warps = num_threads / 32;
+
+    auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
+    auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    const int num_ranks = kNumRDMARanks * NUM_MAX_NVL_PEERS;
+    const int E_local = num_experts / num_ranks;
+    const int num_rdma_experts = num_experts / kNumRDMARanks;
+    EP_DEVICE_ASSERT(E_local <= NUM_MAX_LOCAL_EXPERTS);
+
+    // Layout the streaming SymBuffer: per (src_world → dst_rdma) slab of
+    //   [num_channels][NUM_MAX_NVL_PEERS][E_local] int32.
+    const int kStreamSlabInts = num_channels * NUM_MAX_NVL_PEERS * E_local;
+    void* streaming_rdma_base = static_cast<uint8_t*>(rdma_buffer_ptr) + streaming_rdma_offset;
+    auto streaming_rdma_recv = SymBuffer<int>(streaming_rdma_base, kStreamSlabInts, kNumRDMARanks);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Blocks 1..kNumRDMARanks: per-(dst_rdma_rank) channel prefix matrix
+    // (sender-side). Computes `gbl_channel_prefix_matrix[dst_world, c]` and
+    // `rdma_channel_prefix_matrix[dst_rdma, c]` from THIS rank's topk_idx
+    // (the routing-bitmap derivation that get_dispatch_layout used to
+    // perform host-side; folded into this kernel now).
+    // ─────────────────────────────────────────────────────────────────────
+    if (sm_id != 0) {
+        int dst_rdma_rank = sm_id - 1;
+        int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
+        for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+            int t_start = channel_id * num_tokens_per_channel;
+            int t_end = min(t_start + num_tokens_per_channel, num_tokens);
+
+            int total_count = 0;
+            int per_nvl_count[NUM_MAX_NVL_PEERS] = {0};
+            for (int t = t_start + lane_id; t < t_end; t += 32) {
+                // Derive per-(dst_nvl) routing bitmap for this token by
+                // walking topk_idx and bucketing (any k → dst_world ↦ bit).
+                int per_nvl[NUM_MAX_NVL_PEERS] = {0};
+                #pragma unroll
+                for (int k = 0; k < num_topk; ++k) {
+                    int e_global = static_cast<int>(__ldg(topk_idx + static_cast<int64_t>(t) * num_topk + k));
+                    if (e_global < 0) continue;
+                    int dst_world = e_global / E_local;
+                    if (dst_world / NUM_MAX_NVL_PEERS != dst_rdma_rank) continue;
+                    int dst_nvl = dst_world - dst_rdma_rank * NUM_MAX_NVL_PEERS;
+                    per_nvl[dst_nvl] = 1;  // any-k OR
+                }
+                int any_in_rdma = 0;
+                #pragma unroll
+                for (int n = 0; n < NUM_MAX_NVL_PEERS; ++n) {
+                    per_nvl_count[n] += per_nvl[n];
+                    any_in_rdma |= per_nvl[n];
+                }
+                total_count += any_in_rdma;
+            }
+
+            total_count = warp_reduce_sum(total_count);
+            #pragma unroll
+            for (int n = 0; n < NUM_MAX_NVL_PEERS; ++n)
+                per_nvl_count[n] = warp_reduce_sum(per_nvl_count[n]);
+
+            if (elect_one_sync()) {
+                #pragma unroll
+                for (int n = 0; n < NUM_MAX_NVL_PEERS; ++n)
+                    gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + n) * num_channels + channel_id] = per_nvl_count[n];
+                rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] = total_count;
+            }
+        }
+
+        __syncthreads();
+        if (thread_id == 0) {
+            auto prefix_row = rdma_channel_prefix_matrix + dst_rdma_rank * num_channels;
+            #pragma unroll
+            for (int i = 1; i < num_channels; ++i)
+                prefix_row[i] += prefix_row[i - 1];
+        }
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Invalid number of NVL peers");
+        if (thread_id < NUM_MAX_NVL_PEERS) {
+            auto prefix_row = gbl_channel_prefix_matrix + (dst_rdma_rank * NUM_MAX_NVL_PEERS + thread_id) * num_channels;
+            #pragma unroll
+            for (int i = 1; i < num_channels; ++i)
+                prefix_row[i] += prefix_row[i - 1];
+        }
+        return;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Block 0: cross-rank exchange + counters + streaming superset.
+    // ─────────────────────────────────────────────────────────────────────
+
+    EP_DEVICE_ASSERT(num_warps > 1);
+    EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
+    EP_DEVICE_ASSERT(num_rdma_experts <= num_threads);
+    EP_DEVICE_ASSERT(NUM_MAX_NVL_PEERS <= num_threads);
+    EP_DEVICE_ASSERT(E_local <= num_threads);
+
+    // SMEM layout:
+    //   smem_streaming_hist [kNumRDMARanks * kStreamSlabInts] int32
+    //     = streaming-superset histogram per (dst_rdma, c, dst_nvl, e_local).
+    //   smem_local_per_rank        [num_ranks]      int32 (deduped per token)
+    //   smem_local_per_rdma_rank   [kNumRDMARanks]  int32 (deduped per token)
+    //   smem_local_per_expert      [num_experts]    int32 ((token, k) pairs)
+    extern __shared__ int smem_buf[];
+    int* smem_streaming_hist     = smem_buf;
+    int* smem_local_per_rank     = smem_streaming_hist + kNumRDMARanks * kStreamSlabInts;
+    int* smem_local_per_rdma     = smem_local_per_rank + num_ranks;
+    int* smem_local_per_expert   = smem_local_per_rdma + kNumRDMARanks;
+
+    // ── Phase A1: zero local histograms.
+    for (int i = thread_id; i < kNumRDMARanks * kStreamSlabInts; i += num_threads)
+        smem_streaming_hist[i] = 0;
+    for (int i = thread_id; i < num_ranks; i += num_threads)
+        smem_local_per_rank[i] = 0;
+    for (int i = thread_id; i < kNumRDMARanks; i += num_threads)
+        smem_local_per_rdma[i] = 0;
+    for (int i = thread_id; i < num_experts; i += num_threads)
+        smem_local_per_expert[i] = 0;
+    __syncthreads();
+
+    // ── Phase A2: build local histograms from topk_idx.
+    // Per (token, k): increment streaming_hist (count (token, k) pairs);
+    // dedupe per-token via uint64 register bitmask for per-rank /
+    // per-rdma-rank unique counts. Mirrors intranode metadata Phase 3.
+    int num_tokens_per_channel_var = (num_tokens + num_channels - 1) / num_channels;
+    EP_DEVICE_ASSERT(num_ranks <= 64);
+    EP_DEVICE_ASSERT(kNumRDMARanks <= 64);
+    for (int t = thread_id; t < num_tokens; t += num_threads) {
+        int channel_id = t / num_tokens_per_channel_var;
+        if (channel_id >= num_channels) channel_id = num_channels - 1;
+        uint64_t world_mask = 0, rdma_mask = 0;
+        #pragma unroll
+        for (int k = 0; k < num_topk; ++k) {
+            int e_global = static_cast<int>(__ldg(topk_idx + static_cast<int64_t>(t) * num_topk + k));
+            if (e_global < 0) continue;
+            int dst_world = e_global / E_local;
+            int dst_rdma = dst_world / NUM_MAX_NVL_PEERS;
+            int dst_nvl  = dst_world - dst_rdma * NUM_MAX_NVL_PEERS;
+            int e_local  = e_global - dst_world * E_local;
+
+            // Streaming-superset histogram: per (dst_rdma, c, dst_nvl, e_local).
+            atomicAdd(&smem_streaming_hist[((dst_rdma * num_channels + channel_id) * NUM_MAX_NVL_PEERS + dst_nvl) * E_local + e_local], 1);
+
+            // (token, k)-pair count per expert.
+            atomicAdd(&smem_local_per_expert[e_global], 1);
+
+            // Deduped per-rank / per-rdma-rank unique-token counts.
+            uint64_t world_bit = 1ULL << dst_world;
+            if (!(world_mask & world_bit)) {
+                world_mask |= world_bit;
+                atomicAdd(&smem_local_per_rank[dst_world], 1);
+            }
+            uint64_t rdma_bit = 1ULL << dst_rdma;
+            if (!(rdma_mask & rdma_bit)) {
+                rdma_mask |= rdma_bit;
+                atomicAdd(&smem_local_per_rdma[dst_rdma], 1);
+            }
+        }
+    }
+    __syncthreads();
+
+    // ── Phase A3: NVSHMEM cleanup (drain prior-iter WRs) + intra-NVL barrier.
+    {
+        auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
+        for (int i = thread_id; i < qps_per_rdma_rank * (kNumRDMARanks - 1); i += num_threads) {
+            auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % kNumRDMARanks;
+            auto qp_id = i % qps_per_rdma_rank;
+            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
+        }
+        __syncthreads();
+
+        if (thread_id == 32)
+            nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+        barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
+    }
+
+    // ── Phase A4: build + send notify_dispatch's count payload via RDMA.
+    auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
+    auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr,
+        NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
+
+    // Cleanup the inter-iter RDMA scratch region.
+    EP_DEVICE_ASSERT(rdma_recv_num_tokens_mixed.total_bytes <= rdma_clean_offset * sizeof(int));
+    #pragma unroll
+    for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
+        rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
+
+    // Build per-dst_rdma payload from SMEM histograms.
+    for (int i = thread_id; i < num_ranks; i += num_threads)
+        rdma_recv_num_tokens_mixed.send_buffer(i / NUM_MAX_NVL_PEERS)[i % NUM_MAX_NVL_PEERS] = smem_local_per_rank[i];
+    for (int i = thread_id; i < num_experts; i += num_threads)
+        rdma_recv_num_tokens_mixed.send_buffer(i / num_rdma_experts)[NUM_MAX_NVL_PEERS + i % num_rdma_experts] =
+            smem_local_per_expert[i];
+    if (thread_id < kNumRDMARanks)
+        rdma_recv_num_tokens_mixed.send_buffer(thread_id)[NUM_MAX_NVL_PEERS + num_rdma_experts] =
+            smem_local_per_rdma[thread_id];
+
+    // Build per-dst_rdma streaming slab in send_buffer (block-stride copy).
+    for (int d = 0; d < kNumRDMARanks; ++d) {
+        int* dst = streaming_rdma_recv.send_buffer(d);
+        int* src = smem_streaming_hist + d * kStreamSlabInts;
+        for (int i = thread_id; i < kStreamSlabInts; i += num_threads)
+            dst[i] = src[i];
+    }
+    __syncthreads();
+
+    // Issue RDMA puts (count payload + streaming slab) per dst_rdma_rank.
+    for (int i = warp_id; i < kNumRDMARanks; i += num_warps) {
+        if (i != rdma_rank) {
+            nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)),
+                                              reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i)),
+                                              (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
+                                              translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank),
+                                              0, lane_id, 0);
+            nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(streaming_rdma_recv.recv_buffer(rdma_rank)),
+                                              reinterpret_cast<uint64_t>(streaming_rdma_recv.send_buffer(i)),
+                                              kStreamSlabInts * sizeof(int),
+                                              translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank),
+                                              0, lane_id, 0);
+        } else {
+            UNROLLED_WARP_COPY(1, lane_id, NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
+                               rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank),
+                               rdma_recv_num_tokens_mixed.send_buffer(i),
+                               ld_volatile_global, st_na_global);
+            UNROLLED_WARP_COPY(1, lane_id, kStreamSlabInts,
+                               streaming_rdma_recv.recv_buffer(rdma_rank),
+                               streaming_rdma_recv.send_buffer(i),
+                               ld_volatile_global, st_na_global);
+        }
+    }
+    __syncthreads();
+
+    // Wait for in-flight WRs + cross-RDMA-team sync.
+    if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
+        nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
+    __syncthreads();
+    if (thread_id == 0)
+        nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+    __syncthreads();
+
+    // ── Phase A5: NVL aggregation of count payload.
+    auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr;
+    auto nvl_recv_buffer = buffer_ptrs[nvl_rank];
+    auto nvl_reduced_num_tokens_per_expert = Buffer<int>(nvl_recv_buffer, num_rdma_experts).advance_also(nvl_send_buffer);
+    auto nvl_send_num_tokens_per_rank = AsymBuffer<int>(nvl_send_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
+    auto nvl_send_num_tokens_per_expert = AsymBuffer<int>(nvl_send_buffer, E_local, NUM_MAX_NVL_PEERS);
+    auto nvl_recv_num_tokens_per_rank = AsymBuffer<int>(nvl_recv_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
+    auto nvl_recv_num_tokens_per_expert = AsymBuffer<int>(nvl_recv_buffer, E_local, NUM_MAX_NVL_PEERS);
+
+    auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
+    EP_DEVICE_ASSERT(nvl_reduced_num_tokens_per_expert.total_bytes + nvl_send_num_tokens_per_rank.total_bytes +
+                         nvl_send_num_tokens_per_expert.total_bytes <=
+                     nvl_clean_offset * sizeof(int));
+    #pragma unroll
+    for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
+        nvl_buffer_ptr_int[nvl_clean_offset + i] = 0;
+
+    // Reduce per-expert tokens received (sum over kNumRDMARanks senders).
+    if (thread_id < num_rdma_experts) {
+        int sum = 0;
+        #pragma unroll
+        for (int i = 0; i < kNumRDMARanks; ++i)
+            sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + thread_id];
+        nvl_reduced_num_tokens_per_expert[thread_id] = sum;
+    }
+    __syncthreads();
+
+    // Reduce per-RDMA-rank received tokens → moe_recv_rdma_counter + recv_rdma_rank_prefix_sum.
+    if (thread_id == 0) {
+        int sum = 0;
+        #pragma unroll
+        for (int i = 0; i < kNumRDMARanks; ++i) {
+            sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + num_rdma_experts];
+            recv_rdma_rank_prefix_sum[i] = sum;
+        }
+        while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
+            ;
+        *moe_recv_rdma_counter_mapped = sum;
+    }
+
+    // Each NVL peer (lane=peer) writes its "for me" counts into peer's NVL buffer.
+    if (thread_id < NUM_MAX_NVL_PEERS) {
+        #pragma unroll
+        for (int i = 0; i < kNumRDMARanks; ++i)
+            nvl_send_num_tokens_per_rank.buffer(nvl_rank)[i] = rdma_recv_num_tokens_mixed.recv_buffer(i)[thread_id];
+        #pragma unroll
+        for (int i = 0; i < E_local; ++i)
+            nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * E_local + i];
+    }
+    barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+
+    // Reduce → moe_recv_counter + recv_gbl_rank_prefix_sum.
+    if (thread_id == 0) {
+        int sum = 0;
+        #pragma unroll
+        for (int i = 0; i < num_ranks; ++i) {
+            int src_rdma = i / NUM_MAX_NVL_PEERS, src_nvl = i % NUM_MAX_NVL_PEERS;
+            sum += nvl_recv_num_tokens_per_rank.buffer(src_nvl)[src_rdma];
+            recv_gbl_rank_prefix_sum[i] = sum;
+        }
+        while (ld_volatile_global(moe_recv_counter_mapped) != -1)
+            ;
+        *moe_recv_counter_mapped = sum;
+    }
+
+    // Per-local-expert reductions → moe_recv_expert_counter (with alignment).
+    if (thread_id < E_local) {
+        int sum = 0;
+        #pragma unroll
+        for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+            sum += nvl_recv_num_tokens_per_expert.buffer(i)[thread_id];
+        sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
+        while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1)
+            ;
+        moe_recv_expert_counter_mapped[thread_id] = sum;
+    }
+
+    // Final NVL barrier — counters all observable.
+    if (thread_id == 32)
+        nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+    barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase B: streaming-superset.
+    //
+    // After Phase A, this rank's streaming_rdma_recv.recv_buffer(s_rdma)
+    // holds the slab from sender (s_rdma, src_nvl=this_nvl_rank), shape
+    // [num_channels][NUM_MAX_NVL_PEERS][E_local]. The dst_nvl axis spans
+    // contributions to all 8 NVL peers at this RDMA rank — only the slice
+    // dst_nvl == this rank's nvl_rank is for THIS rank.
+    //
+    // We need full per-(c, src_world, e_local) where src_world spans all
+    // num_world_ranks. The src_nvl axis is filled by an NVL exchange:
+    // each NVL rank reads its RDMA-received slabs, extracts the
+    // dst_nvl=peer's_nvl slice, and writes to peer's NVL buffer. After the
+    // exchange, each NVL rank has [s_rdma][src_nvl_in_rdma][c][e_local]
+    // contributions for itself.
+    // ─────────────────────────────────────────────────────────────────────
+
+    // ── NVL exchange: propagate the src_nvl axis among the 8 NVL peers.
+    //
+    // Layout the per-rank NVL slab: per writer (src_nvl) slot of
+    //   [kNumRDMARanks][num_channels][E_local] int32.
+    // (Mirrors notify_dispatch's nvl_send/recv pattern: writer w writes to
+    //  peer m's region at slot indexed by w; receiver reads its own region
+    //  at slot=src_nvl.)
+    const int kNvlSlotInts = kNumRDMARanks * num_channels * E_local;
+    auto nvl_streaming_send = AsymBuffer<int>(nvl_send_buffer, kNvlSlotInts, NUM_MAX_NVL_PEERS);
+    auto nvl_streaming_recv = AsymBuffer<int>(nvl_recv_buffer, kNvlSlotInts, NUM_MAX_NVL_PEERS);
+
+    EP_DEVICE_ASSERT(nvl_reduced_num_tokens_per_expert.total_bytes + nvl_send_num_tokens_per_rank.total_bytes +
+                         nvl_send_num_tokens_per_expert.total_bytes + nvl_streaming_send.total_bytes <=
+                     nvl_clean_offset * sizeof(int));
+
+    // Compute peer m's nvl_streaming region byte offset (same offset in
+    // every peer's NVL buffer, IPC peers are mirror-allocated). nvl_streaming_recv
+    // is constructed against THIS rank's NVL buffer, so the offset is
+    // recv.buffer(0) - buffer_ptrs[nvl_rank]. Same value across all threads.
+    const int64_t nvl_streaming_offset_bytes =
+        reinterpret_cast<uint8_t*>(nvl_streaming_recv.buffer(0)) -
+        reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]);
+
+    // Each warp dispatches to ONE peer m; lanes parallelize the
+    // (src_rdma, c, e) inner loop. Writer slot at peer m is indexed by
+    // this rank's nvl_rank.
+    for (int m = warp_id; m < NUM_MAX_NVL_PEERS; m += num_warps) {
+        int* peer_streaming_base = reinterpret_cast<int*>(
+            static_cast<uint8_t*>(buffer_ptrs[m]) + nvl_streaming_offset_bytes);
+        int* peer_writer_slot = peer_streaming_base + nvl_rank * kNvlSlotInts;
+        for (int idx = lane_id; idx < kNumRDMARanks * num_channels * E_local; idx += 32) {
+            int src_rdma = idx / (num_channels * E_local);
+            int rem = idx - src_rdma * (num_channels * E_local);
+            int c = rem / E_local;
+            int e = rem - c * E_local;
+            int v = ld_nc_global(streaming_rdma_recv.recv_buffer(src_rdma)
+                                 + (c * NUM_MAX_NVL_PEERS + m) * E_local + e);
+            st_na_global(peer_writer_slot + idx, v);
+        }
+    }
+    __syncthreads();
+    barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+
+    // ── Build seen_per_substream from this rank's NVL recv buffer.
+    // After exchange, this rank's nvl_streaming_recv has NUM_MAX_NVL_PEERS
+    // slots (one per writer src_nvl). Slot[w] = [src_rdma][c][e_local]
+    // contributions from sender (src_rdma, src_nvl=w) going to this rank.
+    //
+    // seen_per_substream[c, src_world, e_local] where src_world = src_rdma*8+w.
+    for (int idx = thread_id; idx < num_channels * num_ranks * E_local; idx += num_threads) {
+        int c = idx / (num_ranks * E_local);
+        int rem = idx - c * (num_ranks * E_local);
+        int src_world = rem / E_local;
+        int e = rem - src_world * E_local;
+        int src_rdma = src_world / NUM_MAX_NVL_PEERS;
+        int src_nvl = src_world - src_rdma * NUM_MAX_NVL_PEERS;
+        int* slot_w = nvl_streaming_recv.buffer(src_nvl);
+        int v = ld_volatile_global(slot_w + (src_rdma * num_channels + c) * E_local + e);
+        seen_per_substream[idx] = v;
+    }
+    __syncthreads();
+
+    // ── Phase B3: derive expert_frequency, expert_pool_block_offset,
+    // base_pool, rank_prefix_matrix, total_tiles.
+    int* smem_freq = smem_buf;                 // reuse scratch
+    int* smem_pool_blk = smem_freq + E_local;
+    // (smem_buf is already past use of streaming_hist; safe to reuse.)
+    __syncthreads();
+
+    // expert_frequency[e] = sum over (c, src_world) of seen_per_substream[c, src_world, e].
+    for (int e = thread_id; e < E_local; e += num_threads) {
+        int sum = 0;
+        for (int cs = 0; cs < num_channels * num_ranks; ++cs)
+            sum += seen_per_substream[cs * E_local + e];
+        smem_freq[e] = sum;
+        expert_frequency[e] = sum;
+    }
+    __syncthreads();
+
+    if (thread_id == 0) {
+        int cum_blocks = 0;
+        smem_pool_blk[0] = 0;
+        for (int e = 0; e < E_local; ++e) {
+            int n_blocks = (smem_freq[e] + tile_m - 1) / tile_m;
+            cum_blocks += n_blocks;
+            smem_pool_blk[e + 1] = cum_blocks;
+        }
+        *total_tiles_device = cum_blocks;
+        *streaming_total_tiles_mapped = cum_blocks;
+
+        // rank_prefix_matrix[i, rank]: cumulative unique tokens from senders 0..i.
+        // (NUM_NVL × kNumRDMARanks ranks, all in the same world view.)
+        int cum = 0;
+        for (int i = 0; i < num_ranks; ++i) {
+            cum = recv_gbl_rank_prefix_sum[i];
+            rank_prefix_matrix[i * num_ranks + rank] = cum;
+        }
+    }
+    __syncthreads();
+    for (int e = thread_id; e < E_local + 1; e += num_threads)
+        expert_pool_block_offset[e] = smem_pool_blk[e];
+
+    // base_pool[c, src_world, e] = expert_pool_block_offset[e]*tile_m
+    //   + Σ over (c', s') < (c, s) lex of seen_per_substream[c', s', e].
+    // Per-expert serial accumulator (E_local ≤ NUM_MAX_LOCAL_EXPERTS so
+    // we can run one thread per expert in parallel).
+    for (int e = thread_id; e < E_local; e += num_threads) {
+        int acc = smem_pool_blk[e] * tile_m;
+        for (int cs = 0; cs < num_channels * num_ranks; ++cs) {
+            base_pool[cs * E_local + e] = acc;
+            acc += seen_per_substream[cs * E_local + e];
+        }
+    }
+
+    // tile_id_to_expert + pool_arrival_target.
+    for (int e = thread_id; e < E_local; e += num_threads) {
+        int e_start = smem_pool_blk[e];
+        int e_end = smem_pool_blk[e + 1];
+        int n_tiles = e_end - e_start;
+        int n_e = smem_freq[e];
+        for (int t = 0; t < n_tiles; ++t) {
+            int tile_id = e_start + t;
+            tile_id_to_expert[tile_id] = e;
+            pool_arrival_target[tile_id] = (t == n_tiles - 1) ? (n_e - t * tile_m) : tile_m;
+        }
+    }
+}
+
+void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
+                                 int* moe_recv_counter_mapped,
+                                 int* moe_recv_rdma_counter_mapped,
+                                 int* moe_recv_expert_counter_mapped,
+                                 int* streaming_total_tiles_mapped,
+                                 int* rdma_channel_prefix_matrix,
+                                 int* recv_rdma_rank_prefix_sum,
+                                 int* gbl_channel_prefix_matrix,
+                                 int* recv_gbl_rank_prefix_sum,
+                                 int* expert_frequency,
+                                 int* expert_pool_block_offset,
+                                 int* base_pool,
+                                 int* seen_per_substream,
+                                 int* rank_prefix_matrix,
+                                 int* tile_id_to_expert,
+                                 int* pool_arrival_target,
+                                 int* total_tiles_device,
+                                 int num_tokens,
+                                 int num_topk,
+                                 int num_experts,
+                                 int num_channels,
+                                 int hidden_int4,
+                                 int expert_alignment,
+                                 int tile_m,
+                                 int rdma_clean_offset,
+                                 int rdma_num_int_clean,
+                                 int nvl_clean_offset,
+                                 int nvl_num_int_clean,
+                                 int64_t streaming_rdma_offset,
+                                 void* rdma_buffer_ptr,
+                                 void** buffer_ptrs,
+                                 int** barrier_signal_ptrs,
+                                 int rank,
+                                 int num_ranks,
+                                 cudaStream_t stream,
+                                 int64_t num_rdma_bytes,
+                                 int64_t num_nvl_bytes) {
+    constexpr int kNumThreads = 512;
+    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+    const int E_local = num_experts / num_ranks;
+    const int kStreamSlabInts = num_channels * NUM_MAX_NVL_PEERS * E_local;
+
+    // SMEM = streaming_hist + per_rank + per_rdma + per_expert.
+    int smem_bytes =
+        (num_rdma_ranks * kStreamSlabInts + num_ranks + num_rdma_ranks + num_experts) * sizeof(int);
+
+#define STREAMING_DISPATCH_METADATA_LAUNCH_CASE(num_rdma_ranks)                                       \
+    {                                                                                                  \
+        auto k = streaming_dispatch_metadata_kernel<false, num_rdma_ranks>;                            \
+        EP_HOST_ASSERT(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+                                            smem_bytes) == cudaSuccess);                              \
+        cfg.dynamicSmemBytes = smem_bytes;                                                             \
+        LAUNCH_KERNEL(&cfg, k,                                                                         \
+                      topk_idx,                                                                        \
+                      moe_recv_counter_mapped,                                                         \
+                      moe_recv_rdma_counter_mapped,                                                    \
+                      moe_recv_expert_counter_mapped,                                                  \
+                      streaming_total_tiles_mapped,                                                    \
+                      rdma_channel_prefix_matrix,                                                      \
+                      recv_rdma_rank_prefix_sum,                                                       \
+                      gbl_channel_prefix_matrix,                                                       \
+                      recv_gbl_rank_prefix_sum,                                                        \
+                      expert_frequency,                                                                \
+                      expert_pool_block_offset,                                                        \
+                      base_pool,                                                                       \
+                      seen_per_substream,                                                              \
+                      rank_prefix_matrix,                                                              \
+                      tile_id_to_expert,                                                               \
+                      pool_arrival_target,                                                             \
+                      total_tiles_device,                                                              \
+                      num_tokens, num_topk, num_experts, num_channels,                                 \
+                      expert_alignment, tile_m,                                                        \
+                      rdma_clean_offset, rdma_num_int_clean,                                           \
+                      nvl_clean_offset, nvl_num_int_clean,                                             \
+                      streaming_rdma_offset,                                                           \
+                      rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,                         \
+                      cpu_rdma_team);                                                                  \
+    }                                                                                                  \
+    break
+
+    SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
+    SWITCH_RDMA_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
+#undef STREAMING_DISPATCH_METADATA_LAUNCH_CASE
+}
+
 // At most 8 RDMA ranks to be sent
 constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
     return num_rdma_ranks < 8 ? num_rdma_ranks : 8;
