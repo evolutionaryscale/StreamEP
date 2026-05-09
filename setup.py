@@ -37,6 +37,10 @@ if __name__ == '__main__':
 
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
+    # `-lineinfo` adds source-line debug info without disabling optimizations,
+    # so compute-sanitizer / nsight can map kernel PCs back to .cu source
+    # lines. Cost: ~5% larger .so + ~negligible launch overhead. Always on.
+    nvcc_flags.append('-lineinfo')
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu']
     include_dirs = ['csrc/']
     library_dirs = []

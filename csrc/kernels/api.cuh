@@ -218,6 +218,49 @@ namespace internode {
 
 int get_source_meta_bytes();
 
+// Inline mirror of `get_source_meta_bytes()` for use in __host__ __device__
+// helpers below (the regular function is .cpp-side only). Kept in sync with
+// the SourceMeta struct definition in internode.cu.
+__host__ __device__ inline int get_source_meta_bytes_inline() {
+    return 8;  // sizeof(SourceMeta) — { int src_rdma_rank; int is_token_in_nvl_rank_bits; }
+}
+
+// Wire-format byte size for one NVL/RDMA-staged token (data + SourceMeta +
+// topk_idx + topk_weights). Used by the metadata kernel (cleanup-region
+// sizing) and the dispatch_main kernel (stride into the channel data ring).
+__host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_topk_idx, int num_topk_weights) {
+    auto raw = hidden_int4 * static_cast<int>(sizeof(int4))
+               + get_source_meta_bytes_inline()
+               + num_topk_idx * static_cast<int>(sizeof(int))
+               + num_topk_weights * static_cast<int>(sizeof(float));
+    auto a = static_cast<int>(sizeof(int4));
+    return ((raw + a - 1) / a) * a;
+}
+
+// Per-iter RDMA scratch cleanup metadata for the streaming dispatch metadata
+// kernel (drains the dispatch_main SymBuffer slots beyond the metadata
+// kernel's own count + streaming payloads). Returns
+// {clean_offset_int32, num_int32_to_clean}.
+__host__ __device__ inline std::pair<int, int> get_rdma_clean_meta(
+        int hidden_int4, int num_topk_idx, int num_topk_weights,
+        int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_channels) {
+    return {(get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
+             num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_channels) /
+                static_cast<int>(sizeof(int)),
+            (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
+}
+
+__host__ __device__ inline std::pair<int, int> get_nvl_clean_meta(
+        int hidden_int4, int num_topk_idx, int num_topk_weights,
+        int num_rdma_ranks, int num_nvl_ranks, int num_nvl_recv_buffer_tokens,
+        int num_channels, bool /*is_dispatch*/) {
+    return {(num_nvl_recv_buffer_tokens *
+             get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
+             num_nvl_ranks * num_channels) /
+                static_cast<int>(sizeof(int)),
+            num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels};
+}
+
 // Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
 // Folded single-kernel architecture mirroring `intranode::streaming_dispatch_metadata`'s
 // shape phase-for-phase, with NVL primitives replaced by RDMA equivalents
@@ -298,117 +341,80 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int64_t num_rdma_bytes,
                                  int64_t num_nvl_bytes);
 
-void notify_dispatch(const int* num_tokens_per_rank,
-                     int* moe_recv_counter_mapped,
-                     int num_ranks,
-                     const int* num_tokens_per_rdma_rank,
-                     int* moe_recv_rdma_counter_mapped,
-                     const int* num_tokens_per_expert,
-                     int* moe_recv_expert_counter_mapped,
-                     int num_experts,
-                     const bool* is_token_in_rank,
-                     int num_tokens,
-                     int num_worst_tokens,
-                     int num_channels,
-                     int hidden_int4,
-                     int num_topk,
-                     int expert_alignment,
-                     int* rdma_channel_prefix_matrix,
-                     int* recv_rdma_rank_prefix_sum,
-                     int* gbl_channel_prefix_matrix,
-                     int* recv_gbl_rank_prefix_sum,
-                     void* rdma_buffer_ptr,
-                     int num_max_rdma_chunked_recv_tokens,
-                     void** buffer_ptrs,
-                     int num_max_nvl_chunked_recv_tokens,
-                     int** barrier_signal_ptrs,
-                     int rank,
-                     cudaStream_t stream,
-                     int64_t num_rdma_bytes,
-                     int64_t num_nvl_bytes);
+// Argument groupings for the streaming internode dispatch main kernel. Same
+// six-struct shape as `intranode::Dispatch*` (api.cuh:76–121); internode-
+// specific deltas live inside `DispatchPerTokenOut` (combine plumbing —
+// recv_src_meta + send_rdma_head + send_nvl_head + recv_*_channel_prefix_*),
+// `DispatchInputs` (sender/forwarder reads from metadata kernel), and
+// `DispatchEnv` (RDMA buffer + NVL/RDMA chunked send/recv sizes).
+struct DispatchPoolOut {
+    int4* pool;                    // [TK_padded, hidden_int4]   data (int4-vector)
+    float* pool_topk_weight;       // [TK_padded]                per-pool-slot weight
+    int* pool_recv_token;          // [TK_padded]                slot → recv-token id (-1 = padding)
+    int* pool_k_slot;              // [TK_padded]                slot → k (-1 = padding)
+};
 
-void dispatch(void* recv_x,
-              topk_idx_t* recv_topk_idx,
-              float* recv_topk_weights,
-              void* recv_src_meta,
-              const void* x,
-              const topk_idx_t* topk_idx,
-              const float* topk_weights,
-              int* send_rdma_head,
-              int* send_nvl_head,
-              int* recv_rdma_channel_prefix_matrix,
-              int* recv_gbl_channel_prefix_matrix,
-              const int* rdma_channel_prefix_matrix,
-              const int* recv_rdma_rank_prefix_sum,
-              const int* gbl_channel_prefix_matrix,
-              const int* recv_gbl_rank_prefix_sum,
-              const bool* is_token_in_rank,
-              int num_tokens,
-              int num_worst_tokens,
-              int hidden_int4,
-              int num_topk,
-              int num_experts,
-              void* rdma_buffer_ptr,
-              int num_max_rdma_chunked_send_tokens,
-              int num_max_rdma_chunked_recv_tokens,
-              void** buffer_ptrs,
-              int num_max_nvl_chunked_send_tokens,
-              int num_max_nvl_chunked_recv_tokens,
-              int rank,
-              int num_ranks,
-              bool is_cached_dispatch,
-              cudaStream_t stream,
-              int num_channels);
+struct DispatchPerTokenOut {
+    // Streaming-essential per-recv-token outputs (mirror intranode):
+    int* per_token_remaining;      // [T_recv]                   K_local(r); kernel Y atomicSubs to 0
+    int* recv_token_to_slots;      // [T_recv, num_topk]         (r, k) → pool slot, -1 for non-local k
+    int* k_local_count;            // [T_recv]                   write-once K_local mirror
 
-void cached_notify(int hidden_int4,
-                   int num_topk_idx,
-                   int num_topk_weights,
-                   int num_ranks,
-                   int num_channels,
-                   int num_combined_tokens,
-                   int* combined_rdma_head,
-                   const int* rdma_channel_prefix_matrix,
-                   const int* rdma_rank_prefix_sum,
-                   int* combined_nvl_head,
-                   void* rdma_buffer_ptr,
-                   int num_max_rdma_chunked_recv_tokens,
-                   void** buffer_ptrs,
-                   int num_max_nvl_chunked_recv_tokens,
-                   int** barrier_signal_ptrs,
-                   int rank,
-                   cudaStream_t stream,
-                   int64_t num_rdma_bytes,
-                   int64_t num_nvl_bytes,
-                   bool is_cached_dispatch);
+    // Combine plumbing (internode-specific):
+    void* recv_src_meta;                   // [T_recv, get_source_meta_bytes()] (uint8)
+    int*  send_rdma_head;                  // [num_tokens, num_rdma_ranks]
+    int*  send_nvl_head;                   // [num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]
+    int*  recv_rdma_channel_prefix_matrix; // [num_rdma_ranks, num_channels]
+    int*  recv_gbl_channel_prefix_matrix;  // [num_world_ranks, num_channels]
+};
 
-void combine(cudaDataType_t type,
-             void* combined_x,
-             float* combined_topk_weights,
-             const bool* is_combined_token_in_rank,
-             const void* x,
-             const float* topk_weights,
-             const void* bias_0,
-             const void* bias_1,
-             const int* combined_rdma_head,
-             const int* combined_nvl_head,
-             const void* src_meta,
-             const int* rdma_channel_prefix_matrix,
-             const int* rdma_rank_prefix_sum,
-             const int* gbl_channel_prefix_matrix,
-             int num_tokens,
-             int num_combined_tokens,
-             int hidden,
-             int num_topk,
-             void* rdma_buffer_ptr,
-             int num_max_rdma_chunked_send_tokens,
-             int num_max_rdma_chunked_recv_tokens,
-             void** buffer_ptrs,
-             int num_max_nvl_chunked_send_tokens,
-             int num_max_nvl_chunked_recv_tokens,
-             int rank,
-             int num_ranks,
-             cudaStream_t stream,
-             int num_channels);
+struct DispatchInputs {
+    const int4* x;                      // [num_tokens, hidden_int4]
+    const topk_idx_t* topk_idx;         // [num_tokens, num_topk]
+    const float* topk_weights;          // [num_tokens, num_topk]
+    const bool* is_token_in_rank;       // [num_tokens, num_world_ranks]
+    // Sender / forwarder reads from metadata kernel:
+    const int* rdma_channel_prefix_matrix;  // [num_rdma_ranks, num_channels]
+    const int* recv_rdma_rank_prefix_sum;   // [num_rdma_ranks]
+    const int* gbl_channel_prefix_matrix;   // [num_world_ranks, num_channels]
+    const int* recv_gbl_rank_prefix_sum;    // [num_world_ranks]
+};
+
+struct DispatchTileSignal {
+    const int* base_pool;            // [num_channels, num_world_ranks, E_local]
+    int* pool_arrival_count;         // [total_tiles]
+    const int* pool_arrival_target;  // [total_tiles]
+    int64_t* tile_ready;             // [total_tiles]
+    int64_t dispatch_seq;
+};
+
+struct DispatchShape {
+    int num_tokens;
+    int hidden_int4;
+    int num_topk;
+    int num_experts;
+    int tile_m;
+};
+
+struct DispatchEnv {
+    void* rdma_buffer_ptr;
+    void** buffer_ptrs;              // [NUM_MAX_NVL_PEERS]
+    int rank;
+    int num_max_rdma_chunked_send_tokens;
+    int num_max_rdma_chunked_recv_tokens;
+    int num_max_nvl_chunked_send_tokens;
+    int num_max_nvl_chunked_recv_tokens;
+};
+
+void launch_dispatch_main(const DispatchPoolOut& pool_out,
+                          const DispatchPerTokenOut& per_token_out,
+                          const DispatchInputs& inputs,
+                          const DispatchTileSignal& tile_signal,
+                          const DispatchShape& shape,
+                          const DispatchEnv& env,
+                          int num_rdma_ranks,
+                          int num_channels,
+                          cudaStream_t stream);
 
 }  // namespace internode
 

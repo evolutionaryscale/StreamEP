@@ -108,8 +108,15 @@ struct StreamingDispatchOutputs {
     torch::Tensor pool_recv_token;
     torch::Tensor pool_k_slot;
 
+    // Intranode combine plumbing. For internode, `send_head` /
+    // `channel_prefix_matrix` / `recv_channel_prefix_matrix` are empty and
+    // the `*_rdma_*` / `*_gbl_*` / `recv_src_meta` fields below carry the
+    // equivalent reverse-routing data.
     torch::Tensor send_head;
 
+    // Per-source-rank cumulative recv-token offset. Sized [num_ranks, num_ranks]
+    // for intranode and [num_world_ranks, num_world_ranks] for internode; only
+    // this rank's column is populated.
     torch::Tensor rank_prefix_matrix;
     torch::Tensor channel_prefix_matrix;
     torch::Tensor recv_channel_prefix_matrix;
@@ -134,6 +141,23 @@ struct StreamingDispatchOutputs {
     int total_tiles;
 
     EventHandle metadata_done_event;
+
+    // Internode-only combine plumbing. Empty tensors for the intranode path.
+    // Produced by the metadata kernel (the four prefix tensors below) and by
+    // the dispatch_main kernel's forwarder + NVL receiver (`send_rdma_head` /
+    // `send_nvl_head` / `recv_rdma_channel_prefix_matrix` /
+    // `recv_gbl_channel_prefix_matrix` / `recv_src_meta`). The combine path
+    // (yet to be refactored) will consume these alongside `cached_notify_combine`'s
+    // `combined_rdma_head` / `combined_nvl_head` outputs.
+    torch::Tensor rdma_channel_prefix_matrix;       // [num_rdma_ranks, num_channels]
+    torch::Tensor recv_rdma_rank_prefix_sum;        // [num_rdma_ranks]
+    torch::Tensor gbl_channel_prefix_matrix;        // [num_world_ranks, num_channels]
+    torch::Tensor recv_gbl_rank_prefix_sum;         // [num_world_ranks]
+    torch::Tensor recv_rdma_channel_prefix_matrix;  // [num_rdma_ranks, num_channels]
+    torch::Tensor recv_gbl_channel_prefix_matrix;   // [num_world_ranks, num_channels]
+    torch::Tensor send_rdma_head;                   // [num_tokens, num_rdma_ranks]
+    torch::Tensor send_nvl_head;                    // [num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]
+    torch::Tensor recv_src_meta;                    // [T_recv, get_source_meta_bytes()]  uint8
 };
 
 struct Buffer {
@@ -321,48 +345,22 @@ public:
         int64_t combine_seq,
         const Config& config);
 
-    std::tuple<torch::Tensor,
-               std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>,
-               std::vector<int>,
-               torch::Tensor,
-               torch::Tensor,
-               std::optional<torch::Tensor>,
-               torch::Tensor,
-               std::optional<torch::Tensor>,
-               torch::Tensor,
-               std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>,
-               std::optional<torch::Tensor>>
-    internode_dispatch(const torch::Tensor& x,
-                       const std::optional<torch::Tensor>& topk_idx,
-                       const std::optional<torch::Tensor>& topk_weights,
-                       const std::optional<torch::Tensor>& num_tokens_per_rank,
-                       const std::optional<torch::Tensor>& num_tokens_per_rdma_rank,
-                       const torch::Tensor& is_token_in_rank,
-                       const std::optional<torch::Tensor>& num_tokens_per_expert,
-                       int cached_num_recv_tokens,
-                       int cached_num_rdma_recv_tokens,
-                       const std::optional<torch::Tensor>& cached_rdma_channel_prefix_matrix,
-                       const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
-                       const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
-                       const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
-                       int expert_alignment,
-                       int num_worst_tokens,
-                       const Config& config);
-
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>> internode_combine(
+    // Streaming-MoE consolidated dispatch (internode, pool layout). Mirrors
+    // the intranode entry point: one folded metadata kernel + one host poll +
+    // one dispatch_main kernel. Returns the same `StreamingDispatchOutputs`
+    // shape as intranode, plus the internode-specific combine-plumbing
+    // tensors (see struct definition above).
+    //
+    // Streams: kernels run on `at::cuda::getCurrentCUDAStream()` — caller-managed.
+    StreamingDispatchOutputs internode_dispatch(
         const torch::Tensor& x,
-        const std::optional<torch::Tensor>& topk_weights,
-        const std::optional<torch::Tensor>& bias_0,
-        const std::optional<torch::Tensor>& bias_1,
-        const torch::Tensor& src_meta,
-        const torch::Tensor& is_combined_token_in_rank,
-        const torch::Tensor& rdma_channel_prefix_matrix,
-        const torch::Tensor& rdma_rank_prefix_sum,
-        const torch::Tensor& gbl_channel_prefix_matrix,
-        const torch::Tensor& combined_rdma_head,
-        const torch::Tensor& combined_nvl_head,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& is_token_in_rank,
+        int num_experts,
+        int expert_alignment,
+        int tile_m,
+        int64_t dispatch_seq,
         const Config& config);
 
 };

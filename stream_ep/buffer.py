@@ -163,6 +163,17 @@ class Buffer:
             self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
             os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
 
+            # ``dispatch_main_kernel``'s forwarder coordinator passes
+            # ``qp_id = channel_id + num_channels`` to IBGDA, so qp_ids
+            # span ``[0, 2*num_channels) = [0, num_sms)``. Under NVSHMEM
+            # 3.5's v2 device-state struct, ``ibgda_get_rc`` indexes
+            # ``rcs[pe + npes * id]`` with no modulo, so the rcs array
+            # must be sized for the full qp_id range — i.e.
+            # ``num_rc_per_pe >= num_sms``. (NVSHMEM's default is 1.)
+            # Set BEFORE the runtime.sync() call below — that's where
+            # NVSHMEM_INIT_WITH_UNIQUEID creates the RCs and reads this.
+            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = str(Buffer.num_sms)
+
             # Reduce gpu memory usage
             # 6 default teams + 1 extra team
             os.environ['NVSHMEM_MAX_TEAMS'] = '7'
@@ -526,78 +537,4 @@ class Buffer:
             bwd_compute_done_per_token, seq,
             config)
 
-    # noinspection PyTypeChecker
-    def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                           handle: Optional[Tuple] = None,
-                           num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
-                           is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
-                           topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
-                           num_worst_tokens: int = 0, config: Optional[Config] = None) -> \
-            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
-            Optional[torch.Tensor], List[int], Tuple]:
-        """
-        Internode dispatch implementation, for more details, please refer to the `dispatch` docs.
-        Normally, you should not directly call this function.
-
-        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
-        """
-        assert config is not None
-
-        # Launch the kernel with cached or non-cached mode
-        if handle is not None:
-            assert topk_idx is None and topk_weights is None
-            is_token_in_rank, \
-                rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
-                recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head = handle
-            num_recv_tokens = recv_src_meta.size(0)
-            num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, _, _, _, _, _, _, _, _, _, _, _, _ = self.runtime.internode_dispatch(
-                x, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
-                rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                expert_alignment, num_worst_tokens, config)
-            return recv_x, None, None, None, None
-        else:
-            assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
-                rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
-                recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
-                recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head = self.runtime.internode_dispatch(
-                x, topk_idx, topk_weights,
-                num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
-                0, 0, None, None, None, None,
-                expert_alignment, num_worst_tokens, config)
-            handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
-                      recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
-                      send_nvl_head)
-            return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
-
-    # noinspection PyTypeChecker
-    def internode_combine(self, x: torch.Tensor, handle: Union[tuple, list],
-                          topk_weights: Optional[torch.Tensor] = None,
-                          bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
-                          config: Optional[Config] = None) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Internode combine implementation, for more details, please refer to the `combine` docs.
-        Normally, you should not directly call this function.
-
-        Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
-        """
-        assert config is not None
-
-        # Unpack handle and bias
-        is_combined_token_in_rank, \
-            _, _, \
-            rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, gbl_rank_prefix_sum, \
-            src_meta, send_rdma_head, send_nvl_head = handle
-        bias_0, bias_1 = Buffer._unpack_bias(bias)
-
-        # Launch the kernel
-        return self.runtime.internode_combine(
-            x, topk_weights, bias_0, bias_1, src_meta,
-            is_combined_token_in_rank, rdma_channel_prefix_matrix,
-            rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
-            send_rdma_head, send_nvl_head, config)
 
