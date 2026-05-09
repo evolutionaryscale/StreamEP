@@ -1050,6 +1050,67 @@ StreamingMetadataTestOutputs Buffer::streaming_metadata_test(
 #endif
 }
 
+// Test-only wrapper for `internode::cached_notify_combine`. Drives the kernel
+// against the dispatch output struct's `send_rdma_head` / `send_nvl_head`
+// (mutates them in place — that's the kernel's production contract). Returns
+// the same tensors so the test caller can assert against an eager reference.
+std::tuple<torch::Tensor, torch::Tensor> Buffer::cached_notify_combine_test(
+    const StreamingDispatchOutputs& dispatch_out,
+    const Config& config) {
+#ifndef DISABLE_NVSHMEM
+    pybind11::gil_scoped_release release;
+
+    EP_HOST_ASSERT(num_rdma_ranks > 1 and "cached_notify_combine_test requires multi-RDMA-rank world");
+    EP_HOST_ASSERT(config.num_sms % 2 == 0);
+    int num_channels = config.num_sms / 2;
+
+    // Derived shapes from the dispatch output. send_rdma_head is per source
+    // token; o is per recv token; recv_token_to_slots's K-axis carries num_topk.
+    EP_HOST_ASSERT(dispatch_out.send_rdma_head.dim() == 2 and dispatch_out.send_rdma_head.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.send_nvl_head.dim() == 2 and dispatch_out.send_nvl_head.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.o.dim() == 2 and dispatch_out.o.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.recv_token_to_slots.dim() == 2 and dispatch_out.recv_token_to_slots.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.send_rdma_head.size(1) == num_rdma_ranks);
+    EP_HOST_ASSERT(dispatch_out.send_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
+    int num_combined_tokens = static_cast<int>(dispatch_out.send_rdma_head.size(0));
+    int hidden = static_cast<int>(dispatch_out.o.size(1));
+    int num_topk = static_cast<int>(dispatch_out.recv_token_to_slots.size(1));
+    int hidden_int4 = static_cast<int>(hidden * dispatch_out.o.element_size() / sizeof(int4));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Forwarder side of combine slices `send_nvl_head` (shape
+    // `[num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]`) by per-(dst_rdma_rank,
+    // channel) recv ranges, so the prefix matrix must be the recv-side one
+    // (`recv_rdma_channel_prefix_matrix`), not the send-side one. Same for
+    // the per-rank prefix.
+    internode::cached_notify_combine(
+        hidden_int4,
+        num_topk,
+        num_ranks,
+        num_channels,
+        num_combined_tokens,
+        dispatch_out.send_rdma_head.data_ptr<int>(),
+        dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
+        dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        dispatch_out.send_nvl_head.data_ptr<int>(),
+        rdma_buffer_ptr,
+        config.num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu,
+        config.num_max_nvl_chunked_recv_tokens,
+        barrier_signal_ptrs_gpu,
+        rank,
+        stream,
+        num_rdma_bytes,
+        num_nvl_bytes);
+
+    return {dispatch_out.send_rdma_head, dispatch_out.send_nvl_head};
+#else
+    EP_HOST_ASSERT(false and "cached_notify_combine_test requires NVSHMEM");
+    return {};
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     const torch::Tensor& dL_dy,
     const torch::Tensor& is_token_in_rank,
@@ -1614,6 +1675,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("sync", &stream_ep::Buffer::sync)
         .def("destroy", &stream_ep::Buffer::destroy)
         .def("streaming_metadata_test", &stream_ep::Buffer::streaming_metadata_test)
+        .def("cached_notify_combine_test", &stream_ep::Buffer::cached_notify_combine_test)
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)

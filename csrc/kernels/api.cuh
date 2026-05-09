@@ -416,6 +416,46 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
                           int num_channels,
                           cudaStream_t stream);
 
+// Pre-combine fixup. Two architectural jobs, mirroring the intranode
+// `cached_notify_combine` (`api.cuh:177`) but scaled to the two-tier
+// RDMA + NVL ring buffers:
+//
+//   1. Zero the head/tail control regions of this iter's combine RDMA +
+//      NVL ring buffers (so combine's queues start at 0). The data
+//      buffer itself is also zeroed in the same pass — combine's
+//      receivers don't expect data residue, but zeroing is cheap and
+//      matches the legacy contract.
+//   2. In-place reverse-order sentinel encoding of `combined_rdma_head`
+//      (input: dispatch's `send_rdma_head`) and `combined_nvl_head`
+//      (input: dispatch's `send_nvl_head`). For tokens whose head entry
+//      is `< 0` (no contribution from that source), encode the *next*
+//      real head ahead of it as `-last_head - 1`. Combine's receivers
+//      use this to skip cleanly past gaps without re-reading the
+//      counter region.
+//
+// Both jobs are this-iter combine prelude; next-iter dispatch cleanup
+// is the streaming metadata kernel's responsibility, separately. Same
+// pattern as intranode but with the NVL-head pass added on top of the
+// RDMA-head pass (intranode has no RDMA tier).
+void cached_notify_combine(int hidden_int4,
+                           int num_topk,
+                           int num_ranks,
+                           int num_channels,
+                           int num_combined_tokens,
+                           int* combined_rdma_head,
+                           const int* rdma_channel_prefix_matrix,
+                           const int* rdma_rank_prefix_sum,
+                           int* combined_nvl_head,
+                           void* rdma_buffer_ptr,
+                           int num_max_rdma_chunked_recv_tokens,
+                           void** buffer_ptrs,
+                           int num_max_nvl_chunked_recv_tokens,
+                           int** barrier_signal_ptrs,
+                           int rank,
+                           cudaStream_t stream,
+                           int64_t num_rdma_bytes,
+                           int64_t num_nvl_bytes);
+
 }  // namespace internode
 
 }  // namespace stream_ep

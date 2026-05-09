@@ -278,6 +278,20 @@ public:
         int tile_m,
         const Config& config);
 
+    // Drives `internode::cached_notify_combine` directly. Mutates
+    // ``dispatch_out.send_rdma_head`` and ``dispatch_out.send_nvl_head`` in
+    // place via the same sentinel encoding production combine relies on,
+    // and returns those (now-encoded) tensors so the test can assert against
+    // an eager Python reference. The buffer-cleanup half of the kernel runs
+    // too (touches the symmetric NVSHMEM heap and the rank's NVL IPC slab)
+    // — not directly asserted; combine_main_kernel will exercise it.
+    // Test-only wrapper, removed when `Buffer::internode_combine` lands.
+    //
+    // Streams: kernel runs on `at::cuda::getCurrentCUDAStream()`.
+    std::tuple<torch::Tensor, torch::Tensor> cached_notify_combine_test(
+        const StreamingDispatchOutputs& dispatch_out,
+        const Config& config);
+
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
     // + one host sync per call: a fused metadata kernel (cross-rank count
     // exchange + per-tile arrays), a host poll on
