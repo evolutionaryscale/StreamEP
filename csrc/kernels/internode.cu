@@ -1759,6 +1759,87 @@ __global__ void cached_notify_combine_kernel(
     }
 }
 
+// Cleanup-only kernel: zero the dispatch RDMA + NVL ring control regions
+// before bwd `dispatch_grads_main_kernel` runs. Mirrors the cleanup half of
+// `cached_notify_combine` (Block 0) but with dispatch-side clean offsets
+// (`num_topk_idx = num_topk` since dispatch's wire format includes
+// topk_idx + topk_weights). Single-block: IBGDA quiet → RDMA team sync →
+// NVL barrier → memset both regions → RDMA team sync → NVL barrier.
+__global__ void cleanup_dispatch_buffers_kernel(
+    int rdma_clean_offset,
+    int rdma_num_int_clean,
+    int nvl_clean_offset,
+    int nvl_num_int_clean,
+    void* rdma_buffer_ptr,
+    void** buffer_ptrs,
+    int** barrier_signal_ptrs,
+    int rank,
+    int num_ranks,
+    nvshmem_team_t rdma_team) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+    auto num_threads = static_cast<int>(blockDim.x);
+    auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+    auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
+
+    auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
+    for (int i = thread_id; i < qps_per_rdma_rank * (num_rdma_ranks - 1); i += num_threads) {
+        auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % num_rdma_ranks;
+        auto qp_id = i % qps_per_rdma_rank;
+        nvshmemi_ibgda_quiet(translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank), qp_id);
+    }
+    __syncthreads();
+
+    if (thread_id == 32)
+        nvshmem_sync_with_same_gpu_idx<false>(rdma_team);
+    barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
+
+    auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
+    #pragma unroll
+    for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
+        rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
+
+    auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
+    #pragma unroll
+    for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
+        nvl_buffer_ptr_int[nvl_clean_offset + i] = 0;
+    __syncthreads();
+
+    if (thread_id == 32)
+        nvshmem_sync_with_same_gpu_idx<false>(rdma_team);
+    barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+}
+
+void cleanup_dispatch_buffers(int hidden_int4,
+                              int num_topk,
+                              int num_ranks,
+                              int num_channels,
+                              int num_max_rdma_chunked_recv_tokens,
+                              int num_max_nvl_chunked_recv_tokens,
+                              void* rdma_buffer_ptr,
+                              void** buffer_ptrs,
+                              int** barrier_signal_ptrs,
+                              int rank,
+                              cudaStream_t stream,
+                              int64_t num_rdma_bytes,
+                              int64_t num_nvl_bytes) {
+    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+    auto rdma_clean = get_rdma_clean_meta(
+        hidden_int4, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+    auto nvl_clean = get_nvl_clean_meta(
+        hidden_int4, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS,
+        num_max_nvl_chunked_recv_tokens, num_channels, /*is_dispatch=*/true);
+    EP_HOST_ASSERT((rdma_clean.first + rdma_clean.second) * sizeof(int) <= num_rdma_bytes);
+    EP_HOST_ASSERT((nvl_clean.first + nvl_clean.second) * sizeof(int) <= num_nvl_bytes);
+
+    SETUP_LAUNCH_CONFIG(1, 128, stream);
+    LAUNCH_KERNEL(&cfg, cleanup_dispatch_buffers_kernel,
+                  rdma_clean.first, rdma_clean.second,
+                  nvl_clean.first, nvl_clean.second,
+                  rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs,
+                  rank, num_ranks, cpu_rdma_team);
+}
+
 void cached_notify_combine(int hidden_int4,
                            int num_topk,
                            int num_ranks,
@@ -1809,6 +1890,630 @@ void cached_notify_combine(int hidden_int4,
                   combined_nvl_head,
                   rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs,
                   rank, num_ranks, cpu_rdma_team);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dispatch_grads_main_kernel — bwd dispatch, mirrors `dispatch_main_kernel`
+// shape (kRDMASender / kRDMASenderCoordinator / kRDMAAndNVLForwarder /
+// kForwarderCoordinator / kNVLReceivers) but for the bwd path: ships
+// dL/dy[t] origin → expert ranks via the same RDMA + NVL hierarchy as fwd
+// dispatch. The receiver SKIPS Pass A — slot lookups come from
+// `recv_token_to_slots[r, :K]` (persisted by fwd Pass B). Pass 2 fires
+// `bwd_y_ready[block] = dispatch_seq` when `bwd_dispatch_arrival_count[block]`
+// reaches `pool_arrival_target[block]` (re-fires the same target fwd uses).
+//
+// Wire format reuses fwd's per-token bytes layout (data + SourceMeta +
+// topk_idx + topk_weights bytes). Bwd writes only the data + SourceMeta
+// regions; topk_* bytes are untouched (zero from cached_notify_combine
+// cleanup). Saves layout-divergence complexity at the cost of ~5–10%
+// wasted RDMA + NVL bandwidth per token.
+// ─────────────────────────────────────────────────────────────────────────────
+template <int kNumRDMARanks,
+          int kNumTMABytesPerWarp,
+          int kNumDispatchRDMASenderWarps,
+          int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
+__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
+dispatch_grads_main_kernel(DispatchGradsIO io,
+                           DispatchGradsRouting routing,
+                           DispatchGradsTileSignal tile_signal,
+                           DispatchGradsShape shape,
+                           DispatchEnv env) {
+    enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
+
+    const auto num_sms = static_cast<int>(gridDim.x);
+    const auto sm_id = static_cast<int>(blockIdx.x);
+    const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
+    const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
+    const bool is_forwarder = sm_id % 2 == 0;
+    const auto rdma_rank = env.rank / NUM_MAX_NVL_PEERS, nvl_rank = env.rank % NUM_MAX_NVL_PEERS;
+    const int num_world_ranks = kNumRDMARanks * NUM_MAX_NVL_PEERS;
+    const int E_local = shape.num_experts / num_world_ranks;
+    const int local_expert_begin = env.rank * E_local;
+    const int local_expert_end = local_expert_begin + E_local;
+    (void)local_expert_begin; (void)local_expert_end;
+
+    EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
+    EP_DEVICE_ASSERT(shape.num_topk <= 32);
+    EP_DEVICE_ASSERT(E_local > 0 and E_local <= NUM_MAX_LOCAL_EXPERTS);
+
+    const auto role_meta = [=]() -> std::pair<WarpRole, int> {
+        if (is_forwarder) {
+            if (warp_id < NUM_MAX_NVL_PEERS) {
+                return {WarpRole::kRDMAAndNVLForwarder, (warp_id + channel_id) % NUM_MAX_NVL_PEERS};
+            } else {
+                return {WarpRole::kForwarderCoordinator, warp_id - NUM_MAX_NVL_PEERS};
+            }
+        } else if (warp_id < kNumDispatchRDMASenderWarps) {
+            return {WarpRole::kRDMASender, -1};
+        } else if (warp_id == kNumDispatchRDMASenderWarps) {
+            return {WarpRole::kRDMASenderCoordinator, -1};
+        } else {
+            return {WarpRole::kNVLReceivers, (warp_id + channel_id - kNumDispatchRDMASenderWarps) % NUM_MAX_NVL_PEERS};
+        }
+    }();
+    auto warp_role = role_meta.first;
+    auto target_rank = role_meta.second;
+    EP_DEVICE_ASSERT(num_warps == kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
+
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
+    auto hidden_bytes = shape.hidden_int4 * sizeof(int4);
+    auto num_bytes_per_token = get_num_bytes_per_token(shape.hidden_int4, shape.num_topk, shape.num_topk);
+    auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
+        env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
+    auto rdma_channel_meta = SymBuffer<int>(env.rdma_buffer_ptr,
+        NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
+    auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+    auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+
+    void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
+    int rs_wr_rank = 0, ws_rr_rank = 0;
+    if (warp_role == WarpRole::kRDMAAndNVLForwarder)
+        rs_wr_buffer_ptr = env.buffer_ptrs[nvl_rank], ws_rr_buffer_ptr = env.buffer_ptrs[target_rank],
+        rs_wr_rank = nvl_rank, ws_rr_rank = target_rank;
+    if (warp_role == WarpRole::kNVLReceivers)
+        rs_wr_buffer_ptr = env.buffer_ptrs[target_rank], ws_rr_buffer_ptr = env.buffer_ptrs[nvl_rank],
+        rs_wr_rank = target_rank, ws_rr_rank = nvl_rank;
+
+    auto nvl_channel_x = AsymBuffer<uint8_t>(ws_rr_buffer_ptr,
+                                             env.num_max_nvl_chunked_recv_tokens * num_bytes_per_token,
+                                             NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+                             .advance_also(rs_wr_buffer_ptr);
+    auto nvl_channel_prefix_start =
+        AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+            .advance_also(rs_wr_buffer_ptr);
+    auto nvl_channel_prefix_end = AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+                                      .advance_also(rs_wr_buffer_ptr);
+    auto nvl_channel_head =
+        AsymBuffer<int>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
+    auto nvl_channel_tail =
+        AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
+
+    __shared__ int rdma_send_channel_lock[kNumRDMARanks];
+    __shared__ int rdma_send_channel_tail[kNumRDMARanks];
+    __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
+    auto sync_rdma_sender_smem = []() { asm volatile("barrier.sync 0, %0;" ::"r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
+
+    extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
+    auto tma_buffer = smem_tma_buffer + target_rank * kNumTMABytesPerWarp;
+    auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
+    uint32_t tma_phase = 0;
+    if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
+        mbarrier_init(tma_mbarrier, 1);
+        fence_barrier_init();
+        EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+    }
+    __syncwarp();
+
+    __shared__ volatile int forward_channel_head[NUM_MAX_NVL_PEERS][kNumRDMARanks];
+    __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
+    auto sync_forwarder_smem = []() { asm volatile("barrier.sync 1, %0;" ::"r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
+
+    auto sync_nvl_receivers = []() { asm volatile("barrier.sync 2, %0;" ::"r"(NUM_MAX_NVL_PEERS * 32)); };
+
+    if (warp_role == WarpRole::kRDMASender) {
+        // Sender: identical structure to fwd dispatch, but reads `io.dL_dy`
+        // and skips topk_idx / topk_weights metadata packing (those bytes
+        // are untouched in the wire — receiver doesn't read them for bwd).
+        int token_start_idx, token_end_idx;
+        get_channel_task_range(shape.num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
+        for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
+            auto dst_ptr =
+                dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
+            if (lane_id < NUM_MAX_NVL_PEERS) {
+                dst_ptr[lane_id] =
+                    -(channel_id == 0
+                          ? 0
+                          : routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1]) -
+                    1;
+            } else if (lane_id < NUM_MAX_NVL_PEERS * 2) {
+                dst_ptr[lane_id] =
+                    -routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
+                                                       channel_id] -
+                    1;
+            } else if (lane_id == NUM_MAX_NVL_PEERS * 2) {
+                dst_ptr[lane_id] = -(channel_id == 0 ? 0 : routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1]) - 1;
+            } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
+                dst_ptr[lane_id] = -routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] - 1;
+            }
+            __syncwarp();
+
+            if (dst_rdma_rank != rdma_rank) {
+                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
+                                                  reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank)),
+                                                  sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
+                                                  translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                                                  channel_id, lane_id, 0);
+            }
+        }
+        sync_rdma_sender_smem();
+
+        int64_t token_idx;
+        int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
+        auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
+        for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
+            uint64_t is_token_in_rank_uint64 = 0;
+            if (lane_id < kNumRDMARanks) {
+                is_token_in_rank_uint64 =
+                    __ldg(reinterpret_cast<const uint64_t*>(io.is_token_in_rank + token_idx * num_world_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
+            }
+            __syncwarp();
+
+            if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
+                continue;
+            auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
+
+            auto start_time = clock64();
+            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
+                cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
+                if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP dispatch_grads RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, cached_rdma_channel_head, rdma_tail_idx);
+                    trap();
+                }
+            }
+            __syncwarp();
+
+            // Build per-(dst_rdma_rank) destination buffer pointers.
+            SourceMeta src_meta;
+            int num_topk_ranks = 0, topk_ranks[kNumTopkRDMARanks];
+            void* dst_send_buffers[kNumTopkRDMARanks];
+            #pragma unroll
+            for (int i = 0, slot_idx; i < kNumRDMARanks; ++i)
+                if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
+                    slot_idx = slot_idx % env.num_max_rdma_chunked_recv_tokens;
+                    topk_ranks[num_topk_ranks] = i;
+                    auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
+                    auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
+                    if (lane_id == num_topk_ranks)
+                        src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
+                    dst_send_buffers[num_topk_ranks++] =
+                        reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_token;
+                }
+            EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
+
+            // Copy `dL/dy` into symmetric send buffers.
+            auto st_broadcast = [=](const int key, const int4& value) {
+                #pragma unroll
+                for (int j = 0; j < num_topk_ranks; ++j)
+                    st_na_global(reinterpret_cast<int4*>(dst_send_buffers[j]) + key, value);
+            };
+            UNROLLED_WARP_COPY(5, lane_id, shape.hidden_int4, 0, io.dL_dy + token_idx * shape.hidden_int4, ld_nc_global, st_broadcast);
+            #pragma unroll
+            for (int i = 0; i < num_topk_ranks; ++i)
+                dst_send_buffers[i] = reinterpret_cast<int4*>(dst_send_buffers[i]) + shape.hidden_int4;
+
+            // Copy SourceMeta — needed by receiver to derive src_rdma_rank.
+            // Skip topk_idx / topk_weights writes (bwd doesn't use them).
+            if (lane_id < num_topk_ranks)
+                st_na_global(reinterpret_cast<SourceMeta*>(dst_send_buffers[lane_id]), src_meta);
+            __syncwarp();
+
+            // Release the transaction in the window.
+            if (is_token_in_rank_uint64 != 0) {
+                acquire_lock(rdma_send_channel_lock + lane_id);
+                auto latest_tail = rdma_send_channel_tail[lane_id];
+                auto offset = rdma_tail_idx - latest_tail;
+                while (offset >= 32) {
+                    release_lock(rdma_send_channel_lock + lane_id);
+                    acquire_lock(rdma_send_channel_lock + lane_id);
+                    latest_tail = rdma_send_channel_tail[lane_id];
+                    offset = rdma_tail_idx - latest_tail;
+                }
+                auto window = rdma_send_channel_window[lane_id] | (1u << offset);
+                if (offset == 0) {
+                    auto num_empty_slots = (~window) == 0 ? 32 : __ffs(~window) - 1;
+                    st_release_cta(rdma_send_channel_tail + lane_id, latest_tail + num_empty_slots);
+                    window >>= num_empty_slots;
+                }
+                rdma_send_channel_window[lane_id] = window;
+                release_lock(rdma_send_channel_lock + lane_id);
+            }
+            __syncwarp();
+        }
+    } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
+        // RDMA sender coordinator — same as fwd: issue chunked RDMA puts to
+        // dst_rdma_ranks as windows fill up. Per-channel num_tokens_to_send
+        // comes from `recv_rdma_channel_prefix_matrix` (recv-side: from this
+        // rank's perspective, "tokens this rank's RDMA inbox holds for
+        // dst_rdma_rank in this channel"). For bwd, this is symmetric — bwd
+        // sends from the same per-channel partition fwd dispatch did.
+        EP_DEVICE_ASSERT(env.num_max_rdma_chunked_recv_tokens % env.num_max_rdma_chunked_send_tokens == 0);
+
+        EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA ranks");
+        (lane_id < kNumRDMARanks) ? (rdma_send_channel_lock[lane_id] = 0) : 0;
+        (lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
+        (lane_id < kNumRDMARanks) ? (rdma_send_channel_window[lane_id] = 0) : 0;
+
+        sync_rdma_sender_smem();
+
+        int num_tokens_to_send = 0;
+        if (lane_id < kNumRDMARanks) {
+            num_tokens_to_send = routing.rdma_channel_prefix_matrix[lane_id * num_channels + channel_id];
+            if (channel_id > 0)
+                num_tokens_to_send -= routing.rdma_channel_prefix_matrix[lane_id * num_channels + channel_id - 1];
+        }
+
+        int last_issued_tail = 0;
+        auto start_time = clock64();
+        while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
+            if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
+                printf("DeepEP dispatch_grads RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",
+                       channel_id, rdma_rank, nvl_rank, lane_id, last_issued_tail, num_tokens_to_send);
+                trap();
+            }
+
+            for (int i = 0, synced_num_tokens_to_send; i < kNumRDMARanks; ++i) {
+                int dst_rdma_rank = (i + channel_id + rdma_rank) % kNumRDMARanks;
+                synced_num_tokens_to_send = __shfl_sync(0xffffffff, num_tokens_to_send, dst_rdma_rank);
+                if (synced_num_tokens_to_send == 0)
+                    continue;
+
+                int processed_tail = ld_acquire_cta(rdma_send_channel_tail + dst_rdma_rank);
+                int synced_last_issued_tail = __shfl_sync(0xffffffff, last_issued_tail, dst_rdma_rank);
+                int num_tokens_processed = processed_tail - synced_last_issued_tail;
+                if (num_tokens_processed != synced_num_tokens_to_send and num_tokens_processed < env.num_max_rdma_chunked_send_tokens)
+                    continue;
+
+                int num_tokens_in_chunk = min(num_tokens_processed, env.num_max_rdma_chunked_send_tokens);
+                if (dst_rdma_rank != rdma_rank) {
+                    const size_t num_bytes_per_msg = num_tokens_in_chunk * num_bytes_per_token;
+                    auto src_slot_idx = synced_last_issued_tail % env.num_max_rdma_chunked_recv_tokens;
+                    const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + src_slot_idx * num_bytes_per_token);
+                    const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + src_slot_idx * num_bytes_per_token);
+                    nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg,
+                                                      translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                                                      channel_id, lane_id, 0);
+                } else {
+                    memory_fence();
+                }
+
+                __syncwarp();
+                if (lane_id == 0) {
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
+                                                    num_tokens_in_chunk,
+                                                    translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                                                    channel_id,
+                                                    dst_rdma_rank == rdma_rank);
+                }
+
+                if (lane_id == dst_rdma_rank) {
+                    last_issued_tail += num_tokens_in_chunk;
+                    num_tokens_to_send -= num_tokens_in_chunk;
+                }
+            }
+        }
+    } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
+        // RDMA consumers and NVL producers. Bulk-copy stage — no slot logic,
+        // no per-(c, src, e) bookkeeping. Wire format on NVL ring is the same
+        // as fwd dispatch (data + SourceMeta + unused topk_idx + topk_weights
+        // bytes). Bwd doesn't write back to `recv_rdma_channel_prefix_matrix`
+        // or `send_nvl_head` — those were populated by fwd dispatch and live
+        // on the StreamingHandle. Otherwise this is verbatim from fwd.
+        const auto dst_nvl_rank = target_rank;
+
+        int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
+        EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
+        auto start_time = clock64();
+        if (lane_id < kNumRDMARanks) {
+            while (true) {
+                auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
+                auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
+                auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
+                auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
+                if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
+                    int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
+                    EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
+                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
+                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
+
+                    src_rdma_channel_prefix = -meta_2 - 1;
+                    auto src_rdma_channel_prefix_1 = -meta_3 - 1;
+                    num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
+                    src_rdma_channel_prefix += lane_id == 0 ? 0 : routing.recv_rdma_rank_prefix_sum[lane_id - 1];
+                    EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
+                    break;
+                }
+
+                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP dispatch_grads forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
+                    trap();
+                }
+            }
+        }
+        __syncwarp();
+        sync_forwarder_smem();
+
+        int src_rdma_rank = sm_id % kNumRDMARanks;
+        int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
+        int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0;
+        while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
+            start_time = clock64();
+            while (true) {
+                const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
+                if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
+                    break;
+                cached_nvl_channel_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+
+                if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP dispatch_grads forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
+                           channel_id, rdma_rank, nvl_rank, dst_nvl_rank);
+                    trap();
+                }
+            }
+
+            start_time = clock64();
+            while (true) {
+                src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
+                if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
+                    if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
+                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                    if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
+                        break;
+                }
+                if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
+                    printf("DeepEP dispatch_grads forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
+                           channel_id, rdma_rank, nvl_rank, dst_nvl_rank);
+                    trap();
+                }
+            }
+            auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
+            auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
+
+            for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
+                auto rdma_slot_idx = i % env.num_max_rdma_chunked_recv_tokens;
+                auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
+                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
+                lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
+                bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
+                if (not is_in_dst_nvl_rank)
+                    continue;
+
+                int dst_slot_idx = (cached_nvl_channel_tail++) % env.num_max_nvl_chunked_recv_tokens;
+                auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
+
+                if (elect_one_sync()) {
+                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, num_bytes_per_token, false);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, num_bytes_per_token);
+                }
+                __syncwarp();
+                mbarrier_wait(tma_mbarrier, tma_phase);
+                if (elect_one_sync())
+                    tma_store_1d(tma_buffer, dst_shifted, num_bytes_per_token);
+                __syncwarp();
+
+                if ((++num_tokens_sent) == env.num_max_nvl_chunked_send_tokens)
+                    src_rdma_tail = i + 1;
+
+                tma_store_wait<0>();
+                __syncwarp();
+            }
+
+            if (lane_id == src_rdma_rank)
+                forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
+
+            __syncwarp();
+            if (elect_one_sync())
+                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+        }
+
+        __syncwarp();
+        if (elect_one_sync())
+            forward_channel_retired[dst_nvl_rank] = true;
+    } else if (warp_role == WarpRole::kForwarderCoordinator) {
+        if (target_rank > 0)
+            return;
+
+        EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Invalid number of NVL peers");
+        #pragma unroll
+        for (int i = lane_id; i < kNumRDMARanks * NUM_MAX_NVL_PEERS; i += 32)
+            forward_channel_head[i % NUM_MAX_NVL_PEERS][i / NUM_MAX_NVL_PEERS] = 0;
+        if (lane_id < NUM_MAX_NVL_PEERS)
+            forward_channel_retired[lane_id] = false;
+        sync_forwarder_smem();
+
+        int last_head = 0, target_rdma = lane_id < kNumRDMARanks ? lane_id : 0;
+        while (true) {
+            int min_head = std::numeric_limits<int>::max();
+            #pragma unroll
+            for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+                if (not forward_channel_retired[i])
+                    min_head = min(min_head, forward_channel_head[i][target_rdma]);
+            if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max()))
+                break;
+
+            if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + env.num_max_rdma_chunked_send_tokens and
+                lane_id < kNumRDMARanks) {
+                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
+                                                min_head - last_head,
+                                                translate_dst_rdma_rank<false>(lane_id, nvl_rank),
+                                                channel_id + num_channels,
+                                                lane_id == rdma_rank);
+                last_head = min_head;
+            }
+
+            __nanosleep(NUM_WAIT_NANOSECONDS);
+        }
+    } else {
+        // ── kNVLReceivers (bwd): drain NVL ring, derive recv_token_id from
+        // iteration order (per-src_rdma_rank counter), look up
+        // `recv_token_to_slots[r, :K]`, K-fanout-write `dL_do_pool[slot]`.
+        // Pass 2 fires `bwd_y_ready` using `seen_per_substream` from the
+        // routing struct.
+        const int src_nvl_rank = target_rank;
+        int total_offset = 0;
+
+        // `recv_gbl_channel_prefix_matrix[src_world, channel]` was written by
+        // fwd dispatch's NVL receiver as `recv_gbl_rank_prefix_sum[src_world-1]
+        // + per-channel start_offset` — the starting recv_token_id for this
+        // (src_world, channel) substream's tokens in recv-x. Read directly
+        // (vs fwd's runtime derivation from prefix-announce).
+        if (lane_id < kNumRDMARanks) {
+            int src_world = lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
+            total_offset = routing.recv_gbl_channel_prefix_matrix[src_world * num_channels + channel_id];
+        }
+        __syncwarp();
+
+        int num_tokens_to_recv = 0;
+        int start_offset = 0, end_offset = 0;
+        auto start_time = clock64();
+        while (lane_id < kNumRDMARanks) {
+            start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
+            end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
+            if (start_offset < 0 and end_offset < 0) {
+                start_offset = -start_offset - 1, end_offset = -end_offset - 1;
+                break;
+            }
+            if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                printf("DeepEP dispatch_grads NVL receiver timeout (prefix), channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d\n",
+                       channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank);
+                trap();
+            }
+        }
+        num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
+
+        const int* seen_for_substream = routing.seen_per_substream + channel_id * num_world_ranks * E_local;
+
+        int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
+        while (num_tokens_to_recv > 0) {
+            start_time = clock64();
+            while (true) {
+                if (cached_channel_head_idx != cached_channel_tail_idx)
+                    break;
+                cached_channel_tail_idx = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP dispatch_grads NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
+                           channel_id, rdma_rank, nvl_rank, src_nvl_rank);
+                    trap();
+                }
+            }
+
+            int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
+            for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++chunk_idx, --num_tokens_to_recv) {
+                int token_idx_in_buffer = (cached_channel_head_idx++) % env.num_max_nvl_chunked_recv_tokens;
+                auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
+                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
+                int src_rdma_rank = meta.src_rdma_rank;
+                int recv_token_idx = __shfl_sync(0xffffffff, total_offset, src_rdma_rank);
+                (lane_id == src_rdma_rank) ? (total_offset += 1) : 0;
+
+                // TMA-load hidden, K-fanout TMA-store to dL_do_pool[slot].
+                if (elect_one_sync()) {
+                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                }
+                __syncwarp();
+                mbarrier_wait(tma_mbarrier, tma_phase);
+
+                if (lane_id == 0) {
+                    for (int k = 0; k < shape.num_topk; ++k) {
+                        int slot = routing.recv_token_to_slots[recv_token_idx * shape.num_topk + k];
+                        if (slot < 0) continue;
+                        tma_store_1d(tma_buffer,
+                                     io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4,
+                                     hidden_bytes, false);
+                    }
+                }
+                __syncwarp();
+                tma_store_wait<0>();
+                __syncwarp();
+            }
+
+            if (elect_one_sync())
+                st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
+        }
+
+        // Pass 2 fire — uses seen_per_substream from routing (vs fwd's
+        // warp_local_seen) and bwd_y_ready instead of tile_ready.
+        tma_store_wait<0>();
+        __syncwarp();
+        __threadfence_system();
+        sync_nvl_receivers();
+
+        if (lane_id == 0) {
+            for (int e = 0; e < E_local; ++e) {
+                #pragma unroll 1
+                for (int src_rdma_rank = 0; src_rdma_rank < kNumRDMARanks; ++src_rdma_rank) {
+                    int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                    int n_writes_for_e = seen_for_substream[src_world * E_local + e];
+                    if (n_writes_for_e == 0) continue;
+                    int slot_start_e = tile_signal.pool_arrival_target /* placeholder; need base_pool */ ? 0 : 0;
+                    (void)slot_start_e;
+                    int base_slot = routing.base_pool[(channel_id * num_world_ranks + src_world) * E_local + e];
+                    int slot_end_e = base_slot + n_writes_for_e;
+                    int first_block = base_slot / shape.tile_m;
+                    int last_block = (slot_end_e - 1) / shape.tile_m;
+                    for (int block_id = first_block; block_id <= last_block; ++block_id) {
+                        int block_slot_start = block_id * shape.tile_m;
+                        int block_slot_end = block_slot_start + shape.tile_m;
+                        int writes_in_block =
+                            min(slot_end_e, block_slot_end) - max(base_slot, block_slot_start);
+                        int cnt_before = atomicAdd(&tile_signal.bwd_dispatch_arrival_count[block_id], writes_in_block);
+                        if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
+                            memory_fence();
+                            st_release_sys_global(tile_signal.bwd_y_ready + block_id, tile_signal.dispatch_seq);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void launch_dispatch_grads_main(const DispatchGradsIO& io,
+                                const DispatchGradsRouting& routing,
+                                const DispatchGradsTileSignal& tile_signal,
+                                const DispatchGradsShape& shape,
+                                const DispatchEnv& env,
+                                int num_rdma_ranks,
+                                int num_channels,
+                                cudaStream_t stream) {
+    constexpr int kNumDispatchRDMASenderWarps = 7;
+    constexpr int kNumTMABytesPerWarp = 16384;
+
+    int num_world_ranks = num_rdma_ranks * NUM_MAX_NVL_PEERS;
+    (void)num_world_ranks;
+    int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
+
+#define DISPATCH_GRADS_LAUNCH_CASE(num_rdma_ranks_)                                       \
+    {                                                                                     \
+        auto kernel = dispatch_grads_main_kernel<num_rdma_ranks_,                         \
+                                                 kNumTMABytesPerWarp,                     \
+                                                 kNumDispatchRDMASenderWarps>;            \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                                \
+        LAUNCH_KERNEL(&cfg, kernel, io, routing, tile_signal, shape, env);                \
+    }                                                                                     \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32, stream);
+    int num_ranks = num_world_ranks;
+    SWITCH_RDMA_RANKS(DISPATCH_GRADS_LAUNCH_CASE);
+#undef DISPATCH_GRADS_LAUNCH_CASE
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

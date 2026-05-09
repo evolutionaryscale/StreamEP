@@ -377,6 +377,24 @@ public:
         int64_t dispatch_seq,
         const Config& config);
 
+    // Streaming-MoE bwd dispatch (internode, pool layout). Mirrors
+    // `Buffer::intranode_dispatch_grads`: ships dL/dy[t] origin → expert ranks
+    // along the same (t, dst_rank) routing as fwd dispatch. Receiver writes
+    // dL_do_pool[slot] K times per packet using `recv_token_to_slots`
+    // (populated by fwd Pass B), no Pass A. Returns (dL_do_pool, bwd_y_ready).
+    //
+    // No metadata kernel, no host poll — the routing tensors live on
+    // `StreamingDispatchOutputs` from the fwd dispatch and are reused here.
+    //
+    // Streams: kernel runs on `at::cuda::getCurrentCUDAStream()`.
+    std::tuple<torch::Tensor, torch::Tensor> internode_dispatch_grads(
+        const torch::Tensor& dL_dy,
+        const torch::Tensor& is_token_in_rank,
+        const StreamingDispatchOutputs& dispatch_out,
+        int64_t TK_padded,
+        int64_t dispatch_seq,
+        const Config& config);
+
     // Streaming-MoE combine (internode, pool layout). Two kernels per call:
     // `internode::cached_notify_combine` (buffer cleanup + reverse-order
     // sentinel encoding of `send_rdma_head` / `send_nvl_head`) followed by

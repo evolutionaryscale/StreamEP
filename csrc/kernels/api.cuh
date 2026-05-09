@@ -416,6 +416,80 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
                           int num_channels,
                           cudaStream_t stream);
 
+// Backward dispatch_grads (internode). Same architectural shape as
+// `intranode::launch_dispatch_grads_main` (sender ships dL/dy → expert
+// ranks; receiver uses fwd-persisted `recv_token_to_slots` to scatter
+// `dL_do_pool[slot]` K times per packet; Pass 2 fires `bwd_y_ready`),
+// scaled to the RDMA + NVL hierarchy. Reuses fwd dispatch's wire format
+// — the per-token bytes carry data + SourceMeta + topk_* but bwd only
+// writes/reads the data region; metadata bytes are zero from
+// `cached_notify_combine`'s buffer cleanup.
+struct DispatchGradsIO {
+    int4* dL_do_pool;                 // [TK_padded, hidden_int4] receiver writes K times per recv-token
+    const int4* dL_dy;                // [num_tokens, hidden_int4] sender reads
+    const bool* is_token_in_rank;     // [num_tokens, num_world_ranks] same routing as fwd dispatch
+};
+
+struct DispatchGradsRouting {
+    const int* recv_token_to_slots;   // [T_recv, num_topk]                       bwd Pass B slot lookup
+    const int* base_pool;             // [num_channels, num_world_ranks, E_local] Pass 2: per-substream slot start
+    const int* seen_per_substream;    // [num_channels, num_world_ranks, E_local] Pass 2: per-substream-per-expert recv count
+    // Sender-side prefix matrices (drive sender + sender_coordinator's
+    // per-channel send counts and the negative-encoded meta the forwarder
+    // reads to derive `num_tokens_to_recv_from_rdma`).
+    const int* gbl_channel_prefix_matrix;          // [num_world_ranks, num_channels]   sender-side, per-(dst_world, channel)
+    const int* rdma_channel_prefix_matrix;         // [num_rdma_ranks, num_channels]    sender-side, per-(dst_rdma, channel)
+    // Receiver-side: forwarder uses these for per-(src_rdma) base offset
+    // computation; receiver uses recv_gbl_channel_prefix_matrix to map
+    // (channel, src_world) → starting recv_token_id.
+    const int* recv_rdma_rank_prefix_sum;          // [num_rdma_ranks]
+    const int* recv_gbl_channel_prefix_matrix;     // [num_world_ranks, num_channels]
+};
+
+struct DispatchGradsTileSignal {
+    int* bwd_dispatch_arrival_count;  // [total_tiles] int32  atomic-add target during Pass 2
+    const int* pool_arrival_target;   // [total_tiles] int32  firing target (same as fwd's)
+    int64_t* bwd_y_ready;             // [total_tiles] int64  per-tile release stamp (consumed by kernel_y_bwd)
+    int64_t dispatch_seq;
+};
+
+struct DispatchGradsShape {
+    int num_tokens;
+    int hidden_int4;
+    int num_topk;
+    int num_experts;
+    int tile_m;
+};
+
+void launch_dispatch_grads_main(const DispatchGradsIO& io,
+                                const DispatchGradsRouting& routing,
+                                const DispatchGradsTileSignal& tile_signal,
+                                const DispatchGradsShape& shape,
+                                const DispatchEnv& env,
+                                int num_rdma_ranks,
+                                int num_channels,
+                                cudaStream_t stream);
+
+// Pre-bwd-dispatch fixup: zero the dispatch RDMA + NVL ring control regions
+// so bwd `dispatch_grads_main_kernel` doesn't latch onto stale negative
+// start/end values or stale head/tail counters from the prior fwd dispatch.
+// Mirrors the intranode pattern at `deep_ep.cpp:1176-1186` (cudaMemsetAsync +
+// intranode::barrier) but scaled to two-tier RDMA + NVL with cross-RDMA-rank
+// nvshmem_sync. Uses dispatch-side clean offsets (num_topk_idx=num_topk).
+void cleanup_dispatch_buffers(int hidden_int4,
+                              int num_topk,
+                              int num_ranks,
+                              int num_channels,
+                              int num_max_rdma_chunked_recv_tokens,
+                              int num_max_nvl_chunked_recv_tokens,
+                              void* rdma_buffer_ptr,
+                              void** buffer_ptrs,
+                              int** barrier_signal_ptrs,
+                              int rank,
+                              cudaStream_t stream,
+                              int64_t num_rdma_bytes,
+                              int64_t num_nvl_bytes);
+
 // Pre-combine fixup. Two architectural jobs, mirroring the intranode
 // `cached_notify_combine` (`api.cuh:177`) but scaled to the two-tier
 // RDMA + NVL ring buffers:

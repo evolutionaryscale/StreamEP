@@ -1583,6 +1583,107 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Streaming-MoE bwd dispatch (internode, pool layout). Single kernel; no
+// metadata kernel, no host poll — routing tensors come from the fwd
+// dispatch's StreamingDispatchOutputs (persisted on the StreamingHandle).
+// ─────────────────────────────────────────────────────────────────────────────
+std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
+    const torch::Tensor& dL_dy,
+    const torch::Tensor& is_token_in_rank,
+    const StreamingDispatchOutputs& dispatch_out,
+    int64_t TK_padded,
+    int64_t dispatch_seq,
+    const Config& config) {
+#ifndef DISABLE_NVSHMEM
+    pybind11::gil_scoped_release release;
+
+    EP_HOST_ASSERT(num_rdma_ranks > 1 and "internode_dispatch_grads requires multi-RDMA-rank world");
+    EP_HOST_ASSERT(config.num_sms % 2 == 0);
+    int num_channels = config.num_sms / 2;
+
+    EP_HOST_ASSERT(dL_dy.dim() == 2 and dL_dy.is_contiguous());
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous() and is_token_in_rank.scalar_type() == torch::kBool);
+    EP_HOST_ASSERT(is_token_in_rank.size(1) == num_ranks);
+    EP_HOST_ASSERT(dispatch_out.recv_token_to_slots.dim() == 2 and dispatch_out.recv_token_to_slots.is_contiguous());
+
+    int num_tokens = static_cast<int>(dL_dy.size(0));
+    int hidden = static_cast<int>(dL_dy.size(1));
+    int num_topk = static_cast<int>(dispatch_out.recv_token_to_slots.size(1));
+    int hidden_int4 = static_cast<int>(hidden * dL_dy.element_size() / sizeof(int4));
+    int num_local_experts = static_cast<int>(dispatch_out.expert_pool_block_offset.size(0)) - 1;
+    int num_experts = num_local_experts * num_ranks;
+    int total_tiles = static_cast<int>(dispatch_out.tile_id_to_expert.size(0));
+    int tile_m = (total_tiles == 0) ? 0 : static_cast<int>(TK_padded / total_tiles);
+    EP_HOST_ASSERT(tile_m > 0 and "tile_m must be derivable from TK_padded / total_tiles");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto dL_do_pool = torch::zeros({TK_padded, hidden}, dL_dy.options());
+    auto i64_opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    auto i32_opts = at::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    auto bwd_y_ready = torch::zeros({total_tiles}, i64_opts);
+    auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
+
+    // Wipe stale ring-control state from prior fwd dispatch so bwd's
+    // sender/forwarder/receiver don't latch onto negative-encoded values
+    // left in nvl_channel_prefix_start/end or stale head/tail counters.
+    // Mirrors intranode `Buffer::intranode_dispatch_grads` (memset + barrier
+    // at deep_ep.cpp:1176-1186) but scaled to two-tier RDMA + NVL.
+    internode::cleanup_dispatch_buffers(
+        hidden_int4, num_topk, num_ranks, num_channels,
+        config.num_max_rdma_chunked_recv_tokens,
+        config.num_max_nvl_chunked_recv_tokens,
+        rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
+        rank, stream, num_rdma_bytes, num_nvl_bytes);
+
+    internode::DispatchGradsIO io{
+        .dL_do_pool        = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
+        .dL_dy             = reinterpret_cast<const int4*>(dL_dy.data_ptr()),
+        .is_token_in_rank  = is_token_in_rank.data_ptr<bool>(),
+    };
+
+    internode::DispatchGradsRouting routing{
+        .recv_token_to_slots                = dispatch_out.recv_token_to_slots.data_ptr<int>(),
+        .base_pool                          = dispatch_out.base_pool.data_ptr<int>(),
+        .seen_per_substream                 = dispatch_out.seen_per_substream.data_ptr<int>(),
+        .gbl_channel_prefix_matrix          = dispatch_out.gbl_channel_prefix_matrix.data_ptr<int>(),
+        .rdma_channel_prefix_matrix         = dispatch_out.rdma_channel_prefix_matrix.data_ptr<int>(),
+        .recv_rdma_rank_prefix_sum          = dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        .recv_gbl_channel_prefix_matrix     = dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
+    };
+    internode::DispatchGradsTileSignal tile_signal{
+        .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),
+        .pool_arrival_target        = dispatch_out.pool_arrival_target.data_ptr<int>(),
+        .bwd_y_ready                = bwd_y_ready.data_ptr<int64_t>(),
+        .dispatch_seq               = dispatch_seq,
+    };
+    internode::DispatchGradsShape shape{
+        .num_tokens   = num_tokens,
+        .hidden_int4  = hidden_int4,
+        .num_topk     = num_topk,
+        .num_experts  = num_experts,
+        .tile_m       = tile_m,
+    };
+    internode::DispatchEnv env{
+        .rdma_buffer_ptr                     = rdma_buffer_ptr,
+        .buffer_ptrs                         = buffer_ptrs_gpu,
+        .rank                                = rank,
+        .num_max_rdma_chunked_send_tokens    = config.num_max_rdma_chunked_send_tokens,
+        .num_max_rdma_chunked_recv_tokens    = config.num_max_rdma_chunked_recv_tokens,
+        .num_max_nvl_chunked_send_tokens     = config.num_max_nvl_chunked_send_tokens,
+        .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
+    };
+
+    internode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env, num_rdma_ranks, num_channels, stream);
+
+    return {dL_do_pool, bwd_y_ready};
+#else
+    EP_HOST_ASSERT(false and "internode_dispatch_grads requires NVSHMEM");
+    return {};
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Streaming-MoE combine (internode, pool layout). Two kernels per call,
 // mirroring `Buffer::intranode_combine`'s two-kernel-one-method pattern
 // (`deep_ep.cpp:1218 + 1235`):
@@ -1780,6 +1881,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &stream_ep::Buffer::internode_dispatch)
+        .def("internode_dispatch_grads", &stream_ep::Buffer::internode_dispatch_grads)
         .def("internode_combine", &stream_ep::Buffer::internode_combine);
 
     m.def("is_sm90_compiled", stream_ep::is_sm90_compiled);
