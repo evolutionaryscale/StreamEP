@@ -27,10 +27,26 @@ Launch
 ------
     torchrun --nproc_per_node=8 \\
         -m stream_ep.stream_moe.validate_multi_iter \\
-        [--n_iter 20] [--rtol 5e-2] [--atol 5e-2]
+        [--n_iter 20]
 
 Outputs PASS / FAIL per iter on rank 0, with per-tensor max-abs / max-rel
 diffs for the failing iters.
+
+Per-tensor thresholds
+---------------------
+``out`` / ``dL/dx`` / ``dL/dtopk_weights`` are checked tightly (atol=1e-3,
+rtol=1e-2) — they sum over at most K_local ≤ TOPK contributions per token (or
+H per (t, k) for dL/dweight), so the bf16 chain noise floor is well below
+1e-3 at production magnitudes. ``dL/dW1_local`` / ``dL/dW2_local`` use a
+looser (atol=8e-2, rtol=8e-2) because their grouped GEMM sums over the per-
+expert K-axis (= expert_frequency, scales with world size — 8192 at 16-rank
+internode, 4096 at 8-rank intranode). bf16 storage of preact_a (the largest-
+magnitude intermediate, |max| ~ 1.5 → bf16 ULP ~0.012) propagates through
+swiglu_bwd into dL_dswiglu_in / postact_a_for_dW2; when summed over K=8192
+in the dW gemm the noise lands at ~0.06 max-abs. This matches sonic-moe's
+bf16 grad tolerance (atol=2e-2 at x_scale=0.02) once scaled to our x_scale=0.1
+and our larger K. Storing preact in fp32 would tighten this 5-10× at the
+cost of ~256 MB / layer; see logbook.
 """
 
 import argparse
@@ -38,6 +54,17 @@ import argparse
 import torch
 import torch.distributed as torch_dist
 import torch.nn.functional as F
+
+
+# Per-tensor (atol, rtol) thresholds. Matched to the bf16 chain noise floor
+# at production shape — see module docstring.
+TOL_DEFAULT = {
+    "out":              (1e-3, 1e-2),
+    "dL/dx":            (1e-3, 1e-2),
+    "dL/dtopk_weights": (1e-3, 1e-2),
+    "dL/dW1_local":     (8e-2, 8e-2),
+    "dL/dW2_local":     (8e-2, 8e-2),
+}
 
 from stream_ep.stream_moe.profile_pipeline import (
     DTYPE,
@@ -143,8 +170,6 @@ def main():
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=3)
     p.add_argument("--n_iter", type=int, default=20)
-    p.add_argument("--rtol", type=float, default=5e-2)
-    p.add_argument("--atol", type=float, default=5e-2)
     args = p.parse_args()
 
     device = init_distributed()
@@ -155,8 +180,11 @@ def main():
     rank_zero_print(
         f"[validate] world={world_size} num_sms={args.num_sms} "
         f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-        f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
-        f"rtol={args.rtol} atol={args.atol}"
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter}"
+    )
+    rank_zero_print(
+        "[validate] per-tensor thresholds (atol, rtol): "
+        + ", ".join(f"{n}={a:.0e}/{r:.0e}" for n, (a, r) in TOL_DEFAULT.items())
     )
 
     buffer = make_buffer(group, args.num_sms)
@@ -297,8 +325,8 @@ def main():
         )
         torch.cuda.synchronize()
 
-        # Compare every (actual, ref) pair under the same dual-threshold rule
-        # forward uses (fail iff BOTH atol and rtol violated).
+        # Compare every (actual, ref) pair under per-tensor (atol, rtol).
+        # Fail iff BOTH absolute and relative diff thresholds are violated.
         diagnostics = []
         ok = True
         for name, actual, ref in [
@@ -308,11 +336,12 @@ def main():
             ("dL/dW1_local", dL_dW1_local_actual, dL_dW1_local_ref),
             ("dL/dW2_local", dL_dW2_local_actual, dL_dW2_local_ref),
         ]:
+            atol, rtol = TOL_DEFAULT[name]
             actual_f = actual.to(torch.float32)
             ref_f = ref.to(torch.float32)
             diff = (actual_f - ref_f).abs()
             rel = diff / (ref_f.abs() + 1e-3)
-            bad = (diff > args.atol) & (rel > args.rtol)
+            bad = (diff > atol) & (rel > rtol)
             n_bad_t = bad.sum().item()
             max_abs_t = diff.max().item()
             max_rel_t = rel.max().item()
