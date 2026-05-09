@@ -282,10 +282,17 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.compute_done_per_token.record_stream(streams.combine)
         handle.o.record_stream(streams.combine)
         handle.rank_prefix_matrix.record_stream(streams.combine)
-        handle.channel_prefix_matrix.record_stream(streams.combine)
-        handle.send_head.record_stream(streams.combine)
         handle.pool_topk_weight.record_stream(streams.combine)
         handle.recv_token_to_slots.record_stream(streams.combine)
+        # `channel_prefix_matrix` / `send_head` are intranode-combine inputs;
+        # internode dispatch leaves them empty (pybind → None). The internode
+        # combine reads its routing from `handle._dispatch_out`'s tensors
+        # instead — those were allocated on the dispatch stream too, so the
+        # `metadata_done` event above covers visibility for both topologies.
+        if handle.channel_prefix_matrix is not None:
+            handle.channel_prefix_matrix.record_stream(streams.combine)
+        if handle.send_head is not None:
+            handle.send_head.record_stream(streams.combine)
         with torch.cuda.stream(streams.combine):
             out, _ = buffer.combine(handle.o, handle, combine_seq=dispatch_seq)
 

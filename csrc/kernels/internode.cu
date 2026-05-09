@@ -1861,7 +1861,13 @@ void cached_notify_combine(int hidden_int4,
     const int num_threads = std::max(128, 32 * num_channels);
     const int num_warps = num_threads / 32;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-    constexpr int kNumTMABytesPerWarp = 8192;
+    // 4096 B/warp at num_sms=64 (= 32 channels) → 32×4096 = 128 KB SMEM,
+    // comfortably under H100's ~228 KB dynamic cap. Per-warp TMA-batched
+    // NVL-head pass packs ~127 tokens/batch (= (4096 − 8) / (4 ×
+    // NUM_MAX_NVL_PEERS)). Larger num_sms (e.g. 80 → 40 channels = 160 KB)
+    // also fits. The legacy's 8192 (= 256 KB at 32 channels) is over-cap on
+    // H100 — never tested at num_channels ≥ 32 in the pre-streaming path.
+    constexpr int kNumTMABytesPerWarp = 4096;
     const int smem_size = kNumTMABytesPerWarp * num_warps;
 
     // Combine wire format: data + SourceMeta + topk_weights (no topk_idx, in
