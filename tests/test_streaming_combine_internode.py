@@ -2,10 +2,8 @@
 
 Mirrors ``tests/test_streaming_combine.py`` (intranode combine) for the
 internode topology — 2 RDMA × 8 NVL = 16 GPUs via ``./srun_internode.sh``.
-Drives the new C++ entry points ``Buffer.runtime.internode_dispatch`` and
-``Buffer.runtime.internode_combine`` directly (not yet wired through
-``Buffer.combine``'s topology branch — that switchover lands alongside
-the legacy-kernel parity gate flip in a later commit).
+Drives ``Buffer.dispatch`` and ``Buffer.combine`` (which route through the
+internode entry points via the topology branch when ``num_rdma_ranks > 1``).
 
 The combine reduction is direction- and topology-uniform (same arg surface
 intranode's unified ``combine_main_kernel`` uses); the internode delta is
@@ -127,21 +125,20 @@ def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
                              world_size: int, rank: int, tile_m: int,
                              dispatch_seq: int, combine_seq: int,
                              *, dtype: torch.dtype,
-                             device: torch.device, cfg) -> int:
+                             device: torch.device) -> int:
     """Drive one dispatch + manual o-fill + combine cycle and check output."""
-    out = buf.runtime.internode_dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank,
-        num_experts, 1, tile_m, dispatch_seq, cfg)
+    _, handle, _ = buf.dispatch(
+        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
+        tile_m=tile_m, dispatch_seq=dispatch_seq)
     torch.cuda.synchronize()
 
-    T_recv = out.o.shape[0]
+    T_recv = handle.o.shape[0]
 
-    out.o.fill_(float(rank))
-    out.compute_done_per_token.fill_(combine_seq)
+    handle.o.fill_(float(rank))
+    handle.compute_done_per_token.fill_(combine_seq)
 
-    recv_x, recv_topk = buf.runtime.internode_combine(
-        out.o, out.pool_topk_weight, out,
-        out.compute_done_per_token, combine_seq, cfg)
+    recv_x, recv_topk = buf.combine(
+        handle.o, handle, combine_seq=combine_seq)
 
     torch.cuda.synchronize()
 
@@ -198,16 +195,6 @@ def main():
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
-    if not hasattr(buf.runtime, 'internode_combine'):
-        if rank == 0:
-            print("[skip] Buffer.runtime.internode_combine not "
-                  "built — combine kernel implementation pending "
-                  "(see internode.md §'Files to change' §3).", flush=True)
-        cleanup_dist()
-        return
-
-    cfg = Buffer.get_combine_config(world_size)
-
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
         seed=123)
@@ -215,7 +202,7 @@ def main():
         buf, x, topk_idx, topk_weights, is_token_in_rank,
         num_experts, num_topk, hidden, world_size, rank, tile_m,
         dispatch_seq=1, combine_seq=1,
-        dtype=dtype, device=device, cfg=cfg)
+        dtype=dtype, device=device)
     if rank == 0:
         print(f"PASS test_basic_combine_internode: world={world_size} "
               f"T_recv={T_recv}", flush=True)
@@ -228,7 +215,7 @@ def main():
             buf, x, topk_idx, topk_weights, is_token_in_rank,
             num_experts, num_topk, hidden, world_size, rank, tile_m,
             dispatch_seq=seq, combine_seq=seq,
-            dtype=dtype, device=device, cfg=cfg)
+            dtype=dtype, device=device)
         if rank == 0:
             print(f"PASS test_multi_iter_combine_internode #{seq - 1} "
                   f"(seed={seed}): T_recv={T_recv}", flush=True)
@@ -241,7 +228,7 @@ def main():
         buf, x, topk_idx, topk_weights, is_token_in_rank,
         num_experts, num_topk, hidden, world_size, rank, tile_m,
         dispatch_seq=10, combine_seq=10,
-        dtype=dtype, device=device, cfg=cfg)
+        dtype=dtype, device=device)
     if rank == 0:
         print(f"PASS test_combine_internode_empty_expert (e={plant_e}): "
               f"world={world_size} T_recv={T_recv}", flush=True)

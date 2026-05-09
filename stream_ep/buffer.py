@@ -1,8 +1,8 @@
 import os
 import torch
 import torch.distributed as dist
-from dataclasses import dataclass
-from typing import Callable, List, Tuple, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
 import stream_ep_cpp
@@ -72,6 +72,17 @@ class StreamingHandle:
     total_tiles: int
     tile_m: int
     dispatch_seq: int
+
+    # ── Internode-only stash. The C++ ``StreamingDispatchOutputs`` struct
+    # carries the internode-specific routing tensors (``send_rdma_head`` /
+    # ``send_nvl_head`` / ``recv_src_meta`` / ``rdma_channel_prefix_matrix`` /
+    # ``recv_rdma_channel_prefix_matrix`` / ``recv_rdma_rank_prefix_sum`` /
+    # ``recv_gbl_channel_prefix_matrix`` / ``recv_gbl_rank_prefix_sum``) that
+    # the internode combine + dispatch_grads kernels read. Stashing the
+    # struct here keeps the topology-branch dispatch_grads/combine wrappers
+    # one-line passthroughs and avoids dataclass churn for fields that only
+    # apply to one topology. ``None`` for intranode dispatches.
+    _dispatch_out: Any = None
 
 
 class Buffer:
@@ -284,12 +295,12 @@ class Buffer:
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]
 
-    def _assert_intranode_only(self) -> None:
-        """Streaming dispatch / combine are intranode-only today."""
-        if self.runtime.get_num_rdma_ranks() > 1:
-            raise NotImplementedError(
-                "Internode streaming path is not yet implemented."
-            )
+    def _is_internode(self) -> bool:
+        """True iff this buffer spans multiple RDMA hosts (``num_rdma_ranks > 1``).
+        Drives the topology branch in ``dispatch`` / ``combine`` /
+        ``dispatch_grads`` / ``combine_grads``.
+        """
+        return self.runtime.get_num_rdma_ranks() > 1
 
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
@@ -376,13 +387,19 @@ class Buffer:
                 serializing against dispatch main.
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
-        self._assert_intranode_only()
 
-        out = self.runtime.intranode_dispatch(
-            x, topk_idx, topk_weights, is_token_in_rank,
-            num_experts, expert_alignment, tile_m, dispatch_seq,
-            config,
-        )
+        if self._is_internode():
+            out = self.runtime.internode_dispatch(
+                x, topk_idx, topk_weights, is_token_in_rank,
+                num_experts, expert_alignment, tile_m, dispatch_seq,
+                config,
+            )
+        else:
+            out = self.runtime.intranode_dispatch(
+                x, topk_idx, topk_weights, is_token_in_rank,
+                num_experts, expert_alignment, tile_m, dispatch_seq,
+                config,
+            )
 
         handle = StreamingHandle(
             pool=out.pool,
@@ -410,6 +427,7 @@ class Buffer:
             total_tiles=out.total_tiles,
             tile_m=tile_m,
             dispatch_seq=dispatch_seq,
+            _dispatch_out=out,
         )
 
         return out.pool, handle, out.metadata_done_event
@@ -429,7 +447,6 @@ class Buffer:
         launches. Runs on ``torch.cuda.current_stream()``.
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
-        self._assert_intranode_only()
         seq = handle.dispatch_seq if dispatch_seq is None else dispatch_seq
 
         TK_padded = handle.pool.shape[0]
@@ -437,21 +454,31 @@ class Buffer:
         num_local_experts = handle.expert_frequency.shape[0]
         num_experts = num_local_experts * self.group_size
 
-        dL_do_pool, bwd_y_ready = self.runtime.intranode_dispatch_grads(
-            dL_dy,
-            handle.is_token_in_rank,
-            handle.recv_token_to_slots,
-            handle.base_pool,
-            handle.seen_per_substream,
-            handle.pool_arrival_target,
-            handle.rank_prefix_matrix,
-            num_experts,
-            num_topk,
-            handle.tile_m,
-            TK_padded,
-            seq,
-            config,
-        )
+        if self._is_internode():
+            dL_do_pool, bwd_y_ready = self.runtime.internode_dispatch_grads(
+                dL_dy,
+                handle.is_token_in_rank,
+                handle._dispatch_out,
+                TK_padded,
+                seq,
+                config,
+            )
+        else:
+            dL_do_pool, bwd_y_ready = self.runtime.intranode_dispatch_grads(
+                dL_dy,
+                handle.is_token_in_rank,
+                handle.recv_token_to_slots,
+                handle.base_pool,
+                handle.seen_per_substream,
+                handle.pool_arrival_target,
+                handle.rank_prefix_matrix,
+                num_experts,
+                num_topk,
+                handle.tile_m,
+                TK_padded,
+                seq,
+                config,
+            )
         return dL_do_pool, bwd_y_ready
 
     # noinspection PyTypeChecker
@@ -481,8 +508,12 @@ class Buffer:
         underlying kernel is shared.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
-        self._assert_intranode_only()
 
+        if self._is_internode():
+            return self.runtime.internode_combine(
+                x, handle.pool_topk_weight, handle._dispatch_out,
+                handle.compute_done_per_token, combine_seq,
+                config)
         return self.runtime.intranode_combine(
             x, handle.pool_topk_weight, handle.recv_token_to_slots,
             handle.rank_prefix_matrix,
@@ -527,9 +558,13 @@ class Buffer:
                 dL_dtopk_weights: ``[num_tokens, num_topk]`` fp32
         """
         config = self.get_combine_config(self.group_size) if config is None else config
-        self._assert_intranode_only()
         seq = handle.dispatch_seq if dispatch_seq is None else dispatch_seq
 
+        if self._is_internode():
+            return self.runtime.internode_combine(
+                dL_dx_per_r, weight_grads, handle._dispatch_out,
+                bwd_compute_done_per_token, seq,
+                config)
         return self.runtime.intranode_combine(
             dL_dx_per_r, weight_grads, handle.recv_token_to_slots,
             handle.rank_prefix_matrix,

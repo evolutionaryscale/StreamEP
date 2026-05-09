@@ -1,9 +1,9 @@
 """End-to-end test for the streaming-MoE internode dispatch_grads (bwd dispatch).
 
 Mirrors ``tests/test_streaming_dispatch_grads.py`` (intranode bwd dispatch)
-for the 16-rank internode topology. Drives ``Buffer.runtime.internode_dispatch``
-+ ``Buffer.runtime.internode_dispatch_grads`` directly (not yet wired
-through ``Buffer.dispatch_grads``'s topology branch).
+for the 16-rank internode topology. Drives ``Buffer.dispatch`` and
+``Buffer.dispatch_grads`` (which route through the internode entry
+points via the topology branch when ``num_rdma_ranks > 1``).
 
 Verifies:
   1. Shape + dtype of ``dL_do_pool`` and ``bwd_y_ready``.
@@ -85,27 +85,18 @@ def main():
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
-    if not hasattr(buf.runtime, 'internode_dispatch_grads'):
-        if rank == 0:
-            print("[skip] Buffer.runtime.internode_dispatch_grads not built — "
-                  "kernel implementation pending.", flush=True)
-        cleanup_dist()
-        return
-
-    cfg = Buffer.get_dispatch_config(world_size)
-
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
         seed=123)
 
-    out = buf.runtime.internode_dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank,
-        num_experts, 1, tile_m, 1, cfg)
+    _, handle, _ = buf.dispatch(
+        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
+        tile_m=tile_m, dispatch_seq=1)
     torch.cuda.synchronize()
 
-    total_tiles = out.total_tiles
+    total_tiles = handle.total_tiles
     TK_padded = total_tiles * tile_m
-    T_recv = out.o.shape[0]
+    T_recv = handle.o.shape[0]
 
     g_dy = torch.Generator(device=device).manual_seed(7919 + rank * 31)
     dL_dy = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16,
@@ -113,8 +104,7 @@ def main():
              + rank * 100.0)
     dL_dy = dL_dy.contiguous()
 
-    dL_do_pool, bwd_y_ready = buf.runtime.internode_dispatch_grads(
-        dL_dy, is_token_in_rank, out, TK_padded, 1, cfg)
+    dL_do_pool, bwd_y_ready = buf.dispatch_grads(handle, dL_dy, dispatch_seq=1)
     torch.cuda.synchronize()
 
     assert dL_do_pool.shape == (TK_padded, hidden), \
@@ -141,8 +131,8 @@ def main():
         cur += n
     assert cur == T_recv, f"recv_token mapping size {cur} != T_recv {T_recv}"
 
-    pool_recv_token = out.pool_recv_token.cpu()
-    pool_k_slot = out.pool_k_slot.cpu()
+    pool_recv_token = handle.pool_recv_token.cpu()
+    pool_k_slot = handle.pool_k_slot.cpu()
     dL_do_pool_cpu = dL_do_pool.cpu()
     all_dL_dy_cpu = [t.cpu() for t in all_dL_dy]
 
@@ -168,10 +158,9 @@ def main():
         f"bwd_y_ready not fully fired; first deviating tile_id: "
         f"{(bwd_y_ready_cpu != 1).nonzero().flatten()[:8]}")
 
-    dL_do_pool2, bwd_y_ready2 = buf.runtime.internode_dispatch_grads(
-        dL_dy, is_token_in_rank, out, TK_padded, 2, cfg)
+    dL_do_pool2, bwd_y_ready2 = buf.dispatch_grads(handle, dL_dy, dispatch_seq=2)
     torch.cuda.synchronize()
-    valid = (out.pool_recv_token.cpu() >= 0)
+    valid = (handle.pool_recv_token.cpu() >= 0)
     assert torch.equal(dL_do_pool.cpu()[valid], dL_do_pool2.cpu()[valid]), \
         "dL_do_pool (valid rows) not deterministic across re-runs"
     assert (bwd_y_ready2.cpu() == 2).all(), \
