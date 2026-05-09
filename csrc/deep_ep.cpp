@@ -1582,6 +1582,106 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
 #endif
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming-MoE combine (internode, pool layout). Two kernels per call,
+// mirroring `Buffer::intranode_combine`'s two-kernel-one-method pattern
+// (`deep_ep.cpp:1218 + 1235`):
+//
+//   1. `internode::cached_notify_combine` — buffer cleanup +
+//      sentinel-encode `send_rdma_head` / `send_nvl_head` in place.
+//   2. `internode::launch_combine_main` — NVL→RDMA→origin reduction with
+//      streaming gate at kNVLSender (gated by compute_done_per_token).
+//
+// Both run on the caller's current stream; stream-order causality
+// guarantees the sentinel-encoded heads are visible to combine_main.
+// ─────────────────────────────────────────────────────────────────────────────
+std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
+    const torch::Tensor& x,
+    const torch::Tensor& per_slot_weights,
+    const StreamingDispatchOutputs& dispatch_out,
+    const torch::Tensor& compute_done_per_token,
+    int64_t combine_seq,
+    const Config& config) {
+#ifndef DISABLE_NVSHMEM
+    pybind11::gil_scoped_release release;
+
+    EP_HOST_ASSERT(num_rdma_ranks > 1 and "internode_combine requires multi-RDMA-rank world");
+    EP_HOST_ASSERT(config.num_sms % 2 == 0);
+    int num_channels = config.num_sms / 2;
+
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and
+                   per_slot_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(dispatch_out.send_rdma_head.dim() == 2 and dispatch_out.send_rdma_head.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.send_nvl_head.dim() == 2 and dispatch_out.send_nvl_head.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.recv_token_to_slots.dim() == 2 and dispatch_out.recv_token_to_slots.is_contiguous());
+    EP_HOST_ASSERT(dispatch_out.send_rdma_head.size(1) == num_rdma_ranks);
+    EP_HOST_ASSERT(dispatch_out.send_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(compute_done_per_token.dim() == 1 and compute_done_per_token.is_contiguous() and
+                   compute_done_per_token.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(compute_done_per_token.size(0) == x.size(0));
+
+    int num_tokens = static_cast<int>(x.size(0));            // recv-side count (= dispatch's T_recv)
+    int num_combined_tokens = static_cast<int>(dispatch_out.send_rdma_head.size(0));
+    int hidden = static_cast<int>(x.size(1));
+    int num_topk = static_cast<int>(dispatch_out.recv_token_to_slots.size(1));
+    int hidden_int4 = static_cast<int>(hidden * x.element_size() / sizeof(int4));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Pre-combine fixup: sentinel-encode heads in place + zero combine's
+    // ring control regions. Forwarder reads recv-side per-(dst_rdma_rank,
+    // channel) ranges, so the prefix matrix is the recv-side one.
+    internode::cached_notify_combine(
+        hidden_int4, num_topk, num_ranks, num_channels, num_combined_tokens,
+        dispatch_out.send_rdma_head.data_ptr<int>(),
+        dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
+        dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        dispatch_out.send_nvl_head.data_ptr<int>(),
+        rdma_buffer_ptr,
+        config.num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu,
+        config.num_max_nvl_chunked_recv_tokens,
+        barrier_signal_ptrs_gpu,
+        rank, stream, num_rdma_bytes, num_nvl_bytes);
+
+    // Combine output tensors.
+    auto recv_x = torch::empty({num_combined_tokens, hidden}, x.options());
+    auto f32_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto recv_topk_weights_out = torch::empty({num_combined_tokens, num_topk}, f32_opts);
+
+    // kNVLSender ships recv-side `x` back to source ranks → it needs the
+    // *recv*-side per-(src_world, channel) prefix (`recv_gbl_channel_prefix_matrix`),
+    // not the dispatch's send-side `gbl_channel_prefix_matrix`. Same bug class
+    // as Phase D's intranode combine fix (see logbook 2026-05-04).
+    internode::launch_combine_main(
+        at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
+        recv_x.data_ptr(), recv_topk_weights_out.data_ptr<float>(),
+        x.data_ptr(), per_slot_weights.data_ptr<float>(),
+        dispatch_out.recv_token_to_slots.data_ptr<int>(),
+        dispatch_out.send_rdma_head.data_ptr<int>(),       // (now sentinel-encoded by cached_notify_combine)
+        dispatch_out.send_nvl_head.data_ptr<int>(),        // (now sentinel-encoded by cached_notify_combine)
+        dispatch_out.recv_src_meta.data_ptr(),
+        dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
+        dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
+        compute_done_per_token.data_ptr<int64_t>(), combine_seq,
+        num_tokens, num_combined_tokens, hidden, num_topk,
+        rdma_buffer_ptr,
+        config.num_max_rdma_chunked_send_tokens,
+        config.num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu,
+        config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens,
+        rank, num_ranks, stream, num_channels);
+
+    return {recv_x, recv_topk_weights_out};
+#else
+    EP_HOST_ASSERT(false and "internode_combine requires NVSHMEM");
+    return {};
+#endif
+}
+
 bool is_sm90_compiled() {
 #ifndef DISABLE_SM90_FEATURES
     return true;
@@ -1679,7 +1779,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)
-        .def("internode_dispatch", &stream_ep::Buffer::internode_dispatch);
+        .def("internode_dispatch", &stream_ep::Buffer::internode_dispatch)
+        .def("internode_combine", &stream_ep::Buffer::internode_combine);
 
     m.def("is_sm90_compiled", stream_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =

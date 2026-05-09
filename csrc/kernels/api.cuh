@@ -456,6 +456,42 @@ void cached_notify_combine(int hidden_int4,
                            int64_t num_rdma_bytes,
                            int64_t num_nvl_bytes);
 
+// combine_main_kernel — used by both forward combine and backward
+// combine_grads. Same arg surface as `intranode::launch_combine_main` for the
+// unified args (recv_x, recv_topk_weights_out, x, per_slot_weights,
+// recv_token_to_slots, compute_done_per_token, combine_seq); internode adds
+// the RDMA-staging plumbing (combined_rdma_head, combined_nvl_head,
+// src_meta, recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,
+// gbl_channel_prefix_matrix). Streaming gate at kNVLSender only.
+void launch_combine_main(cudaDataType_t type,
+                         void* recv_x,
+                         float* recv_topk_weights_out,
+                         const void* x,
+                         const float* per_slot_weights,
+                         const int* recv_token_to_slots,
+                         const int* combined_rdma_head,
+                         const int* combined_nvl_head,
+                         const void* src_meta,
+                         const int* recv_rdma_channel_prefix_matrix,
+                         const int* recv_rdma_rank_prefix_sum,
+                         const int* gbl_channel_prefix_matrix,
+                         const int64_t* compute_done_per_token,
+                         int64_t combine_seq,
+                         int num_tokens,
+                         int num_combined_tokens,
+                         int hidden,
+                         int num_topk,
+                         void* rdma_buffer_ptr,
+                         int num_max_rdma_chunked_send_tokens,
+                         int num_max_rdma_chunked_recv_tokens,
+                         void** buffer_ptrs,
+                         int num_max_nvl_chunked_send_tokens,
+                         int num_max_nvl_chunked_recv_tokens,
+                         int rank,
+                         int num_ranks,
+                         cudaStream_t stream,
+                         int num_channels);
+
 }  // namespace internode
 
 }  // namespace stream_ep

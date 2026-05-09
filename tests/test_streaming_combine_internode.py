@@ -140,7 +140,8 @@ def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
     out.compute_done_per_token.fill_(combine_seq)
 
     recv_x, recv_topk = buf.runtime.internode_combine(
-        out, combine_seq, cfg)
+        out.o, out.pool_topk_weight, out,
+        out.compute_done_per_token, combine_seq, cfg)
 
     torch.cuda.synchronize()
 

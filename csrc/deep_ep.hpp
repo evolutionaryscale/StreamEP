@@ -377,6 +377,31 @@ public:
         int64_t dispatch_seq,
         const Config& config);
 
+    // Streaming-MoE combine (internode, pool layout). Two kernels per call:
+    // `internode::cached_notify_combine` (buffer cleanup + reverse-order
+    // sentinel encoding of `send_rdma_head` / `send_nvl_head`) followed by
+    // `internode::launch_combine_main` (three-warp-role NVL→RDMA→origin
+    // reduction). Mirrors `Buffer::intranode_combine`'s two-kernel-one-method
+    // pattern (`deep_ep.cpp:1218 + 1235`); same arg semantics for the
+    // unified surface (x = handle.o for fwd / dL/dx_per_r for bwd;
+    // per_slot_weights = pool_topk_weight for fwd / weight_grads for bwd;
+    // compute_done_per_token / combine_seq drive the streaming gate at
+    // `kNVLSender`).
+    //
+    // Both passes mutate `dispatch_out.send_rdma_head` and
+    // `dispatch_out.send_nvl_head` in place (the sentinel encoding from the
+    // first pass IS the input to the second) — caller should treat them as
+    // consumed after this call.
+    //
+    // Streams: kernels run on `at::cuda::getCurrentCUDAStream()`.
+    std::tuple<torch::Tensor, torch::Tensor> internode_combine(
+        const torch::Tensor& x,
+        const torch::Tensor& per_slot_weights,
+        const StreamingDispatchOutputs& dispatch_out,
+        const torch::Tensor& compute_done_per_token,
+        int64_t combine_seq,
+        const Config& config);
+
 };
 
 }  // namespace stream_ep
