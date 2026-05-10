@@ -390,11 +390,13 @@ void Buffer::sync(const std::vector<int>& device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks));
         internode::barrier();
 
-        // Allocate
-        rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        // Allocate. Total = 2 * num_rdma_bytes; first half for dispatch-side
+        // SymBuffers, second half for combine-side. See `deep_ep.hpp`.
+        rdma_buffer_ptr = internode::alloc(num_rdma_bytes * 2, NUM_BUFFER_ALIGNMENT_BYTES);
+        rdma_buffer_ptr_combine = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
 
         // Clean buffer
-        CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
+        CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes * 2));
 
         // Persistent reader_prev arrays for the RDMA head/tail slots. See
         // `deep_ep.hpp` for layout / role. Sized for the worst case
@@ -1114,7 +1116,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::cached_notify_combine_test(
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.send_nvl_head.data_ptr<int>(),
-        rdma_buffer_ptr,
+        rdma_buffer_ptr_combine,
         config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu,
         config.num_max_nvl_chunked_recv_tokens,
@@ -1763,7 +1765,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.send_nvl_head.data_ptr<int>(),
-        rdma_buffer_ptr,
+        rdma_buffer_ptr_combine,
         config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu,
         config.num_max_nvl_chunked_recv_tokens,
@@ -1792,7 +1794,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
         compute_done_per_token.data_ptr<int64_t>(), combine_seq,
         num_tokens, num_combined_tokens, hidden, num_topk,
-        rdma_buffer_ptr,
+        rdma_buffer_ptr_combine,
         config.num_max_rdma_chunked_send_tokens,
         config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu,

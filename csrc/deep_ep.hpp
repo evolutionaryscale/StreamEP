@@ -169,9 +169,18 @@ private:
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
 
-    // NVSHMEM Buffer
+    // NVSHMEM Buffer. Allocated as `2 * num_rdma_bytes` and split into two
+    // halves: the first half (`rdma_buffer_ptr`) serves fwd dispatch + bwd
+    // dispatch_grads (both on streams.dispatch); the second half
+    // (`rdma_buffer_ptr_combine = rdma_buffer_ptr + num_rdma_bytes`) serves
+    // fwd combine + bwd combine_grads (both on streams.combine). Disjoint
+    // halves eliminate a latent SymBuffer aliasing where combine's smaller
+    // per-token bytes (no topk_idx in the wire format) put combine's
+    // head/tail offsets inside dispatch's data region. NVSHMEM symmetric
+    // heap means `+ num_rdma_bytes` is the same offset on every rank.
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
+    void* rdma_buffer_ptr_combine = nullptr;
 
     // Persistent ring control state. The cross-host head/tail slots in the
     // RDMA SymBuffers accumulate across iters via amo_nonfetch_add (the

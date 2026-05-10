@@ -1916,6 +1916,13 @@ void cached_notify_combine(int hidden_int4,
     auto rdma_clean = get_rdma_clean_meta(
         hidden_int4, /*num_topk_idx=*/0, /*num_topk_weights=*/num_topk,
         num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+    // Combine's RDMA SymBuffers: data + head + tail (no meta region between
+    // data and head, unlike dispatch). With head/tail now cumulative-cross-
+    // iter under the persistent reader_prev protocol, and data overwritten
+    // by each iter's sender, combine's RDMA region needs no cleanup at all.
+    // Override the formula's clean count to 0; it was sized for the
+    // dispatch-style data+meta+head+tail layout.
+    rdma_clean.second = 0;
     auto nvl_clean = get_nvl_clean_meta(
         hidden_int4, /*num_topk_idx=*/0, /*num_topk_weights=*/num_topk,
         num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens,
