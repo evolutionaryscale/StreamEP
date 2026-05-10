@@ -195,10 +195,13 @@ private:
     // Sized [max_num_channels × num_rdma_ranks] int32, ~512 B each at
     // production; ~2 KB total. Allocated zero-init in `Buffer::Buffer`,
     // freed in destructor.
-    int* dispatch_reader_prev_head = nullptr;
-    int* dispatch_reader_prev_tail = nullptr;
-    int* combine_reader_prev_head  = nullptr;
-    int* combine_reader_prev_tail  = nullptr;
+    // int64_t (M2): the NIC AMOs that drive these counters were widened from
+    // 4-byte to 8-byte (mlx5 MLX5_OPCODE_ATOMIC_FA); int32 wraps at ~250k
+    // training steps × 32 layers, int64 horizon is effectively infinite.
+    int64_t* dispatch_reader_prev_head = nullptr;
+    int64_t* dispatch_reader_prev_tail = nullptr;
+    int64_t* combine_reader_prev_head  = nullptr;
+    int64_t* combine_reader_prev_tail  = nullptr;
     // Persistent prev-sentinel array for the RDMA dispatch meta region (C3).
     // The meta SymBuffer's slot 30 ("kRdmaMetaSentinelSlot") accumulates
     // across iters via amo_nonfetch_add — sender bulk_puts the 18 data ints
