@@ -75,6 +75,30 @@ __forceinline__ __device__ int nvl_unpack_value(int packed) {
     return static_cast<int>(static_cast<uint32_t>(packed) & 0xFFFFFu);
 }
 
+// atomicMax-based writeback for the persistent `reader_prev_*` arrays
+// (Option 1, see `multi-step-correctness.md`). The on-the-wire NIC AMO is
+// 4-byte (mlx5 ATOMIC_MASKED_FA), so the slot's low 32 bits accumulate
+// modulo 2^32. The persistent reader_prev_*[c, peer] is int64, storing the
+// FULL cumulative-since-`Buffer`-creation count.
+//
+// Race-safety: `prev_at_entry` is captured at warp entry, identical across
+// all warps within the same iter (writeback only happens at kernel exit, so
+// no mid-kernel update races). At writeback, each warp computes
+// `new_cumulative = prev_at_entry + (cur_low - prev_at_entry_low) mod 2^32`
+// — adding the iter-local advance (always < 2^31 at production) on top of
+// the entry-time cumulative gives the correct full count, even after the
+// slot's low 32 bits wrap. atomicMax across warps keeps the largest, which
+// is monotonic. No wrap detection branch / CAS loop needed: the "high bits"
+// naturally accumulate as iters advance.
+__forceinline__ __device__ void atomicmax_reader_prev_cumulative(int64_t* prev_addr,
+                                                                  int64_t prev_at_entry,
+                                                                  uint32_t cur_low) {
+    uint32_t advance = cur_low - static_cast<uint32_t>(prev_at_entry);
+    int64_t new_cumulative = prev_at_entry + static_cast<int64_t>(advance);
+    atomicMax(reinterpret_cast<unsigned long long*>(prev_addr),
+              static_cast<unsigned long long>(new_cumulative));
+}
+
 // Round `gbl_ptr` up to a 128-byte boundary in place. Used before allocating
 // the RDMA dispatch meta SymBuffer so each 32-int (=128B) slab aligns to a
 // single H100 L2 cache line — required for the C3 sentinel-amo coherence
@@ -920,7 +944,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             auto start_time = clock64();
             while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head =
-                    static_cast<int>(static_cast<int64_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id))) - prev_rdma_channel_head_at_entry);
+                    static_cast<int>(static_cast<uint32_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id))) - static_cast<uint32_t>(prev_rdma_channel_head_at_entry));
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, cached_rdma_channel_head, rdma_tail_idx);
@@ -1012,9 +1036,10 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         // impact); false-high values can't happen because the slot
         // accumulates monotonically.
         if (lane_id < kNumRDMARanks) {
-            int64_t latest = static_cast<int64_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
-            atomicMax(reinterpret_cast<unsigned long long*>(env.reader_prev_head + channel_id * kNumRDMARanks + lane_id),
-                      static_cast<unsigned long long>(latest));
+            atomicmax_reader_prev_cumulative(
+                env.reader_prev_head + channel_id * kNumRDMARanks + lane_id,
+                prev_rdma_channel_head_at_entry,
+                static_cast<uint32_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id))));
         }
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
         EP_DEVICE_ASSERT(env.num_max_rdma_chunked_recv_tokens % env.num_max_rdma_chunked_send_tokens == 0);
@@ -1077,7 +1102,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-                    nvshmemi_ibgda_amo_nonfetch_add_8byte(rdma_channel_tail.buffer(rdma_rank),
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
                                                     num_tokens_to_issue,
                                                     translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
                                                     channel_id,
@@ -1189,7 +1214,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
                         cached_rdma_channel_tail =
-                            static_cast<int>(static_cast<int64_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - prev_rdma_channel_tail_at_entry);
+                            static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - static_cast<uint32_t>(prev_rdma_channel_tail_at_entry));
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
@@ -1257,9 +1282,10 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         // 1). atomicMax across multiple forwarder warps preserves monotonicity.
         // Stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
-            int64_t latest = static_cast<int64_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-            atomicMax(reinterpret_cast<unsigned long long*>(env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id),
-                      static_cast<unsigned long long>(latest));
+            atomicmax_reader_prev_cumulative(
+                env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id,
+                prev_rdma_channel_tail_at_entry,
+                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))));
             int latest_sentinel = ld_volatile_global(
                 rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
             atomicMax(env.dispatch_meta_sentinel_prev + channel_id * kNumRDMARanks + lane_id, latest_sentinel);
@@ -1289,7 +1315,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + env.num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
-                nvshmemi_ibgda_amo_nonfetch_add_8byte(rdma_channel_head.buffer(rdma_rank),
+                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
                                                 min_head - last_head,
                                                 translate_dst_rdma_rank<false>(lane_id, nvl_rank),
                                                 channel_id + num_channels,
@@ -2068,7 +2094,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             auto start_time = clock64();
             while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head =
-                    static_cast<int>(static_cast<int64_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id))) - prev_rdma_channel_head_at_entry);
+                    static_cast<int>(static_cast<uint32_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id))) - static_cast<uint32_t>(prev_rdma_channel_head_at_entry));
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch_grads RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, cached_rdma_channel_head, rdma_tail_idx);
@@ -2138,9 +2164,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         // Writeback observed cumulative head; see dispatch_main_kernel
         // kRDMASender for rationale.
         if (lane_id < kNumRDMARanks) {
-            int64_t latest = static_cast<int64_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
-            atomicMax(reinterpret_cast<unsigned long long*>(env.reader_prev_head + channel_id * kNumRDMARanks + lane_id),
-                      static_cast<unsigned long long>(latest));
+            atomicmax_reader_prev_cumulative(
+                env.reader_prev_head + channel_id * kNumRDMARanks + lane_id,
+                prev_rdma_channel_head_at_entry,
+                static_cast<uint32_t>(ld_volatile_global(rdma_channel_head.buffer(lane_id))));
         }
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
         // RDMA sender coordinator — same as fwd: issue chunked RDMA puts to
@@ -2201,7 +2228,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
                 __syncwarp();
                 if (lane_id == 0) {
-                    nvshmemi_ibgda_amo_nonfetch_add_8byte(rdma_channel_tail.buffer(rdma_rank),
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
                                                     num_tokens_in_chunk,
                                                     translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
                                                     channel_id,
@@ -2302,7 +2329,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
                         cached_rdma_channel_tail =
-                            static_cast<int>(static_cast<int64_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - prev_rdma_channel_tail_at_entry);
+                            static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - static_cast<uint32_t>(prev_rdma_channel_tail_at_entry));
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
@@ -2365,9 +2392,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         // 1). atomicMax across multiple forwarder warps preserves monotonicity.
         // Stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
-            int64_t latest = static_cast<int64_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-            atomicMax(reinterpret_cast<unsigned long long*>(env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id),
-                      static_cast<unsigned long long>(latest));
+            atomicmax_reader_prev_cumulative(
+                env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id,
+                prev_rdma_channel_tail_at_entry,
+                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))));
             int latest_sentinel = ld_volatile_global(
                 rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
             atomicMax(env.dispatch_meta_sentinel_prev + channel_id * kNumRDMARanks + lane_id, latest_sentinel);
@@ -2397,7 +2425,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + env.num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
-                nvshmemi_ibgda_amo_nonfetch_add_8byte(rdma_channel_head.buffer(rdma_rank),
+                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
                                                 min_head - last_head,
                                                 translate_dst_rdma_rank<false>(lane_id, nvl_rank),
                                                 channel_id + num_channels,
@@ -2919,7 +2947,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                 auto num_chunked_tokens = token_end_idx - token_start_idx;
                 auto start_time = clock64();
                 while (sub_warp_id == 0 and lane_id == 0) {
-                    int cur_iter_head = static_cast<int>(static_cast<int64_t>(ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank))) - prev_rdma_channel_head_at_entry);
+                    int cur_iter_head = static_cast<int>(static_cast<uint32_t>(ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank))) - static_cast<uint32_t>(prev_rdma_channel_head_at_entry));
                     int num_used_slots = token_start_idx - cur_iter_head;
                     if (num_max_rdma_chunked_recv_tokens - num_used_slots >= num_chunked_tokens)
                         break;
@@ -3003,7 +3031,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
 
                     __syncwarp();
                     if (elect_one_sync()) {
-                        nvshmemi_ibgda_amo_nonfetch_add_8byte(rdma_channel_tail.buffer(rdma_rank),
+                        nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
                                                         num_chunked_tokens,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                         channel_id,
@@ -3021,9 +3049,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             // per (channel, dst_rdma) — no atomic needed in principle, but
             // atomicMax keeps shape symmetric with the dispatch path.
             if (lane_id == 0) {
-                int64_t latest = static_cast<int64_t>(ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank)));
-                atomicMax(reinterpret_cast<unsigned long long*>(combine_reader_prev_head + channel_id * kNumRDMARanks + dst_rdma_rank),
-                          static_cast<unsigned long long>(latest));
+                atomicmax_reader_prev_cumulative(
+                    combine_reader_prev_head + channel_id * kNumRDMARanks + dst_rdma_rank,
+                    prev_rdma_channel_head_at_entry,
+                    static_cast<uint32_t>(ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank))));
             }
         } else if (warp_role == WarpRole::kRDMAReceiver) {
             // On origin rank: drain RDMA inbox, reduce K_dst contributions per
@@ -3053,7 +3082,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                 auto start_time = clock64();
                 while (cached_channel_tail_idx <= expected_head) {
                     cached_channel_tail_idx =
-                        static_cast<int>(static_cast<int64_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))) - prev_rdma_channel_tail_at_entry);
+                        static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))) - static_cast<uint32_t>(prev_rdma_channel_tail_at_entry));
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, tail: %d, "
                                "waiting: %ld, expect: %d\n",
@@ -3091,9 +3120,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             // Multiple RDMA receiver warps share the role; atomicMax keeps
             // the array monotonic.
             if (lane_id < kNumRDMARanks) {
-                int64_t latest = static_cast<int64_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-                atomicMax(reinterpret_cast<unsigned long long*>(combine_reader_prev_tail + channel_id * kNumRDMARanks + lane_id),
-                          static_cast<unsigned long long>(latest));
+                atomicmax_reader_prev_cumulative(
+                    combine_reader_prev_tail + channel_id * kNumRDMARanks + lane_id,
+                    prev_rdma_channel_tail_at_entry,
+                    static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))));
             }
         } else {
             // Coordinator
@@ -3119,7 +3149,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                             min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
                         lane_id < kNumRDMARanks) {
-                        nvshmemi_ibgda_amo_nonfetch_add_8byte(rdma_channel_head.buffer(rdma_rank),
+                        nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
                                                         min_head - last_rdma_head,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                         channel_id + num_channels,
