@@ -200,6 +200,29 @@ def main():
     TK_padded = pool.shape[0]
     T_recv = handle.o.shape[0]
 
+    # Snapshot of `send_rdma_head` / `send_nvl_head` for combine isolated
+    # timing. Internode `cached_notify_combine_kernel` block 1+ sentinel-
+    # encodes both arrays in place during every `buffer.combine` call (also
+    # during `buffer.combine_grads` via the same kernel). Re-running combine
+    # on the already-encoded arrays would mangle them — the reverse-walk re-
+    # encoding treats every entry as a sentinel and overwrites them with
+    # `-(1<<25)-1` within one pass, which makes the combine receivers spin
+    # forever waiting for a token count of ~33 M. Production never hits this
+    # because each layer's combine sees a fresh dispatch; the bench works
+    # around it by restoring the pristine heads before each timed iter.
+    # Tensors live on `handle._dispatch_out` for internode, None for intranode.
+    _internode_dispatch_out = getattr(handle, "_dispatch_out", None)
+    send_rdma_head_orig = (
+        _internode_dispatch_out.send_rdma_head.clone()
+        if _internode_dispatch_out is not None and _internode_dispatch_out.send_rdma_head.numel() > 0
+        else None
+    )
+    send_nvl_head_orig = (
+        _internode_dispatch_out.send_nvl_head.clone()
+        if _internode_dispatch_out is not None and _internode_dispatch_out.send_nvl_head.numel() > 0
+        else None
+    )
+
     expert_pool_block_offset = handle.expert_pool_block_offset
     cu_seqlens_m = (expert_pool_block_offset.to(torch.int32) * args.tile_m).contiguous()
     expert_frequency = handle.expert_frequency
@@ -369,6 +392,14 @@ def main():
         )
 
     def run_combine_only():
+        # Restore the pristine send_rdma_head / send_nvl_head before each call
+        # — see the snapshot at the top of main() for why. ~96 KB of GPU→GPU
+        # memcpy at production shape (~1 µs on H100 HBM), well below combine
+        # noise floor. Intranode skips the restore (snapshot is None;
+        # cached_notify_combine doesn't mutate intranode tensors in place).
+        if send_rdma_head_orig is not None:
+            _internode_dispatch_out.send_rdma_head.copy_(send_rdma_head_orig)
+            _internode_dispatch_out.send_nvl_head.copy_(send_nvl_head_orig)
         # Combine sender's per-token gate spins on
         # `compute_done_per_token[r] >= combine_seq`. Kernel Y populated
         # `compute_done_per_token` to `handle.dispatch_seq` for every recv-token
@@ -487,6 +518,12 @@ def main():
         )
 
     def run_combine_grads_only():
+        # Same snapshot-and-restore as run_combine_only — combine_grads also
+        # invokes cached_notify_combine_kernel and mutates send_rdma_head /
+        # send_nvl_head in place.
+        if send_rdma_head_orig is not None:
+            _internode_dispatch_out.send_rdma_head.copy_(send_rdma_head_orig)
+            _internode_dispatch_out.send_nvl_head.copy_(send_nvl_head_orig)
         # combine_grads's sender gate is `bwd_compute_done_per_token`; pre-fire
         # the same way run_combine_only fires `compute_done_per_token`. The
         # kernel runs to completion using captured `dL_dx_per_r` / `dL_dweight`.
