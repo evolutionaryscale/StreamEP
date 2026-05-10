@@ -199,6 +199,17 @@ private:
     int* dispatch_reader_prev_tail = nullptr;
     int* combine_reader_prev_head  = nullptr;
     int* combine_reader_prev_tail  = nullptr;
+    // Persistent prev-sentinel array for the RDMA dispatch meta region (C3).
+    // The meta SymBuffer's slot 30 ("kRdmaMetaSentinelSlot") accumulates
+    // across iters via amo_nonfetch_add — sender bulk_puts the 18 data ints
+    // into slots 0..17, then issues an amo on slot 30 to invalidate the L2
+    // line and signal availability. The forwarder reads its prev from this
+    // array at warp entry, spins on `ld(slot 30) > prev`, reads raw data
+    // slots, and atomicMaxes the latest cumulative back at exit.
+    // Sized [max_num_channels × num_rdma_ranks] int32. Same lifetime as
+    // reader_prev_*; freed in destructor; shared by fwd dispatch + bwd
+    // dispatch_grads (same dispatch stream).
+    int* dispatch_meta_sentinel_prev = nullptr;
 
     // Shrink mode buffer
     bool enable_shrink = false;

@@ -89,7 +89,12 @@ struct Config {
         const int num_channels = num_sms / 2;
 
         size_t num_bytes = 0;
-        num_bytes += num_channels * num_rdma_ranks * (NUM_MAX_NVL_PEERS * 2 + 2) * 2 * sizeof(int);
+        // Up-to-128B padding inserted between the data SymBuffer and the meta
+        // SymBuffer so each meta slab maps to exactly one H100 L2 line. See
+        // `align_meta_base_to_l2_line` in internode.cu and `kRdmaMetaSlabInts`
+        // in api.cuh.
+        num_bytes += NUM_BUFFER_ALIGNMENT_BYTES;
+        num_bytes += num_channels * num_rdma_ranks * kRdmaMetaSlabInts * 2 * sizeof(int);
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * internode::get_source_meta_bytes() * 2;
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(topk_idx_t) * 2;

@@ -237,6 +237,20 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
     return ((raw + a - 1) / a) * a;
 }
 
+// RDMA dispatch meta SymBuffer slab size (ints per (channel, dst_rdma) slab).
+// 32 ints = 128 bytes = one H100 L2 cache line. Slots 0..17 carry the data
+// (NUM_MAX_NVL_PEERS*2 start_sum + NUM_MAX_NVL_PEERS*2 end_sum + 2 prefix);
+// slots 18..29 are padding; slot 30 is the cumulative-across-iters sentinel
+// (8-byte-aligned, mlx5 ATOMIC_FAA target); slot 31 is reserved. The
+// sentinel-amo coherence trick (sender bulk_put + amo on slot 30; reader
+// observes slot 30 > prev_at_entry then reads slots 0..17 plain) requires
+// each slab to occupy exactly one L2 line. The meta SymBuffer base is
+// 128B-aligned by `align_meta_base_to_l2_line` in internode.cu.
+#define kRdmaMetaSlabInts 32
+#define kRdmaMetaSentinelSlot 30
+static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
+              "Meta data slots overflow the 0..17 region of the 32-int slab");
+
 // Per-iter RDMA scratch cleanup metadata for the streaming dispatch metadata
 // kernel (drains the dispatch_main SymBuffer slots beyond the metadata
 // kernel's own count + streaming payloads). Returns
@@ -244,17 +258,18 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
 __host__ __device__ inline std::pair<int, int> get_rdma_clean_meta(
         int hidden_int4, int num_topk_idx, int num_topk_weights,
         int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_channels) {
-    // Clean only the meta SymBuffer (NUM_MAX_NVL_PEERS * 2 + 2 ints,
-    // doubled for kDecoupled). The head/tail SymBuffers (each contributes
-    // +1 int via the kDecoupled=false ÷2 factor → +2 combined) are NOT
-    // cleaned: they're cumulative-cross-iter under the persistent
-    // reader_prev protocol. The `+2` here = the 2 extra meta ints
-    // (rdma_channel_prefix start/end, beyond the NUM_MAX_NVL_PEERS * 2
-    // start_sum/end_sum entries).
+    // Nothing to clean per-iter under the C3 protocol: the meta SymBuffer's
+    // data slots (0..17) are overwritten in full by the sender each iter,
+    // the sentinel (slot 30) is cumulative-across-iters and MUST NOT be
+    // zeroed, and the head/tail SymBuffers are also cumulative under the
+    // persistent reader_prev protocol (C2). The offset is preserved as the
+    // first byte past the data SymBuffer for cleanup-kernel sanity asserts;
+    // the count is 0 so no actual stores happen. The cleanup kernel itself
+    // is deleted in C4.
     return {(get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
              num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_channels) /
                 static_cast<int>(sizeof(int)),
-            (NUM_MAX_NVL_PEERS * 2 + 2) * num_rdma_ranks * 2 * num_channels};
+            0};
 }
 
 __host__ __device__ inline std::pair<int, int> get_nvl_clean_meta(
@@ -419,6 +434,13 @@ struct DispatchEnv {
     // fwd is visible at the start of bwd).
     int* reader_prev_head;
     int* reader_prev_tail;
+    // Persistent prev-sentinel array for the RDMA dispatch meta region.
+    // [num_channels × num_rdma_ranks] int32. Same lifetime/protocol as
+    // reader_prev_{head,tail}, but tracks the slab[c, src_rdma].slot[30]
+    // sentinel (cumulative amo). The forwarder seeds prev at warp entry,
+    // spins on `ld(slot 30) > prev`, reads raw data slots 0..17 once
+    // tripped, and atomicMaxes the latest slot 30 value back at exit.
+    int* dispatch_meta_sentinel_prev;
 };
 
 void launch_dispatch_main(const DispatchPoolOut& pool_out,

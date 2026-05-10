@@ -49,6 +49,23 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
     return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
 }
 
+// Round `gbl_ptr` up to a 128-byte boundary in place. Used before allocating
+// the RDMA dispatch meta SymBuffer so each 32-int (=128B) slab aligns to a
+// single H100 L2 cache line — required for the C3 sentinel-amo coherence
+// trick (sender bulk_put → amo_nonfetch_add(slot 30) on the same QP; the
+// amo invalidates the entire 128B line on the receiver, so subsequent reads
+// of slots 0..17 return HBM values rather than stale L2). The 128B base
+// alignment of `rdma_buffer_ptr` (NUM_BUFFER_ALIGNMENT_BYTES) is preserved
+// only at the start of the heap; intermediate SymBuffer advances depend on
+// `num_bytes_per_token * num_max_rdma_chunked_recv_tokens * num_rdma_ranks`
+// which is only int4-aligned. A `get_rdma_buffer_size_hint` slack of
+// NUM_BUFFER_ALIGNMENT_BYTES covers the up-to-127-byte gap this introduces.
+__forceinline__ __device__ void align_meta_base_to_l2_line(void*& gbl_ptr) {
+    constexpr uintptr_t kMask = NUM_BUFFER_ALIGNMENT_BYTES - 1;
+    auto p = reinterpret_cast<uintptr_t>(gbl_ptr);
+    gbl_ptr = reinterpret_cast<void*>((p + kMask) & ~kMask);
+}
+
 template <bool kLowLatencyMode>
 __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
     kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
@@ -771,8 +788,9 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     auto num_bytes_per_token = get_num_bytes_per_token(shape.hidden_int4, shape.num_topk, shape.num_topk);
     auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
         env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
+    align_meta_base_to_l2_line(env.rdma_buffer_ptr);
     auto rdma_channel_meta = SymBuffer<int>(env.rdma_buffer_ptr,
-        NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
+        kRdmaMetaSlabInts, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
@@ -836,26 +854,32 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         int token_start_idx, token_end_idx;
         get_channel_task_range(shape.num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-        // Send number of tokens in this channel by `-value - 1`
+        // Publish per-channel meta to each dst_rdma_rank: 18 raw data ints in
+        // slots 0..17 (NUM_MAX_NVL_PEERS*2 start_sum/end_sum + 2 rdma_channel
+        // prefix start/end) + a cumulative-across-iters sentinel at slot 30.
+        // Remote dst: bulk_put → amo_nonfetch_add(slot 30, 1) on the same QP;
+        // RC ordering places the put before the amo, and the amo invalidates
+        // the receiver's 128B L2 line so the forwarder's reads of slots 0..17
+        // fetch fresh from HBM (see kRdmaMetaSlabInts in api.cuh).
+        // Local dst: direct stores + __threadfence + atomicAdd(slot 30) — the
+        // forwarder is on the same GPU and observes the data via the L2.
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
             auto dst_ptr =
                 dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
             if (lane_id < NUM_MAX_NVL_PEERS) {
                 dst_ptr[lane_id] =
-                    -(channel_id == 0
-                          ? 0
-                          : inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1]) -
-                    1;
+                    channel_id == 0
+                        ? 0
+                        : inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1];
             } else if (lane_id < NUM_MAX_NVL_PEERS * 2) {
                 dst_ptr[lane_id] =
-                    -inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
-                                                      channel_id] -
-                    1;
+                    inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
+                                                     channel_id];
             } else if (lane_id == NUM_MAX_NVL_PEERS * 2) {
-                dst_ptr[lane_id] = -(channel_id == 0 ? 0 : inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1]) - 1;
+                dst_ptr[lane_id] = channel_id == 0 ? 0 : inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
             } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
-                dst_ptr[lane_id] = -inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] - 1;
+                dst_ptr[lane_id] = inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
             }
             __syncwarp();
 
@@ -865,6 +889,16 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                                                   sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
                                                   translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
                                                   channel_id, lane_id, 0);
+                if (lane_id == 0) {
+                    nvshmemi_ibgda_amo_nonfetch_add(
+                        rdma_channel_meta.recv_buffer(rdma_rank) + kRdmaMetaSentinelSlot,
+                        1,
+                        translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                        channel_id);
+                }
+            } else if (lane_id == 0) {
+                __threadfence();
+                atomicAdd(dst_ptr + kRdmaMetaSentinelSlot, 1);
             }
         }
         sync_rdma_sender_smem();
@@ -1072,20 +1106,32 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
+        // Seed prev_at_entry from the persistent sentinel array (written at
+        // the prior kernel's exit, stream-ordered, race-free). Spin on the
+        // cumulative slot 30 advancing past prev; once tripped, the bulk_put
+        // delivering slots 0..17 is RC-ordered before the amo and the L2
+        // line is freshly invalidated, so plain ld_volatile reads return the
+        // current iter's raw data.
+        int prev_meta_sentinel_at_entry = lane_id < kNumRDMARanks
+            ? env.dispatch_meta_sentinel_prev[channel_id * kNumRDMARanks + lane_id]
+            : 0;
         if (lane_id < kNumRDMARanks) {
             while (true) {
-                auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
-                auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
-                auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
-                auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
-                if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
-                    int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
+                auto cur_sentinel = ld_volatile_global(
+                    rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
+                if (cur_sentinel > prev_meta_sentinel_at_entry) {
+                    auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
+                    auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
+                    auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
+                    auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
+                    int start_sum = meta_0, end_sum = meta_1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
+                    // NVL ring still uses iter-local negative-encoded sentinels (C4).
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
                     st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
 
-                    src_rdma_channel_prefix = -meta_2 - 1;
-                    auto src_rdma_channel_prefix_1 = -meta_3 - 1;
+                    src_rdma_channel_prefix = meta_2;
+                    auto src_rdma_channel_prefix_1 = meta_3;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
                     per_token_out.recv_rdma_channel_prefix_matrix[lane_id * num_channels + channel_id] = src_rdma_channel_prefix_1;
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : inputs.recv_rdma_rank_prefix_sum[lane_id - 1];
@@ -1195,14 +1241,19 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         if (elect_one_sync())
             forward_channel_retired[dst_nvl_rank] = true;
 
-        // Writeback observed cumulative tail to persistent reader_prev_tail.
-        // Forwarder exits only after draining the expected count from each
-        // src_rdma; therefore ld(slot) at exit >= prev_at_entry + this iter's
-        // expected count. atomicMax across multiple forwarder warps preserves
-        // monotonicity. Stream-ordered with the next kernel's read.
+        // Writeback observed cumulative tail + meta-sentinel to the persistent
+        // arrays. Forwarder exits only after draining the expected count from
+        // each src_rdma — so ld(rdma_channel_tail) at exit >= prev_at_entry +
+        // this iter's expected count, and ld(slab[lane].slot[30]) >=
+        // prev_meta_sentinel_at_entry + 1 (this iter's amo bumps slot 30 by
+        // 1). atomicMax across multiple forwarder warps preserves monotonicity.
+        // Stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             int latest = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
             atomicMax(env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id, latest);
+            int latest_sentinel = ld_volatile_global(
+                rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
+            atomicMax(env.dispatch_meta_sentinel_prev + channel_id * kNumRDMARanks + lane_id, latest_sentinel);
         }
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
         if (target_rank > 0)
@@ -2015,8 +2066,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
     auto num_bytes_per_token = get_num_bytes_per_token(shape.hidden_int4, shape.num_topk, shape.num_topk);
     auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
         env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
+    align_meta_base_to_l2_line(env.rdma_buffer_ptr);
     auto rdma_channel_meta = SymBuffer<int>(env.rdma_buffer_ptr,
-        NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
+        kRdmaMetaSlabInts, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
@@ -2072,25 +2124,27 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         int token_start_idx, token_end_idx;
         get_channel_task_range(shape.num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
+        // See dispatch_main_kernel kRDMASender for the sentinel-amo / 128B
+        // L2-line packing rationale (C3). Mirrored here verbatim — fwd
+        // dispatch and bwd dispatch_grads share the meta SymBuffer + the
+        // dispatch_meta_sentinel_prev array (both run on streams.dispatch).
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
             auto dst_ptr =
                 dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
             if (lane_id < NUM_MAX_NVL_PEERS) {
                 dst_ptr[lane_id] =
-                    -(channel_id == 0
-                          ? 0
-                          : routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1]) -
-                    1;
+                    channel_id == 0
+                        ? 0
+                        : routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1];
             } else if (lane_id < NUM_MAX_NVL_PEERS * 2) {
                 dst_ptr[lane_id] =
-                    -routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
-                                                       channel_id] -
-                    1;
+                    routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
+                                                      channel_id];
             } else if (lane_id == NUM_MAX_NVL_PEERS * 2) {
-                dst_ptr[lane_id] = -(channel_id == 0 ? 0 : routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1]) - 1;
+                dst_ptr[lane_id] = channel_id == 0 ? 0 : routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
             } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
-                dst_ptr[lane_id] = -routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] - 1;
+                dst_ptr[lane_id] = routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
             }
             __syncwarp();
 
@@ -2100,6 +2154,16 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                                                   sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
                                                   translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
                                                   channel_id, lane_id, 0);
+                if (lane_id == 0) {
+                    nvshmemi_ibgda_amo_nonfetch_add(
+                        rdma_channel_meta.recv_buffer(rdma_rank) + kRdmaMetaSentinelSlot,
+                        1,
+                        translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                        channel_id);
+                }
+            } else if (lane_id == 0) {
+                __threadfence();
+                atomicAdd(dst_ptr + kRdmaMetaSentinelSlot, 1);
             }
         }
         sync_rdma_sender_smem();
@@ -2284,20 +2348,27 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
+        // See dispatch_main_kernel forwarder for the sentinel-amo rationale.
+        int prev_meta_sentinel_at_entry = lane_id < kNumRDMARanks
+            ? env.dispatch_meta_sentinel_prev[channel_id * kNumRDMARanks + lane_id]
+            : 0;
         if (lane_id < kNumRDMARanks) {
             while (true) {
-                auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
-                auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
-                auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
-                auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
-                if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
-                    int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
+                auto cur_sentinel = ld_volatile_global(
+                    rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
+                if (cur_sentinel > prev_meta_sentinel_at_entry) {
+                    auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
+                    auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
+                    auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
+                    auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
+                    int start_sum = meta_0, end_sum = meta_1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
+                    // NVL ring still uses iter-local negative-encoded sentinels (C4).
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
                     st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
 
-                    src_rdma_channel_prefix = -meta_2 - 1;
-                    auto src_rdma_channel_prefix_1 = -meta_3 - 1;
+                    src_rdma_channel_prefix = meta_2;
+                    auto src_rdma_channel_prefix_1 = meta_3;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : routing.recv_rdma_rank_prefix_sum[lane_id - 1];
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
@@ -2396,14 +2467,19 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         if (elect_one_sync())
             forward_channel_retired[dst_nvl_rank] = true;
 
-        // Writeback observed cumulative tail to persistent reader_prev_tail.
-        // Forwarder exits only after draining the expected count from each
-        // src_rdma; therefore ld(slot) at exit >= prev_at_entry + this iter's
-        // expected count. atomicMax across multiple forwarder warps preserves
-        // monotonicity. Stream-ordered with the next kernel's read.
+        // Writeback observed cumulative tail + meta-sentinel to the persistent
+        // arrays. Forwarder exits only after draining the expected count from
+        // each src_rdma — so ld(rdma_channel_tail) at exit >= prev_at_entry +
+        // this iter's expected count, and ld(slab[lane].slot[30]) >=
+        // prev_meta_sentinel_at_entry + 1 (this iter's amo bumps slot 30 by
+        // 1). atomicMax across multiple forwarder warps preserves monotonicity.
+        // Stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             int latest = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
             atomicMax(env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id, latest);
+            int latest_sentinel = ld_volatile_global(
+                rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
+            atomicMax(env.dispatch_meta_sentinel_prev + channel_id * kNumRDMARanks + lane_id, latest_sentinel);
         }
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
         if (target_rank > 0)
