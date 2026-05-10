@@ -244,10 +244,17 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
 __host__ __device__ inline std::pair<int, int> get_rdma_clean_meta(
         int hidden_int4, int num_topk_idx, int num_topk_weights,
         int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_channels) {
+    // Clean only the meta SymBuffer (NUM_MAX_NVL_PEERS * 2 + 2 ints,
+    // doubled for kDecoupled). The head/tail SymBuffers (each contributes
+    // +1 int via the kDecoupled=false ÷2 factor → +2 combined) are NOT
+    // cleaned: they're cumulative-cross-iter under the persistent
+    // reader_prev protocol. The `+2` here = the 2 extra meta ints
+    // (rdma_channel_prefix start/end, beyond the NUM_MAX_NVL_PEERS * 2
+    // start_sum/end_sum entries).
     return {(get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
              num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_channels) /
                 static_cast<int>(sizeof(int)),
-            (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
+            (NUM_MAX_NVL_PEERS * 2 + 2) * num_rdma_ranks * 2 * num_channels};
 }
 
 __host__ __device__ inline std::pair<int, int> get_nvl_clean_meta(
