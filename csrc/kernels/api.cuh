@@ -274,13 +274,22 @@ __host__ __device__ inline std::pair<int, int> get_rdma_clean_meta(
 
 __host__ __device__ inline std::pair<int, int> get_nvl_clean_meta(
         int hidden_int4, int num_topk_idx, int num_topk_weights,
-        int num_rdma_ranks, int num_nvl_ranks, int num_nvl_recv_buffer_tokens,
+        int /*num_rdma_ranks*/, int num_nvl_ranks, int num_nvl_recv_buffer_tokens,
         int num_channels, bool /*is_dispatch*/) {
+    // Nothing to clean per-iter under the C4 protocol: the dispatch NVL ring
+    // slots (`nvl_channel_prefix_start/end`, `nvl_channel_head`,
+    // `nvl_channel_tail`) carry a 12-bit gen-stamp from
+    // `tile_signal.dispatch_seq` in their high bits — readers ignore stale
+    // prior-iter values by checking the seq tag, so no inter-iter memset is
+    // needed. The combine NVL slots use a separate sentinel encoding
+    // applied by `cached_notify_combine_kernel` block 1+ and aren't touched
+    // here. Offset preserved as the first byte past the data SymBuffer for
+    // call-site assertion sanity; count is 0.
     return {(num_nvl_recv_buffer_tokens *
              get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
              num_nvl_ranks * num_channels) /
                 static_cast<int>(sizeof(int)),
-            num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels};
+            0};
 }
 
 // Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
@@ -345,11 +354,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int hidden_int4,
                                  int expert_alignment,
                                  int tile_m,
-                                 // Cleanup (mirrors notify_dispatch's args)
-                                 int rdma_clean_offset,
-                                 int rdma_num_int_clean,
-                                 int nvl_clean_offset,
-                                 int nvl_num_int_clean,
                                  // Streaming SymBuffer offset within rdma_buffer_ptr
                                  // (placed AFTER notify_dispatch's existing payload).
                                  int64_t streaming_rdma_offset,
@@ -507,47 +511,19 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
                                 int num_channels,
                                 cudaStream_t stream);
 
-// Pre-bwd-dispatch fixup: zero the dispatch RDMA + NVL ring control regions
-// so bwd `dispatch_grads_main_kernel` doesn't latch onto stale negative
-// start/end values or stale head/tail counters from the prior fwd dispatch.
-// Mirrors the intranode pattern at `deep_ep.cpp:1176-1186` (cudaMemsetAsync +
-// intranode::barrier) but scaled to two-tier RDMA + NVL with cross-RDMA-rank
-// nvshmem_sync. Uses dispatch-side clean offsets (num_topk_idx=num_topk).
-void cleanup_dispatch_buffers(int hidden_int4,
-                              int num_topk,
-                              int num_ranks,
-                              int num_channels,
-                              int num_max_rdma_chunked_recv_tokens,
-                              int num_max_nvl_chunked_recv_tokens,
-                              void* rdma_buffer_ptr,
-                              void** buffer_ptrs,
-                              int** barrier_signal_ptrs,
-                              int rank,
-                              cudaStream_t stream,
-                              int64_t num_rdma_bytes,
-                              int64_t num_nvl_bytes);
-
-// Pre-combine fixup. Two architectural jobs, mirroring the intranode
-// `cached_notify_combine` (`api.cuh:177`) but scaled to the two-tier
-// RDMA + NVL ring buffers:
+// Pre-combine fixup: in-place reverse-order sentinel encoding of
+// `combined_rdma_head` (input: dispatch's `send_rdma_head`) and
+// `combined_nvl_head` (input: dispatch's `send_nvl_head`). For tokens whose
+// head entry is `< 0` (no contribution from that source), encode the *next*
+// real head ahead of it as `-last_head - 1`; combine's receivers use this
+// to skip cleanly past gaps without re-reading the counter region.
 //
-//   1. Zero the head/tail control regions of this iter's combine RDMA +
-//      NVL ring buffers (so combine's queues start at 0). The data
-//      buffer itself is also zeroed in the same pass — combine's
-//      receivers don't expect data residue, but zeroing is cheap and
-//      matches the legacy contract.
-//   2. In-place reverse-order sentinel encoding of `combined_rdma_head`
-//      (input: dispatch's `send_rdma_head`) and `combined_nvl_head`
-//      (input: dispatch's `send_nvl_head`). For tokens whose head entry
-//      is `< 0` (no contribution from that source), encode the *next*
-//      real head ahead of it as `-last_head - 1`. Combine's receivers
-//      use this to skip cleanly past gaps without re-reading the
-//      counter region.
-//
-// Both jobs are this-iter combine prelude; next-iter dispatch cleanup
-// is the streaming metadata kernel's responsibility, separately. Same
-// pattern as intranode but with the NVL-head pass added on top of the
-// RDMA-head pass (intranode has no RDMA tier).
+// (The legacy buffer-cleanup half of this kernel — IBGDA quiet + RDMA team
+// sync + NVL barrier + memset of dispatch ring-control regions — was
+// retired in C4: every polled slot is iter-disambiguated by the cumulative
+// head/tail / RDMA meta sentinel-amo / NVL gen-stamp protocols. Block 0 of
+// the kernel is now an early return to preserve block-id offsets in
+// blocks 1+.)
 void cached_notify_combine(int hidden_int4,
                            int num_topk,
                            int num_ranks,
@@ -557,15 +533,7 @@ void cached_notify_combine(int hidden_int4,
                            const int* rdma_channel_prefix_matrix,
                            const int* rdma_rank_prefix_sum,
                            int* combined_nvl_head,
-                           void* rdma_buffer_ptr,
-                           int num_max_rdma_chunked_recv_tokens,
-                           void** buffer_ptrs,
-                           int num_max_nvl_chunked_recv_tokens,
-                           int** barrier_signal_ptrs,
-                           int rank,
-                           cudaStream_t stream,
-                           int64_t num_rdma_bytes,
-                           int64_t num_nvl_bytes);
+                           cudaStream_t stream);
 
 // combine_main_kernel — used by both forward combine and backward
 // combine_grads. Same arg surface as `intranode::launch_combine_main` for the

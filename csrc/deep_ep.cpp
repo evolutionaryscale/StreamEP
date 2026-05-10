@@ -977,19 +977,9 @@ StreamingMetadataTestOutputs Buffer::streaming_metadata_test(
         2 * static_cast<int64_t>(num_rdma_ranks) *
         (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int);
 
-    // Cleanup args: kernel asserts metadata payloads fit before clean offset;
-    // pass past-end and skip cleanup (no dispatch_main following this test).
     int64_t streaming_rdma_total =
         2 * static_cast<int64_t>(num_rdma_ranks) * num_channels *
         NUM_MAX_NVL_PEERS * num_local_experts * sizeof(int);
-    int rdma_clean_offset =
-        static_cast<int>((streaming_rdma_offset + streaming_rdma_total) / sizeof(int));
-    int rdma_num_int_clean = 0;
-    int kNvlSlotInts = num_rdma_ranks * num_channels * num_local_experts;
-    int nvl_clean_offset = num_rdma_experts +
-        (num_rdma_ranks + num_local_experts + kNvlSlotInts) * NUM_MAX_NVL_PEERS;
-    int nvl_num_int_clean = 0;
-
     EP_HOST_ASSERT(streaming_rdma_offset + streaming_rdma_total <= num_rdma_bytes);
 
     // hidden_int4 unused inside the metadata kernel; placeholder.
@@ -1015,8 +1005,6 @@ StreamingMetadataTestOutputs Buffer::streaming_metadata_test(
         total_tiles_device.data_ptr<int>(),
         num_tokens, num_topk, num_experts, num_channels,
         hidden_int4, expert_alignment, tile_m,
-        rdma_clean_offset, rdma_num_int_clean,
-        nvl_clean_offset, nvl_num_int_clean,
         streaming_rdma_offset,
         rdma_buffer_ptr,
         buffer_ptrs_gpu,
@@ -1119,15 +1107,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::cached_notify_combine_test(
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.send_nvl_head.data_ptr<int>(),
-        rdma_buffer_ptr_combine,
-        config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_recv_tokens,
-        barrier_signal_ptrs_gpu,
-        rank,
-        stream,
-        num_rdma_bytes,
-        num_nvl_bytes);
+        stream);
 
     return {dispatch_out.send_rdma_head, dispatch_out.send_nvl_head};
 #else
@@ -1426,15 +1406,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         NUM_MAX_NVL_PEERS * num_local_experts * sizeof(int);
     EP_HOST_ASSERT(streaming_rdma_offset + streaming_rdma_total <= num_rdma_bytes);
 
-    // Cleanup args — drain stale state from prior dispatch_main runs so the
-    // sender/forwarder/receiver's SymBuffer / AsymBuffer slots start fresh.
-    auto rdma_clean = internode::get_rdma_clean_meta(
-        hidden_int4, num_topk, num_topk, num_rdma_ranks,
-        config.num_max_rdma_chunked_recv_tokens, num_channels);
-    auto nvl_clean = internode::get_nvl_clean_meta(
-        hidden_int4, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS,
-        config.num_max_nvl_chunked_recv_tokens, num_channels, /*is_dispatch=*/true);
-
     internode::streaming_dispatch_metadata(
         topk_idx.data_ptr<topk_idx_t>(),
         moe_recv_counter_mapped, moe_recv_rdma_counter_mapped,
@@ -1453,8 +1424,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         total_tiles_device.data_ptr<int>(),
         num_tokens, num_topk, num_experts, num_channels,
         hidden_int4, expert_alignment, tile_m,
-        rdma_clean.first, rdma_clean.second,
-        nvl_clean.first,  nvl_clean.second,
         streaming_rdma_offset,
         rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
         rank, num_ranks, stream, num_rdma_bytes, num_nvl_bytes);
@@ -1652,17 +1621,12 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
     auto bwd_y_ready = torch::zeros({total_tiles}, i64_opts);
     auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
 
-    // Wipe stale ring-control state from prior fwd dispatch so bwd's
-    // sender/forwarder/receiver don't latch onto negative-encoded values
-    // left in nvl_channel_prefix_start/end or stale head/tail counters.
-    // Mirrors intranode `Buffer::intranode_dispatch_grads` (memset + barrier
-    // at deep_ep.cpp:1176-1186) but scaled to two-tier RDMA + NVL.
-    internode::cleanup_dispatch_buffers(
-        hidden_int4, num_topk, num_ranks, num_channels,
-        config.num_max_rdma_chunked_recv_tokens,
-        config.num_max_nvl_chunked_recv_tokens,
-        rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
-        rank, stream, num_rdma_bytes, num_nvl_bytes);
+    // No pre-bwd-dispatch cleanup: under the C2/C3/C4 cumulative protocols
+    // (head/tail amo, RDMA meta sentinel-amo, NVL gen-stamp), every polled
+    // ring-control slot disambiguates this iter's value from prior-iter
+    // residue without an inter-iter memset. The dispatch stream's sequencing
+    // (fwd dispatch → cleanup_dispatch_buffers → bwd dispatch_grads in the
+    // legacy flow) is now just (fwd dispatch → bwd dispatch_grads).
 
     internode::DispatchGradsIO io{
         .dL_do_pool        = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
@@ -1761,21 +1725,16 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Pre-combine fixup: sentinel-encode heads in place + zero combine's
-    // ring control regions. Forwarder reads recv-side per-(dst_rdma_rank,
-    // channel) ranges, so the prefix matrix is the recv-side one.
+    // Pre-combine fixup: sentinel-encode heads in place. Forwarder reads
+    // recv-side per-(dst_rdma_rank, channel) ranges, so the prefix matrix
+    // is the recv-side one.
     internode::cached_notify_combine(
         hidden_int4, num_topk, num_ranks, num_channels, num_combined_tokens,
         dispatch_out.send_rdma_head.data_ptr<int>(),
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.send_nvl_head.data_ptr<int>(),
-        rdma_buffer_ptr_combine,
-        config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_recv_tokens,
-        barrier_signal_ptrs_gpu,
-        rank, stream, num_rdma_bytes, num_nvl_bytes);
+        stream);
 
     // Combine output tensors.
     auto recv_x = torch::empty({num_combined_tokens, hidden}, x.options());

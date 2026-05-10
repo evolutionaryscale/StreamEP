@@ -49,6 +49,32 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
     return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
 }
 
+// Gen-stamp encoding for the NVL dispatch ring slots (C4). Packs a 12-bit
+// generation tag (low 12 bits of `tile_signal.dispatch_seq`, monotonic
+// across the training run) into the high 12 bits of a 32-bit slot, and a
+// 20-bit value into the low 20 bits. The reader checks the high bits
+// match the current iter's seq before consuming the low bits — that
+// distinguishes this-iter writes from prior-iter residue and removes the
+// need for inter-iter cleanup memsets on `nvl_channel_prefix_start/end`,
+// `nvl_channel_head`, and `nvl_channel_tail`. NVLink writes are intra-node
+// coherent, so no amo / L2-line-pack trick is required (unlike the RDMA
+// meta region in C3). Adjacent iters always have distinct seqs within
+// the 4096-iter window since the slot is written every iter.
+//
+// Value-range invariants at production shape (verified during C4):
+//   prefix start_sum/end_sum:  ≤ T*K = 8192*4 = 32K   (≪ 2^20-1 = 1.05M)
+//   nvl_channel_head/tail:     ≤ tokens per channel    (≪ 2^20-1)
+__forceinline__ __device__ int nvl_pack(int64_t seq, int value) {
+    return static_cast<int>(((static_cast<uint32_t>(seq) & 0xFFFu) << 20) |
+                            (static_cast<uint32_t>(value) & 0xFFFFFu));
+}
+__forceinline__ __device__ bool nvl_seq_match(int packed, int64_t seq) {
+    return (static_cast<uint32_t>(packed) >> 20) == (static_cast<uint32_t>(seq) & 0xFFFu);
+}
+__forceinline__ __device__ int nvl_unpack_value(int packed) {
+    return static_cast<int>(static_cast<uint32_t>(packed) & 0xFFFFFu);
+}
+
 // Round `gbl_ptr` up to a 128-byte boundary in place. Used before allocating
 // the RDMA dispatch meta SymBuffer so each 32-int (=128B) slab aligns to a
 // single H100 L2 cache line — required for the C3 sentinel-amo coherence
@@ -129,11 +155,6 @@ __global__ void streaming_dispatch_metadata_kernel(
         int num_channels,
         int expert_alignment,
         int tile_m,
-        // Cleanup
-        int rdma_clean_offset,
-        int rdma_num_int_clean,
-        int nvl_clean_offset,
-        int nvl_num_int_clean,
         // Streaming SymBuffer offset within rdma_buffer_ptr (post notify_dispatch's payload)
         int64_t streaming_rdma_offset,
         // Env
@@ -304,31 +325,16 @@ __global__ void streaming_dispatch_metadata_kernel(
     }
     __syncthreads();
 
-    // ── Phase A3: NVSHMEM cleanup (drain prior-iter WRs) + intra-NVL barrier.
-    {
-        auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
-        for (int i = thread_id; i < qps_per_rdma_rank * (kNumRDMARanks - 1); i += num_threads) {
-            auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % kNumRDMARanks;
-            auto qp_id = i % qps_per_rdma_rank;
-            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
-        }
-        __syncthreads();
-
-        if (thread_id == 32)
-            nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
-        barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
-    }
-
     // ── Phase A4: build + send notify_dispatch's count payload via RDMA.
-    auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
+    // (Phase A3 retired in C4: the inter-iter IBGDA quiet + nvshmem_sync +
+    // NVL barrier — formerly required because the dispatch ring slots
+    // reset to 0 each iter and needed all peer WRs drained before the
+    // memset — are unnecessary now that every polled slot is iter-
+    // disambiguated by its cumulative protocol. The metadata kernel's own
+    // RDMA puts in this phase remain bracketed by their own quiet + sync
+    // below; only the upfront cross-iter drain is gone.)
     auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr,
         NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
-
-    // Cleanup the inter-iter RDMA scratch region.
-    EP_DEVICE_ASSERT(rdma_recv_num_tokens_mixed.total_bytes <= rdma_clean_offset * sizeof(int));
-    #pragma unroll
-    for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
-        rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
 
     // Build per-dst_rdma payload from SMEM histograms.
     for (int i = thread_id; i < num_ranks; i += num_threads)
@@ -391,14 +397,6 @@ __global__ void streaming_dispatch_metadata_kernel(
     auto nvl_send_num_tokens_per_expert = AsymBuffer<int>(nvl_send_buffer, E_local, NUM_MAX_NVL_PEERS);
     auto nvl_recv_num_tokens_per_rank = AsymBuffer<int>(nvl_recv_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
     auto nvl_recv_num_tokens_per_expert = AsymBuffer<int>(nvl_recv_buffer, E_local, NUM_MAX_NVL_PEERS);
-
-    auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
-    EP_DEVICE_ASSERT(nvl_reduced_num_tokens_per_expert.total_bytes + nvl_send_num_tokens_per_rank.total_bytes +
-                         nvl_send_num_tokens_per_expert.total_bytes <=
-                     nvl_clean_offset * sizeof(int));
-    #pragma unroll
-    for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
-        nvl_buffer_ptr_int[nvl_clean_offset + i] = 0;
 
     // Reduce per-expert tokens received (sum over kNumRDMARanks senders).
     if (thread_id < num_rdma_experts) {
@@ -492,10 +490,6 @@ __global__ void streaming_dispatch_metadata_kernel(
     const int kNvlSlotInts = kNumRDMARanks * num_channels * E_local;
     auto nvl_streaming_send = AsymBuffer<int>(nvl_send_buffer, kNvlSlotInts, NUM_MAX_NVL_PEERS);
     auto nvl_streaming_recv = AsymBuffer<int>(nvl_recv_buffer, kNvlSlotInts, NUM_MAX_NVL_PEERS);
-
-    EP_DEVICE_ASSERT(nvl_reduced_num_tokens_per_expert.total_bytes + nvl_send_num_tokens_per_rank.total_bytes +
-                         nvl_send_num_tokens_per_expert.total_bytes + nvl_streaming_send.total_bytes <=
-                     nvl_clean_offset * sizeof(int));
 
     // Compute peer m's nvl_streaming region byte offset (same offset in
     // every peer's NVL buffer, IPC peers are mirror-allocated). nvl_streaming_recv
@@ -634,10 +628,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int hidden_int4,
                                  int expert_alignment,
                                  int tile_m,
-                                 int rdma_clean_offset,
-                                 int rdma_num_int_clean,
-                                 int nvl_clean_offset,
-                                 int nvl_num_int_clean,
                                  int64_t streaming_rdma_offset,
                                  void* rdma_buffer_ptr,
                                  void** buffer_ptrs,
@@ -682,8 +672,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       total_tiles_device,                                                              \
                       num_tokens, num_topk, num_experts, num_channels,                                 \
                       expert_alignment, tile_m,                                                        \
-                      rdma_clean_offset, rdma_num_int_clean,                                           \
-                      nvl_clean_offset, nvl_num_int_clean,                                             \
                       streaming_rdma_offset,                                                           \
                       rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,                         \
                       cpu_rdma_team);                                                                  \
@@ -1126,9 +1114,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
                     int start_sum = meta_0, end_sum = meta_1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-                    // NVL ring still uses iter-local negative-encoded sentinels (C4).
-                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
-                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
+                    // NVL ring uses gen-stamp encoding (C4).
+                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
+                                         nvl_pack(tile_signal.dispatch_seq, start_sum));
+                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
+                                         nvl_pack(tile_signal.dispatch_seq, end_sum));
 
                     src_rdma_channel_prefix = meta_2;
                     auto src_rdma_channel_prefix_1 = meta_3;
@@ -1167,7 +1157,9 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
                     break;
-                cached_nvl_channel_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+                int raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+                if (nvl_seq_match(raw_head, tile_signal.dispatch_seq))
+                    cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
@@ -1234,7 +1226,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
             __syncwarp();
             if (elect_one_sync())
-                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+                st_release_sys_global(nvl_channel_tail.buffer(),
+                                     nvl_pack(tile_signal.dispatch_seq, cached_nvl_channel_tail));
         }
 
         __syncwarp();
@@ -1318,10 +1311,12 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
-            start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
-            end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
-            if (start_offset < 0 and end_offset < 0) {
-                start_offset = -start_offset - 1, end_offset = -end_offset - 1;
+            int raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
+            int raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
+            if (nvl_seq_match(raw_start, tile_signal.dispatch_seq) and
+                nvl_seq_match(raw_end, tile_signal.dispatch_seq)) {
+                start_offset = nvl_unpack_value(raw_start);
+                end_offset   = nvl_unpack_value(raw_end);
                 total_offset += start_offset;
                 break;
             }
@@ -1360,7 +1355,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             while (true) {
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
-                cached_channel_tail_idx = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                {
+                    int raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                    if (nvl_seq_match(raw_tail, tile_signal.dispatch_seq))
+                        cached_channel_tail_idx = nvl_unpack_value(raw_tail);
+                }
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank);
@@ -1450,7 +1449,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             }
 
             if (elect_one_sync())
-                st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
+                st_relaxed_sys_global(nvl_channel_head.buffer(),
+                                     nvl_pack(tile_signal.dispatch_seq, cached_channel_head_idx));
         }
 
         // ── Pass 2 fire: substream-end.
@@ -1682,11 +1682,13 @@ __device__ int combine_token(bool is_token_in_rank,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // cached_notify_combine — pre-combine fixup. See api.cuh for the architectural
-// contract; this is the kernel body. Block layout (mirrors legacy
-// `cached_notify` from the pre-streaming-port internode combine path):
+// contract; this is the kernel body. Block layout:
 //
-//   block 0:  buffer cleanup (IBGDA quiet → RDMA team sync → NVL barrier →
-//             zero RDMA & NVL control + data regions → barrier).
+//   block 0:  reserved historically for buffer cleanup (IBGDA quiet + team
+//             sync + memset). Under the C2/C3/C4 cumulative protocols every
+//             polled dispatch slot is iter-disambiguated, so block 0 is now
+//             an early return — kept only to preserve the kernel's block
+//             count (block-id offsets in blocks 1+ unchanged).
 //   block 1:  reverse-order sentinel encoding of `combined_rdma_head`
 //             ([num_combined_tokens, num_rdma_ranks]). Per-channel × per
 //             dst_rdma_rank, walks the channel's recv-token range in reverse
@@ -1695,29 +1697,16 @@ __device__ int combine_token(bool is_token_in_rank,
 //             ([num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]). TMA-batched
 //             per (dst_rdma_rank, channel) — same pattern as block 1 but
 //             along the NVL axis with TMA load/store batches.
-//
-// All three sub-passes always run (no `is_cached_dispatch` branching as
-// in the legacy — the streaming-internode path has no separate
-// "cached dispatch" mode that skips encoding).
 // ─────────────────────────────────────────────────────────────────────────────
 template <int kNumTMABytesPerWarp>
 __global__ void cached_notify_combine_kernel(
-    int rdma_clean_offset,
-    int rdma_num_int_clean,
-    int nvl_clean_offset,
-    int nvl_num_int_clean,
     int* combined_rdma_head,
     int num_combined_tokens,
     int num_channels,
     const int* rdma_channel_prefix_matrix,
     const int* rdma_rank_prefix_sum,
     int* combined_nvl_head,
-    void* rdma_buffer_ptr,
-    void** buffer_ptrs,
-    int** barrier_signal_ptrs,
-    int rank,
-    int num_ranks,
-    nvshmem_team_t rdma_team) {
+    int num_ranks) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
@@ -1725,40 +1714,13 @@ __global__ void cached_notify_combine_kernel(
     auto warp_id = thread_id / 32;
     auto lane_id = get_lane_id();
 
-    auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-    auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
 
     if (sm_id == 0) {
-        // Drain prior IBGDA traffic on every (peer, qp) combination so the
-        // upcoming combine starts with the RDMA WQ slots clean.
-        auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
-        for (int i = thread_id; i < qps_per_rdma_rank * (num_rdma_ranks - 1); i += num_threads) {
-            auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % num_rdma_ranks;
-            auto qp_id = i % qps_per_rdma_rank;
-            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank), qp_id);
-        }
-        __syncthreads();
-
-        if (thread_id == 32)
-            nvshmem_sync_with_same_gpu_idx<false>(rdma_team);
-
-        barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
-
-        auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
-        #pragma unroll
-        for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
-            rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
-
-        auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
-        #pragma unroll
-        for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
-            nvl_buffer_ptr_int[nvl_clean_offset + i] = 0;
-        __syncthreads();
-
-        if (thread_id == 32)
-            nvshmem_sync_with_same_gpu_idx<false>(rdma_team);
-        barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+        // Block 0 retired (C4): every dispatch ring slot is now iter-
+        // disambiguated by the cumulative protocols, so the team-sync +
+        // IBGDA quiet + memset block formerly here is no longer needed.
+        return;
 
     } else if (sm_id == 1) {
         EP_DEVICE_ASSERT(num_warps >= num_channels);
@@ -1851,87 +1813,6 @@ __global__ void cached_notify_combine_kernel(
     }
 }
 
-// Cleanup-only kernel: zero the dispatch RDMA + NVL ring control regions
-// before bwd `dispatch_grads_main_kernel` runs. Mirrors the cleanup half of
-// `cached_notify_combine` (Block 0) but with dispatch-side clean offsets
-// (`num_topk_idx = num_topk` since dispatch's wire format includes
-// topk_idx + topk_weights). Single-block: IBGDA quiet → RDMA team sync →
-// NVL barrier → memset both regions → RDMA team sync → NVL barrier.
-__global__ void cleanup_dispatch_buffers_kernel(
-    int rdma_clean_offset,
-    int rdma_num_int_clean,
-    int nvl_clean_offset,
-    int nvl_num_int_clean,
-    void* rdma_buffer_ptr,
-    void** buffer_ptrs,
-    int** barrier_signal_ptrs,
-    int rank,
-    int num_ranks,
-    nvshmem_team_t rdma_team) {
-    auto thread_id = static_cast<int>(threadIdx.x);
-    auto num_threads = static_cast<int>(blockDim.x);
-    auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
-    auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-    auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
-
-    auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
-    for (int i = thread_id; i < qps_per_rdma_rank * (num_rdma_ranks - 1); i += num_threads) {
-        auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % num_rdma_ranks;
-        auto qp_id = i % qps_per_rdma_rank;
-        nvshmemi_ibgda_quiet(translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank), qp_id);
-    }
-    __syncthreads();
-
-    if (thread_id == 32)
-        nvshmem_sync_with_same_gpu_idx<false>(rdma_team);
-    barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
-
-    auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
-    #pragma unroll
-    for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
-        rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
-
-    auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
-    #pragma unroll
-    for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
-        nvl_buffer_ptr_int[nvl_clean_offset + i] = 0;
-    __syncthreads();
-
-    if (thread_id == 32)
-        nvshmem_sync_with_same_gpu_idx<false>(rdma_team);
-    barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
-}
-
-void cleanup_dispatch_buffers(int hidden_int4,
-                              int num_topk,
-                              int num_ranks,
-                              int num_channels,
-                              int num_max_rdma_chunked_recv_tokens,
-                              int num_max_nvl_chunked_recv_tokens,
-                              void* rdma_buffer_ptr,
-                              void** buffer_ptrs,
-                              int** barrier_signal_ptrs,
-                              int rank,
-                              cudaStream_t stream,
-                              int64_t num_rdma_bytes,
-                              int64_t num_nvl_bytes) {
-    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-    auto rdma_clean = get_rdma_clean_meta(
-        hidden_int4, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
-    auto nvl_clean = get_nvl_clean_meta(
-        hidden_int4, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS,
-        num_max_nvl_chunked_recv_tokens, num_channels, /*is_dispatch=*/true);
-    EP_HOST_ASSERT((rdma_clean.first + rdma_clean.second) * sizeof(int) <= num_rdma_bytes);
-    EP_HOST_ASSERT((nvl_clean.first + nvl_clean.second) * sizeof(int) <= num_nvl_bytes);
-
-    SETUP_LAUNCH_CONFIG(1, 128, stream);
-    LAUNCH_KERNEL(&cfg, cleanup_dispatch_buffers_kernel,
-                  rdma_clean.first, rdma_clean.second,
-                  nvl_clean.first, nvl_clean.second,
-                  rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs,
-                  rank, num_ranks, cpu_rdma_team);
-}
-
 void cached_notify_combine(int hidden_int4,
                            int num_topk,
                            int num_ranks,
@@ -1941,18 +1822,9 @@ void cached_notify_combine(int hidden_int4,
                            const int* rdma_channel_prefix_matrix,
                            const int* rdma_rank_prefix_sum,
                            int* combined_nvl_head,
-                           void* rdma_buffer_ptr,
-                           int num_max_rdma_chunked_recv_tokens,
-                           void** buffer_ptrs,
-                           int num_max_nvl_chunked_recv_tokens,
-                           int** barrier_signal_ptrs,
-                           int rank,
-                           cudaStream_t stream,
-                           int64_t num_rdma_bytes,
-                           int64_t num_nvl_bytes) {
+                           cudaStream_t stream) {
     const int num_threads = std::max(128, 32 * num_channels);
     const int num_warps = num_threads / 32;
-    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     // 4096 B/warp at num_sms=64 (= 32 channels) → 32×4096 = 128 KB SMEM,
     // comfortably under H100's ~228 KB dynamic cap. Per-warp TMA-batched
     // NVL-head pass packs ~127 tokens/batch (= (4096 − 8) / (4 ×
@@ -1962,39 +1834,16 @@ void cached_notify_combine(int hidden_int4,
     constexpr int kNumTMABytesPerWarp = 4096;
     const int smem_size = kNumTMABytesPerWarp * num_warps;
 
-    // Combine wire format: data + SourceMeta + topk_weights (no topk_idx, in
-    // contrast to dispatch). Pass `num_topk_idx=0` to the clean-meta helpers.
-    auto rdma_clean = get_rdma_clean_meta(
-        hidden_int4, /*num_topk_idx=*/0, /*num_topk_weights=*/num_topk,
-        num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
-    // Combine's RDMA SymBuffers: data + head + tail (no meta region between
-    // data and head, unlike dispatch). With head/tail now cumulative-cross-
-    // iter under the persistent reader_prev protocol, and data overwritten
-    // by each iter's sender, combine's RDMA region needs no cleanup at all.
-    // Override the formula's clean count to 0; it was sized for the
-    // dispatch-style data+meta+head+tail layout.
-    rdma_clean.second = 0;
-    auto nvl_clean = get_nvl_clean_meta(
-        hidden_int4, /*num_topk_idx=*/0, /*num_topk_weights=*/num_topk,
-        num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens,
-        num_channels, /*is_dispatch=*/false);
-    EP_HOST_ASSERT((rdma_clean.first + rdma_clean.second) * sizeof(int) <= num_rdma_bytes);
-    EP_HOST_ASSERT((nvl_clean.first + nvl_clean.second) * sizeof(int) <= num_nvl_bytes);
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_channels * 2 > 3);
 
     auto kernel = cached_notify_combine_kernel<kNumTMABytesPerWarp>;
     SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
     SET_SHARED_MEMORY_FOR_TMA(kernel);
     LAUNCH_KERNEL(&cfg, kernel,
-                  rdma_clean.first, rdma_clean.second,
-                  nvl_clean.first, nvl_clean.second,
                   combined_rdma_head, num_combined_tokens, num_channels,
                   rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
                   combined_nvl_head,
-                  rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs,
-                  rank, num_ranks, cpu_rdma_team);
+                  num_ranks);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2363,9 +2212,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                     auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
                     int start_sum = meta_0, end_sum = meta_1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-                    // NVL ring still uses iter-local negative-encoded sentinels (C4).
-                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
-                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
+                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
+                                         nvl_pack(tile_signal.dispatch_seq, start_sum));
+                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
+                                         nvl_pack(tile_signal.dispatch_seq, end_sum));
 
                     src_rdma_channel_prefix = meta_2;
                     auto src_rdma_channel_prefix_1 = meta_3;
@@ -2398,7 +2248,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
                     break;
-                cached_nvl_channel_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+                int raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+                if (nvl_seq_match(raw_head, tile_signal.dispatch_seq))
+                    cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch_grads forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
@@ -2460,7 +2312,8 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
             __syncwarp();
             if (elect_one_sync())
-                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+                st_release_sys_global(nvl_channel_tail.buffer(),
+                                     nvl_pack(tile_signal.dispatch_seq, cached_nvl_channel_tail));
         }
 
         __syncwarp();
@@ -2540,10 +2393,12 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         int start_offset = 0, end_offset = 0;
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
-            start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
-            end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
-            if (start_offset < 0 and end_offset < 0) {
-                start_offset = -start_offset - 1, end_offset = -end_offset - 1;
+            int raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
+            int raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
+            if (nvl_seq_match(raw_start, tile_signal.dispatch_seq) and
+                nvl_seq_match(raw_end, tile_signal.dispatch_seq)) {
+                start_offset = nvl_unpack_value(raw_start);
+                end_offset   = nvl_unpack_value(raw_end);
                 break;
             }
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -2562,7 +2417,11 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             while (true) {
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
-                cached_channel_tail_idx = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                {
+                    int raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                    if (nvl_seq_match(raw_tail, tile_signal.dispatch_seq))
+                        cached_channel_tail_idx = nvl_unpack_value(raw_tail);
+                }
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch_grads NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank);
@@ -2602,7 +2461,8 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             }
 
             if (elect_one_sync())
-                st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
+                st_relaxed_sys_global(nvl_channel_head.buffer(),
+                                     nvl_pack(tile_signal.dispatch_seq, cached_channel_head_idx));
         }
 
         // Pass 2 fire — uses seen_per_substream from routing (vs fwd's
