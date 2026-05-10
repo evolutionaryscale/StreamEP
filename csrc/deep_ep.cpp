@@ -323,6 +323,10 @@ void Buffer::destroy() {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
         internode::free(rdma_buffer_ptr);
+        if (dispatch_reader_prev_head) CUDA_CHECK(cudaFree(dispatch_reader_prev_head));
+        if (dispatch_reader_prev_tail) CUDA_CHECK(cudaFree(dispatch_reader_prev_tail));
+        if (combine_reader_prev_head)  CUDA_CHECK(cudaFree(combine_reader_prev_head));
+        if (combine_reader_prev_tail)  CUDA_CHECK(cudaFree(combine_reader_prev_tail));
         if (enable_shrink) {
             internode::free(mask_buffer_ptr);
             internode::free(sync_buffer_ptr);
@@ -391,6 +395,22 @@ void Buffer::sync(const std::vector<int>& device_ids,
 
         // Clean buffer
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
+
+        // Persistent reader_prev arrays for the RDMA head/tail slots. See
+        // `deep_ep.hpp` for layout / role. Sized for the worst case
+        // (max_num_channels × num_rdma_ranks). Local memory (not symmetric);
+        // each rank tracks its own reader's last-observed cumulative.
+        const int max_num_channels = num_device_sms / 2;
+        const int64_t prev_array_bytes =
+            static_cast<int64_t>(max_num_channels) * num_rdma_ranks * sizeof(int);
+        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_head, prev_array_bytes));
+        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail, prev_array_bytes));
+        CUDA_CHECK(cudaMalloc(&combine_reader_prev_head,  prev_array_bytes));
+        CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail,  prev_array_bytes));
+        CUDA_CHECK(cudaMemset(dispatch_reader_prev_head, 0, prev_array_bytes));
+        CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail, 0, prev_array_bytes));
+        CUDA_CHECK(cudaMemset(combine_reader_prev_head,  0, prev_array_bytes));
+        CUDA_CHECK(cudaMemset(combine_reader_prev_tail,  0, prev_array_bytes));
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -1537,6 +1557,8 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .num_max_rdma_chunked_recv_tokens    = config.num_max_rdma_chunked_recv_tokens,
         .num_max_nvl_chunked_send_tokens     = config.num_max_nvl_chunked_send_tokens,
         .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
+        .reader_prev_head                    = dispatch_reader_prev_head,
+        .reader_prev_tail                    = dispatch_reader_prev_tail,
     };
 
     internode::launch_dispatch_main(pool_out, per_token_out, inputs, tile_signal,
@@ -1672,6 +1694,8 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
         .num_max_rdma_chunked_recv_tokens    = config.num_max_rdma_chunked_recv_tokens,
         .num_max_nvl_chunked_send_tokens     = config.num_max_nvl_chunked_send_tokens,
         .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
+        .reader_prev_head                    = dispatch_reader_prev_head,
+        .reader_prev_tail                    = dispatch_reader_prev_tail,
     };
 
     internode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env, num_rdma_ranks, num_channels, stream);
@@ -1774,7 +1798,8 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens,
-        rank, num_ranks, stream, num_channels);
+        rank, num_ranks, stream, num_channels,
+        combine_reader_prev_head, combine_reader_prev_tail);
 
     return {recv_x, recv_topk_weights_out};
 #else

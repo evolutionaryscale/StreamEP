@@ -404,6 +404,14 @@ struct DispatchEnv {
     int num_max_rdma_chunked_recv_tokens;
     int num_max_nvl_chunked_send_tokens;
     int num_max_nvl_chunked_recv_tokens;
+    // Persistent reader_prev arrays for the RDMA head/tail SymBuffer slots.
+    // [num_channels × num_rdma_ranks] int32 each. Read at warp entry,
+    // written back at kernel exit. See `Buffer` in `deep_ep.hpp` for the
+    // role / lifetime. Shared by fwd dispatch + bwd dispatch_grads (both on
+    // streams.dispatch — stream-ordered, so the writeback at the end of
+    // fwd is visible at the start of bwd).
+    int* reader_prev_head;
+    int* reader_prev_tail;
 };
 
 void launch_dispatch_main(const DispatchPoolOut& pool_out,
@@ -564,7 +572,14 @@ void launch_combine_main(cudaDataType_t type,
                          int rank,
                          int num_ranks,
                          cudaStream_t stream,
-                         int num_channels);
+                         int num_channels,
+                         // Persistent reader_prev arrays for the combine
+                         // direction's RDMA head/tail. Same role and layout
+                         // as `DispatchEnv::reader_prev_*`. Shared by fwd
+                         // combine + bwd combine_grads (both on
+                         // streams.combine — stream-ordered).
+                         int* combine_reader_prev_head,
+                         int* combine_reader_prev_tail);
 
 }  // namespace internode
 

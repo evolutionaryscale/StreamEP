@@ -2587,7 +2587,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     int num_max_nvl_chunked_send_tokens,
     int num_max_nvl_chunked_recv_tokens,
     int rank,
-    int num_ranks) {
+    int num_ranks,
+    int* combine_reader_prev_head,
+    int* combine_reader_prev_tail) {
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -3086,7 +3088,9 @@ void launch_combine_main(cudaDataType_t type,
                          int rank,
                          int num_ranks,
                          cudaStream_t stream,
-                         int num_channels) {
+                         int num_channels,
+                         int* combine_reader_prev_head,
+                         int* combine_reader_prev_tail) {
     constexpr int kNumCombineForwarderWarps = 24;
     constexpr int kNumTMABytesPerSenderWarp = 16384;
     constexpr int kNumTMABytesPerForwarderWarp = 9248;
@@ -3121,7 +3125,8 @@ void launch_combine_main(cudaDataType_t type,
                       buffer_ptrs,                                                   \
                       num_max_nvl_chunked_send_tokens,                               \
                       num_max_nvl_chunked_recv_tokens,                               \
-                      rank, num_ranks);                                              \
+                      rank, num_ranks,                                               \
+                      combine_reader_prev_head, combine_reader_prev_tail);           \
     }                                                                                \
     break
 

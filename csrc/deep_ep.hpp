@@ -173,6 +173,24 @@ private:
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
 
+    // Persistent ring control state. The cross-host head/tail slots in the
+    // RDMA SymBuffers accumulate across iters via amo_nonfetch_add (the
+    // sender publishes deltas, the slot's value is the cumulative across
+    // all iters). Each kernel's reader reads `prev` from these arrays at
+    // warp entry, computes iter-local cached values as `cur - prev`, then
+    // writes the latest cumulative back to the array at kernel exit. The
+    // arrays are written in lockstep with kernel exit (no race with peer
+    // amos), unlike an in-kernel `ld(slot)` seed which is racy because
+    // peer amos land asynchronously through the NIC.
+    //
+    // Sized [max_num_channels × num_rdma_ranks] int32, ~512 B each at
+    // production; ~2 KB total. Allocated zero-init in `Buffer::Buffer`,
+    // freed in destructor.
+    int* dispatch_reader_prev_head = nullptr;
+    int* dispatch_reader_prev_tail = nullptr;
+    int* combine_reader_prev_head  = nullptr;
+    int* combine_reader_prev_tail  = nullptr;
+
     // Shrink mode buffer
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;
