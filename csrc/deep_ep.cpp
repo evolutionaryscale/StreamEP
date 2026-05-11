@@ -1668,6 +1668,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     };
     internode::DispatchTileSignal tile_signal{
         .base_pool           = pre.base_pool.data_ptr<int>(),
+        .seen_per_substream  = pre.seen_per_substream.data_ptr<int>(),
         .pool_arrival_count  = post.pool_arrival_count.data_ptr<int>(),
         .pool_arrival_target = pool_arrival_target_n.data_ptr<int>(),
         .tile_ready          = post.tile_ready.data_ptr<int64_t>(),
@@ -1795,6 +1796,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
         .recv_token_to_slots                = dispatch_out.recv_token_to_slots.data_ptr<int>(),
         .base_pool                          = dispatch_out.base_pool.data_ptr<int>(),
         .seen_per_substream                 = dispatch_out.seen_per_substream.data_ptr<int>(),
+        .tile_id_to_expert                  = dispatch_out.tile_id_to_expert.data_ptr<int>(),
         .gbl_channel_prefix_matrix          = dispatch_out.gbl_channel_prefix_matrix.data_ptr<int>(),
         .rdma_channel_prefix_matrix         = dispatch_out.rdma_channel_prefix_matrix.data_ptr<int>(),
         .recv_rdma_rank_prefix_sum          = dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),

@@ -367,6 +367,12 @@ struct DispatchInputs {
 
 struct DispatchTileSignal {
     const int* base_pool;            // [num_channels, num_world_ranks, E_local]
+    const int* seen_per_substream;   // [num_channels, num_world_ranks, E_local]
+                                     //   eager-fire target: NVL receiver compares its
+                                     //   per-warp `seen[src_rdma][e_local]` against this
+                                     //   per-iter; on match, fires `tile_ready` for the
+                                     //   completed expert's blocks (vs the substream-end
+                                     //   walk intranode still uses).
     int* pool_arrival_count;         // [total_tiles]
     const int* pool_arrival_target;  // [total_tiles]
     int64_t* tile_ready;             // [total_tiles]
@@ -435,6 +441,7 @@ struct DispatchGradsRouting {
     const int* recv_token_to_slots;   // [T_recv, num_topk]                       bwd Pass B slot lookup
     const int* base_pool;             // [num_channels, num_world_ranks, E_local] Pass 2: per-substream slot start
     const int* seen_per_substream;    // [num_channels, num_world_ranks, E_local] Pass 2: per-substream-per-expert recv count
+    const int* tile_id_to_expert;     // [total_tiles] int32                      Eager Pass 2: slot → e_local via slot/tile_m
     // Sender-side prefix matrices (drive sender + sender_coordinator's
     // per-channel send counts and the negative-encoded meta the forwarder
     // reads to derive `num_tokens_to_recv_from_rdma`).

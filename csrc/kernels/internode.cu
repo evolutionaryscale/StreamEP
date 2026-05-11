@@ -885,11 +885,6 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
     auto sync_forwarder_smem = []() { asm volatile("barrier.sync 1, %0;" ::"r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
 
-    // NVL receiver synchronization (custom barrier 2 — only the
-    // NUM_MAX_NVL_PEERS receiver warps participate, not the RDMA senders sharing
-    // this block).
-    auto sync_nvl_receivers = []() { asm volatile("barrier.sync 2, %0;" ::"r"(NUM_MAX_NVL_PEERS * 32)); };
-
     if (warp_role == WarpRole::kRDMASender) {
         // Get tasks
         int token_start_idx, token_end_idx;
@@ -1437,6 +1432,21 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         // base_pool slice for this warp's substreams: indexed by [src_rdma][e]
         // inside the kernel via (channel_id * num_world_ranks + src_world) * E_local.
         const int* base_pool_for_channel = tile_signal.base_pool + channel_id * num_world_ranks * E_local;
+        const int* seen_for_channel = tile_signal.seen_per_substream + channel_id * num_world_ranks * E_local;
+
+        // Eager Pass 2 fire bookkeeping: lane-0 register bitmask of `e_local`s
+        // this warp has already fired tile_ready for (across all src_rdma_rank
+        // src_worlds). Each warp's substream binding is to a specific
+        // src_nvl_rank — `e_local` alone identifies the (src_world, e) tuple
+        // we may have already fired, because seen-per-substream completion
+        // for a given (src_rdma, e) only fires once across the warp's life,
+        // and a `(src_rdma_a, e) → fired` does not block `(src_rdma_b, e) →
+        // fire` since each (src_rdma, e) gets its own atomicAdd's worth of
+        // writes_in_block. So the mask is per-(src_rdma, e) — we need
+        // 2D bookkeeping. Use kNumRDMARanks bitmasks of E_local bits each;
+        // since NUM_MAX_LOCAL_EXPERTS = 64 and kNumRDMARanks ≤ 16, this is
+        // a uint64_t[kNumRDMARanks] register array.
+        uint64_t completed_mask[kNumRDMARanks] = {0};
 
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
@@ -1486,14 +1496,18 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 auto topk_weights_in_msg = reinterpret_cast<const float*>(shifted + hidden_bytes + sizeof(SourceMeta) + shape.num_topk * sizeof(int));
 
                 // ── Pass A: lane-0 K-loop, slot allocation. Reads topk_idx
-                //    from the global NVL ring (independent of TMA). ──
+                //    from the global NVL ring (independent of TMA). Also
+                //    records `e_local_row[k]` for the per-iter eager-fire
+                //    check below. ──
                 int slot_row[kMaxTopK];
+                int e_local_row[kMaxTopK];
                 if (lane_id == 0) {
                     int* base_pool_substream = const_cast<int*>(base_pool_for_channel + src_world * E_local);
                     int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
                     for (int k = 0; k < shape.num_topk; ++k) {
                         int e_global = static_cast<int>(__ldg(topk_idx_in_msg + k));
                         int e_local = (e_global >= local_expert_begin and e_global < local_expert_end) ? e_global - local_expert_begin : -1;
+                        e_local_row[k] = e_local;
                         if (e_local >= 0) {
                             int slot = base_pool_substream[e_local] + seen_for_src[e_local];
                             seen_for_src[e_local] += 1;
@@ -1557,54 +1571,74 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     st_na_global(reinterpret_cast<SourceMeta*>(per_token_out.recv_src_meta) + recv_token_idx, meta);
 
                 // Drain this iter's K-fanout stores before stage `s` is reused
-                // (two iters from now) by the next prefetch's load.
+                // (two iters from now) by the next prefetch's load — and before
+                // the eager-fire check below issues atomicAdds whose target
+                // ordering depends on the pool writes being sys-visible.
                 tma_store_wait<0>();
+                __syncwarp();
+
+                // ── Eager Pass 2 fire.
+                // For each unique `e_local` this iter touched on this src_world
+                // (= src_rdma × NUM_MAX_NVL_PEERS + src_nvl), check whether
+                // `warp_local_seen[src_rdma][e_local]` just hit the metadata-
+                // kernel-computed `seen_per_substream[c, src_world, e_local]`.
+                // If yes, this warp has finished its contribution to expert
+                // `e_local` in this substream: fence + atomic-add the writes-
+                // in-block count + release-store `tile_ready` on completion.
+                //
+                // Visibility: each warp's `__threadfence_system()` before its
+                // own atomicAdd orders this warp's pool writes (K-fanout TMA
+                // stores + per-pool-slot scalars) sys-visible before the
+                // atomicAdd. When the count reaches target on some warp's
+                // atomicAdd, that warp's `cnt_before` value reflects every
+                // contributor's add; per atomicAdd's intrinsic ordering, each
+                // contributor's fenced writes are visible by then. So the
+                // release-store of `tile_ready` is safe to be followed by a
+                // consumer-side acquire on `tile_ready`. Mirrors intranode's
+                // single-fusion pattern without the cross-warp `bar.sync 2` —
+                // each warp's own fence-before-atomic carries the invariant.
+                if (lane_id == 0) {
+                    uint64_t newly_complete = 0;
+                    for (int k = 0; k < shape.num_topk; ++k) {
+                        int e_local = e_local_row[k];
+                        if (e_local < 0) continue;
+                        uint64_t bit = 1ULL << e_local;
+                        if ((completed_mask[src_rdma_rank] | newly_complete) & bit) continue;
+                        int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
+                        int expected = ld_nc_global(seen_for_channel + src_world * E_local + e_local);
+                        if (my_seen == expected) newly_complete |= bit;
+                    }
+
+                    if (newly_complete != 0) {
+                        completed_mask[src_rdma_rank] |= newly_complete;
+                        __threadfence_system();
+                        for (int e_local = 0; e_local < E_local; ++e_local) {
+                            if (!((newly_complete >> e_local) & 1)) continue;
+                            int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
+                            int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
+                            int slot_end_e = slot_start_e + my_seen;
+                            int first_block = slot_start_e / shape.tile_m;
+                            int last_block = (slot_end_e - 1) / shape.tile_m;
+                            for (int block_id = first_block; block_id <= last_block; ++block_id) {
+                                int block_slot_start = block_id * shape.tile_m;
+                                int block_slot_end = block_slot_start + shape.tile_m;
+                                int writes_in_block =
+                                    min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
+                                int cnt_before = atomicAdd(&tile_signal.pool_arrival_count[block_id], writes_in_block);
+                                if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
+                                    memory_fence();
+                                    st_release_sys_global(tile_signal.tile_ready + block_id, tile_signal.dispatch_seq);
+                                }
+                            }
+                        }
+                    }
+                }
                 __syncwarp();
             }
 
             if (elect_one_sync())
                 st_relaxed_sys_global(nvl_channel_head.buffer(),
                                      nvl_pack(nvl_seq, cached_channel_head_idx));
-        }
-
-        // ── Pass 2 fire: substream-end.
-        // Every NVL receiver thread does its own __threadfence_system() to
-        // publish its prior writes (per-pool-slot scalars + recv_token_to_slots
-        // are written by lane 0 of every receiver warp; the fence on every
-        // thread covers that thread's writes). The cross-receiver-warp
-        // bar.sync 2 ensures all 8 NVL receiver warps in this block reach
-        // the fence point AND finish their fences before any warp's Pass 2
-        // walk fires `tile_ready` for a tile that other warps contributed
-        // to. Mirrors `intranode.cu:781–797`.
-        tma_store_wait<0>();
-        __syncwarp();
-        __threadfence_system();
-        sync_nvl_receivers();
-
-        if (lane_id == 0) {
-            for (int e = 0; e < E_local; ++e) {
-                #pragma unroll 1
-                for (int src_rdma_rank = 0; src_rdma_rank < kNumRDMARanks; ++src_rdma_rank) {
-                    int n_writes_for_e = warp_local_seen[src_rdma_rank * E_local + e];
-                    if (n_writes_for_e == 0) continue;
-                    int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
-                    int slot_start_e = base_pool_for_channel[src_world * E_local + e];
-                    int slot_end_e = slot_start_e + n_writes_for_e;
-                    int first_block = slot_start_e / shape.tile_m;
-                    int last_block = (slot_end_e - 1) / shape.tile_m;
-                    for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                        int block_slot_start = block_id * shape.tile_m;
-                        int block_slot_end = block_slot_start + shape.tile_m;
-                        int writes_in_block =
-                            min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-                        int cnt_before = atomicAdd(&tile_signal.pool_arrival_count[block_id], writes_in_block);
-                        if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
-                            memory_fence();
-                            st_release_sys_global(tile_signal.tile_ready + block_id, tile_signal.dispatch_seq);
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -2098,7 +2132,6 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
     auto sync_forwarder_smem = []() { asm volatile("barrier.sync 1, %0;" ::"r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
 
-    auto sync_nvl_receivers = []() { asm volatile("barrier.sync 2, %0;" ::"r"(NUM_MAX_NVL_PEERS * 32)); };
 
     if (warp_role == WarpRole::kRDMASender) {
         // Sender: identical structure to fwd dispatch, but reads `io.dL_dy`
@@ -2571,7 +2604,22 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
 
-        const int* seen_for_substream = routing.seen_per_substream + channel_id * num_world_ranks * E_local;
+        const int* seen_for_channel = routing.seen_per_substream + channel_id * num_world_ranks * E_local;
+        const int* base_pool_for_channel = routing.base_pool + channel_id * num_world_ranks * E_local;
+
+        // Per-warp Pass-A-equivalent counter table for eager-fire bookkeeping,
+        // mirrors fwd `warp_local_seen`. Placed in SMEM right after the
+        // NUM_MAX_NVL_PEERS TMA stage slabs. Lane 0 reads/writes it.
+        int* warp_local_seen = reinterpret_cast<int*>(
+            smem_tma_buffer + NUM_MAX_NVL_PEERS * kNumTMABytesPerWarp
+            + target_rank * kNumRDMARanks * E_local * static_cast<int>(sizeof(int)));
+        for (int i = lane_id; i < kNumRDMARanks * E_local; i += 32)
+            warp_local_seen[i] = 0;
+        __syncwarp();
+
+        // Eager Pass 2 fire dedup mask, per-src_rdma_rank (see fwd dispatch
+        // for the rationale comment).
+        uint64_t completed_mask[kNumRDMARanks] = {0};
 
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
@@ -2628,10 +2676,23 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                     __syncwarp();
                 }
 
+                // Bwd Pass A equivalent: per K, derive (slot, e_local) and
+                // increment the per-warp `warp_local_seen[src_rdma][e_local]`
+                // counter. e_local comes from `tile_id_to_expert[slot/tile_m]`
+                // (the metadata kernel built it; small and L2-resident).
+                int e_local_row[kMaxTopK];
                 if (lane_id == 0) {
+                    int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
                     for (int k = 0; k < shape.num_topk; ++k) {
                         int slot = routing.recv_token_to_slots[recv_token_idx * shape.num_topk + k];
-                        if (slot < 0) continue;
+                        if (slot < 0) {
+                            e_local_row[k] = -1;
+                            continue;
+                        }
+                        int tile_id = slot / shape.tile_m;
+                        int e_local = __ldg(routing.tile_id_to_expert + tile_id);
+                        e_local_row[k] = e_local;
+                        seen_for_src[e_local] += 1;
                         tma_store_1d(tma_buffer(s),
                                      io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4,
                                      hidden_bytes, false);
@@ -2640,46 +2701,57 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 __syncwarp();
                 tma_store_wait<0>();
                 __syncwarp();
+
+                // ── Eager Pass 2 fire (bwd).
+                // Same shape as fwd's eager fire (see dispatch_main_kernel for
+                // the visibility argument). Fires `bwd_y_ready[block]` when
+                // this substream's contribution to expert `e_local` is
+                // complete; `seen_per_substream` is the metadata-kernel-
+                // computed expected count, matching fwd's count.
+                if (lane_id == 0) {
+                    uint64_t newly_complete = 0;
+                    for (int k = 0; k < shape.num_topk; ++k) {
+                        int e_local = e_local_row[k];
+                        if (e_local < 0) continue;
+                        uint64_t bit = 1ULL << e_local;
+                        if ((completed_mask[src_rdma_rank] | newly_complete) & bit) continue;
+                        int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                        int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
+                        int expected = ld_nc_global(seen_for_channel + src_world * E_local + e_local);
+                        if (my_seen == expected) newly_complete |= bit;
+                    }
+
+                    if (newly_complete != 0) {
+                        completed_mask[src_rdma_rank] |= newly_complete;
+                        __threadfence_system();
+                        int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                        for (int e_local = 0; e_local < E_local; ++e_local) {
+                            if (!((newly_complete >> e_local) & 1)) continue;
+                            int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
+                            int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
+                            int slot_end_e = slot_start_e + my_seen;
+                            int first_block = slot_start_e / shape.tile_m;
+                            int last_block = (slot_end_e - 1) / shape.tile_m;
+                            for (int block_id = first_block; block_id <= last_block; ++block_id) {
+                                int block_slot_start = block_id * shape.tile_m;
+                                int block_slot_end = block_slot_start + shape.tile_m;
+                                int writes_in_block =
+                                    min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
+                                int cnt_before = atomicAdd(&tile_signal.bwd_dispatch_arrival_count[block_id], writes_in_block);
+                                if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
+                                    memory_fence();
+                                    st_release_sys_global(tile_signal.bwd_y_ready + block_id, tile_signal.dispatch_seq);
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncwarp();
             }
 
             if (elect_one_sync())
                 st_relaxed_sys_global(nvl_channel_head.buffer(),
                                      nvl_pack(nvl_seq, cached_channel_head_idx));
-        }
-
-        // Pass 2 fire — uses seen_per_substream from routing (vs fwd's
-        // warp_local_seen) and bwd_y_ready instead of tile_ready.
-        tma_store_wait<0>();
-        __syncwarp();
-        __threadfence_system();
-        sync_nvl_receivers();
-
-        if (lane_id == 0) {
-            for (int e = 0; e < E_local; ++e) {
-                #pragma unroll 1
-                for (int src_rdma_rank = 0; src_rdma_rank < kNumRDMARanks; ++src_rdma_rank) {
-                    int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
-                    int n_writes_for_e = seen_for_substream[src_world * E_local + e];
-                    if (n_writes_for_e == 0) continue;
-                    int slot_start_e = tile_signal.pool_arrival_target /* placeholder; need base_pool */ ? 0 : 0;
-                    (void)slot_start_e;
-                    int base_slot = routing.base_pool[(channel_id * num_world_ranks + src_world) * E_local + e];
-                    int slot_end_e = base_slot + n_writes_for_e;
-                    int first_block = base_slot / shape.tile_m;
-                    int last_block = (slot_end_e - 1) / shape.tile_m;
-                    for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                        int block_slot_start = block_id * shape.tile_m;
-                        int block_slot_end = block_slot_start + shape.tile_m;
-                        int writes_in_block =
-                            min(slot_end_e, block_slot_end) - max(base_slot, block_slot_start);
-                        int cnt_before = atomicAdd(&tile_signal.bwd_dispatch_arrival_count[block_id], writes_in_block);
-                        if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
-                            memory_fence();
-                            st_release_sys_global(tile_signal.bwd_y_ready + block_id, tile_signal.dispatch_seq);
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -2696,8 +2768,9 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
     constexpr int kNumTMABytesPerWarp = 16384;
 
     int num_world_ranks = num_rdma_ranks * NUM_MAX_NVL_PEERS;
-    (void)num_world_ranks;
-    int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
+    int E_local = shape.num_experts / num_world_ranks;
+    int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS
+                  + receiver_seen_smem_bytes(num_rdma_ranks, E_local);
 
 #define DISPATCH_GRADS_LAUNCH_CASE(num_rdma_ranks_)                                       \
     {                                                                                     \
