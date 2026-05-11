@@ -854,15 +854,29 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
     // TMA buffer slabs (per (channel-block, NVL-peer-warp)). Forwarder warps and
     // NVL receiver warps both index by `target_rank` ∈ [0, NUM_MAX_NVL_PEERS),
-    // sharing the layout (mirrors legacy).
+    // sharing the layout (mirrors legacy). Two-stage pipeline: each warp owns
+    // two `num_bytes_per_token`-sized stage buffers (16-byte aligned) + two
+    // 8-byte mbarriers at the tail. Stage `s` (∈ {0, 1}) is one outstanding
+    // TMA load; the next iter's load issues into stage `1-s` before this iter
+    // waits on its store, so load latency is hidden behind the store-wait.
+    constexpr int kNumStages = 2;
+    const int kStageStride = (num_bytes_per_token + 15) & ~15;
     extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-    auto tma_buffer = smem_tma_buffer + target_rank * kNumTMABytesPerWarp;
-    auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
-    uint32_t tma_phase = 0;
+    auto tma_buffer = [=](int s) {
+        return smem_tma_buffer + target_rank * kNumTMABytesPerWarp + s * kStageStride;
+    };
+    auto tma_mbarrier = [=](int s) {
+        return reinterpret_cast<uint64_t*>(
+            smem_tma_buffer + target_rank * kNumTMABytesPerWarp
+            + kNumStages * kStageStride + s * static_cast<int>(sizeof(uint64_t)));
+    };
+    uint32_t tma_phase[kNumStages] = {0, 0};
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
-        mbarrier_init(tma_mbarrier, 1);
+        #pragma unroll
+        for (int s = 0; s < kNumStages; ++s)
+            mbarrier_init(tma_mbarrier(s), 1);
         fence_barrier_init();
-        EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(kNumStages * kStageStride + kNumStages * static_cast<int>(sizeof(uint64_t)) <= kNumTMABytesPerWarp);
     }
     __syncwarp();
 
@@ -1226,6 +1240,17 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
             auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
 
+            // Two-stage prefetch pipeline: while iter `i` waits on its store,
+            // iter `i+1`'s load is already in flight on the TMA unit. Forward-
+            // iters that skip the TMA (not-in-dst-nvl-rank) do NOT advance the
+            // stage cursor — the next forwarded iter inherits the pending head
+            // slot. Pending queue is at most `kNumStages` deep.
+            struct PendingForward { uint8_t* dst_shifted; };
+            PendingForward pending[kNumStages] = {};
+            int pending_count = 0;
+            int issue_stage = 0;
+            int drain_stage = 0;
+
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
                 auto rdma_slot_idx = i % env.num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
@@ -1243,21 +1268,44 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 int dst_slot_idx = (cached_nvl_channel_tail++) % env.num_max_nvl_chunked_recv_tokens;
                 auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
 
+                // Drain the oldest pending stage if both stages are in flight.
+                if (pending_count == kNumStages) {
+                    mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
+                    if (elect_one_sync())
+                        tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                    __syncwarp();
+                    tma_store_wait<0>();
+                    __syncwarp();
+                    drain_stage = (drain_stage + 1) % kNumStages;
+                    pending_count -= 1;
+                }
+
+                // Issue load for the current token into the free stage. Runs
+                // async on the TMA unit, overlapping with any in-flight store
+                // from a prior iter.
                 if (elect_one_sync()) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, num_bytes_per_token, false);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, num_bytes_per_token);
+                    tma_load_1d(tma_buffer(issue_stage), shifted, tma_mbarrier(issue_stage), num_bytes_per_token, false);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier(issue_stage), num_bytes_per_token);
                 }
                 __syncwarp();
-                mbarrier_wait(tma_mbarrier, tma_phase);
-                if (elect_one_sync())
-                    tma_store_1d(tma_buffer, dst_shifted, num_bytes_per_token);
-                __syncwarp();
+                pending[issue_stage].dst_shifted = dst_shifted;
+                issue_stage = (issue_stage + 1) % kNumStages;
+                pending_count += 1;
 
                 if ((++num_tokens_sent) == env.num_max_nvl_chunked_send_tokens)
                     src_rdma_tail = i + 1;
+            }
 
+            // Drain remaining in-flight stages in FIFO order.
+            while (pending_count > 0) {
+                mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
+                if (elect_one_sync())
+                    tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                __syncwarp();
                 tma_store_wait<0>();
                 __syncwarp();
+                drain_stage = (drain_stage + 1) % kNumStages;
+                pending_count -= 1;
             }
 
             if (lane_id == src_rdma_rank)
@@ -1409,7 +1457,23 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             }
 
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
+
+            // Pre-loop: prefetch the first token's hidden-bytes load into stage 0.
+            // The inner-for body waits on this and then prefetches stage 1, etc.
+            if (num_recv_tokens > 0) {
+                int prefetch_buf = cached_channel_head_idx % env.num_max_nvl_chunked_recv_tokens;
+                auto prefetch_shifted = nvl_channel_x.buffer() + prefetch_buf * num_bytes_per_token;
+                if (elect_one_sync()) {
+                    tma_load_1d(tma_buffer(0), prefetch_shifted, tma_mbarrier(0), hidden_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier(0), hidden_bytes);
+                }
+                __syncwarp();
+            }
+
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++chunk_idx, --num_tokens_to_recv) {
+                const int s = chunk_idx % kNumStages;
+                const int ns = (chunk_idx + 1) % kNumStages;
+
                 int token_idx_in_buffer = (cached_channel_head_idx++) % env.num_max_nvl_chunked_recv_tokens;
                 auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
                 auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
@@ -1421,7 +1485,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 auto topk_idx_in_msg     = reinterpret_cast<const int*>(shifted + hidden_bytes + sizeof(SourceMeta));
                 auto topk_weights_in_msg = reinterpret_cast<const float*>(shifted + hidden_bytes + sizeof(SourceMeta) + shape.num_topk * sizeof(int));
 
-                // ── Pass A: lane-0 K-loop, slot allocation. ──
+                // ── Pass A: lane-0 K-loop, slot allocation. Reads topk_idx
+                //    from the global NVL ring (independent of TMA). ──
                 int slot_row[kMaxTopK];
                 if (lane_id == 0) {
                     int* base_pool_substream = const_cast<int*>(base_pool_for_channel + src_world * E_local);
@@ -1442,19 +1507,27 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 // and per-pool-slot scalar writes. Other lanes participate in the
                 // TMA load below via the warp's shared mbarrier.
 
-                // ── Pass B: TMA-load hidden, K-fanout TMA-store. ──
-                if (elect_one_sync()) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                // ── Pass B: wait this iter's load, prefetch next, K-fanout store. ──
+                mbarrier_wait(tma_mbarrier(s), tma_phase[s]);
+
+                // Prefetch next iter's load (overlaps with the K-fanout below).
+                // The prior iter's `tma_store_wait<0>` drained the stores reading
+                // from `tma_buffer(ns)` two iters ago, so the buffer is free.
+                if (chunk_idx + 1 < num_recv_tokens) {
+                    int next_buf = cached_channel_head_idx % env.num_max_nvl_chunked_recv_tokens;
+                    auto next_shifted = nvl_channel_x.buffer() + next_buf * num_bytes_per_token;
+                    if (elect_one_sync()) {
+                        tma_load_1d(tma_buffer(ns), next_shifted, tma_mbarrier(ns), hidden_bytes);
+                        mbarrier_arrive_and_expect_tx(tma_mbarrier(ns), hidden_bytes);
+                    }
+                    __syncwarp();
                 }
-                __syncwarp();
-                mbarrier_wait(tma_mbarrier, tma_phase);
 
                 if (lane_id == 0) {
                     for (int k = 0; k < shape.num_topk; ++k) {
                         int slot = slot_row[k];
                         if (slot < 0) continue;
-                        tma_store_1d(tma_buffer,
+                        tma_store_1d(tma_buffer(s),
                                      pool_out.pool + static_cast<int64_t>(slot) * shape.hidden_int4,
                                      hidden_bytes, false);
                     }
@@ -1483,8 +1556,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (elect_one_sync())
                     st_na_global(reinterpret_cast<SourceMeta*>(per_token_out.recv_src_meta) + recv_token_idx, meta);
 
-                // Wait for K-fanout TMA stores to publish before the next token
-                // reuses tma_buffer.
+                // Drain this iter's K-fanout stores before stage `s` is reused
+                // (two iters from now) by the next prefetch's load.
                 tma_store_wait<0>();
                 __syncwarp();
             }
@@ -1998,14 +2071,26 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
     auto sync_rdma_sender_smem = []() { asm volatile("barrier.sync 0, %0;" ::"r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
 
+    // Two-stage TMA pipeline (mirrors `dispatch_main_kernel`). See the
+    // companion comment there for the layout / why-this-works.
+    constexpr int kNumStages = 2;
+    const int kStageStride = (num_bytes_per_token + 15) & ~15;
     extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-    auto tma_buffer = smem_tma_buffer + target_rank * kNumTMABytesPerWarp;
-    auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
-    uint32_t tma_phase = 0;
+    auto tma_buffer = [=](int s) {
+        return smem_tma_buffer + target_rank * kNumTMABytesPerWarp + s * kStageStride;
+    };
+    auto tma_mbarrier = [=](int s) {
+        return reinterpret_cast<uint64_t*>(
+            smem_tma_buffer + target_rank * kNumTMABytesPerWarp
+            + kNumStages * kStageStride + s * static_cast<int>(sizeof(uint64_t)));
+    };
+    uint32_t tma_phase[kNumStages] = {0, 0};
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
-        mbarrier_init(tma_mbarrier, 1);
+        #pragma unroll
+        for (int s = 0; s < kNumStages; ++s)
+            mbarrier_init(tma_mbarrier(s), 1);
         fence_barrier_init();
-        EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(kNumStages * kStageStride + kNumStages * static_cast<int>(sizeof(uint64_t)) <= kNumTMABytesPerWarp);
     }
     __syncwarp();
 
@@ -2328,6 +2413,13 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
             auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
 
+            // Two-stage prefetch pipeline (mirrors fwd dispatch forwarder).
+            struct PendingForward { uint8_t* dst_shifted; };
+            PendingForward pending[kNumStages] = {};
+            int pending_count = 0;
+            int issue_stage = 0;
+            int drain_stage = 0;
+
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
                 auto rdma_slot_idx = i % env.num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
@@ -2340,21 +2432,39 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 int dst_slot_idx = (cached_nvl_channel_tail++) % env.num_max_nvl_chunked_recv_tokens;
                 auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
 
+                if (pending_count == kNumStages) {
+                    mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
+                    if (elect_one_sync())
+                        tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                    __syncwarp();
+                    tma_store_wait<0>();
+                    __syncwarp();
+                    drain_stage = (drain_stage + 1) % kNumStages;
+                    pending_count -= 1;
+                }
+
                 if (elect_one_sync()) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, num_bytes_per_token, false);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, num_bytes_per_token);
+                    tma_load_1d(tma_buffer(issue_stage), shifted, tma_mbarrier(issue_stage), num_bytes_per_token, false);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier(issue_stage), num_bytes_per_token);
                 }
                 __syncwarp();
-                mbarrier_wait(tma_mbarrier, tma_phase);
-                if (elect_one_sync())
-                    tma_store_1d(tma_buffer, dst_shifted, num_bytes_per_token);
-                __syncwarp();
+                pending[issue_stage].dst_shifted = dst_shifted;
+                issue_stage = (issue_stage + 1) % kNumStages;
+                pending_count += 1;
 
                 if ((++num_tokens_sent) == env.num_max_nvl_chunked_send_tokens)
                     src_rdma_tail = i + 1;
+            }
 
+            while (pending_count > 0) {
+                mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
+                if (elect_one_sync())
+                    tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                __syncwarp();
                 tma_store_wait<0>();
                 __syncwarp();
+                drain_stage = (drain_stage + 1) % kNumStages;
+                pending_count -= 1;
             }
 
             if (lane_id == src_rdma_rank)
@@ -2482,7 +2592,22 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             }
 
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
+
+            // Pre-loop: prefetch first token's load into stage 0.
+            if (num_recv_tokens > 0) {
+                int prefetch_buf = cached_channel_head_idx % env.num_max_nvl_chunked_recv_tokens;
+                auto prefetch_shifted = nvl_channel_x.buffer() + prefetch_buf * num_bytes_per_token;
+                if (elect_one_sync()) {
+                    tma_load_1d(tma_buffer(0), prefetch_shifted, tma_mbarrier(0), hidden_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier(0), hidden_bytes);
+                }
+                __syncwarp();
+            }
+
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++chunk_idx, --num_tokens_to_recv) {
+                const int s = chunk_idx % kNumStages;
+                const int ns = (chunk_idx + 1) % kNumStages;
+
                 int token_idx_in_buffer = (cached_channel_head_idx++) % env.num_max_nvl_chunked_recv_tokens;
                 auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
                 auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
@@ -2490,19 +2615,24 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 int recv_token_idx = __shfl_sync(0xffffffff, total_offset, src_rdma_rank);
                 (lane_id == src_rdma_rank) ? (total_offset += 1) : 0;
 
-                // TMA-load hidden, K-fanout TMA-store to dL_do_pool[slot].
-                if (elect_one_sync()) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, hidden_bytes);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
+                // Wait this iter's load, then prefetch next, then K-fanout store.
+                mbarrier_wait(tma_mbarrier(s), tma_phase[s]);
+
+                if (chunk_idx + 1 < num_recv_tokens) {
+                    int next_buf = cached_channel_head_idx % env.num_max_nvl_chunked_recv_tokens;
+                    auto next_shifted = nvl_channel_x.buffer() + next_buf * num_bytes_per_token;
+                    if (elect_one_sync()) {
+                        tma_load_1d(tma_buffer(ns), next_shifted, tma_mbarrier(ns), hidden_bytes);
+                        mbarrier_arrive_and_expect_tx(tma_mbarrier(ns), hidden_bytes);
+                    }
+                    __syncwarp();
                 }
-                __syncwarp();
-                mbarrier_wait(tma_mbarrier, tma_phase);
 
                 if (lane_id == 0) {
                     for (int k = 0; k < shape.num_topk; ++k) {
                         int slot = routing.recv_token_to_slots[recv_token_idx * shape.num_topk + k];
                         if (slot < 0) continue;
-                        tma_store_1d(tma_buffer,
+                        tma_store_1d(tma_buffer(s),
                                      io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4,
                                      hidden_bytes, false);
                     }
@@ -2724,14 +2854,25 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         auto nvl_channel_tail = AsymBuffer<uint64_t>(dst_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank)
                                     .advance_also(local_buffer_ptr);
 
+        // Two-stage TMA pipeline (mirrors `dispatch_main_kernel`'s NVL receiver).
+        constexpr int kNumStages = 2;
+        const int kStageStride = (num_bytes_per_token + 15) & ~15;
         extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-        auto tma_buffer = smem_tma_buffer + dst_nvl_rank * kNumTMABytesPerSenderWarp;
-        auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
-        uint32_t tma_phase = 0;
+        auto tma_buffer = [=](int s) {
+            return smem_tma_buffer + dst_nvl_rank * kNumTMABytesPerSenderWarp + s * kStageStride;
+        };
+        auto tma_mbarrier = [=](int s) {
+            return reinterpret_cast<uint64_t*>(
+                smem_tma_buffer + dst_nvl_rank * kNumTMABytesPerSenderWarp
+                + kNumStages * kStageStride + s * static_cast<int>(sizeof(uint64_t)));
+        };
+        uint32_t tma_phase[kNumStages] = {0, 0};
         if (elect_one_sync()) {
-            mbarrier_init(tma_mbarrier, 1);
+            #pragma unroll
+            for (int s = 0; s < kNumStages; ++s)
+                mbarrier_init(tma_mbarrier(s), 1);
             fence_barrier_init();
-            EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerSenderWarp);
+            EP_DEVICE_ASSERT(kNumStages * kStageStride + kNumStages * static_cast<int>(sizeof(uint64_t)) <= kNumTMABytesPerSenderWarp);
         }
         __syncwarp();
 
@@ -2794,24 +2935,37 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                 int num_tokens_in_chunk =
                     __shfl_sync(0xffffffff, min(num_max_nvl_chunked_send_tokens, token_end_idx - token_start_idx), current_rdma_idx);
 
-                for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
-                    // Streaming gate. Spin until kernel_y (fwd) or kernel_a_bwd (bwd)
-                    // has release-stored `combine_seq` into compute_done_per_token[token_idx]
-                    // — meaning x[token_idx] is fully assembled and visible. The acquire
-                    // pairs with kernel Y's `.sys`-scope release.
+                // Pre-batch: gate-wait + prefetch the first token's hidden-bytes
+                // load into stage 0. The inner-for body waits this iter, prefetches
+                // the next, K=1 store, and drains via `tma_store_wait<0>` — so each
+                // iter's load latency overlaps with the prior iter's store-wait.
+                if (num_tokens_in_chunk > 0) {
+                    int64_t first_token_idx = token_idx;
                     if (elect_one_sync()) {
                         auto gate_start = clock64();
-                        while (ld_acquire_sys_global(&compute_done_per_token[token_idx]) < combine_seq) {
+                        while (ld_acquire_sys_global(&compute_done_per_token[first_token_idx]) < combine_seq) {
                             if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                 printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                        "token: %ld, seq: %ld\n",
                                        channel_id, rdma_rank, nvl_rank, dst_nvl_rank,
-                                       static_cast<int64_t>(token_idx), combine_seq);
+                                       static_cast<int64_t>(first_token_idx), combine_seq);
                                 trap();
                             }
                         }
                     }
                     __syncwarp();
+
+                    auto shifted_x_first = x + first_token_idx * hidden_int4;
+                    if (elect_one_sync()) {
+                        tma_load_1d(tma_buffer(0), shifted_x_first, tma_mbarrier(0), hidden_bytes);
+                        mbarrier_arrive_and_expect_tx(tma_mbarrier(0), hidden_bytes);
+                    }
+                    __syncwarp();
+                }
+
+                for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
+                    const int s = chunk_idx % kNumStages;
+                    const int ns = (chunk_idx + 1) % kNumStages;
 
                     int dst_slot_idx = 0;
                     if (lane_id == current_rdma_idx) {
@@ -2821,17 +2975,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     dst_slot_idx = __shfl_sync(0xffffffff, dst_slot_idx, current_rdma_idx);
 
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
-                    auto shifted_x = x + token_idx * hidden_int4;
-                    tma_store_wait<0>();
-                    if (elect_one_sync()) {
-                        tma_load_1d(tma_buffer, shifted_x, tma_mbarrier, hidden_bytes);
-                        mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
-                    }
-                    __syncwarp();
-                    mbarrier_wait(tma_mbarrier, tma_phase);
+
+                    // Wait for this iter's load (prefetched pre-batch or by prior iter).
+                    mbarrier_wait(tma_mbarrier(s), tma_phase[s]);
 
                     if (lane_id == num_topk)
-                        *reinterpret_cast<SourceMeta*>(tma_buffer + hidden_bytes) = ld_nc_global(src_meta + token_idx);
+                        *reinterpret_cast<SourceMeta*>(tma_buffer(s) + hidden_bytes) = ld_nc_global(src_meta + token_idx);
 
                     // Per-(token_idx, k) weight: `recv_token_to_slots[token_idx, k]`
                     // gives the pool slot for this (recv-token, k) pair, which holds
@@ -2843,13 +2992,42 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     if (lane_id < num_topk) {
                         int slot = recv_token_to_slots[token_idx * num_topk + lane_id];
                         float w = (slot >= 0) ? __ldg(per_slot_weights + slot) : 0.0f;
-                        *reinterpret_cast<float*>(tma_buffer + hidden_bytes + sizeof(SourceMeta) + lane_id * sizeof(float)) = w;
+                        *reinterpret_cast<float*>(tma_buffer(s) + hidden_bytes + sizeof(SourceMeta) + lane_id * sizeof(float)) = w;
                     }
 
                     tma_store_fence();
                     __syncwarp();
                     if (elect_one_sync())
-                        tma_store_1d(tma_buffer, shifted_x_buffers, num_bytes_per_token, false);
+                        tma_store_1d(tma_buffer(s), shifted_x_buffers, num_bytes_per_token, false);
+
+                    // Prefetch next iter's gate-wait + load (overlaps with store-wait).
+                    if (chunk_idx + 1 < num_tokens_in_chunk) {
+                        int64_t next_token_idx = token_idx + 1;
+                        if (elect_one_sync()) {
+                            auto gate_start = clock64();
+                            while (ld_acquire_sys_global(&compute_done_per_token[next_token_idx]) < combine_seq) {
+                                if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                                    printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
+                                           "token: %ld, seq: %ld\n",
+                                           channel_id, rdma_rank, nvl_rank, dst_nvl_rank,
+                                           static_cast<int64_t>(next_token_idx), combine_seq);
+                                    trap();
+                                }
+                            }
+                        }
+                        __syncwarp();
+
+                        auto shifted_x_next = x + next_token_idx * hidden_int4;
+                        if (elect_one_sync()) {
+                            tma_load_1d(tma_buffer(ns), shifted_x_next, tma_mbarrier(ns), hidden_bytes);
+                            mbarrier_arrive_and_expect_tx(tma_mbarrier(ns), hidden_bytes);
+                        }
+                        __syncwarp();
+                    }
+
+                    // Drain this iter's store before stage `s` is reused.
+                    tma_store_wait<0>();
+                    __syncwarp();
                 }
                 lane_id == current_rdma_idx ? (token_start_idx = static_cast<int>(token_idx)) : 0;
             }
