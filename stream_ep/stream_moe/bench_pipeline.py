@@ -200,29 +200,6 @@ def main():
     TK_padded = pool.shape[0]
     T_recv = handle.o.shape[0]
 
-    # Snapshot of `send_rdma_head` / `send_nvl_head` for combine isolated
-    # timing. Internode `cached_notify_combine_kernel` block 1+ sentinel-
-    # encodes both arrays in place during every `buffer.combine` call (also
-    # during `buffer.combine_grads` via the same kernel). Re-running combine
-    # on the already-encoded arrays would mangle them — the reverse-walk re-
-    # encoding treats every entry as a sentinel and overwrites them with
-    # `-(1<<25)-1` within one pass, which makes the combine receivers spin
-    # forever waiting for a token count of ~33 M. Production never hits this
-    # because each layer's combine sees a fresh dispatch; the bench works
-    # around it by restoring the pristine heads before each timed iter.
-    # Tensors live on `handle._dispatch_out` for internode, None for intranode.
-    _internode_dispatch_out = getattr(handle, "_dispatch_out", None)
-    send_rdma_head_orig = (
-        _internode_dispatch_out.send_rdma_head.clone()
-        if _internode_dispatch_out is not None and _internode_dispatch_out.send_rdma_head.numel() > 0
-        else None
-    )
-    send_nvl_head_orig = (
-        _internode_dispatch_out.send_nvl_head.clone()
-        if _internode_dispatch_out is not None and _internode_dispatch_out.send_nvl_head.numel() > 0
-        else None
-    )
-
     expert_pool_block_offset = handle.expert_pool_block_offset
     cu_seqlens_m = (expert_pool_block_offset.to(torch.int32) * args.tile_m).contiguous()
     expert_frequency = handle.expert_frequency
@@ -391,32 +368,17 @@ def main():
             cu_seqlens_m=cu_seqlens_m,
         )
 
-    def run_combine_only():
-        # Restore the pristine send_rdma_head / send_nvl_head before each call
-        # — see the snapshot at the top of main() for why. ~96 KB of GPU→GPU
-        # memcpy at production shape (~1 µs on H100 HBM), well below combine
-        # noise floor. Intranode skips the restore (snapshot is None;
-        # cached_notify_combine doesn't mutate intranode tensors in place).
-        if send_rdma_head_orig is not None:
-            _internode_dispatch_out.send_rdma_head.copy_(send_rdma_head_orig)
-            _internode_dispatch_out.send_nvl_head.copy_(send_nvl_head_orig)
-        # Combine sender's per-token gate spins on
-        # `compute_done_per_token[r] >= combine_seq`. Kernel Y populated
-        # `compute_done_per_token` to `handle.dispatch_seq` for every recv-token
-        # in the preceding `run_streaming_y_only()` warmup; refresh defensively
-        # in case run_streaming_y_only zeroed it before the gate was supposed to
-        # fire (it doesn't, but the explicit fill_ keeps the isolated timing
-        # decoupled from kernel-Y call ordering).
-        handle.compute_done_per_token.fill_(handle.dispatch_seq)
-        buffer.combine(handle.o, handle, combine_seq=handle.dispatch_seq)
-
-    # ── Bwd-side isolated runners ──────────────────────────────────────────
-    # `dispatch_grads` allocates a fresh `dL_do_pool` / `bwd_y_ready` each
-    # call; the kernel_y_bwd runner reuses one captured pair below.
+    # ── Bwd-side: materialize one dispatch_grads result for kernel_y_bwd /
+    # kernel_a_bwd / dW1 / dW2 isolated timing. Iterated per-kernel timing
+    # for the collective ops (dispatch, dispatch_grads, combine,
+    # combine_grads) lives in `profile_pipeline.py` — C4's single-slot
+    # `rdma_channel_meta` region doesn't tolerate isolated rapid-fire at
+    # sub-ms cadence (cross-rank wall-time drift races ahead and clobbers
+    # the meta slot the lagging rank is still polling).
     _dL_do_pool_captured: torch.Tensor | None = None
     _bwd_y_ready_captured: torch.Tensor | None = None
 
-    def run_dispatch_grads_only():
+    def materialize_dispatch_grads():
         nonlocal _dL_do_pool_captured, _bwd_y_ready_captured
         with torch.cuda.stream(streams.dispatch):
             _dL_do_pool_captured, _bwd_y_ready_captured = buffer.dispatch_grads(
@@ -517,25 +479,6 @@ def main():
             cu_seqlens_m=cu_seqlens_m,
         )
 
-    def run_combine_grads_only():
-        # Same snapshot-and-restore as run_combine_only — combine_grads also
-        # invokes cached_notify_combine_kernel and mutates send_rdma_head /
-        # send_nvl_head in place.
-        if send_rdma_head_orig is not None:
-            _internode_dispatch_out.send_rdma_head.copy_(send_rdma_head_orig)
-            _internode_dispatch_out.send_nvl_head.copy_(send_nvl_head_orig)
-        # combine_grads's sender gate is `bwd_compute_done_per_token`; pre-fire
-        # the same way run_combine_only fires `compute_done_per_token`. The
-        # kernel runs to completion using captured `dL_dx_per_r` / `dL_dweight`.
-        bwd_compute_done_per_token.fill_(handle.dispatch_seq)
-        buffer.combine_grads(
-            dL_dx_per_r,
-            handle,
-            dL_dweight,
-            bwd_compute_done_per_token,
-            dispatch_seq=handle.dispatch_seq,
-        )
-
     # ── dW1 / dW2 grouped-GEMM tail timing (varlen-K). Same calls the bwd
     # orchestrator runs after kernel_y_bwd / kernel_a_bwd. Quack `gemm` with
     # `cu_seqlens_k`. ──
@@ -580,24 +523,21 @@ def main():
     # Capture initial per_token_remaining so isolated y timing can reset it.
     _per_token_remaining_init = handle.per_token_remaining.clone()
 
-    # Materialize one dispatch_grads result for kernel_y_bwd / a_bwd / combine_grads inputs.
-    run_dispatch_grads_only()
+    # Materialize one dispatch_grads result for kernel_y_bwd / a_bwd / dW1 / dW2 inputs.
+    materialize_dispatch_grads()
     torch.cuda.synchronize()
     assert _dL_do_pool_captured is not None
 
-    # Warm everything up: A, gemm_gated, Y, gemm, combine, and the bwd-side
-    # kernels (kernel_y_bwd / kernel_a_bwd / combine_grads + dW1/dW2 grouped
-    # GEMMs). dispatch_grads was already warmed by the capture above.
+    # Warm everything up: compute-only kernels (collective ops are timed
+    # via profile_pipeline.py).
     run_streaming_a()
     run_gemm_gated_ref()
     run_streaming_y_only()
     run_gemm_y_ref()
-    run_combine_only()
     run_streaming_y_bwd()
     run_gemm_y_bwd_ref()
     run_streaming_a_bwd()
     run_gemm_a_bwd_ref()
-    run_combine_grads_only()
     run_dW2_grouped_gemm()
     run_dW1_grouped_gemm()
     torch.cuda.synchronize()
@@ -638,24 +578,10 @@ def main():
         "gemm (ref, no scatter)", args.tile_m, args.tile_n_y, gemm_y_us, 2 * TK * H * I
     )
 
-    combine_us = time_kernel(run_combine_only)
-    if rank == 0:
-        # Combine isn't a matmul — print as raw µs without TFLOPs.
-        print(
-            f"{'buffer.combine':>26s}  {'-':>6s}  {'-':>6s}  {combine_us:>10.1f}  {'-':>10s}"
-        )
-
     # ── Bwd-side isolated timing rows. FLOPs match the per-kernel data-grad
     # GEMM (kernel_y_bwd: dL_do_pool @ W2 → 2*TK*H*I; kernel_a_bwd:
     # dL_dswiglu_in @ W1 → 2*2*TK*H*I; dW2 / dW1 grouped GEMMs are the
     # transposed varlen-K versions of the same arithmetic intensity). ──
-    dispatch_grads_us = time_kernel(run_dispatch_grads_only)
-    if rank == 0:
-        print(
-            f"{'buffer.dispatch_grads':>26s}  {'-':>6s}  {'-':>6s}  "
-            f"{dispatch_grads_us:>10.1f}  {'-':>10s}"
-        )
-
     streaming_y_bwd_us = time_kernel(run_streaming_y_bwd)
     fmt_row(
         "streaming_moe_y_bwd",
@@ -691,13 +617,6 @@ def main():
         gemm_a_bwd_us,
         2 * 2 * TK * H * I,
     )
-
-    combine_grads_us = time_kernel(run_combine_grads_only)
-    if rank == 0:
-        print(
-            f"{'buffer.combine_grads':>26s}  {'-':>6s}  {'-':>6s}  "
-            f"{combine_grads_us:>10.1f}  {'-':>10s}"
-        )
 
     dW2_us = time_kernel(run_dW2_grouped_gemm)
     fmt_row(
@@ -762,25 +681,6 @@ def main():
 
     pipeline_us = time_kernel(step, warmup=pipe_warmup, iters=pipe_iters)
 
-    # Dispatch-only timing for context (we already paid for it once above).
-    def dispatch_only():
-        seq = seq_counter[0]
-        seq_counter[0] += 1
-        with torch.cuda.stream(streams.dispatch):
-            buffer.dispatch(
-                x,
-                topk_idx,
-                topk_weights,
-                is_token_in_rank,
-                NUM_EXPERTS,
-                tile_m=args.tile_m,
-                dispatch_seq=seq,
-            )
-        # Layer-end barrier: default stream waits on streams.dispatch.
-        torch.cuda.current_stream().wait_stream(streams.dispatch)
-
-    dispatch_us = time_kernel(dispatch_only, warmup=pipe_warmup, iters=pipe_iters)
-
     # ── Fwd+bwd e2e (training-iter cost). Separate `step` because we need
     # leaves with requires_grad=True for autograd to track. We toggle the
     # flag here so the fwd-only run above stays representative of inference. ──
@@ -823,49 +723,33 @@ def main():
 
     if rank == 0:
         print("=== end-to-end pipeline (dispatch + A + Y + combine, 4 streams) ===")
-        print(f"  dispatch (alone, dispatch_stream):           {dispatch_us:7.1f} μs")
         print(f"  streaming_moe_a (alone, compute_a):      {streaming_a_us:7.1f} μs")
         print(f"  streaming_moe_y (alone, compute_y):      {streaming_y_us:7.1f} μs")
-        print(f"  buffer.combine (alone, combine_send):    {combine_us:7.1f} μs")
-        sequential_sum = dispatch_us + streaming_a_us + streaming_y_us + combine_us
-        print(f"  serial sum of stages:                    {sequential_sum:7.1f} μs")
         print(f"  fwd-only e2e (4 streams, real overlap):  {pipeline_us:7.1f} μs")
-        if pipeline_us < sequential_sum:
-            saved = sequential_sum - pipeline_us
-            pct = 100.0 * saved / sequential_sum
-            print(f"  fwd overlap saved: {saved:7.1f} μs ({pct:.1f}% of serial sum)")
-        else:
-            print("  (no overlap savings observed; pipeline > serial sum)")
-        # Bwd serial budget: 4 bwd-stage isolated timings + 2 dW grouped GEMMs.
-        bwd_stages_sum = (
-            dispatch_grads_us
-            + streaming_y_bwd_us
-            + streaming_a_bwd_us
-            + combine_grads_us
-        )
-        bwd_grouped_sum = dW2_us + dW1_us
-        full_serial_sum = sequential_sum + bwd_stages_sum + bwd_grouped_sum
-        print(f"  dispatch_grads (alone):                  {dispatch_grads_us:7.1f} μs")
         print(
             f"  streaming_moe_y_bwd (alone):             {streaming_y_bwd_us:7.1f} μs"
         )
         print(
             f"  streaming_moe_a_bwd (alone):             {streaming_a_bwd_us:7.1f} μs"
         )
-        print(f"  buffer.combine_grads (alone):            {combine_grads_us:7.1f} μs")
         print(f"  gemm_grouped dW2 (alone):                {dW2_us:7.1f} μs")
         print(f"  gemm_grouped dW1 (alone):                {dW1_us:7.1f} μs")
-        print(f"  serial sum (fwd + bwd + dW1/dW2):        {full_serial_sum:7.1f} μs")
         print(
             f"  fwd+bwd e2e (training iter):             {pipeline_fwd_bwd_us:7.1f} μs"
         )
-        if pipeline_fwd_bwd_us < full_serial_sum:
-            saved_fb = full_serial_sum - pipeline_fwd_bwd_us
-            pct_fb = 100.0 * saved_fb / full_serial_sum
-            print(
-                f"  fwd+bwd overlap saved: {saved_fb:7.1f} μs ({pct_fb:.1f}% of serial sum)"
-            )
-
+        print()
+        print(
+            "  Collective per-kernel timing (dispatch / dispatch_grads / combine /"
+        )
+        print(
+            "  combine_grads) and overlap-vs-serial analysis: run"
+        )
+        print(
+            "  `python -m stream_ep.stream_moe.profile_pipeline` and read the"
+        )
+        print(
+            "  per-kernel summary table."
+        )
         print()
         print("=== summary ===")
         print(f"  streaming_moe_a:           {streaming_a_us:7.1f} μs")
