@@ -89,6 +89,14 @@ __device__ __forceinline__ void st_release_sys_global(const int64_t* ptr, int64_
     asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
 }
 
+__device__ __forceinline__ void st_relaxed_sys_global(const uint64_t* ptr, uint64_t val) {
+    asm volatile("st.relaxed.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
+__device__ __forceinline__ void st_release_sys_global(const uint64_t* ptr, uint64_t val) {
+    asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
 __device__ __forceinline__ int64_t ld_acquire_sys_global(const int64_t* ptr) {
     int64_t ret;
     asm volatile("ld.acquire.sys.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));

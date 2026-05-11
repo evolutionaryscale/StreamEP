@@ -61,7 +61,12 @@ struct Config {
         const int num_channels = num_sms / 2;
 
         size_t num_bytes = 0;
-        num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(int);
+        // NVL gen-stamp slots (`nvl_channel_prefix_start/end`, `nvl_channel_head`,
+        // `nvl_channel_tail` in `internode::dispatch_main_kernel` and the combine
+        // sender/forwarder/coord) are 64-bit `(seq32, value32)` pairs. Sizing
+        // covers the largest user across dispatch and combine, with one slot of
+        // slack.
+        num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(uint64_t);
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * hidden_bytes;
 #ifndef DISABLE_NVSHMEM
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * internode::get_source_meta_bytes();

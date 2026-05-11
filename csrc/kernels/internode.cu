@@ -48,30 +48,31 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
     return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
 }
 
-// Gen-stamp encoding for the NVL dispatch ring slots (C4). Packs a 12-bit
-// generation tag (low 12 bits of `tile_signal.dispatch_seq`, monotonic
-// across the training run) into the high 12 bits of a 32-bit slot, and a
-// 20-bit value into the low 20 bits. The reader checks the high bits
-// match the current iter's seq before consuming the low bits — that
-// distinguishes this-iter writes from prior-iter residue and removes the
-// need for inter-iter cleanup memsets on `nvl_channel_prefix_start/end`,
-// `nvl_channel_head`, and `nvl_channel_tail`. NVLink writes are intra-node
-// coherent, so no amo / L2-line-pack trick is required (unlike the RDMA
-// meta region in C3). Adjacent iters always have distinct seqs within
-// the 4096-iter window since the slot is written every iter.
+// Gen-stamp encoding for the NVL dispatch / combine ring slots. Each slot
+// is a 64-bit pair `(seq, value)` — high 32 bits carry the generation tag
+// (low 32 bits of `tile_signal.dispatch_seq` / `combine_seq`, monotonic
+// across the training run), low 32 bits carry the payload. The reader
+// checks the high half matches the current iter's seq before consuming the
+// low half — that distinguishes this-iter writes from prior-iter residue
+// and removes the need for inter-iter cleanup memsets on
+// `nvl_channel_prefix_start/end`, `nvl_channel_head`, and
+// `nvl_channel_tail`. NVLink writes are intra-node coherent, so no amo /
+// L2-line-pack trick is required (unlike the RDMA meta region in C3).
 //
-// Value-range invariants at production shape (verified during C4):
-//   prefix start_sum/end_sum:  ≤ T*K = 8192*4 = 32K   (≪ 2^20-1 = 1.05M)
-//   nvl_channel_head/tail:     ≤ tokens per channel    (≪ 2^20-1)
-__forceinline__ __device__ int nvl_pack(int64_t seq, int value) {
-    return static_cast<int>(((static_cast<uint32_t>(seq) & 0xFFFu) << 20) |
-                            (static_cast<uint32_t>(value) & 0xFFFFFu));
+// Wrap horizon: 32-bit seq window, one increment per kernel call, so
+// ~2^31 distinct iter tags / phase before aliasing. With the phase bit
+// the caller stamps in the LSB (fwd vs bwd of one layer), that's still
+// ~2^30 phase-distinct logical iters — ~16M training steps × 64 layers
+// before any aliasing risk. Effectively infinite for production training.
+__forceinline__ __device__ uint64_t nvl_pack(int64_t seq, int value) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(seq)) << 32) |
+           static_cast<uint64_t>(static_cast<uint32_t>(value));
 }
-__forceinline__ __device__ bool nvl_seq_match(int packed, int64_t seq) {
-    return (static_cast<uint32_t>(packed) >> 20) == (static_cast<uint32_t>(seq) & 0xFFFu);
+__forceinline__ __device__ bool nvl_seq_match(uint64_t packed, int64_t seq) {
+    return static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(seq);
 }
-__forceinline__ __device__ int nvl_unpack_value(int packed) {
-    return static_cast<int>(static_cast<uint32_t>(packed) & 0xFFFFFu);
+__forceinline__ __device__ int nvl_unpack_value(uint64_t packed) {
+    return static_cast<int>(static_cast<uint32_t>(packed));
 }
 
 // Signed-difference atomicMax for the persistent `reader_prev_*` arrays.
@@ -825,14 +826,14 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                                              NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
                              .advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_prefix_start =
-        AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+        AsymBuffer<uint64_t>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
             .advance_also(rs_wr_buffer_ptr);
-    auto nvl_channel_prefix_end = AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+    auto nvl_channel_prefix_end = AsymBuffer<uint64_t>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
                                       .advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_head =
-        AsymBuffer<int>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
+        AsymBuffer<uint64_t>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
     auto nvl_channel_tail =
-        AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
+        AsymBuffer<uint64_t>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
 
     // RDMA sender warp synchronization
     __shared__ int rdma_send_channel_lock[kNumRDMARanks];
@@ -1199,7 +1200,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
                     break;
-                int raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+                uint64_t raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
                 if (nvl_seq_match(raw_head, tile_signal.dispatch_seq))
                     cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
@@ -1366,8 +1367,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
-            int raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
-            int raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
+            uint64_t raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
+            uint64_t raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
             if (nvl_seq_match(raw_start, tile_signal.dispatch_seq) and
                 nvl_seq_match(raw_end, tile_signal.dispatch_seq)) {
                 start_offset = nvl_unpack_value(raw_start);
@@ -1411,7 +1412,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 {
-                    int raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                    uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, tile_signal.dispatch_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
@@ -1990,14 +1991,14 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                                              NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
                              .advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_prefix_start =
-        AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+        AsymBuffer<uint64_t>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
             .advance_also(rs_wr_buffer_ptr);
-    auto nvl_channel_prefix_end = AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
+    auto nvl_channel_prefix_end = AsymBuffer<uint64_t>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank)
                                       .advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_head =
-        AsymBuffer<int>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
+        AsymBuffer<uint64_t>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
     auto nvl_channel_tail =
-        AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
+        AsymBuffer<uint64_t>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
 
     __shared__ int rdma_send_channel_lock[kNumRDMARanks];
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
@@ -2312,7 +2313,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
                     break;
-                int raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
+                uint64_t raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
                 if (nvl_seq_match(raw_head, tile_signal.dispatch_seq))
                     cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
@@ -2466,8 +2467,8 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         int start_offset = 0, end_offset = 0;
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
-            int raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
-            int raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
+            uint64_t raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
+            uint64_t raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
             if (nvl_seq_match(raw_start, tile_signal.dispatch_seq) and
                 nvl_seq_match(raw_end, tile_signal.dispatch_seq)) {
                 start_offset = nvl_unpack_value(raw_start);
@@ -2491,7 +2492,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 {
-                    int raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
+                    uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, tile_signal.dispatch_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
@@ -2730,9 +2731,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                                                  num_channels,
                                                  nvl_rank)
                                  .advance_also(local_buffer_ptr);
-        auto nvl_channel_head = AsymBuffer<int>(local_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, dst_nvl_rank)
+        auto nvl_channel_head = AsymBuffer<uint64_t>(local_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, dst_nvl_rank)
                                     .advance_also(dst_buffer_ptr);
-        auto nvl_channel_tail = AsymBuffer<int>(dst_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank)
+        auto nvl_channel_tail = AsymBuffer<uint64_t>(dst_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank)
                                     .advance_also(local_buffer_ptr);
 
         extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
@@ -2792,13 +2793,13 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     // carry the prior iter's seq and are ignored; cached_head
                     // stays at its last-valid value (initial 0) until a matching
                     // read arrives.
-                    int raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
+                    uint64_t raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
                     if (nvl_seq_match(raw_head, combine_seq))
                         cached_channel_head_idx = nvl_unpack_value(raw_head);
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                    int raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
+                    uint64_t raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
                     int head_seq_ok = nvl_seq_match(raw_head, combine_seq) ? nvl_unpack_value(raw_head) : -1;
                     printf("DeepEP combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head (seq-ok or -1): %d, tail: "
                            "%d, start: %d, end: %d\n",
@@ -2901,9 +2902,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                 local_nvl_buffer, num_max_nvl_chunked_recv_tokens * num_bytes_per_token, NUM_MAX_NVL_PEERS, channel_id, num_channels)
                 .advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
         auto nvl_channel_head =
-            AsymBuffer<int, NUM_MAX_NVL_PEERS>(nvl_buffers, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank)
+            AsymBuffer<uint64_t, NUM_MAX_NVL_PEERS>(nvl_buffers, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank)
                 .advance_also(local_nvl_buffer);
-        auto nvl_channel_tail = AsymBuffer<int>(local_nvl_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels)
+        auto nvl_channel_tail = AsymBuffer<uint64_t>(local_nvl_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels)
                                     .advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
 
         __shared__ volatile int forwarder_nvl_head[kNumForwarders][NUM_MAX_NVL_PEERS];
@@ -2999,7 +3000,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         // values. The sender's iter-entry force-write +
                         // per-chunk packed writes ensure the slot eventually
                         // carries this iter's tag; pre-tag residue is ignored.
-                        int raw_tail = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
+                        uint64_t raw_tail = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
                         if (nvl_seq_match(raw_tail, combine_seq))
                             cached_nvl_channel_tail_idx = nvl_unpack_value(raw_tail);
                         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
