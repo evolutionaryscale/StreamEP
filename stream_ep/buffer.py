@@ -513,6 +513,11 @@ class Buffer:
             return self.runtime.internode_combine(
                 x, handle.pool_topk_weight, handle._dispatch_out,
                 handle.compute_done_per_token, combine_seq,
+                # `combine_phase=0` = fwd combine. Phase-distinguishes the NVL
+                # gen-stamp tag from bwd `combine_grads` (phase=1) so the two
+                # phases of one layer (which share `combine_seq`) can't alias
+                # on the shared combine NVL ring slots.
+                0,
                 config)
         return self.runtime.intranode_combine(
             x, handle.pool_topk_weight, handle.recv_token_to_slots,
@@ -564,6 +569,11 @@ class Buffer:
             return self.runtime.internode_combine(
                 dL_dx_per_r, weight_grads, handle._dispatch_out,
                 bwd_compute_done_per_token, seq,
+                # `combine_phase=1` = bwd combine_grads. Pairs with the fwd
+                # combine call's `combine_phase=0` to make the two phases'
+                # NVL gen-stamp tags differ in the low bit, despite sharing
+                # the `seq` value within a layer.
+                1,
                 config)
         return self.runtime.intranode_combine(
             dL_dx_per_r, weight_grads, handle.recv_token_to_slots,

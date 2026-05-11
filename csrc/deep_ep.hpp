@@ -462,6 +462,10 @@ public:
         const StreamingDispatchOutputs& dispatch_out,
         const torch::Tensor& compute_done_per_token,
         int64_t combine_seq,
+        // 0 = fwd combine, 1 = bwd combine_grads. Forwarded into
+        // `internode::launch_combine_main` to phase-distinguish the NVL
+        // gen-stamp tag on the combine ring.
+        int64_t combine_phase,
         const Config& config);
 
 };

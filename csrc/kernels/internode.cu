@@ -835,6 +835,17 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     auto nvl_channel_tail =
         AsymBuffer<uint64_t>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
 
+    // NVL gen-stamp tag carried in the high 32 bits of each NVL slot.
+    // Phase-distinct from `dispatch_grads_main_kernel`'s tag (low bit 1 for
+    // bwd) so the fwd-dispatch leftover (seq tag = nvl_seq) doesn't alias
+    // the same-iter bwd-dispatch reader (looking for nvl_seq | 1) on the
+    // shared dispatch NVL ring. `tile_signal.dispatch_seq` is the user-
+    // supplied per-call counter, monotonic across the training run; the
+    // 32-bit window after the phase bit (~2 B distinct iters) is the wrap
+    // horizon. Release stamps (`tile_ready`) and consumer compare values
+    // (`compute_seq` in kernel A) use the unshifted `tile_signal.dispatch_seq`.
+    const int64_t nvl_seq = tile_signal.dispatch_seq << 1;
+
     // RDMA sender warp synchronization
     __shared__ int rdma_send_channel_lock[kNumRDMARanks];
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
@@ -1120,20 +1131,6 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         // as legacy internode dispatch (data + SourceMeta + topk_idx + topk_weights).
         const auto dst_nvl_rank = target_rank;
 
-        // C4 force-write (M1): publish (current_seq, 0) to nvl_channel_tail at
-        // iter entry, unconditionally. The slot is otherwise written only when
-        // tokens flow this iter — under sparse routing a substream can be
-        // dormant for ≥ 4096 iters then resume, at which point the 12-bit seq
-        // tag in the residual value would falsely match the current iter and
-        // the NVL receiver would consume a stale tail. The iter-entry write
-        // forces every (channel, dst_nvl) tail slot to carry the current iter's
-        // seq before any reader looks. No barrier needed: the receiver gates
-        // on prefix_start/end seq-match (written later in this kernel by the
-        // meta-poll branch below) before it inspects tail.
-        if (elect_one_sync())
-            st_relaxed_sys_global(nvl_channel_tail.buffer(),
-                                  nvl_pack(tile_signal.dispatch_seq, 0));
-
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
@@ -1157,11 +1154,10 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
                     int start_sum = meta_0, end_sum = meta_1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-                    // NVL ring uses gen-stamp encoding (C4).
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
-                                         nvl_pack(tile_signal.dispatch_seq, start_sum));
+                                         nvl_pack(nvl_seq, start_sum));
                     st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
-                                         nvl_pack(tile_signal.dispatch_seq, end_sum));
+                                         nvl_pack(nvl_seq, end_sum));
 
                     src_rdma_channel_prefix = meta_2;
                     auto src_rdma_channel_prefix_1 = meta_3;
@@ -1201,7 +1197,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
                     break;
                 uint64_t raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
-                if (nvl_seq_match(raw_head, tile_signal.dispatch_seq))
+                if (nvl_seq_match(raw_head, nvl_seq))
                     cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -1270,7 +1266,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             __syncwarp();
             if (elect_one_sync())
                 st_release_sys_global(nvl_channel_tail.buffer(),
-                                     nvl_pack(tile_signal.dispatch_seq, cached_nvl_channel_tail));
+                                     nvl_pack(nvl_seq, cached_nvl_channel_tail));
         }
 
         __syncwarp();
@@ -1348,17 +1344,6 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         //           on completion, release-store tile_ready[block_id] = dispatch_seq.
         const int src_nvl_rank = target_rank;
 
-        // C4 force-write (M1): publish (current_seq, 0) to nvl_channel_head at
-        // iter entry. Symmetric to the forwarder's nvl_channel_tail force-write
-        // — covers the dormant-substream + cross-phase aliasing cases. No
-        // barrier needed: the forwarder gates on tail backpressure (cached_head
-        // initialized to 0), and only consumes head reads that seq-match the
-        // current iter; pre-force-write reads see the prior iter's tag and are
-        // ignored by the spin.
-        if (elect_one_sync())
-            st_relaxed_sys_global(nvl_channel_head.buffer(),
-                                  nvl_pack(tile_signal.dispatch_seq, 0));
-
         int total_offset = 0;
 
         if (lane_id < kNumRDMARanks and lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank > 0)
@@ -1369,8 +1354,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         while (lane_id < kNumRDMARanks) {
             uint64_t raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
             uint64_t raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
-            if (nvl_seq_match(raw_start, tile_signal.dispatch_seq) and
-                nvl_seq_match(raw_end, tile_signal.dispatch_seq)) {
+            if (nvl_seq_match(raw_start, nvl_seq) and
+                nvl_seq_match(raw_end, nvl_seq)) {
                 start_offset = nvl_unpack_value(raw_start);
                 end_offset   = nvl_unpack_value(raw_end);
                 total_offset += start_offset;
@@ -1413,7 +1398,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     break;
                 {
                     uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
-                    if (nvl_seq_match(raw_tail, tile_signal.dispatch_seq))
+                    if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -1506,7 +1491,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
             if (elect_one_sync())
                 st_relaxed_sys_global(nvl_channel_head.buffer(),
-                                     nvl_pack(tile_signal.dispatch_seq, cached_channel_head_idx));
+                                     nvl_pack(nvl_seq, cached_channel_head_idx));
         }
 
         // ── Pass 2 fire: substream-end.
@@ -2000,6 +1985,14 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
     auto nvl_channel_tail =
         AsymBuffer<uint64_t>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
 
+    // NVL gen-stamp tag with the bwd phase bit set in the LSB. Phase-distinct
+    // from fwd `dispatch_main_kernel`'s tag (low bit 0) so fwd's leftover on
+    // the shared dispatch NVL ring doesn't alias bwd's current-iter reader,
+    // even though both kernels see the same `tile_signal.dispatch_seq` value
+    // within a layer (see `stream_moe.py`: fwd dispatch and bwd
+    // dispatch_grads share the per-call `dispatch_seq` int).
+    const int64_t nvl_seq = (tile_signal.dispatch_seq << 1) | 1;
+
     __shared__ int rdma_send_channel_lock[kNumRDMARanks];
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
@@ -2251,14 +2244,6 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         // on the StreamingHandle. Otherwise this is verbatim from fwd.
         const auto dst_nvl_rank = target_rank;
 
-        // C4 force-write (M1): see dispatch_main_kernel forwarder. Fwd
-        // dispatch and bwd dispatch_grads share the same dispatch_seq within
-        // a layer, so bwd's iter entry must rewrite the slot to overwrite
-        // fwd's leftover same-seq value before any bwd reader looks.
-        if (elect_one_sync())
-            st_relaxed_sys_global(nvl_channel_tail.buffer(),
-                                  nvl_pack(tile_signal.dispatch_seq, 0));
-
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
@@ -2278,9 +2263,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                     int start_sum = meta_0, end_sum = meta_1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
-                                         nvl_pack(tile_signal.dispatch_seq, start_sum));
+                                         nvl_pack(nvl_seq, start_sum));
                     st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
-                                         nvl_pack(tile_signal.dispatch_seq, end_sum));
+                                         nvl_pack(nvl_seq, end_sum));
 
                     src_rdma_channel_prefix = meta_2;
                     auto src_rdma_channel_prefix_1 = meta_3;
@@ -2314,7 +2299,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 if (env.num_max_nvl_chunked_recv_tokens - num_used_slots >= env.num_max_nvl_chunked_send_tokens)
                     break;
                 uint64_t raw_head = __shfl_sync(0xffffffffu, ld_volatile_global(nvl_channel_head.buffer()), 0);
-                if (nvl_seq_match(raw_head, tile_signal.dispatch_seq))
+                if (nvl_seq_match(raw_head, nvl_seq))
                     cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -2378,7 +2363,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             __syncwarp();
             if (elect_one_sync())
                 st_release_sys_global(nvl_channel_tail.buffer(),
-                                     nvl_pack(tile_signal.dispatch_seq, cached_nvl_channel_tail));
+                                     nvl_pack(nvl_seq, cached_nvl_channel_tail));
         }
 
         __syncwarp();
@@ -2443,13 +2428,6 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         // routing struct.
         const int src_nvl_rank = target_rank;
 
-        // C4 force-write (M1): see dispatch_main_kernel NVL receiver. Same
-        // rationale as bwd forwarder above — fwd dispatch and bwd
-        // dispatch_grads share dispatch_seq within a layer.
-        if (elect_one_sync())
-            st_relaxed_sys_global(nvl_channel_head.buffer(),
-                                  nvl_pack(tile_signal.dispatch_seq, 0));
-
         int total_offset = 0;
 
         // `recv_gbl_channel_prefix_matrix[src_world, channel]` was written by
@@ -2469,8 +2447,8 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         while (lane_id < kNumRDMARanks) {
             uint64_t raw_start = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
             uint64_t raw_end   = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
-            if (nvl_seq_match(raw_start, tile_signal.dispatch_seq) and
-                nvl_seq_match(raw_end, tile_signal.dispatch_seq)) {
+            if (nvl_seq_match(raw_start, nvl_seq) and
+                nvl_seq_match(raw_end, nvl_seq)) {
                 start_offset = nvl_unpack_value(raw_start);
                 end_offset   = nvl_unpack_value(raw_end);
                 break;
@@ -2493,7 +2471,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                     break;
                 {
                     uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
-                    if (nvl_seq_match(raw_tail, tile_signal.dispatch_seq))
+                    if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -2536,7 +2514,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
             if (elect_one_sync())
                 st_relaxed_sys_global(nvl_channel_head.buffer(),
-                                     nvl_pack(tile_signal.dispatch_seq, cached_channel_head_idx));
+                                     nvl_pack(nvl_seq, cached_channel_head_idx));
         }
 
         // Pass 2 fire — uses seen_per_substream from routing (vs fwd's
@@ -2661,6 +2639,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     const int* gbl_channel_prefix_matrix,
     const int64_t* compute_done_per_token,
     int64_t combine_seq,
+    int combine_phase,
     int num_tokens,
     int num_combined_tokens,
     int hidden,
@@ -2717,6 +2696,15 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     EP_DEVICE_ASSERT(num_warps == kNumForwarders + 1);
     auto num_max_nvl_chunked_recv_tokens_per_rdma = num_max_nvl_chunked_recv_tokens / kNumRDMARanks;
 
+    // NVL gen-stamp tag for the combine ring slots. Phase bit (0 for fwd
+    // combine, 1 for bwd combine_grads — supplied by the host launcher)
+    // ensures the combine ring's leftover from one phase doesn't alias the
+    // other within the same layer, where `combine_seq` is shared. Release
+    // stamps (`compute_done_per_token`, written by kernel Y / kernel_a_bwd)
+    // remain on the unshifted `combine_seq` value and gate the streaming
+    // sender unchanged.
+    const int64_t nvl_seq = (combine_seq << 1) | (combine_phase & 1);
+
     if (warp_role == WarpRole::kNVLSender) {
         // NVL producers: read x[token_idx] from local memory, TMA-load into
         // the dst NVL peer's combine ring buffer, pack SourceMeta + per-(t, k)
@@ -2745,19 +2733,6 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             fence_barrier_init();
             EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerSenderWarp);
         }
-        __syncwarp();
-
-        // C4/M1 force-write of `nvl_channel_tail` at iter entry. Without this,
-        // iter-N's stale tail residue would satisfy iter-N+1's forwarder spin
-        // (`tail > expected_head`) before this iter's sender has written any
-        // tokens, and the forwarder would combine uninitialized ring slots.
-        // Publishing `nvl_pack(combine_seq, 0)` to every (rdma_src) slot makes
-        // the forwarder's `nvl_seq_match` filter reject pre-force-write reads
-        // until this iter's sender increments the counter. One IPC store per
-        // lane; no barrier — the forwarder spins on seq-match.
-        if (lane_id < kNumRDMARanks)
-            st_release_sys_global(nvl_channel_tail.buffer() + lane_id,
-                                  nvl_pack(combine_seq, 0));
         __syncwarp();
 
         // Per-RDMA-source token range for this (channel, dst_nvl_rank).
@@ -2794,13 +2769,13 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     // stays at its last-valid value (initial 0) until a matching
                     // read arrives.
                     uint64_t raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
-                    if (nvl_seq_match(raw_head, combine_seq))
+                    if (nvl_seq_match(raw_head, nvl_seq))
                         cached_channel_head_idx = nvl_unpack_value(raw_head);
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                     uint64_t raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
-                    int head_seq_ok = nvl_seq_match(raw_head, combine_seq) ? nvl_unpack_value(raw_head) : -1;
+                    int head_seq_ok = nvl_seq_match(raw_head, nvl_seq) ? nvl_unpack_value(raw_head) : -1;
                     printf("DeepEP combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head (seq-ok or -1): %d, tail: "
                            "%d, start: %d, end: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id,
@@ -2883,7 +2858,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             __syncwarp();
             if (lane_id < kNumRDMARanks and is_lane_ready)
                 st_release_sys_global(nvl_channel_tail.buffer() + lane_id,
-                                      nvl_pack(combine_seq, cached_channel_tail_idx));
+                                      nvl_pack(nvl_seq, cached_channel_tail_idx));
         }
     } else {
         // Combiners and coordinators
@@ -3001,7 +2976,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         // per-chunk packed writes ensure the slot eventually
                         // carries this iter's tag; pre-tag residue is ignored.
                         uint64_t raw_tail = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
-                        if (nvl_seq_match(raw_tail, combine_seq))
+                        if (nvl_seq_match(raw_tail, nvl_seq))
                             cached_nvl_channel_tail_idx = nvl_unpack_value(raw_tail);
                         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
                             printf("DeepEP combine forwarder (NVL check) timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, dst RDMA: %d, "
@@ -3164,21 +3139,6 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             int dst_nvl_rank = lane_id < NUM_MAX_NVL_PEERS ? lane_id : 0;
             EP_STATIC_ASSERT(kNumCombineForwarderWarps <= 32, "Invalid number of forwarder warps");
 
-            // C4/M1 force-write of `nvl_channel_head` at coordinator entry on
-            // the is_forwarder_sm coordinator (the NVL-coord half). Without
-            // this, iter-N's stale large head residue would make iter-N+1's
-            // sender backpressure check (num_used_slots = tail - head) go
-            // negative — `is_lane_ready` would always pass and the sender
-            // would overrun the ring. One IPC store per (dst_nvl, rdma_src)
-            // slot in this channel; the sender's `nvl_seq_match` filter
-            // ignores pre-force-write reads.
-            if (is_forwarder_sm and lane_id < NUM_MAX_NVL_PEERS) {
-                #pragma unroll
-                for (int i = 0; i < kNumRDMARanks; ++i)
-                    st_relaxed_sys_global(nvl_channel_head.buffer_by(lane_id) + i,
-                                          nvl_pack(combine_seq, 0));
-            }
-
             while (true) {
                 if (not is_forwarder_sm and __all_sync(0xffffffff, lane_id >= kNumRDMAReceivers or rdma_receiver_retired[lane_id]))
                     break;
@@ -3211,7 +3171,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         if (min_head != std::numeric_limits<int>::max() and min_head > last_nvl_head[i] and lane_id < NUM_MAX_NVL_PEERS) {
                             last_nvl_head[i] = min_head;
                             st_relaxed_sys_global(nvl_channel_head.buffer_by(dst_nvl_rank) + i,
-                                                  nvl_pack(combine_seq, min_head));
+                                                  nvl_pack(nvl_seq, min_head));
                         }
                     }
                 }
@@ -3236,6 +3196,7 @@ void launch_combine_main(cudaDataType_t type,
                          const int* gbl_channel_prefix_matrix,
                          const int64_t* compute_done_per_token,
                          int64_t combine_seq,
+                         int combine_phase,
                          int num_tokens,
                          int num_combined_tokens,
                          int hidden,
@@ -3278,7 +3239,7 @@ void launch_combine_main(cudaDataType_t type,
                       recv_rdma_channel_prefix_matrix,                               \
                       recv_rdma_rank_prefix_sum,                                     \
                       gbl_channel_prefix_matrix,                                     \
-                      compute_done_per_token, combine_seq,                           \
+                      compute_done_per_token, combine_seq, combine_phase,            \
                       num_tokens, num_combined_tokens, hidden, num_topk,             \
                       rdma_buffer_ptr,                                               \
                       num_max_rdma_chunked_send_tokens,                              \

@@ -1699,6 +1699,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
     const StreamingDispatchOutputs& dispatch_out,
     const torch::Tensor& compute_done_per_token,
     int64_t combine_seq,
+    int64_t combine_phase,
     const Config& config) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
@@ -1759,6 +1760,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
         compute_done_per_token.data_ptr<int64_t>(), combine_seq,
+        static_cast<int>(combine_phase),
         num_tokens, num_combined_tokens, hidden, num_topk,
         rdma_buffer_ptr_combine,
         config.num_max_rdma_chunked_send_tokens,

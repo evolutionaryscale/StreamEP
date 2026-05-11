@@ -516,6 +516,13 @@ void launch_combine_main(cudaDataType_t type,
                          const int* gbl_channel_prefix_matrix,
                          const int64_t* compute_done_per_token,
                          int64_t combine_seq,
+                         // 0 = fwd combine, 1 = bwd combine_grads. Phase-
+                         // distinguishes the NVL gen-stamp tag so fwd's slot
+                         // residue can't alias the bwd reader on the same
+                         // (channel, dst_nvl, rdma_src) slot within one layer
+                         // where `combine_seq` is shared between the two
+                         // phases.
+                         int combine_phase,
                          int num_tokens,
                          int num_combined_tokens,
                          int hidden,
