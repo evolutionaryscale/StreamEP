@@ -606,13 +606,42 @@ __global__ void streaming_dispatch_metadata_kernel(
     for (int e = thread_id; e < E_local + 1; e += num_threads)
         expert_pool_block_offset[e] = smem_pool_blk[e];
 
-    // base_pool[c, src_world, e] = expert_pool_block_offset[e]*tile_m
-    //   + Σ over (c', s') < (c, s) lex of seen_per_substream[c', s', e].
-    // Per-expert serial accumulator (E_local ≤ NUM_MAX_LOCAL_EXPERTS so
-    // we can run one thread per expert in parallel).
+    // base_pool[c, src_world, e]: per-expert, partition the slot range
+    // into NVL-local substreams (`src_rdma == rdma_rank`) first, then
+    // RDMA-remote substreams (`src_rdma != rdma_rank`). Within each
+    // partition the order is `(c, src_world)` lex.
+    //
+    // Rationale: `pool_arrival_count[block]` waits on the slowest contributor
+    // to that block. NVL-local substreams complete ~µs after dispatch start;
+    // RDMA-routed substreams complete after the round-trip + forwarder cost.
+    // Without this partition, slow RDMA tiles can land at low `tile_id`s and
+    // HOL-block the linear-claim CTAs in kernel A. With it, low `tile_id`s
+    // within each expert are NVL-only paths (low latency) and high `tile_id`s
+    // are RDMA-routed paths (high latency); producer fire order and consumer
+    // claim order stay aligned with transport heterogeneity. Determinism is
+    // preserved (the NVL-local set is a deterministic function of
+    // `src_rdma == rdma_rank`).
+    //
+    // Tile-boundary cost: if `tile_m` doesn't divide the NVL-local count for
+    // an expert, exactly one tile per expert straddles the partition and
+    // contains both NVL and RDMA slots; that tile is RDMA-bound (waits on
+    // the slowest contributor as before). Accepted as-is — bounding to one
+    // tile per expert is a small upper bound on pool overhead.
     for (int e = thread_id; e < E_local; e += num_threads) {
         int acc = smem_pool_blk[e] * tile_m;
+        // Pass 1: NVL-local substreams.
         for (int cs = 0; cs < num_channels * num_ranks; ++cs) {
+            int src_world = cs % num_ranks;
+            int src_rdma = src_world / NUM_MAX_NVL_PEERS;
+            if (src_rdma != rdma_rank) continue;
+            base_pool[cs * E_local + e] = acc;
+            acc += seen_per_substream[cs * E_local + e];
+        }
+        // Pass 2: RDMA-remote substreams.
+        for (int cs = 0; cs < num_channels * num_ranks; ++cs) {
+            int src_world = cs % num_ranks;
+            int src_rdma = src_world / NUM_MAX_NVL_PEERS;
+            if (src_rdma == rdma_rank) continue;
             base_pool[cs * E_local + e] = acc;
             acc += seen_per_substream[cs * E_local + e];
         }
