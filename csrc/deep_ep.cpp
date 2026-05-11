@@ -402,25 +402,21 @@ void Buffer::sync(const std::vector<int>& device_ids,
         // Persistent reader_prev arrays for the RDMA head/tail slots. See
         // `deep_ep.hpp` for layout / role. Sized for the worst case
         // (max_num_channels × num_rdma_ranks). Local memory (not symmetric);
-        // each rank tracks its own reader's last-observed cumulative.
+        // each rank tracks its own reader's last-observed slot value (uint32
+        // matching the NIC's 4-byte AMO; cross-iter wrap absorbed by
+        // modular subtraction + signed-difference CAS).
         const int max_num_channels = num_device_sms / 2;
-        // M2: head/tail prev arrays widened to int64 (NIC AMO is now 8-byte).
-        // Meta sentinel stays int32 — it only increments by 1 per iter per
-        // (channel, dst_rdma), so 2^31 ≈ 2.1 B iters is far beyond any
-        // realistic training duration.
-        const int64_t prev_array_bytes_64 =
-            static_cast<int64_t>(max_num_channels) * num_rdma_ranks * sizeof(int64_t);
         const int64_t prev_array_bytes_32 =
-            static_cast<int64_t>(max_num_channels) * num_rdma_ranks * sizeof(int);
-        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_head,    prev_array_bytes_64));
-        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail,    prev_array_bytes_64));
-        CUDA_CHECK(cudaMalloc(&combine_reader_prev_head,     prev_array_bytes_64));
-        CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail,     prev_array_bytes_64));
+            static_cast<int64_t>(max_num_channels) * num_rdma_ranks * sizeof(uint32_t);
+        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_head,    prev_array_bytes_32));
+        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail,    prev_array_bytes_32));
+        CUDA_CHECK(cudaMalloc(&combine_reader_prev_head,     prev_array_bytes_32));
+        CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail,     prev_array_bytes_32));
         CUDA_CHECK(cudaMalloc(&dispatch_meta_sentinel_prev,  prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(dispatch_reader_prev_head,    0, prev_array_bytes_64));
-        CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail,    0, prev_array_bytes_64));
-        CUDA_CHECK(cudaMemset(combine_reader_prev_head,     0, prev_array_bytes_64));
-        CUDA_CHECK(cudaMemset(combine_reader_prev_tail,     0, prev_array_bytes_64));
+        CUDA_CHECK(cudaMemset(dispatch_reader_prev_head,    0, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail,    0, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(combine_reader_prev_head,     0, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(combine_reader_prev_tail,     0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(dispatch_meta_sentinel_prev,  0, prev_array_bytes_32));
 
         // Allocate and clean shrink buffer

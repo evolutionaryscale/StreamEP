@@ -192,16 +192,19 @@ private:
     // amos), unlike an in-kernel `ld(slot)` seed which is racy because
     // peer amos land asynchronously through the NIC.
     //
-    // Sized [max_num_channels × num_rdma_ranks] int32, ~512 B each at
-    // production; ~2 KB total. Allocated zero-init in `Buffer::Buffer`,
-    // freed in destructor.
-    // int64_t (M2): the NIC AMOs that drive these counters were widened from
-    // 4-byte to 8-byte (mlx5 MLX5_OPCODE_ATOMIC_FA); int32 wraps at ~250k
-    // training steps × 32 layers, int64 horizon is effectively infinite.
-    int64_t* dispatch_reader_prev_head = nullptr;
-    int64_t* dispatch_reader_prev_tail = nullptr;
-    int64_t* combine_reader_prev_head  = nullptr;
-    int64_t* combine_reader_prev_tail  = nullptr;
+    // Sized [max_num_channels × num_rdma_ranks] uint32, ~256 B each at
+    // production; ~1 KB total. Allocated zero-init in `Buffer::Buffer`,
+    // freed in destructor. Storage is uint32 (matching the on-the-wire
+    // 4-byte AMO width); cross-iter wrap is absorbed by modular uint32
+    // subtraction in the read-side `cur - prev` math and a signed-difference
+    // CAS in the write-side helper (`atomicmax_reader_prev_cumulative`).
+    // Wrap horizon is effectively infinite — the protocol never compares
+    // across-iter slot values directly, so it doesn't care that the slot
+    // (and the array) cycle through 2^32 every ~500k training steps.
+    uint32_t* dispatch_reader_prev_head = nullptr;
+    uint32_t* dispatch_reader_prev_tail = nullptr;
+    uint32_t* combine_reader_prev_head  = nullptr;
+    uint32_t* combine_reader_prev_tail  = nullptr;
     // Persistent prev-sentinel array for the RDMA dispatch meta region (C3).
     // The meta SymBuffer's slot 30 ("kRdmaMetaSentinelSlot") accumulates
     // across iters via amo_nonfetch_add — sender bulk_puts the 18 data ints

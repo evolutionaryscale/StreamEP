@@ -251,47 +251,6 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
 static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
               "Meta data slots overflow the 0..17 region of the 32-int slab");
 
-// Per-iter RDMA scratch cleanup metadata for the streaming dispatch metadata
-// kernel (drains the dispatch_main SymBuffer slots beyond the metadata
-// kernel's own count + streaming payloads). Returns
-// {clean_offset_int32, num_int32_to_clean}.
-__host__ __device__ inline std::pair<int, int> get_rdma_clean_meta(
-        int hidden_int4, int num_topk_idx, int num_topk_weights,
-        int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_channels) {
-    // Nothing to clean per-iter under the C3 protocol: the meta SymBuffer's
-    // data slots (0..17) are overwritten in full by the sender each iter,
-    // the sentinel (slot 30) is cumulative-across-iters and MUST NOT be
-    // zeroed, and the head/tail SymBuffers are also cumulative under the
-    // persistent reader_prev protocol (C2). The offset is preserved as the
-    // first byte past the data SymBuffer for cleanup-kernel sanity asserts;
-    // the count is 0 so no actual stores happen. The cleanup kernel itself
-    // is deleted in C4.
-    return {(get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
-             num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_channels) /
-                static_cast<int>(sizeof(int)),
-            0};
-}
-
-__host__ __device__ inline std::pair<int, int> get_nvl_clean_meta(
-        int hidden_int4, int num_topk_idx, int num_topk_weights,
-        int /*num_rdma_ranks*/, int num_nvl_ranks, int num_nvl_recv_buffer_tokens,
-        int num_channels, bool /*is_dispatch*/) {
-    // Nothing to clean per-iter under the C4 protocol: the dispatch NVL ring
-    // slots (`nvl_channel_prefix_start/end`, `nvl_channel_head`,
-    // `nvl_channel_tail`) carry a 12-bit gen-stamp from
-    // `tile_signal.dispatch_seq` in their high bits — readers ignore stale
-    // prior-iter values by checking the seq tag, so no inter-iter memset is
-    // needed. The combine NVL slots use a separate sentinel encoding
-    // applied by `cached_notify_combine_kernel` block 1+ and aren't touched
-    // here. Offset preserved as the first byte past the data SymBuffer for
-    // call-site assertion sanity; count is 0.
-    return {(num_nvl_recv_buffer_tokens *
-             get_num_bytes_per_token(hidden_int4, num_topk_idx, num_topk_weights) *
-             num_nvl_ranks * num_channels) /
-                static_cast<int>(sizeof(int)),
-            0};
-}
-
 // Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
 // Folded single-kernel architecture mirroring `intranode::streaming_dispatch_metadata`'s
 // shape phase-for-phase, with NVL primitives replaced by RDMA equivalents
@@ -431,14 +390,14 @@ struct DispatchEnv {
     int num_max_nvl_chunked_send_tokens;
     int num_max_nvl_chunked_recv_tokens;
     // Persistent reader_prev arrays for the RDMA head/tail SymBuffer slots.
-    // [num_channels × num_rdma_ranks] int64 each (M2: widened from int32 —
-    // see `multi-step-correctness.md`). Read at warp entry, written back
-    // at kernel exit. See `Buffer` in `deep_ep.hpp` for the role / lifetime.
-    // Shared by fwd dispatch + bwd dispatch_grads (both on streams.dispatch
-    // — stream-ordered, so the writeback at the end of fwd is visible at
-    // the start of bwd).
-    int64_t* reader_prev_head;
-    int64_t* reader_prev_tail;
+    // [num_channels × num_rdma_ranks] uint32 each — matches the NIC's
+    // 4-byte AMO width. Read at warp entry, written back at kernel exit by
+    // `atomicmax_reader_prev_cumulative`. See `Buffer` in `deep_ep.hpp` for
+    // the role / lifetime. Shared by fwd dispatch + bwd dispatch_grads
+    // (both on streams.dispatch — stream-ordered, so the writeback at the
+    // end of fwd is visible at the start of bwd).
+    uint32_t* reader_prev_head;
+    uint32_t* reader_prev_tail;
     // Persistent prev-sentinel array for the RDMA dispatch meta region.
     // [num_channels × num_rdma_ranks] int32. Same lifetime/protocol as
     // reader_prev_{head,tail}, but tracks the slab[c, src_rdma].slot[30]
@@ -576,8 +535,8 @@ void launch_combine_main(cudaDataType_t type,
                          // as `DispatchEnv::reader_prev_*`. Shared by fwd
                          // combine + bwd combine_grads (both on
                          // streams.combine — stream-ordered).
-                         int64_t* combine_reader_prev_head,
-                         int64_t* combine_reader_prev_tail);
+                         uint32_t* combine_reader_prev_head,
+                         uint32_t* combine_reader_prev_tail);
 
 }  // namespace internode
 
