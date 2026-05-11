@@ -357,14 +357,17 @@ def main():
         with open(full_table_path, "w") as f:
             f.write(full_table)
 
-        # Substring matches against profiler event keys, in priority order so
-        # `streaming_moe_a_bwd` matches before `streaming_moe_a` etc. Each
-        # event is attributed to the first match. `gemm` sits last so the
-        # more-specific streaming-moe kernels claim their events first; what
-        # remains under `gemm` is mostly the dW1 / dW2 grouped GEMMs that
-        # stream_moe.py invokes via `quack.gemm(...cu_seqlens_k=...)`. If
-        # the `gemm` row picks up unrelated noise, narrow it once we see
-        # the actual symbol names in `full_kernel_table.txt`.
+        # Logical roles we attribute each profiler event to. C++ kernels match
+        # by their natural symbol substring; CuTeDSL-emitted kernels (kernel A,
+        # Y, A_bwd, Y_bwd, dW grouped GEMM) get mangled to names like
+        # `kernel_cutlass_kernel_stream_epstream_moekernel_aStreamingMoeASm90_
+        # object_at__TiledMM...`, so we normalize via a case-insensitive,
+        # underscore-stripped probe of CamelCase class fragments.
+        #
+        # Order matters: the more-specific patterns must be tried first so
+        # `streaming_moe_a_bwd` claims its events before `streaming_moe_a`,
+        # and the streaming-moe kernels claim their events before the `gemm`
+        # catch-all (which then collects only the dW1 / dW2 quack.gemm calls).
         target_kernels = [
             # Collective ops (removed from bench_pipeline; this is their home).
             "streaming_dispatch_metadata_kernel",
@@ -380,18 +383,46 @@ def main():
             # dW1 / dW2 grouped GEMMs (varlen-K quack.gemm calls in bwd).
             "gemm",
         ]
+
+        def _classify(ev_key: str) -> str | None:
+            # C++ kernels: direct substring match on the natural name.
+            for key in (
+                "streaming_dispatch_metadata_kernel",
+                "dispatch_grads_main_kernel",
+                "dispatch_main_kernel",
+                "cached_notify_combine_kernel",
+                "combine_main_kernel",
+            ):
+                if key in ev_key:
+                    return key
+            # CuTeDSL-emitted kernels: probe a normalized form so the mangled
+            # `kernel_cutlass_kernel_..._StreamingMoeABwdSm90_...` symbols
+            # resolve back to their logical role. Case + underscore stripped
+            # so future name shuffles in the JIT layer don't break the match.
+            norm = ev_key.lower().replace("_", "")
+            for probe, key in (
+                ("streamingmoeabwdsm90", "streaming_moe_a_bwd"),
+                ("streamingmoeybwdsm90", "streaming_moe_y_bwd"),
+                ("streamingmoeasm90", "streaming_moe_a"),
+                ("streamingmoeysm90", "streaming_moe_y"),
+                ("quackgemm", "gemm"),
+            ):
+                if probe in norm:
+                    return key
+            return None
+
         # Aggregate cuda_time_total and count by target key (a single key may
         # match multiple event-list entries if torch splits by minor variation).
         total_us_by_key: dict[str, float] = {k: 0.0 for k in target_kernels}
         count_by_key: dict[str, int] = {k: 0 for k in target_kernels}
         sample_event_key: dict[str, str] = {}
         for ev in events:
-            for key in target_kernels:
-                if key in ev.key:
-                    total_us_by_key[key] += _dev_time_total(ev)
-                    count_by_key[key] += ev.count
-                    sample_event_key.setdefault(key, ev.key)
-                    break
+            key = _classify(ev.key)
+            if key is None:
+                continue
+            total_us_by_key[key] += _dev_time_total(ev)
+            count_by_key[key] += ev.count
+            sample_event_key.setdefault(key, ev.key)
 
         def per_call(key: str) -> float:
             n = count_by_key.get(key, 0)
