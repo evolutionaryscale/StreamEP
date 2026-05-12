@@ -10,7 +10,7 @@ with routing). The kernel-Y output ``handle.o`` is allocated by DeepEP inside
 ``Buffer.dispatch`` at ``[T_recv, hidden]`` zero-init; kernel Y atomic-scatters
 into it via PTX-predicated atomics, and the combine sender consumes it on a
 separate stream — its per-warp send loop spins on
-``handle.compute_done_per_token[r] >= dispatch_seq`` (the per-token gate)
+``handle.y_done_per_token[r] >= dispatch_seq`` (the per-token gate)
 before pushing ``o[r]`` back to ``r``'s origin rank.
 
 Within a layer the forward streams overlap (intra-layer); across layers they
@@ -128,7 +128,7 @@ class StreamMoEFunc(torch.autograd.Function):
     kernel_y_bwd's per-tile ``bwd_a_ready`` release-store
     (threadfence_system) fences ALL three of its outputs (dL_dswiglu_in,
     postact_a_for_dW2, dL_dweight) system-scope. combine_grads's sender's
-    per-recv-token gate (``bwd_compute_done_per_token[r]``, fired by
+    per-recv-token gate (``bwd_a_done_per_token[r]``, fired by
     kernel_a_bwd which acquires bwd_a_ready) transitively makes
     ``dL_dweight`` visible to the sender — same chain that publishes
     ``dL_dx_per_r``. Per-recv-token streaming on combine_grads is
@@ -258,8 +258,8 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.a_ready.record_stream(streams.compute_y)
         handle.pool_recv_token.record_stream(streams.compute_y)
         handle.pool_topk_weight.record_stream(streams.compute_y)
-        handle.per_token_remaining.record_stream(streams.compute_y)
-        handle.compute_done_per_token.record_stream(streams.compute_y)
+        handle.k_local_remaining.record_stream(streams.compute_y)
+        handle.y_done_per_token.record_stream(streams.compute_y)
         handle.o.record_stream(streams.compute_y)
         with torch.cuda.stream(streams.compute_y):
             streaming_moe_y(
@@ -268,8 +268,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.o,
                 handle.pool_recv_token,
                 handle.pool_topk_weight,
-                handle.per_token_remaining,
-                handle.compute_done_per_token,
+                handle.k_local_remaining,
+                handle.y_done_per_token,
                 handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 handle.a_ready,
@@ -282,19 +282,19 @@ class StreamMoEFunc(torch.autograd.Function):
             )
 
         # ── Combine sender path. Per-(channel, dst_rank) sender warps spin on
-        # ``handle.compute_done_per_token[r] >= dispatch_seq`` before pushing
+        # ``handle.y_done_per_token[r] >= dispatch_seq`` before pushing
         # ``o[r]`` to r's origin rank. The per-token gate lets early-completing
         # tokens (K_local=1 first-wave-expert tokens) ship while late-wave
         # tokens are still landing — combine ↔ kernel Y tail overlap. Streaming
         # granularity = NVL chunk size (default 4 tokens per chunk at 8-rank
         # intranode per ``Buffer.get_combine_config``).
         #
-        # Cross-stream visibility on ``compute_done_per_token`` is carried by
+        # Cross-stream visibility on ``y_done_per_token`` is carried by
         # the per-token ``.sys``-scope release/acquire pair the kernels
         # themselves issue; ``streams.combine``'s only cross-stream sync is the
         # ``metadata_done`` event (one-shot, before dispatch main).
         streams.combine.wait_event(metadata_done)
-        handle.compute_done_per_token.record_stream(streams.combine)
+        handle.y_done_per_token.record_stream(streams.combine)
         handle.o.record_stream(streams.combine)
         handle.rank_prefix_matrix.record_stream(streams.combine)
         handle.pool_topk_weight.record_stream(streams.combine)
@@ -388,7 +388,7 @@ class StreamMoEFunc(torch.autograd.Function):
 
         Inter-stage waits are per-tile / per-recv-token system-scope
         release/acquire stamps embedded in the kernels (`bwd_y_ready` →
-        kernel_y_bwd, `bwd_a_ready` → kernel_a_bwd, `bwd_compute_done_per_token`
+        kernel_y_bwd, `bwd_a_ready` → kernel_a_bwd, `bwd_a_done_per_token`
         → combine_grads). No `cudaStreamWaitEvent` between bwd stages — the
         per-tile acquire-spins inside each kernel handle cross-stream
         visibility.
@@ -397,7 +397,7 @@ class StreamMoEFunc(torch.autograd.Function):
         mPostAct = postact_a_for_dW2, mColVecReduce = dL_dweight via
         per-pid_n red.global.add.f32). All three are fenced by the
         per-tile bwd_a_ready release-store; combine_grads's per-token
-        gate (bwd_compute_done_per_token[r], fired by kernel_a_bwd which
+        gate (bwd_a_done_per_token[r], fired by kernel_a_bwd which
         acquires bwd_a_ready) transitively publishes dL_dweight to
         combine's sender. No cross-stream events anywhere in the bwd
         path — purely device-side per-tile / per-token release/acquire.
@@ -405,8 +405,8 @@ class StreamMoEFunc(torch.autograd.Function):
         Per-stream zero-init setup ops are issued BEFORE the
         `wait_stream(caller_stream)` fan-out so they overlap with the upstream
         layer's bwd tail running on caller_stream. Only the
-        `bwd_per_token_remaining.copy_(handle.k_local_count)` op is
-        caller-dependent (handle.k_local_count was last-written on
+        `bwd_k_local_remaining.copy_(handle.k_local_total)` op is
+        caller-dependent (handle.k_local_total was last-written on
         streams.dispatch in fwd → caller-visible after fwd's exit chain), so it
         runs after streams.compute_a's wait_stream(caller_stream).
 
@@ -451,7 +451,7 @@ class StreamMoEFunc(torch.autograd.Function):
         I = two_I // 2
         total_tiles = handle.total_tiles
         TK_padded = pool.shape[0]
-        T_recv = handle.k_local_count.shape[0]
+        T_recv = handle.k_local_total.shape[0]
 
         # ── Per-stream setup, in parallel, before any wait_stream ──────────
         # Fresh-tensor zero-inits + the `bwd_a_ready` cross-stream signal
@@ -462,10 +462,10 @@ class StreamMoEFunc(torch.autograd.Function):
 
         with torch.cuda.stream(streams.compute_a):
             dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
-            bwd_per_token_remaining = torch.empty(
+            bwd_k_local_remaining = torch.empty(
                 T_recv, dtype=torch.int32, device=device
             )
-            bwd_compute_done_per_token = torch.zeros(
+            bwd_a_done_per_token = torch.zeros(
                 T_recv, dtype=torch.int64, device=device
             )
 
@@ -520,11 +520,11 @@ class StreamMoEFunc(torch.autograd.Function):
         streams.w2.wait_stream(caller_stream)
 
         # ── Caller-dependent setup op ──────────────────────────────────────
-        # handle.k_local_count was written on streams.dispatch in fwd; visible
+        # handle.k_local_total was written on streams.dispatch in fwd; visible
         # on caller_stream after fwd's exit chain. The copy onto compute_a must
         # wait for caller_stream first.
         with torch.cuda.stream(streams.compute_a):
-            bwd_per_token_remaining.copy_(handle.k_local_count, non_blocking=True)
+            bwd_k_local_remaining.copy_(handle.k_local_total, non_blocking=True)
 
         # ── Cross-stream record_stream for handle tensors used on streams
         # they were NOT recorded on during fwd. Held alive by ctx; ensures the
@@ -538,7 +538,7 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.pool_arrival_target.record_stream(streams.dispatch)
         handle.pool_recv_token.record_stream(streams.compute_a)
         handle.pool_recv_token.record_stream(streams.compute_y)
-        handle.k_local_count.record_stream(streams.compute_a)
+        handle.k_local_total.record_stream(streams.compute_a)
         pool.record_stream(streams.compute_a)
 
         # ── Stage 1 — dispatch_grads on streams.dispatch ───────────────────
@@ -600,7 +600,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # cross-stream visibility is carried by the per-tile bwd_a_ready
         # release-store's threadfence_system (kernel_y_bwd) → kernel_a_bwd's
         # acquire of bwd_a_ready → kernel_a_bwd's release of
-        # bwd_compute_done_per_token → combine_grads's per-token gate
+        # bwd_a_done_per_token → combine_grads's per-token gate
         # acquire. record_stream is just allocator bookkeeping (combine
         # might free dL_dweight before compute_y has retired its writes
         # without it).
@@ -609,7 +609,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # ── Stage 3 — kernel_a_bwd on streams.compute_a ────────────────────
         # Acquire-spins on bwd_a_ready[tile] internally. Vanilla streaming GEMM
         # `dL/dpool = dL/dswiglu_in @ W1` + atomic-scatter into dL_dx_per_r;
-        # per-row stripe-done bookkeeping fires bwd_compute_done_per_token[r]
+        # per-row stripe-done bookkeeping fires bwd_a_done_per_token[r]
         # on the last contributor.
         with torch.cuda.stream(streams.compute_a):
             streaming_moe_a_bwd(
@@ -617,8 +617,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 w1_local,
                 dL_dx_per_r,
                 handle.pool_recv_token,
-                bwd_per_token_remaining,
-                bwd_compute_done_per_token,
+                bwd_k_local_remaining,
+                bwd_a_done_per_token,
                 handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 bwd_a_ready,
@@ -628,22 +628,22 @@ class StreamMoEFunc(torch.autograd.Function):
                 num_sms=num_sms_y,
             )
 
-        # dL_dx_per_r / bwd_compute_done_per_token are written on compute_a,
+        # dL_dx_per_r / bwd_a_done_per_token are written on compute_a,
         # consumed by combine_grads on streams.combine.
         dL_dx_per_r.record_stream(streams.combine)
-        bwd_compute_done_per_token.record_stream(streams.combine)
+        bwd_a_done_per_token.record_stream(streams.combine)
 
         # ── Stage 4 — combine_grads on streams.combine ─────────────────────
-        # Sender per-warp loop spins on bwd_compute_done_per_token[r] >=
+        # Sender per-warp loop spins on bwd_a_done_per_token[r] >=
         # dispatch_seq before reading dL_dx_per_r[r] AND dL_dweight[slot]
         # (gathered via recv_token_to_slots[r, k]). Cross-stream visibility
         # of BOTH is carried by the device-side fence chain:
         #   kernel_y_bwd's per-tile bwd_a_ready release-store
         #     (threadfence_system fences mPostAct + dL_dweight + dL_dswiglu_in)
         #   → kernel_a_bwd acquire bwd_a_ready
-        #   → kernel_a_bwd release-store bwd_compute_done_per_token[r]
+        #   → kernel_a_bwd release-store bwd_a_done_per_token[r]
         #     (per-token, fenced)
-        #   → combine_grads sender acquire bwd_compute_done_per_token[r]
+        #   → combine_grads sender acquire bwd_a_done_per_token[r]
         # No explicit cross-stream event — per-recv-token streaming preserved
         # (combine_grads's first packet ships when the FIRST r's tile is done,
         # not when all of compute_y has drained).
@@ -652,7 +652,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 dL_dx_per_r,
                 handle,
                 dL_dweight,
-                bwd_compute_done_per_token,
+                bwd_a_done_per_token,
                 dispatch_seq=handle.dispatch_seq,
             )
 

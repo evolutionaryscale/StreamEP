@@ -65,13 +65,13 @@ namespace stream_ep {
 //   tile_id_to_expert,
 //   pool_arrival_target,
 //   tile_ready, a_ready      per-tile arrays (scheduler + cross-stream signals).
-//   per_token_remaining,
-//   compute_done_per_token,
+//   k_local_remaining,
+//   y_done_per_token,
 //   o                        kernel Y atomic-scatter destination + Y→combine gate.
 //   recv_token_to_slots,
-//   k_local_count            backward-pass scaffolding written by fwd Pass B
+//   k_local_total            backward-pass scaffolding written by fwd Pass B
 //                            (dispatch_grads receiver gathers slots; bwd setup
-//                            memcpy's k_local_count into bwd_per_token_remaining).
+//                            memcpy's k_local_total into bwd_k_local_remaining).
 
 struct StreamingDispatchOutputs {
     torch::Tensor pool;
@@ -102,12 +102,12 @@ struct StreamingDispatchOutputs {
     torch::Tensor tile_ready;
 
     torch::Tensor a_ready;
-    torch::Tensor per_token_remaining;
-    torch::Tensor compute_done_per_token;
+    torch::Tensor k_local_remaining;
+    torch::Tensor y_done_per_token;
     torch::Tensor o;
 
     torch::Tensor recv_token_to_slots;
-    torch::Tensor k_local_count;
+    torch::Tensor k_local_total;
 
     int total_tiles;
 
@@ -330,7 +330,7 @@ public:
     //   recv_token_to_slots   handle.recv_token_to_slots (same for both directions)
     //   x                     fwd: handle.o                   bwd: dL/dx_per_r
     //   bias_0 / bias_1       optional (fwd only)             nullopt for bwd
-    //   compute_done_per_token  fwd: kernel_y release stamp   bwd: kernel_a_bwd release stamp
+    //   y_done_per_token  fwd: kernel_y release stamp   bwd: kernel_a_bwd release stamp
     //   combine_seq           caller's monotonic int (`dispatch_seq`)
     std::tuple<torch::Tensor, torch::Tensor> intranode_combine(
         const torch::Tensor& x,
@@ -339,7 +339,7 @@ public:
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
         const torch::Tensor& send_head,
-        const torch::Tensor& compute_done_per_token,
+        const torch::Tensor& y_done_per_token,
         int64_t combine_seq,
         const Config& config);
 
@@ -387,7 +387,7 @@ public:
     // pattern (`stream_ep.cpp:1218 + 1235`); same arg semantics for the
     // unified surface (x = handle.o for fwd / dL/dx_per_r for bwd;
     // per_slot_weights = pool_topk_weight for fwd / weight_grads for bwd;
-    // compute_done_per_token / combine_seq drive the streaming gate at
+    // y_done_per_token / combine_seq drive the streaming gate at
     // `kNVLSender`).
     //
     // Both passes mutate `dispatch_out.send_rdma_head` and
@@ -400,7 +400,7 @@ public:
         const torch::Tensor& x,
         const torch::Tensor& per_slot_weights,
         const StreamingDispatchOutputs& dispatch_out,
-        const torch::Tensor& compute_done_per_token,
+        const torch::Tensor& y_done_per_token,
         int64_t combine_seq,
         // 0 = fwd combine, 1 = bwd combine_grads. Forwarded into
         // `internode::launch_combine_main` to phase-distinguish the NVL

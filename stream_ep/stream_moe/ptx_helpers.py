@@ -17,7 +17,7 @@ Three groups:
    reduction with PTX-level predication so out-of-range / padding lanes
    skip the atomic entirely (no HBM op, no need for a trash-row sink).
    Intra-GPU scope is enough; cross-stream visibility for the eventual
-   combine sender is carried by `compute_done_per_token[r]`'s separate
+   combine sender is carried by `y_done_per_token[r]`'s separate
    release-store.
 
 Lifted out of `quack/utils.py` so the streaming code is self-contained in
@@ -121,7 +121,7 @@ def red_add_bf16x2_v4_pred(
 
     Default `.gpu`-scope `.relaxed` semantics: kernel Y's atomic-scatter is
     intra-GPU; cross-stream visibility for the eventual combine sender is
-    carried by `compute_done_per_token[r]`'s separate release-store.
+    carried by `y_done_per_token[r]`'s separate release-store.
 
     PTX requires `.noftz` (denormals must NOT be flushed; ptxas rejects the
     instruction without it).

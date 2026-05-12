@@ -20,7 +20,7 @@ semantics. Test verifies:
      seeds — each combine sees its own dispatch's state, no cross-iter
      contamination.
 
-Note on the streaming gate: this test fills ``compute_done_per_token``
+Note on the streaming gate: this test fills ``y_done_per_token``
 with ``combine_seq`` before invoking combine (gate trivially open),
 mirroring the intranode combine test. End-to-end gate exercise (kernel-Y
 release fires the gate while combine is spinning) requires the production
@@ -100,7 +100,7 @@ def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
     T_recv = handle.o.shape[0]
 
     handle.o.fill_(float(rank))
-    handle.compute_done_per_token.fill_(combine_seq)
+    handle.y_done_per_token.fill_(combine_seq)
 
     recv_x, recv_topk = buf.combine(
         handle.o, handle, combine_seq=combine_seq)

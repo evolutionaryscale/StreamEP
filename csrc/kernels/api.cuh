@@ -83,10 +83,10 @@ struct DispatchPoolOut {
 struct DispatchPerTokenOut {
     int* recv_channel_prefix_matrix;  // [num_ranks, num_channels]  receiver-side cumulative
     int* send_head;                // [num_tokens, num_ranks]
-    int* per_token_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs to 0
+    int* k_local_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs to 0
     // Backward-pass scaffolding written by Pass B's per-recv-token lane-0 K-loop:
     int* recv_token_to_slots;      // [T_recv, num_topk]    (r, k) → pool slot, -1 for non-local k
-    int* k_local_count;            // [T_recv]              K_local(r); write-once mirror of per_token_remaining
+    int* k_local_total;            // [T_recv]              K_local(r); write-once mirror of k_local_remaining
 };
 
 struct DispatchInputs {
@@ -197,7 +197,7 @@ void launch_combine_main(cudaDataType_t type,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
              int* send_head,
-             const int64_t* compute_done_per_token,
+             const int64_t* y_done_per_token,
              int64_t combine_seq,
              int num_tokens,
              int num_recv_tokens,
@@ -342,9 +342,9 @@ struct DispatchPoolOut {
 
 struct DispatchPerTokenOut {
     // Streaming-essential per-recv-token outputs (mirror intranode):
-    int* per_token_remaining;      // [T_recv]                   K_local(r); kernel Y atomicSubs to 0
+    int* k_local_remaining;      // [T_recv]                   K_local(r); kernel Y atomicSubs to 0
     int* recv_token_to_slots;      // [T_recv, num_topk]         (r, k) → pool slot, -1 for non-local k
-    int* k_local_count;            // [T_recv]                   write-once K_local mirror
+    int* k_local_total;            // [T_recv]                   write-once K_local mirror
 
     // Combine plumbing (internode-specific):
     void* recv_src_meta;                   // [T_recv, get_source_meta_bytes()] (uint8)
@@ -505,7 +505,7 @@ void encode_combine_heads(int hidden_int4,
 // combine_main_kernel — used by both forward combine and backward
 // combine_grads. Same arg surface as `intranode::launch_combine_main` for the
 // unified args (recv_x, recv_topk_weights_out, x, per_slot_weights,
-// recv_token_to_slots, compute_done_per_token, combine_seq); internode adds
+// recv_token_to_slots, y_done_per_token, combine_seq); internode adds
 // the RDMA-staging plumbing (combined_rdma_head, combined_nvl_head,
 // src_meta, recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,
 // gbl_channel_prefix_matrix). Streaming gate at kNVLSender only.
@@ -521,7 +521,7 @@ void launch_combine_main(cudaDataType_t type,
                          const int* recv_rdma_channel_prefix_matrix,
                          const int* recv_rdma_rank_prefix_sum,
                          const int* gbl_channel_prefix_matrix,
-                         const int64_t* compute_done_per_token,
+                         const int64_t* y_done_per_token,
                          int64_t combine_seq,
                          // 0 = fwd combine, 1 = bwd combine_grads. Phase-
                          // distinguishes the NVL gen-stamp tag so fwd's slot

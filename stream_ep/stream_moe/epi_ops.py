@@ -12,7 +12,7 @@ per-stripe partials land in ``dL_dweight_per_stripe[slot, n_stripe]`` and the
 orchestrator collapses them post-hoc with a ``.sum(dim=-1)`` torch op. That
 post-hoc reduction is a SECOND kernel on streams.compute_y, which forces a
 ``weight_grads_ready`` event into combine_grads's path and destroys the
-per-recv-token streaming the ``bwd_compute_done_per_token`` gate was
+per-recv-token streaming the ``bwd_a_done_per_token`` gate was
 designed for (combine has to wait for the .sum() to complete globally
 before its first packet ships).
 
@@ -21,7 +21,7 @@ per-tile ``bwd_a_ready`` release-store transitively publishes
 ``dL_dweight`` along with the rest of the tile's writes (the
 ``threadfence_system`` inside ``TileReadyRelease.end()`` is system-scope).
 Combine_grads's existing per-token gate
-(``bwd_compute_done_per_token[r]``, fired by kernel_a_bwd which acquires
+(``bwd_a_done_per_token[r]``, fired by kernel_a_bwd which acquires
 ``bwd_a_ready``) then transitively makes ``dL_dweight`` visible to
 combine's sender — no explicit cross-stream event, per-token streaming
 restored.

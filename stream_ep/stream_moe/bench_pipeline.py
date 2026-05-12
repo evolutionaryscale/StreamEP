@@ -257,9 +257,9 @@ def main():
     # zero-init before each call so multi-pid_n stripe-done gating fires
     # cleanly. Reset inside run_streaming_y_bwd.
     bwd_a_ready_for_y = torch.zeros(total_tiles, dtype=torch.int64, device=device)
-    bwd_per_token_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
-    bwd_per_token_remaining_init = handle.k_local_count.to(torch.int32).clone()
-    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
+    bwd_k_local_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
+    bwd_k_local_remaining_init = handle.k_local_total.to(torch.int32).clone()
+    bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     if rank == 0:
         # MoE forward FLOPs (kernel A + kernel Y bf16 matmuls).
@@ -325,8 +325,8 @@ def main():
         # Reset per-call accumulator state. (Production pipeline: DeepEP's
         # dispatch zeros these; here we time kernel Y in isolation across many
         # calls so we reset by hand.)
-        handle.per_token_remaining.copy_(_per_token_remaining_init)
-        handle.compute_done_per_token.zero_()
+        handle.k_local_remaining.copy_(_k_local_remaining_init)
+        handle.y_done_per_token.zero_()
         o_buf.zero_()
         streaming_moe_y(
             postact_a,
@@ -334,8 +334,8 @@ def main():
             o_buf,
             handle.pool_recv_token,
             handle.pool_topk_weight,
-            handle.per_token_remaining,
-            handle.compute_done_per_token,
+            handle.k_local_remaining,
+            handle.y_done_per_token,
             handle.tile_id_to_expert,
             handle.expert_pool_block_offset,
             a_ready_fired,
@@ -443,16 +443,16 @@ def main():
         )
 
     def run_streaming_a_bwd():
-        bwd_per_token_remaining.copy_(bwd_per_token_remaining_init)
-        bwd_compute_done_per_token.zero_()
+        bwd_k_local_remaining.copy_(bwd_k_local_remaining_init)
+        bwd_a_done_per_token.zero_()
         dL_dx_per_r.zero_()
         streaming_moe_a_bwd(
             dL_dswiglu_in,
             w1_local,
             dL_dx_per_r,
             handle.pool_recv_token,
-            bwd_per_token_remaining,
-            bwd_compute_done_per_token,
+            bwd_k_local_remaining,
+            bwd_a_done_per_token,
             handle.tile_id_to_expert,
             handle.expert_pool_block_offset,
             bwd_a_ready_fired,
@@ -520,8 +520,8 @@ def main():
             cu_seqlens_k=cu_seqlens_k,
         )
 
-    # Capture initial per_token_remaining so isolated y timing can reset it.
-    _per_token_remaining_init = handle.per_token_remaining.clone()
+    # Capture initial k_local_remaining so isolated y timing can reset it.
+    _k_local_remaining_init = handle.k_local_remaining.clone()
 
     # Materialize one dispatch_grads result for kernel_y_bwd / a_bwd / dW1 / dW2 inputs.
     materialize_dispatch_grads()
@@ -646,7 +646,7 @@ def main():
     #     this to safely read metadata tensors without serializing against
     #     dispatch main, preserving per-tile streaming overlap.
     # (b) per-tile `tile_ready` (dispatch→A) / `a_ready` (A→Y) release/acquire
-    #     pairs and per-token `compute_done_per_token` (Y→combine sender) gate.
+    #     pairs and per-token `y_done_per_token` (Y→combine sender) gate.
 
     def run_pipeline_step(seq):
         stream_moe_func(

@@ -1,11 +1,11 @@
 """End-to-end test for the consolidated streaming-MoE combine (intranode).
 
 Exercises ``Buffer.combine`` with the Phase-D per-token gate. Combine sender
-spins on ``compute_done_per_token[r] >= combine_seq`` before pushing
+spins on ``y_done_per_token[r] >= combine_seq`` before pushing
 ``handle.o[r]`` back to ``r``'s origin rank; in production the release-store
 of ``combine_seq`` is fired by kernel Y. Here we do not run kernel Y — we
 manually populate ``handle.o`` with rank-tagged sentinel values and fill
-``compute_done_per_token`` with ``combine_seq`` so the gate clears
+``y_done_per_token`` with ``combine_seq`` so the gate clears
 unconditionally, then call ``buf.combine`` and verify the cross-rank
 reduction in ``recv_x``.
 
@@ -70,7 +70,7 @@ def populate_handle_o_with_rank_tag(handle, rank, num_recv_tokens, hidden, dtype
 def run_one_dispatch_combine(buf, x, topk_idx, topk_weights, is_token_in_rank,
                              num_experts, num_topk, hidden, num_ranks, rank,
                              tile_m, dispatch_seq, dtype, device):
-    """One dispatch + manual o/compute_done_per_token fill + combine + check."""
+    """One dispatch + manual o/y_done_per_token fill + combine + check."""
     pool, handle, _event = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,
         tile_m=tile_m, dispatch_seq=dispatch_seq,
@@ -82,7 +82,7 @@ def run_one_dispatch_combine(buf, x, topk_idx, topk_weights, is_token_in_rank,
     populate_handle_o_with_rank_tag(handle, rank, T_recv, hidden, dtype)
 
     # Manually fire the per-token gate (kernel Y release-store replacement).
-    handle.compute_done_per_token.fill_(dispatch_seq)
+    handle.y_done_per_token.fill_(dispatch_seq)
 
     # Run combine. Use the same int as combine_seq for symmetry with the
     # production layer wrapper.

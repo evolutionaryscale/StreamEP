@@ -48,7 +48,7 @@ Per tile:
        a flat ``dL_dweight[slot]`` fp32 buffer. The per-tile ``bwd_a_ready``
        release-store transitively publishes ``dL_dweight`` writes via
        system-scope fence — combine_grads's per-token gate
-       (``bwd_compute_done_per_token[r]``, fired by kernel_a_bwd which
+       (``bwd_a_done_per_token[r]``, fired by kernel_a_bwd which
        acquires ``bwd_a_ready``) makes them visible to combine's sender so
        per-recv-token streaming on combine_grads is preserved.
     4. Per-row weight multiply on (dgate, dup, postact): SwiGLU bwd is
@@ -573,7 +573,7 @@ def streaming_moe_y_bwd(
     before launch on the same stream.** The per-tile ``bwd_a_ready``
     release-store transitively publishes ``dL_dweight`` writes to other
     streams via the system-scope fence inside ``TileReadyRelease.end()``,
-    so combine_grads's per-token gate (``bwd_compute_done_per_token[r]``,
+    so combine_grads's per-token gate (``bwd_a_done_per_token[r]``,
     fired by kernel_a_bwd which acquires ``bwd_a_ready``) makes them
     visible to combine's sender — no explicit cross-stream event needed.
 

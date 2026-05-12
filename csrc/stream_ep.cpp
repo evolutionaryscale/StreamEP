@@ -620,8 +620,8 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
 //          (kernel A's release), which serializes after this memset on
 //          dispatch_stream → no race; backward consumers serialize via
 //          caller_stream's wait on dispatch_stream at fwd's exit):
-//     per_token_remaining, compute_done_per_token, o,
-//     recv_token_to_slots, k_local_count
+//     k_local_remaining, y_done_per_token, o,
+//     recv_token_to_slots, k_local_total
 struct PostPollBundle {
     // Z_pre + N region views.
     torch::Tensor pool_topk_weight;
@@ -634,13 +634,13 @@ struct PostPollBundle {
     torch::Tensor pool_k_slot;
 
     // Z_post region views (allocated after metadata_done_event is recorded).
-    torch::Tensor per_token_remaining;
-    torch::Tensor compute_done_per_token;
+    torch::Tensor k_local_remaining;
+    torch::Tensor y_done_per_token;
     torch::Tensor o;
 
     // Backward-pass scaffolding (Z_post; populated by fwd Pass B; read by bwd):
     torch::Tensor recv_token_to_slots;  // [T_recv, num_topk] int32, -1 for non-local k
-    torch::Tensor k_local_count;        // [T_recv]            int32, write-once K_local mirror
+    torch::Tensor k_local_total;        // [T_recv]            int32, write-once K_local mirror
 
     // Recorded between Z_pre/N memsets and Z_post memset. Consumer streams
     // wait_event on this to safely read metadata tensors without serializing
@@ -683,11 +683,11 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     int64_t n_end               = b.total_bytes();
 
     // Z_post region (zeroed after metadata_done).
-    int64_t off_per_token_remaining    = b.reserve<int>(num_recv_tokens);
-    int64_t off_compute_done_per_token = b.reserve<int64_t>(num_recv_tokens);
+    int64_t off_k_local_remaining    = b.reserve<int>(num_recv_tokens);
+    int64_t off_y_done_per_token = b.reserve<int64_t>(num_recv_tokens);
     int64_t off_o                      = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
     int64_t off_recv_token_to_slots    = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
-    int64_t off_k_local_count          = b.reserve<int>(num_recv_tokens);
+    int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
@@ -717,11 +717,11 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // Z_post memset (queued AFTER metadata_done event recording).
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
-    out.per_token_remaining    = at::from_blob(base + off_per_token_remaining,    {num_recv_tokens},                        keep, i32_opts);
-    out.compute_done_per_token = at::from_blob(base + off_compute_done_per_token, {num_recv_tokens},                        keep, i64_opts);
+    out.k_local_remaining    = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                        keep, i32_opts);
+    out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                        keep, i64_opts);
     out.o                      = at::from_blob(base + off_o,                      {num_recv_tokens, hidden},                keep, x_options);
     out.recv_token_to_slots    = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},              keep, i32_opts);
-    out.k_local_count          = at::from_blob(base + off_k_local_count,          {num_recv_tokens},                        keep, i32_opts);
+    out.k_local_total          = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                        keep, i32_opts);
 
     return out;
 }
@@ -820,10 +820,10 @@ struct PostPollBundleInternode {
     torch::Tensor recv_token_to_slots;
 
     // Z_post region (zero-init, after metadata_done_event).
-    torch::Tensor per_token_remaining;
-    torch::Tensor compute_done_per_token;
+    torch::Tensor k_local_remaining;
+    torch::Tensor y_done_per_token;
     torch::Tensor o;
-    torch::Tensor k_local_count;
+    torch::Tensor k_local_total;
 
     EventHandle metadata_done_event{};
 };
@@ -869,10 +869,10 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     int64_t n_end                      = b.total_bytes();
 
     // Z_post region (zeroed after metadata_done event).
-    int64_t off_per_token_remaining    = b.reserve<int>(num_recv_tokens);
-    int64_t off_compute_done_per_token = b.reserve<int64_t>(num_recv_tokens);
+    int64_t off_k_local_remaining    = b.reserve<int>(num_recv_tokens);
+    int64_t off_y_done_per_token = b.reserve<int64_t>(num_recv_tokens);
     int64_t off_o                      = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
-    int64_t off_k_local_count          = b.reserve<int>(num_recv_tokens);
+    int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
@@ -903,10 +903,10 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // Z_post memset (queued AFTER metadata_done event recording).
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
-    out.per_token_remaining             = at::from_blob(base + off_per_token_remaining,    {num_recv_tokens},                            keep, i32_opts);
-    out.compute_done_per_token          = at::from_blob(base + off_compute_done_per_token, {num_recv_tokens},                            keep, i64_opts);
+    out.k_local_remaining             = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                            keep, i32_opts);
+    out.y_done_per_token          = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                            keep, i64_opts);
     out.o                               = at::from_blob(base + off_o,                      {num_recv_tokens, hidden},                    keep, x_options);
-    out.k_local_count                   = at::from_blob(base + off_k_local_count,          {num_recv_tokens},                            keep, i32_opts);
+    out.k_local_total                   = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                            keep, i32_opts);
 
     return out;
 }
@@ -1044,9 +1044,9 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     intranode::DispatchPerTokenOut dispatch_per_token_out{
         .recv_channel_prefix_matrix = post.recv_channel_prefix_matrix.data_ptr<int>(),
         .send_head                  = post.send_head.data_ptr<int>(),
-        .per_token_remaining        = post.per_token_remaining.data_ptr<int>(),
+        .k_local_remaining        = post.k_local_remaining.data_ptr<int>(),
         .recv_token_to_slots        = post.recv_token_to_slots.data_ptr<int>(),
-        .k_local_count              = post.k_local_count.data_ptr<int>(),
+        .k_local_total              = post.k_local_total.data_ptr<int>(),
     };
     intranode::DispatchInputs dispatch_inputs{
         .x                = reinterpret_cast<const int4*>(x.data_ptr()),
@@ -1097,11 +1097,11 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .pool_arrival_target        = pool_arrival_target,
         .tile_ready                 = post.tile_ready,
         .a_ready                    = post.a_ready,
-        .per_token_remaining        = post.per_token_remaining,
-        .compute_done_per_token     = post.compute_done_per_token,
+        .k_local_remaining        = post.k_local_remaining,
+        .y_done_per_token     = post.y_done_per_token,
         .o                          = post.o,
         .recv_token_to_slots        = post.recv_token_to_slots,
-        .k_local_count              = post.k_local_count,
+        .k_local_total              = post.k_local_total,
         .total_tiles                = poll.total_tiles,
         .metadata_done_event        = post.metadata_done_event,
     };
@@ -1224,7 +1224,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
     const torch::Tensor& rank_prefix_matrix,
     const torch::Tensor& channel_prefix_matrix,
     const torch::Tensor& send_head,
-    const torch::Tensor& compute_done_per_token,
+    const torch::Tensor& y_done_per_token,
     int64_t combine_seq,
     const Config& config) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
@@ -1239,10 +1239,10 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                    channel_prefix_matrix.scalar_type() == torch::kInt32);
     // Phase-D per-token gate: kernel_y forward (fwd combine) or kernel_a_bwd
     // (bwd combine_grads) release-stores `combine_seq` into
-    // compute_done_per_token[r] once the per-recv-token stripe is fully
+    // y_done_per_token[r] once the per-recv-token stripe is fully
     // assembled. Sender's per-warp send loop spins on this before reading x[r].
-    EP_HOST_ASSERT(compute_done_per_token.dim() == 1 and compute_done_per_token.is_contiguous() and
-                   compute_done_per_token.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(y_done_per_token.dim() == 1 and y_done_per_token.is_contiguous() and
+                   y_done_per_token.scalar_type() == torch::kInt64);
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1253,12 +1253,12 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
     EP_HOST_ASSERT(send_head.size(1) == num_ranks);
     EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
     EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
-    // compute_done_per_token is indexed by combine sender's iteration variable
+    // y_done_per_token is indexed by combine sender's iteration variable
     // `token_idx` ∈ [0, num_tokens), which (in combine's naming convention)
     // is the number of input rows of `x` = handle.o.size(0) = T_recv from
     // dispatch's perspective. Note combine's `num_recv_tokens` is dispatch's
     // source-token count (output rows of combine), NOT the size of the gate.
-    EP_HOST_ASSERT(compute_done_per_token.size(0) == num_tokens);
+    EP_HOST_ASSERT(y_done_per_token.size(0) == num_tokens);
     EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
     EP_HOST_ASSERT(recv_token_to_slots.size(0) == num_tokens);
 
@@ -1298,7 +1298,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
                        send_head.data_ptr<int>(),
-                       compute_done_per_token.data_ptr<int64_t>(),
+                       y_done_per_token.data_ptr<int64_t>(),
                        combine_seq,
                        num_tokens,
                        num_recv_tokens,
@@ -1449,9 +1449,9 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .pool_k_slot      = post.pool_k_slot.data_ptr<int>(),
     };
     internode::DispatchPerTokenOut per_token_out{
-        .per_token_remaining               = post.per_token_remaining.data_ptr<int>(),
+        .k_local_remaining               = post.k_local_remaining.data_ptr<int>(),
         .recv_token_to_slots               = post.recv_token_to_slots.data_ptr<int>(),
-        .k_local_count                     = post.k_local_count.data_ptr<int>(),
+        .k_local_total                     = post.k_local_total.data_ptr<int>(),
         .recv_src_meta                     = post.recv_src_meta.data_ptr(),
         .send_rdma_head                    = post.send_rdma_head.data_ptr<int>(),
         .send_nvl_head                     = post.send_nvl_head.data_ptr<int>(),
@@ -1516,11 +1516,11 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .pool_arrival_target             = pool_arrival_target_n,
         .tile_ready                      = post.tile_ready,
         .a_ready                         = post.a_ready,
-        .per_token_remaining             = post.per_token_remaining,
-        .compute_done_per_token          = post.compute_done_per_token,
+        .k_local_remaining             = post.k_local_remaining,
+        .y_done_per_token          = post.y_done_per_token,
         .o                               = post.o,
         .recv_token_to_slots             = post.recv_token_to_slots,
-        .k_local_count                   = post.k_local_count,
+        .k_local_total                   = post.k_local_total,
         .total_tiles                     = total_tiles,
         .metadata_done_event             = post.metadata_done_event,
         .rdma_channel_prefix_matrix      = pre.rdma_channel_prefix_matrix,
@@ -1647,7 +1647,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
 //   1. `internode::encode_combine_heads` — buffer cleanup +
 //      sentinel-encode `send_rdma_head` / `send_nvl_head` in place.
 //   2. `internode::launch_combine_main` — NVL→RDMA→origin reduction with
-//      streaming gate at kNVLSender (gated by compute_done_per_token).
+//      streaming gate at kNVLSender (gated by y_done_per_token).
 //
 // Both run on the caller's current stream; stream-order causality
 // guarantees the sentinel-encoded heads are visible to combine_main.
@@ -1656,7 +1656,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
     const torch::Tensor& x,
     const torch::Tensor& per_slot_weights,
     const StreamingDispatchOutputs& dispatch_out,
-    const torch::Tensor& compute_done_per_token,
+    const torch::Tensor& y_done_per_token,
     int64_t combine_seq,
     int64_t combine_phase,
     const Config& config) {
@@ -1675,9 +1675,9 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
     EP_HOST_ASSERT(dispatch_out.recv_token_to_slots.dim() == 2 and dispatch_out.recv_token_to_slots.is_contiguous());
     EP_HOST_ASSERT(dispatch_out.send_rdma_head.size(1) == num_rdma_ranks);
     EP_HOST_ASSERT(dispatch_out.send_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
-    EP_HOST_ASSERT(compute_done_per_token.dim() == 1 and compute_done_per_token.is_contiguous() and
-                   compute_done_per_token.scalar_type() == torch::kInt64);
-    EP_HOST_ASSERT(compute_done_per_token.size(0) == x.size(0));
+    EP_HOST_ASSERT(y_done_per_token.dim() == 1 and y_done_per_token.is_contiguous() and
+                   y_done_per_token.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(y_done_per_token.size(0) == x.size(0));
 
     int num_tokens = static_cast<int>(x.size(0));            // recv-side count (= dispatch's T_recv)
     int num_combined_tokens = static_cast<int>(dispatch_out.send_rdma_head.size(0));
@@ -1718,7 +1718,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
-        compute_done_per_token.data_ptr<int64_t>(), combine_seq,
+        y_done_per_token.data_ptr<int64_t>(), combine_seq,
         static_cast<int>(combine_phase),
         num_tokens, num_combined_tokens, hidden, num_topk,
         rdma_buffer_ptr_combine,
@@ -1782,11 +1782,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("pool_arrival_target",        &stream_ep::StreamingDispatchOutputs::pool_arrival_target)
         .def_readonly("tile_ready",                 &stream_ep::StreamingDispatchOutputs::tile_ready)
         .def_readonly("a_ready",                    &stream_ep::StreamingDispatchOutputs::a_ready)
-        .def_readonly("per_token_remaining",        &stream_ep::StreamingDispatchOutputs::per_token_remaining)
-        .def_readonly("compute_done_per_token",     &stream_ep::StreamingDispatchOutputs::compute_done_per_token)
+        .def_readonly("k_local_remaining",        &stream_ep::StreamingDispatchOutputs::k_local_remaining)
+        .def_readonly("y_done_per_token",     &stream_ep::StreamingDispatchOutputs::y_done_per_token)
         .def_readonly("o",                          &stream_ep::StreamingDispatchOutputs::o)
         .def_readonly("recv_token_to_slots",        &stream_ep::StreamingDispatchOutputs::recv_token_to_slots)
-        .def_readonly("k_local_count",                   &stream_ep::StreamingDispatchOutputs::k_local_count)
+        .def_readonly("k_local_total",                   &stream_ep::StreamingDispatchOutputs::k_local_total)
         .def_readonly("total_tiles",                     &stream_ep::StreamingDispatchOutputs::total_tiles)
         .def_readonly("metadata_done_event",             &stream_ep::StreamingDispatchOutputs::metadata_done_event)
         // Internode-only combine plumbing (empty for intranode):

@@ -1404,7 +1404,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         //           each local k; lane-0 writes per-pool-slot scalars
         //           (pool_topk_weight, pool_recv_token, pool_k_slot) and
         //           per-recv-token reverse-map (recv_token_to_slots[r, :K],
-        //           per_token_remaining[r], k_local_count[r]); lane-0 writes
+        //           k_local_remaining[r], k_local_total[r]); lane-0 writes
         //           recv_src_meta (combine plumbing).
         //   Pass 2 fire (substream-end): per-warp `__threadfence_system()` +
         //           cross-NVL-receiver-warp `bar.sync 2` (for system-scope
@@ -1577,7 +1577,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
                 // ── Pass B (continued): per-pool-slot scalars + per-recv-token scalars. ──
                 if (lane_id == 0) {
-                    int k_local_count_val = 0;
+                    int k_local_total_val = 0;
                     for (int k = 0; k < shape.num_topk; ++k) {
                         int slot = slot_row[k];
                         per_token_out.recv_token_to_slots[recv_token_idx * shape.num_topk + k] = slot;
@@ -1585,11 +1585,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                         pool_out.pool_topk_weight[slot] = ld_nc_global(topk_weights_in_msg + k);
                         pool_out.pool_recv_token[slot] = recv_token_idx;
                         pool_out.pool_k_slot[slot] = k;
-                        ++k_local_count_val;
+                        ++k_local_total_val;
                     }
-                    if (k_local_count_val > 0) {
-                        per_token_out.per_token_remaining[recv_token_idx] = k_local_count_val;
-                        per_token_out.k_local_count[recv_token_idx] = k_local_count_val;
+                    if (k_local_total_val > 0) {
+                        per_token_out.k_local_remaining[recv_token_idx] = k_local_total_val;
+                        per_token_out.k_local_total[recv_token_idx] = k_local_total_val;
                     }
                 }
 
@@ -2791,7 +2791,7 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 // combine_main_kernel — three warp roles + coordinator on the unified
 // fwd/bwd arg surface. Mirrors `intranode::combine_main_kernel` shape (same
 // arg semantics for `recv_x` / `recv_topk_weights_out` / `x` /
-// `per_slot_weights` / `recv_token_to_slots` / `compute_done_per_token` /
+// `per_slot_weights` / `recv_token_to_slots` / `y_done_per_token` /
 // `combine_seq`); internode adds RDMA staging via a forwarder + receiver
 // pair on top of NVL senders. Streaming gate at `kNVLSender` only —
 // downstream stages ride on existing ring-buffer flow control.
@@ -2802,7 +2802,7 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 //   │ x                       │ handle.o[num_tokens, H]                  │ dL/dx_per_r[num_tokens, H]             │
 //   │ per_slot_weights        │ pool_topk_weight[TK_padded] fp32         │ weight_grads[TK_padded] fp32           │
 //   │ recv_token_to_slots     │ same — populated by fwd dispatch Pass B  │ same                                   │
-//   │ compute_done_per_token  │ kernel_y forward release stamp           │ kernel_a_bwd release stamp             │
+//   │ y_done_per_token  │ kernel_y forward release stamp           │ kernel_a_bwd release stamp             │
 //   │ combine_seq             │ dispatch_seq (fwd's value)               │ dispatch_seq (bwd uses same int)       │
 //   └─────────────────────────┴──────────────────────────────────────────┴────────────────────────────────────────┘
 //
@@ -2839,7 +2839,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     const int* recv_rdma_channel_prefix_matrix,
     const int* recv_rdma_rank_prefix_sum,
     const int* gbl_channel_prefix_matrix,
-    const int64_t* compute_done_per_token,
+    const int64_t* y_done_per_token,
     int64_t combine_seq,
     int combine_phase,
     int num_tokens,
@@ -2902,7 +2902,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     // combine, 1 for bwd combine_grads — supplied by the host launcher)
     // ensures the combine ring's leftover from one phase doesn't alias the
     // other within the same layer, where `combine_seq` is shared. Release
-    // stamps (`compute_done_per_token`, written by kernel Y / kernel_a_bwd)
+    // stamps (`y_done_per_token`, written by kernel Y / kernel_a_bwd)
     // remain on the unshifted `combine_seq` value and gate the streaming
     // sender unchanged.
     const int64_t nvl_seq = (combine_seq << 1) | (combine_phase & 1);
@@ -3015,7 +3015,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     int64_t first_token_idx = token_idx;
                     if (elect_one_sync()) {
                         auto gate_start = clock64();
-                        while (ld_acquire_sys_global(&compute_done_per_token[first_token_idx]) < combine_seq) {
+                        while (ld_acquire_sys_global(&y_done_per_token[first_token_idx]) < combine_seq) {
                             if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                 printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                        "token: %ld, seq: %ld\n",
@@ -3077,7 +3077,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         int64_t next_token_idx = token_idx + 1;
                         if (elect_one_sync()) {
                             auto gate_start = clock64();
-                            while (ld_acquire_sys_global(&compute_done_per_token[next_token_idx]) < combine_seq) {
+                            while (ld_acquire_sys_global(&y_done_per_token[next_token_idx]) < combine_seq) {
                                 if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                     printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                            "token: %ld, seq: %ld\n",
@@ -3444,7 +3444,7 @@ void launch_combine_main(cudaDataType_t type,
                          const int* recv_rdma_channel_prefix_matrix,
                          const int* recv_rdma_rank_prefix_sum,
                          const int* gbl_channel_prefix_matrix,
-                         const int64_t* compute_done_per_token,
+                         const int64_t* y_done_per_token,
                          int64_t combine_seq,
                          int combine_phase,
                          int num_tokens,
@@ -3489,7 +3489,7 @@ void launch_combine_main(cudaDataType_t type,
                       recv_rdma_channel_prefix_matrix,                               \
                       recv_rdma_rank_prefix_sum,                                     \
                       gbl_channel_prefix_matrix,                                     \
-                      compute_done_per_token, combine_seq, combine_phase,            \
+                      y_done_per_token, combine_seq, combine_phase,            \
                       num_tokens, num_combined_tokens, hidden, num_topk,             \
                       rdma_buffer_ptr,                                               \
                       num_max_rdma_chunked_send_tokens,                              \

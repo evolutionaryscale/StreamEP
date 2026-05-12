@@ -725,21 +725,21 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                     // substream, so the K_local count emitted here is final
                     // (no cross-substream accumulation needed). Pass 2's
                     // __threadfence_system + tile_ready release-store sequence
-                    // after this make per_token_remaining[r] visible to kernel Y
+                    // after this make k_local_remaining[r] visible to kernel Y
                     // before kernel Y's first atomicSub on the same address.
                     //
                     // Phase F additions: recv_token_to_slots[r, :K] and
-                    // k_local_count[r] are persisted here as well — both are
+                    // k_local_total[r] are persisted here as well — both are
                     // consumed by the backward path (dispatch_grads receiver
-                    // gathers slots; bwd setup memcpy's k_local_count into
-                    // bwd_per_token_remaining). They share the lane-0 K-loop
+                    // gathers slots; bwd setup memcpy's k_local_total into
+                    // bwd_k_local_remaining). They share the lane-0 K-loop
                     // since both `slot_row[k]` and `recv_token_id` are already
                     // in scope. recv_token_to_slots gets a write for EVERY k
-                    // (the value is -1 for non-local k); k_local_count
-                    // duplicates per_token_remaining's value into a write-once
+                    // (the value is -1 for non-local k); k_local_total
+                    // duplicates k_local_remaining's value into a write-once
                     // buffer that fwd never decrements.
                     if (lane_id == 0) {
-                        int k_local_count_val = 0;
+                        int k_local_total_val = 0;
                         for (int k = 0; k < shape.num_topk; ++k) {
                             int slot = slot_row[k];
                             per_token_out.recv_token_to_slots[recv_token_id * shape.num_topk + k] = slot;
@@ -748,11 +748,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                                 channel_topk_weights_buffers.buffer() + token_idx_in_buffer * shape.num_topk + k);
                             pool_out.pool_recv_token[slot] = recv_token_id;
                             pool_out.pool_k_slot[slot] = k;
-                            ++k_local_count_val;
+                            ++k_local_total_val;
                         }
-                        if (k_local_count_val > 0) {
-                            per_token_out.per_token_remaining[recv_token_id] = k_local_count_val;
-                            per_token_out.k_local_count[recv_token_id] = k_local_count_val;
+                        if (k_local_total_val > 0) {
+                            per_token_out.k_local_remaining[recv_token_id] = k_local_total_val;
+                            per_token_out.k_local_total[recv_token_id] = k_local_total_val;
                         }
                     }
 
@@ -855,7 +855,7 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 //     kernel's persisted output.
 //   - receiver writes ONLY into dL_do_pool[slot] (K-fanout per packet).
 //     No scalar pool-slot writes (pool_topk_weight / pool_recv_token /
-//     pool_k_slot / per_token_remaining are already populated by fwd).
+//     pool_k_slot / k_local_remaining are already populated by fwd).
 //   - Pass 2 atomic-adds into bwd_dispatch_arrival_count and release-stores
 //     bwd_y_ready[block] = dispatch_seq when count == pool_arrival_target
 //     (the same target fwd uses; we re-fire it on the bwd ready signal).
@@ -1244,7 +1244,7 @@ void encode_combine_heads(void** buffer_ptrs,
 //   │ x                       │ handle.o[T_recv, H]                      │ dL/dx_per_r[T_recv, H]                 │
 //   │ per_slot_weights        │ pool_topk_weight[TK_padded] fp32         │ weight_grads[TK_padded] fp32           │
 //   │ recv_token_to_slots     │ same — populated by fwd dispatch Pass B  │ same                                   │
-//   │ compute_done_per_token  │ kernel_y forward release stamp           │ kernel_a_bwd release stamp             │
+//   │ y_done_per_token  │ kernel_y forward release stamp           │ kernel_a_bwd release stamp             │
 //   │ combine_seq             │ dispatch_seq (fwd's value)               │ dispatch_seq (bwd uses same int)       │
 //   └─────────────────────────┴──────────────────────────────────────────┴────────────────────────────────────────┘
 //
@@ -1263,7 +1263,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                                           const int* rank_prefix_matrix,
                                                           const int* channel_prefix_matrix,
                                                           int* send_head,
-                                                          const int64_t* compute_done_per_token,
+                                                          const int64_t* y_done_per_token,
                                                           int64_t combine_seq,
                                                           int num_tokens,
                                                           int num_recv_tokens,
@@ -1353,7 +1353,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
             #pragma unroll
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
                 // Phase-D per-token gate: kernel Y release-stores `combine_seq` into
-                // compute_done_per_token[my_token] once per_token_remaining[my_token]
+                // y_done_per_token[my_token] once k_local_remaining[my_token]
                 // hits zero (all K_local(my_token) contributions to o[my_token] have
                 // landed). Spin until the gate clears, then issue the warp-cooperative
                 // copy below — the acquire pairs with kernel Y's `.sys`-scope release
@@ -1361,7 +1361,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 auto my_token = token_idx + i;
                 if (elect_one_sync()) {
                     auto gate_start = clock64();
-                    while (ld_acquire_sys_global(&compute_done_per_token[my_token]) < combine_seq) {
+                    while (ld_acquire_sys_global(&y_done_per_token[my_token]) < combine_seq) {
                         if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                             printf("DeepEP timeout for combine sender gate, rank %d, channel %d, token %d\n",
                                    rank, responsible_channel, static_cast<int>(my_token));
@@ -1604,7 +1604,7 @@ void launch_combine_main(cudaDataType_t type,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
              int* send_head,
-             const int64_t* compute_done_per_token,
+             const int64_t* y_done_per_token,
              int64_t combine_seq,
              int num_tokens,
              int num_recv_tokens,
@@ -1637,7 +1637,7 @@ void launch_combine_main(cudaDataType_t type,
                       rank_prefix_matrix,                                      \
                       channel_prefix_matrix,                                   \
                       send_head,                                               \
-                      compute_done_per_token,                                  \
+                      y_done_per_token,                                  \
                       combine_seq,                                             \
                       num_tokens,                                              \
                       num_recv_tokens,                                         \

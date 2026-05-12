@@ -72,13 +72,13 @@ def main():
     dL_dx_per_r = torch.full((T_recv, hidden), float(rank), dtype=torch.bfloat16, device=device)
     weight_grads = torch.full((TK_padded,), float(rank), dtype=torch.float32, device=device)
 
-    # Manually fire the bwd_compute_done_per_token gate (kernel_a_bwd's
+    # Manually fire the bwd_a_done_per_token gate (kernel_a_bwd's
     # release-store replacement for this isolated test).
-    bwd_compute_done_per_token = torch.full((T_recv,), 1, dtype=torch.int64, device=device)
+    bwd_a_done_per_token = torch.full((T_recv,), 1, dtype=torch.int64, device=device)
 
     # Run combine_grads.
     dL_dx, dL_dtopk_weights = buf.combine_grads(
-        dL_dx_per_r, handle, weight_grads, bwd_compute_done_per_token,
+        dL_dx_per_r, handle, weight_grads, bwd_a_done_per_token,
         dispatch_seq=1,
     )
     torch.cuda.synchronize()
@@ -116,9 +116,9 @@ def main():
     )
 
     # Re-run with a different bwd seq to verify per-call statefulness.
-    bwd_compute_done_per_token2 = torch.full((T_recv,), 2, dtype=torch.int64, device=device)
+    bwd_a_done_per_token2 = torch.full((T_recv,), 2, dtype=torch.int64, device=device)
     dL_dx2, _ = buf.combine_grads(
-        dL_dx_per_r, handle, weight_grads, bwd_compute_done_per_token2,
+        dL_dx_per_r, handle, weight_grads, bwd_a_done_per_token2,
         dispatch_seq=2,
     )
     torch.cuda.synchronize()

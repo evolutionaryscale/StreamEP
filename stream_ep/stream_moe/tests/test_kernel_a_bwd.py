@@ -11,8 +11,8 @@ parallel `test_kernel_y.py` 1:1.
   * test_multi_tile_static: total_tiles=N spread across multiple experts,
     multiple recv-tokens per tile, K_local>1 per recv-token (so dL_dx_per_r[r]
     gets multiple contributions). Validates per-token accumulation and
-    end-of-tile bookkeeping (bwd_per_token_remaining decrement +
-    bwd_compute_done_per_token release).
+    end-of-tile bookkeeping (bwd_k_local_remaining decrement +
+    bwd_a_done_per_token release).
   * test_padding_rows: tile contains some pool slots with pool_recv_token == -1.
     Validates PTX-predicated atomic-add: padding lanes skip the atomic at
     issue time so no contributions land in valid rows from padding slots.
@@ -23,8 +23,8 @@ parallel `test_kernel_y.py` 1:1.
 All cases assert:
   - dL_dx_per_r[r, :] equals sum over slots s mapping to r of
     (dL_dswiglu_in[s] @ W1[expert_id(s)])
-  - bwd_per_token_remaining[r] hits 0 (each contribution decremented once)
-  - bwd_compute_done_per_token[r] == dispatch_seq (release fired exactly once)
+  - bwd_k_local_remaining[r] hits 0 (each contribution decremented once)
+  - bwd_a_done_per_token[r] == dispatch_seq (release fired exactly once)
   - No trash row needed: predicated atomic skips padding lanes entirely.
 """
 
@@ -116,8 +116,8 @@ def test_streaming_moe_a_bwd_compiles(device):
     W1 = torch.zeros(E_local, two_I, H, dtype=dtype, device=device)
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
     pool_recv_token = torch.zeros(TK_padded, dtype=torch.int32, device=device)
-    bwd_per_token_remaining = torch.zeros(T_recv, dtype=torch.int32, device=device)
-    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
+    bwd_k_local_remaining = torch.zeros(T_recv, dtype=torch.int32, device=device)
+    bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
@@ -134,8 +134,8 @@ def test_streaming_moe_a_bwd_compiles(device):
             W1,
             dL_dx_per_r,
             pool_recv_token,
-            bwd_per_token_remaining,
-            bwd_compute_done_per_token,
+            bwd_k_local_remaining,
+            bwd_a_done_per_token,
             tile_id_to_expert,
             expert_pool_block_offset,
             bwd_a_ready,
@@ -172,8 +172,8 @@ def test_streaming_moe_a_bwd_single_tile(device):
 
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
-    bwd_per_token_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
-    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
+    bwd_k_local_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
+    bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [chosen_expert], E_local, device
@@ -188,8 +188,8 @@ def test_streaming_moe_a_bwd_single_tile(device):
         W1,
         dL_dx_per_r,
         pool_recv_token,
-        bwd_per_token_remaining,
-        bwd_compute_done_per_token,
+        bwd_k_local_remaining,
+        bwd_a_done_per_token,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_a_ready,
@@ -216,11 +216,11 @@ def test_streaming_moe_a_bwd_single_tile(device):
     )
 
     assert (
-        bwd_per_token_remaining == 0
-    ).all(), f"bwd_per_token_remaining not zeroed: {bwd_per_token_remaining}"
-    assert (bwd_compute_done_per_token == dispatch_seq).all(), (
-        f"bwd_compute_done_per_token not all {dispatch_seq}: "
-        f"{bwd_compute_done_per_token}"
+        bwd_k_local_remaining == 0
+    ).all(), f"bwd_k_local_remaining not zeroed: {bwd_k_local_remaining}"
+    assert (bwd_a_done_per_token == dispatch_seq).all(), (
+        f"bwd_a_done_per_token not all {dispatch_seq}: "
+        f"{bwd_a_done_per_token}"
     )
 
 
@@ -256,10 +256,10 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
     pool_recv_token = torch.tensor(
         [s % T_recv for s in range(TK_padded)], dtype=torch.int32, device=device
     )
-    bwd_per_token_remaining = torch.full(
+    bwd_k_local_remaining = torch.full(
         (T_recv,), k_local_each, dtype=torch.int32, device=device
     )
-    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
+    bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
@@ -274,8 +274,8 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
         W1,
         dL_dx_per_r,
         pool_recv_token,
-        bwd_per_token_remaining,
-        bwd_compute_done_per_token,
+        bwd_k_local_remaining,
+        bwd_a_done_per_token,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_a_ready,
@@ -307,13 +307,13 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
         f"max rel diff {rel.max().item():.4f}"
     )
 
-    assert (bwd_per_token_remaining == 0).all(), (
-        f"bwd_per_token_remaining not zeroed: bad indices "
-        f"{(bwd_per_token_remaining != 0).nonzero().squeeze().tolist()}"
+    assert (bwd_k_local_remaining == 0).all(), (
+        f"bwd_k_local_remaining not zeroed: bad indices "
+        f"{(bwd_k_local_remaining != 0).nonzero().squeeze().tolist()}"
     )
-    assert (bwd_compute_done_per_token == dispatch_seq).all(), (
-        f"bwd_compute_done_per_token not all {dispatch_seq}: bad indices "
-        f"{(bwd_compute_done_per_token != dispatch_seq).nonzero().squeeze().tolist()}"
+    assert (bwd_a_done_per_token == dispatch_seq).all(), (
+        f"bwd_a_done_per_token not all {dispatch_seq}: bad indices "
+        f"{(bwd_a_done_per_token != dispatch_seq).nonzero().squeeze().tolist()}"
     )
 
 
@@ -355,8 +355,8 @@ def test_streaming_moe_a_bwd_padding_rows(device):
         pool_recv_token_list, dtype=torch.int32, device=device
     )
 
-    bwd_per_token_remaining = torch.full((T_recv,), 2, dtype=torch.int32, device=device)
-    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
+    bwd_k_local_remaining = torch.full((T_recv,), 2, dtype=torch.int32, device=device)
+    bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 1], E_local, device
@@ -371,8 +371,8 @@ def test_streaming_moe_a_bwd_padding_rows(device):
         W1,
         dL_dx_per_r,
         pool_recv_token,
-        bwd_per_token_remaining,
-        bwd_compute_done_per_token,
+        bwd_k_local_remaining,
+        bwd_a_done_per_token,
         tile_id_to_expert,
         expert_pool_block_offset,
         bwd_a_ready,
@@ -398,8 +398,8 @@ def test_streaming_moe_a_bwd_padding_rows(device):
         f"max rel diff {rel.max().item():.4f}"
     )
 
-    assert (bwd_per_token_remaining == 0).all()
-    assert (bwd_compute_done_per_token == dispatch_seq).all()
+    assert (bwd_k_local_remaining == 0).all()
+    assert (bwd_a_done_per_token == dispatch_seq).all()
 
 
 def test_streaming_moe_a_bwd_producer_consumer(device):
@@ -432,8 +432,8 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
 
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
-    bwd_per_token_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
-    bwd_compute_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
+    bwd_k_local_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
+    bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
@@ -457,8 +457,8 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
             W1,
             dL_dx_per_r,
             pool_recv_token,
-            bwd_per_token_remaining,
-            bwd_compute_done_per_token,
+            bwd_k_local_remaining,
+            bwd_a_done_per_token,
             tile_id_to_expert,
             expert_pool_block_offset,
             bwd_a_ready,
@@ -487,8 +487,8 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
         f"max rel diff {rel.max().item():.4f}"
     )
 
-    assert (bwd_per_token_remaining == 0).all()
-    assert (bwd_compute_done_per_token == 5).all()
+    assert (bwd_k_local_remaining == 0).all()
+    assert (bwd_a_done_per_token == 5).all()
 
 
 if __name__ == "__main__":

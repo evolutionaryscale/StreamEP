@@ -25,8 +25,8 @@ Per tile:
     atomic-scatter from SMEM into `dL_dx_per_r[r, :H]` via packed
     `red.global.add.bf16x2`. Per-slot `pool_recv_token` gating skips r=-1
     padding rows via PTX-level predication.
-  * Per-tile end (last N-stripe gates): `bwd_per_token_remaining[r]` atomicSub
-    by 1; on hit-zero `bwd_compute_done_per_token[r]` release-stores
+  * Per-tile end (last N-stripe gates): `bwd_k_local_remaining[r]` atomicSub
+    by 1; on hit-zero `bwd_a_done_per_token[r]` release-stores
     `dispatch_seq` so the combine_grads sender (on its own stream) can pick
     up `dL_dx_per_r[r]` for RDMA push.
 
@@ -42,8 +42,8 @@ Shares streaming machinery with fwd kernels:
     Substitutions: `tile_ready` → `bwd_a_ready`, `dispatch_seq` from saved
     handle.
   * Pool-layout `StreamingHandle` carries `pool_recv_token`,
-    `bwd_per_token_remaining` (initialized from saved `k_local_count`),
-    `bwd_compute_done_per_token`, `dL_dx_per_r`,
+    `bwd_k_local_remaining` (initialized from saved `k_local_total`),
+    `bwd_a_done_per_token`, `dL_dx_per_r`,
     `tile_id_to_expert`, `expert_pool_block_offset`.
 """
 
@@ -234,10 +234,10 @@ def _compile_streaming_moe_a_bwd(
     pool_recv_token = fake_tensor(
         cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
     )
-    bwd_per_token_remaining = fake_tensor(
+    bwd_k_local_remaining = fake_tensor(
         cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1
     )
-    bwd_compute_done_per_token = fake_tensor(
+    bwd_a_done_per_token = fake_tensor(
         cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
     )
 
@@ -250,8 +250,8 @@ def _compile_streaming_moe_a_bwd(
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
-        per_token_remaining=bwd_per_token_remaining,
-        compute_done_per_token=bwd_compute_done_per_token,
+        k_local_remaining=bwd_k_local_remaining,
+        y_done_per_token=bwd_a_done_per_token,
         tile_n_stripes_done=tile_n_stripes_done,
         expert_pool_block_offset=expert_pool_block_offset_scatter,
         T_recv=Int32(0),
@@ -314,8 +314,8 @@ def streaming_moe_a_bwd(
     W1: torch.Tensor,  # (E_local, 2*I, H) bf16 — k-major per expert
     dL_dx_per_r: torch.Tensor,  # (T_recv, H) bf16 — atomic-scatter destination
     pool_recv_token: torch.Tensor,  # (TK_padded,) int32
-    bwd_per_token_remaining: torch.Tensor,  # (T_recv,) int32 — initialised from K_local_count
-    bwd_compute_done_per_token: torch.Tensor,  # (T_recv,) int64 — zero-init
+    bwd_k_local_remaining: torch.Tensor,  # (T_recv,) int32 — initialised from K_local_count
+    bwd_a_done_per_token: torch.Tensor,  # (T_recv,) int64 — zero-init
     tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
     bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps
@@ -332,15 +332,15 @@ def streaming_moe_a_bwd(
     Computes the data-grad ``dL/dpool = dL_dswiglu_in @ W1`` per tile and
     atomic-scatters into ``dL_dx_per_r[r, :H]`` (one logical recv-token row
     per pool slot via ``pool_recv_token[slot]``). Per-token bookkeeping
-    (atomicSub on ``bwd_per_token_remaining`` + hit-zero release-store on
-    ``bwd_compute_done_per_token``) mirrors fwd kernel_y exactly so the
+    (atomicSub on ``bwd_k_local_remaining`` + hit-zero release-store on
+    ``bwd_a_done_per_token``) mirrors fwd kernel_y exactly so the
     combine_grads sender's per-token gate fires once kernel_a_bwd's last
     contributor for each recv-token has scattered.
 
     Streamed via per-tile acquire-spin on ``bwd_a_ready[tile_id] >=
     dispatch_seq`` (input gate fired by kernel_y_bwd when each tile's
     ``dL_dswiglu_in`` rows have drained their TMA stores) and per-token
-    release-store on ``bwd_compute_done_per_token`` (consumed by
+    release-store on ``bwd_a_done_per_token`` (consumed by
     combine_grads on a different stream).
 
     ``num_sms`` caps the persistent-grid CTA count. ``None`` (default) fills
@@ -351,10 +351,10 @@ def streaming_moe_a_bwd(
       - allocating ``dL_dx_per_r`` zero-init ON THE SAME STREAM this
         function runs on (so the kernel's first atomic-add lands on a
         known-zero buffer; otherwise stale memory leaks through).
-      - allocating ``bwd_per_token_remaining`` initialised to
+      - allocating ``bwd_k_local_remaining`` initialised to
         ``K_local_count[r]`` for each recv-token (the bwd orchestrator
         ``cudaMemcpyAsync``'s this from the saved handle).
-      - allocating ``bwd_compute_done_per_token`` zero-init.
+      - allocating ``bwd_a_done_per_token`` zero-init.
       - ensuring ``bwd_a_ready`` is populated by the upstream producer
         (the SwiGLU bwd materialisation pre-step or a test stub) on a
         stream that release-stores ``bwd_a_ready[tile_id] = dispatch_seq``
@@ -382,10 +382,10 @@ def streaming_moe_a_bwd(
     ), f"W1 must be (E_local, 2*I, H) = {(E_local, two_I, H)}; got {tuple(W1.shape)}"
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
-    assert bwd_per_token_remaining.shape == (T_recv,)
-    assert bwd_per_token_remaining.dtype == torch.int32
-    assert bwd_compute_done_per_token.shape == (T_recv,)
-    assert bwd_compute_done_per_token.dtype == torch.int64
+    assert bwd_k_local_remaining.shape == (T_recv,)
+    assert bwd_k_local_remaining.dtype == torch.int32
+    assert bwd_a_done_per_token.shape == (T_recv,)
+    assert bwd_a_done_per_token.dtype == torch.int64
     assert tile_id_to_expert.shape == (total_tiles,)
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert bwd_a_ready.shape == (total_tiles,)
@@ -446,8 +446,8 @@ def streaming_moe_a_bwd(
 
     # Multi-pid_n N-stripe arrival counter. The CTA whose atomic-add returns
     # `num_pid_n - 1` is the last N-stripe to complete for its tile_id and
-    # owns the per-row bookkeeping (atomicSub bwd_per_token_remaining +
-    # hit-zero release-store on bwd_compute_done_per_token).
+    # owns the per-row bookkeeping (atomicSub bwd_k_local_remaining +
+    # hit-zero release-store on bwd_a_done_per_token).
     num_pid_n = (H + tile_n - 1) // tile_n
     tile_n_stripes_done = torch.zeros(
         total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device
@@ -456,8 +456,8 @@ def streaming_moe_a_bwd(
     scatter = ScatterParams(
         mO=dL_dx_per_r,
         pool_recv_token=pool_recv_token,
-        per_token_remaining=bwd_per_token_remaining,
-        compute_done_per_token=bwd_compute_done_per_token,
+        k_local_remaining=bwd_k_local_remaining,
+        y_done_per_token=bwd_a_done_per_token,
         tile_n_stripes_done=tile_n_stripes_done,
         expert_pool_block_offset=expert_pool_block_offset,
         T_recv=Int32(T_recv),

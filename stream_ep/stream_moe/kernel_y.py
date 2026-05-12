@@ -14,9 +14,9 @@ Forward kernel Y of the streaming pipeline:
     R2S into a kernel-Y-owned bf16 SMEM staging buffer, then per-warp
     coalesced atomic-scatter from SMEM into `o[recv_token, :]` via packed
     `red.global.add.bf16x2`.
-  * On per-tile end, lane 0 of each warp atomicSubs `per_token_remaining[r]`
+  * On per-tile end, lane 0 of each warp atomicSubs `k_local_remaining[r]`
     for its rows; on hit-zero (the recv-token's last contribution landed),
-    release-stores `compute_done_per_token[r] = combine_seq` so the combine
+    release-stores `y_done_per_token[r] = combine_seq` so the combine
     sender (on its own stream) can pick up `o[r]` for RDMA push.
 
 The atomic-scatter staging SMEM is owned by `AtomicScatterStore` (an EpiOp,
@@ -33,7 +33,7 @@ Streaming machinery is shared with kernel A:
   * `StreamingTileScheduler` for linear-claim + per-tile ready spin.
     Substitution: `tile_ready` → `a_ready`, `dispatch_seq` → `compute_seq`.
   * Pool-layout `StreamingHandle` carries: `pool_recv_token`, `pool_topk_weight`,
-    `per_token_remaining`, `compute_done_per_token`, `o`, `a_ready`,
+    `k_local_remaining`, `y_done_per_token`, `o`, `a_ready`,
     `tile_id_to_expert`, `expert_pool_block_offset` from `Buffer.dispatch`.
 
 Padding rows (pool_recv_token[s] == -1) and other masked lanes: PTX-level
@@ -90,8 +90,8 @@ from stream_ep.stream_moe.tile_scheduler import (
 class ScatterParams(NamedTuple):
     mO: cute.Tensor  # [T_recv, H]  bf16  — atomic-scatter destination
     pool_recv_token: cute.Tensor  # [TK_padded]        int32 — slot → r (-1 = padding)
-    per_token_remaining: cute.Tensor  # [T_recv]           int32 — kernel Y atomicSubs
-    compute_done_per_token: (
+    k_local_remaining: cute.Tensor  # [T_recv]           int32 — kernel Y atomicSubs
+    y_done_per_token: (
         cute.Tensor
     )  # [T_recv]           int64 — Y → combine release stamp
     tile_n_stripes_done: (
@@ -303,10 +303,10 @@ class AtomicScatterStore(EpiOp):
         if is_last == Int32(1) and tidx < Int32(tile_M):
             r = recv_token_t[tidx]
             if r >= Int32(0) and r < T_recv:
-                rem_ptr = utils.elem_pointer(param.per_token_remaining, (r,))
+                rem_ptr = utils.elem_pointer(param.k_local_remaining, (r,))
                 prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
                 if prev == Int32(1):
-                    done_ptr = utils.elem_pointer(param.compute_done_per_token, (r,))
+                    done_ptr = utils.elem_pointer(param.y_done_per_token, (r,))
                     st_release_sys_global(done_ptr, combine_seq)
 
 
@@ -340,7 +340,7 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         to pool_start = expert_pool_block_offset[batch_idx] * tile_m + pid_m * tile_m.
       - AtomicScatterStore("scatter"): owns the bf16 staging SMEM and the
         per-tile pool_recv_token SMEM area. End-of-tile bookkeeping fires
-        compute_done_per_token[r] on hit-zero.
+        y_done_per_token[r] on hit-zero.
 
     Overrides:
       - epi_visit_subtile: in-register weight multiply (replaces the additive
@@ -647,10 +647,10 @@ def _compile_streaming_moe_y(
     pool_recv_token = fake_tensor(
         cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
     )
-    per_token_remaining = fake_tensor(
+    k_local_remaining = fake_tensor(
         cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1
     )
-    compute_done_per_token = fake_tensor(
+    y_done_per_token = fake_tensor(
         cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
     )
 
@@ -663,8 +663,8 @@ def _compile_streaming_moe_y(
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
-        per_token_remaining=per_token_remaining,
-        compute_done_per_token=compute_done_per_token,
+        k_local_remaining=k_local_remaining,
+        y_done_per_token=y_done_per_token,
         tile_n_stripes_done=tile_n_stripes_done,
         expert_pool_block_offset=expert_pool_block_offset_scatter,
         T_recv=Int32(0),
@@ -735,8 +735,8 @@ def streaming_moe_y(
     o: torch.Tensor,  # (T_recv, H) bf16 — atomic-scatter destination
     pool_recv_token: torch.Tensor,  # (TK_padded,) int32
     pool_topk_weight: torch.Tensor,  # (TK_padded,) float32
-    per_token_remaining: torch.Tensor,  # (T_recv,) int32
-    compute_done_per_token: torch.Tensor,  # (T_recv,) int64
+    k_local_remaining: torch.Tensor,  # (T_recv,) int32
+    y_done_per_token: torch.Tensor,  # (T_recv,) int64
     tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
     a_ready: torch.Tensor,  # (total_tiles,) int64
@@ -761,9 +761,9 @@ def streaming_moe_y(
         the same stream this function is called from. Padding rows and
         other masked lanes are handled via PTX-level predicated atomic-add
         (no trash row needed).
-      - allocating ``per_token_remaining`` with the K_local count for each
+      - allocating ``k_local_remaining`` with the K_local count for each
         recv-token (DeepEP's dispatch sets this in Pass B's per-pool-slot block).
-      - allocating ``compute_done_per_token`` zero-initialized.
+      - allocating ``y_done_per_token`` zero-initialized.
       - ensuring ``a_ready`` is populated by kernel A (or a test stub) on a
         stream that release-stores ``a_ready[tile_id] = compute_seq`` once
         the tile's postact_a is ready.
@@ -784,10 +784,10 @@ def streaming_moe_y(
     assert pool_recv_token.dtype == torch.int32
     assert pool_topk_weight.shape == (total_tiles * tile_m,)
     assert pool_topk_weight.dtype == torch.float32
-    assert per_token_remaining.shape == (T_recv,)
-    assert per_token_remaining.dtype == torch.int32
-    assert compute_done_per_token.shape == (T_recv,)
-    assert compute_done_per_token.dtype == torch.int64
+    assert k_local_remaining.shape == (T_recv,)
+    assert k_local_remaining.dtype == torch.int32
+    assert y_done_per_token.shape == (T_recv,)
+    assert y_done_per_token.dtype == torch.int64
     assert tile_id_to_expert.shape == (total_tiles,)
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert a_ready.shape == (total_tiles,)
@@ -850,8 +850,8 @@ def streaming_moe_y(
     scatter = ScatterParams(
         mO=o,
         pool_recv_token=pool_recv_token,
-        per_token_remaining=per_token_remaining,
-        compute_done_per_token=compute_done_per_token,
+        k_local_remaining=k_local_remaining,
+        y_done_per_token=y_done_per_token,
         tile_n_stripes_done=tile_n_stripes_done,
         expert_pool_block_offset=expert_pool_block_offset,
         T_recv=Int32(T_recv),

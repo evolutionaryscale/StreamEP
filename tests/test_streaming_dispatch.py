@@ -165,21 +165,21 @@ def main():
                 f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
             )
 
-    # ─── (6) Pipeline buffer initialization. per_token_remaining[r] should equal
+    # ─── (6) Pipeline buffer initialization. k_local_remaining[r] should equal
     #         K_local(r) (the count of local-expert landings for recv-token r),
-    #         which is also the count of pool slots for r. compute_done_per_token
+    #         which is also the count of pool slots for r. y_done_per_token
     #         and o (and a_ready) should be zero-init.
-    per_token_remaining = handle.per_token_remaining.cpu()
-    assert per_token_remaining.shape == (T_recv,), (
-        f"per_token_remaining shape {per_token_remaining.shape} != ({T_recv},)"
+    k_local_remaining = handle.k_local_remaining.cpu()
+    assert k_local_remaining.shape == (T_recv,), (
+        f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)"
     )
     expected_k_local = (expected_recv_topk_local >= 0).sum(dim=1).to(torch.int32)
-    assert torch.equal(per_token_remaining, expected_k_local), (
-        f"per_token_remaining mismatch; first deviating r: "
-        f"{(per_token_remaining != expected_k_local).nonzero().flatten()[:8]}"
+    assert torch.equal(k_local_remaining, expected_k_local), (
+        f"k_local_remaining mismatch; first deviating r: "
+        f"{(k_local_remaining != expected_k_local).nonzero().flatten()[:8]}"
     )
-    compute_done = handle.compute_done_per_token.cpu()
-    assert (compute_done == 0).all(), "compute_done_per_token should be zero-init"
+    compute_done = handle.y_done_per_token.cpu()
+    assert (compute_done == 0).all(), "y_done_per_token should be zero-init"
     a_ready_t = handle.a_ready[:total_tiles].cpu()
     assert (a_ready_t == 0).all(), "a_ready should be zero-init"
     o_t = handle.o.cpu()
@@ -190,8 +190,8 @@ def main():
     # slot for (r, k) when k routes to a local expert, and -1 otherwise. The
     # expected mapping is the inverse of the existing per-slot writes:
     # for every slot s with pool_recv_token[s] >= 0, recv_token_to_slots[
-    #   pool_recv_token[s], pool_k_slot[s]] == s. k_local_count[r] should
-    # equal per_token_remaining[r] (write-once mirror that fwd doesn't decrement).
+    #   pool_recv_token[s], pool_k_slot[s]] == s. k_local_total[r] should
+    # equal k_local_remaining[r] (write-once mirror that fwd doesn't decrement).
     rtts = handle.recv_token_to_slots.cpu()
     assert rtts.shape == (T_recv, num_topk), (
         f"recv_token_to_slots shape {rtts.shape} != ({T_recv}, {num_topk})"
@@ -206,10 +206,10 @@ def main():
         f"recv_token_to_slots mismatch; first deviating (r, k): "
         f"{(rtts != expected_rtts).nonzero()[:8]}"
     )
-    klc = handle.k_local_count.cpu()
-    assert klc.shape == (T_recv,), f"k_local_count shape {klc.shape} != ({T_recv},)"
-    assert torch.equal(klc, per_token_remaining), (
-        "k_local_count should equal per_token_remaining (both = K_local(r) pre-decrement)"
+    klc = handle.k_local_total.cpu()
+    assert klc.shape == (T_recv,), f"k_local_total shape {klc.shape} != ({T_recv},)"
+    assert torch.equal(klc, k_local_remaining), (
+        "k_local_total should equal k_local_remaining (both = K_local(r) pre-decrement)"
     )
 
     # seen_per_substream[c, src, e] = my_e_inbox[c, src, e] from the metadata
@@ -239,8 +239,8 @@ def main():
         "pool_k_slot not deterministic"
     assert torch.equal(handle.recv_token_to_slots.cpu(), handle2.recv_token_to_slots.cpu()), \
         "recv_token_to_slots not deterministic"
-    assert torch.equal(handle.k_local_count.cpu(), handle2.k_local_count.cpu()), \
-        "k_local_count not deterministic"
+    assert torch.equal(handle.k_local_total.cpu(), handle2.k_local_total.cpu()), \
+        "k_local_total not deterministic"
     assert torch.equal(handle.seen_per_substream.cpu(), handle2.seen_per_substream.cpu()), \
         "seen_per_substream not deterministic"
     # `pool` padding rows are now left uninitialized (kernel Y's pool_recv_token

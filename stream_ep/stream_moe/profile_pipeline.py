@@ -22,7 +22,7 @@ What you should see in the resulting chrome trace
 - `compute_y_stream`: streaming_moe_y launches early, overlapped with the
   tail of kernel A. Its CTAs spin on a_ready[tile_id] then GEMM + per-warp
   coalesced atomic-scatter into o[T_recv, H], finishing with per-token
-  bookkeeping (per_token_remaining decrement + compute_done release).
+  bookkeeping (k_local_remaining decrement + compute_done release).
 
 Launch
 ------

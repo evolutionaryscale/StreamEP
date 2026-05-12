@@ -22,7 +22,7 @@ inputs:
      ``[0, total_tiles)``.
   5. ``tile_id_to_expert`` and ``pool_arrival_target`` agree with the
      ``expert_pool_block_offset`` partition.
-  6. ``per_token_remaining[r]`` matches the count of local-expert landings
+  6. ``k_local_remaining[r]`` matches the count of local-expert landings
      for recv-token ``r``; ``recv_token_to_slots[r, k]`` is the inverse of
      ``pool_recv_token`` / ``pool_k_slot``.
   7. Bit-determinism: re-running produces identical ``pool_recv_token`` /
@@ -206,9 +206,9 @@ def main():
     pool_arrival_target      = out.pool_arrival_target.cpu()
     expert_frequency         = out.expert_frequency.cpu()
     tile_ready               = out.tile_ready.cpu()
-    per_token_remaining      = out.per_token_remaining.cpu()
+    k_local_remaining      = out.k_local_remaining.cpu()
     recv_token_to_slots      = out.recv_token_to_slots.cpu()
-    k_local_count            = out.k_local_count.cpu()
+    k_local_total            = out.k_local_total.cpu()
 
     # ─── (1)+(2)+(3) Per-pool-slot validation + coverage. ────────────────────
     assert_pool_correctness(
@@ -242,13 +242,13 @@ def main():
                 f"pool_arrival_target[{tile_id}] = {target} != expected "
                 f"{expected} (e={e}, tile_in_e={tile_in_e})")
 
-    # ─── (6) per_token_remaining + recv_token_to_slots + k_local_count. ─────
-    assert per_token_remaining.shape == (T_recv,), (
-        f"per_token_remaining shape {per_token_remaining.shape} != ({T_recv},)")
+    # ─── (6) k_local_remaining + recv_token_to_slots + k_local_total. ─────
+    assert k_local_remaining.shape == (T_recv,), (
+        f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)")
     expected_k_local = (expected_topk_local >= 0).sum(dim=1).to(torch.int32)
-    assert torch.equal(per_token_remaining, expected_k_local), (
-        f"per_token_remaining mismatch; first deviating r: "
-        f"{(per_token_remaining != expected_k_local).nonzero().flatten()[:8]}")
+    assert torch.equal(k_local_remaining, expected_k_local), (
+        f"k_local_remaining mismatch; first deviating r: "
+        f"{(k_local_remaining != expected_k_local).nonzero().flatten()[:8]}")
 
     assert recv_token_to_slots.shape == (T_recv, num_topk), (
         f"recv_token_to_slots shape {recv_token_to_slots.shape} != "
@@ -263,8 +263,8 @@ def main():
         f"recv_token_to_slots mismatch; first deviating (r, k): "
         f"{(recv_token_to_slots != expected_rtts).nonzero()[:8]}")
 
-    assert torch.equal(k_local_count, per_token_remaining), (
-        "k_local_count should equal per_token_remaining (write-once mirror)")
+    assert torch.equal(k_local_total, k_local_remaining), (
+        "k_local_total should equal k_local_remaining (write-once mirror)")
 
     # ─── (7) Bit-determinism: re-run with same inputs. ──────────────────────
     out2 = buf.runtime.internode_dispatch(

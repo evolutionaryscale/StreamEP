@@ -55,19 +55,19 @@ class StreamingHandle:
     # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers.
     # All allocated on dispatch_stream; cross-stream visibility carried by the
     # per-tile release/acquire pairs `tile_ready` (dispatch→A), `a_ready` (A→Y),
-    # and `compute_done_per_token` (Y→combine).
+    # and `y_done_per_token` (Y→combine).
     a_ready: torch.Tensor                      # [total_tiles] int64 — A→Y per-tile release stamp (zero-init)
-    per_token_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
-    compute_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
+    k_local_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
+    y_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
     o: torch.Tensor                            # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
 
     # ── Backward-pass scaffolding (Phase F).
     # Both populated by fwd Pass B in the same lane-0 K-loop that writes
-    # pool_recv_token / pool_k_slot / per_token_remaining; consumed by the
+    # pool_recv_token / pool_k_slot / k_local_remaining; consumed by the
     # backward path (no fwd consumer). Cost: ~512 KB + ~128 KB at production
     # (T_recv≈32K, K=4).
     recv_token_to_slots: torch.Tensor          # [T_recv, num_topk] int32 — (r, k) → pool slot, -1 for non-local k
-    k_local_count: torch.Tensor                # [T_recv] int32 — write-once K_local mirror (per_token_remaining is decremented to 0 by kernel Y)
+    k_local_total: torch.Tensor                # [T_recv] int32 — write-once K_local mirror (k_local_remaining is decremented to 0 by kernel Y)
 
     total_tiles: int
     tile_m: int
@@ -426,11 +426,11 @@ class Buffer:
             pool_arrival_target=out.pool_arrival_target,
             tile_ready=out.tile_ready,
             a_ready=out.a_ready,
-            per_token_remaining=out.per_token_remaining,
-            compute_done_per_token=out.compute_done_per_token,
+            k_local_remaining=out.k_local_remaining,
+            y_done_per_token=out.y_done_per_token,
             o=out.o,
             recv_token_to_slots=out.recv_token_to_slots,
-            k_local_count=out.k_local_count,
+            k_local_total=out.k_local_total,
             total_tiles=out.total_tiles,
             tile_m=tile_m,
             dispatch_seq=dispatch_seq,
@@ -500,7 +500,7 @@ class Buffer:
         Runs on ``torch.cuda.current_stream()``. Caller manages stream placement.
 
         The combine sender's per-warp send loop spins on
-        ``handle.compute_done_per_token[r] >= combine_seq`` before reading
+        ``handle.y_done_per_token[r] >= combine_seq`` before reading
         ``x[r]`` for each token ``r`` it owns — kernel Y release-stores
         ``combine_seq`` into the same address once all ``K_local(r)``
         contributions to ``x[r]`` (= ``handle.o[r]`` in production) have
@@ -519,7 +519,7 @@ class Buffer:
         if self._is_internode():
             return self.runtime.internode_combine(
                 x, handle.pool_topk_weight, handle._dispatch_out,
-                handle.compute_done_per_token, combine_seq,
+                handle.y_done_per_token, combine_seq,
                 # `combine_phase=0` = fwd combine. Phase-distinguishes the NVL
                 # gen-stamp tag from bwd `combine_grads` (phase=1) so the two
                 # phases of one layer (which share `combine_seq`) can't alias
@@ -530,13 +530,13 @@ class Buffer:
             x, handle.pool_topk_weight, handle.recv_token_to_slots,
             handle.rank_prefix_matrix,
             handle.recv_channel_prefix_matrix, handle.send_head,
-            handle.compute_done_per_token, combine_seq,
+            handle.y_done_per_token, combine_seq,
             config)
 
     # noinspection PyTypeChecker
     def combine_grads(self, dL_dx_per_r: torch.Tensor, handle: 'StreamingHandle',
                       weight_grads: torch.Tensor,
-                      bwd_compute_done_per_token: torch.Tensor,
+                      bwd_a_done_per_token: torch.Tensor,
                       *,
                       dispatch_seq: Optional[int] = None,
                       config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -558,7 +558,7 @@ class Buffer:
             weight_grads: ``[TK_padded]`` fp32 — per-pool-slot weight gradient
                 produced by ``kernel_y_bwd``'s ``dL/dweight``
                 dot-product epilogue.
-            bwd_compute_done_per_token: ``[T_recv]`` int64 release-stamp
+            bwd_a_done_per_token: ``[T_recv]`` int64 release-stamp
                 array fired by ``kernel_a_bwd``'s per-token
                 "stripe-done" epilogue.
             dispatch_seq: monotonic int the entire layer threads through;
@@ -575,7 +575,7 @@ class Buffer:
         if self._is_internode():
             return self.runtime.internode_combine(
                 dL_dx_per_r, weight_grads, handle._dispatch_out,
-                bwd_compute_done_per_token, seq,
+                bwd_a_done_per_token, seq,
                 # `combine_phase=1` = bwd combine_grads. Pairs with the fwd
                 # combine call's `combine_phase=0` to make the two phases'
                 # NVL gen-stamp tags differ in the low bit, despite sharing
@@ -586,7 +586,7 @@ class Buffer:
             dL_dx_per_r, weight_grads, handle.recv_token_to_slots,
             handle.rank_prefix_matrix,
             handle.recv_channel_prefix_matrix, handle.send_head,
-            bwd_compute_done_per_token, seq,
+            bwd_a_done_per_token, seq,
             config)
 
 

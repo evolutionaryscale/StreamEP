@@ -2,7 +2,7 @@
 
 A streaming-tile expert-parallel dispatch / combine library for intranode MoE training on H100 NVLink. Fork of [DeepSeek's DeepEP](https://github.com/deepseek-ai/DeepEP) — see [`NOTICE.md`](NOTICE.md) for fork details.
 
-The headline feature is **per-tile streaming**: dispatch fires release-stamps on expert-major BLOCK_M tiles as soon as their pool slots fill, so a consumer GEMM can spin on `tile_ready[tile_id]` and begin processing while later tokens are still landing. The complementary per-recv-token gate on combine (`compute_done_per_token`) lets the combine sender ship the first packet as soon as that recv-token's compute drains, instead of waiting for the whole compute kernel.
+The headline feature is **per-tile streaming**: dispatch fires release-stamps on expert-major BLOCK_M tiles as soon as their pool slots fill, so a consumer GEMM can spin on `tile_ready[tile_id]` and begin processing while later tokens are still landing. The complementary per-recv-token gate on combine (`y_done_per_token`) lets the combine sender ship the first packet as soon as that recv-token's compute drains, instead of waiting for the whole compute kernel.
 
 ## What's in the box
 
