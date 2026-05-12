@@ -445,10 +445,10 @@ def main():
             # so future name shuffles in the JIT layer don't break the match.
             norm = ev_key.lower().replace("_", "")
             for probe, key in (
-                ("streamingmoeabwdsm90", "streaming_moe_a_bwd"),
-                ("streamingmoeybwdsm90", "streaming_moe_y_bwd"),
-                ("streamingmoeasm90", "streaming_moe_a"),
-                ("streamingmoeysm90", "streaming_moe_y"),
+                ("streamingmoeabwd", "streaming_moe_a_bwd"),
+                ("streamingmoeybwd", "streaming_moe_y_bwd"),
+                ("streamingmoea", "streaming_moe_a"),
+                ("streamingmoey", "streaming_moe_y"),
                 ("quackgemm", "gemm"),
             ):
                 if probe in norm:
