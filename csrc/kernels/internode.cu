@@ -22,7 +22,6 @@ struct SourceMeta {
 
     __forceinline__ SourceMeta() = default;
 
-    // TODO: faster encoding
     __device__ __forceinline__ SourceMeta(int rdma_rank, const bool* is_token_in_nvl_ranks) {
         src_rdma_rank = rdma_rank;
         is_token_in_nvl_rank_bits = is_token_in_nvl_ranks[0];
@@ -1901,9 +1900,9 @@ __global__ void cached_notify_combine_kernel(
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_combined_tokens, num_channels, channel, token_start_idx, token_end_idx);
 
-            // `1 << 25` is a heuristic large sentinel for "no real head ahead";
-            // any combine receiver that hits this is past the channel's tail.
-            int last_head = 1 << 25;
+            // Sentinel for "no real head ahead"; any combine receiver that hits
+            // this is past the channel's tail.
+            int last_head = kReverseScanSentinel;
             for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
                 auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
                 if (current_head < 0) {
@@ -1943,7 +1942,7 @@ __global__ void cached_notify_combine_kernel(
         int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
         token_start_idx += shift, token_end_idx += shift;
 
-        int last_head = 1 << 25;
+        int last_head = kReverseScanSentinel;
         for (int batch_end_idx = token_end_idx; batch_end_idx > token_start_idx; batch_end_idx -= num_tokens_per_batch) {
             auto batch_start_idx = max(token_start_idx, batch_end_idx - num_tokens_per_batch);
 

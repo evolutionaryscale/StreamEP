@@ -47,7 +47,6 @@ __device__ static __forceinline__ uint32_t HtoBE32(uint32_t x) {
 }
 
 __device__ static __forceinline__ uint16_t HtoBE16(uint16_t x) {
-    // TODO: simplify PTX using 16-bit instructions
     auto a = static_cast<uint32_t>(x);
     uint32_t d;
     asm volatile(

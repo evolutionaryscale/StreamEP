@@ -21,22 +21,7 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
-from utils import cleanup_dist
-
-
-def make_inputs(num_tokens, hidden, num_topk, num_experts, num_ranks, rank, device):
-    g = torch.Generator(device=device).manual_seed(123 + rank)
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device) * rank
-    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk),
-                             generator=g, device=device, dtype=torch.int64)
-    topk_weights = torch.rand((num_tokens, num_topk), generator=g, device=device, dtype=torch.float32)
-
-    num_local_experts = num_experts // num_ranks
-    rank_idx = topk_idx // num_local_experts
-    is_token_in_rank = torch.zeros((num_tokens, num_ranks), dtype=torch.bool, device=device)
-    for r in range(num_ranks):
-        is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
-    return x, topk_idx, topk_weights, is_token_in_rank
+from utils import cleanup_dist, make_inputs
 
 
 def main():

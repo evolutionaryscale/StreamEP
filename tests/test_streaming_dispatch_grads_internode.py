@@ -24,35 +24,9 @@ import os
 import torch
 import torch.distributed as dist
 
-import stream_ep
 from stream_ep import Buffer
 
-from utils import cleanup_dist
-
-
-def make_inputs(num_tokens: int, hidden: int, num_topk: int, num_experts: int,
-                num_ranks: int, rank: int, device: torch.device,
-                *, seed: int = 123):
-    g = torch.Generator(device=device).manual_seed(seed + rank)
-    x = torch.randn((num_tokens, hidden), generator=g, device=device,
-                    dtype=torch.bfloat16)
-    idx = torch.randint(0, num_experts, (num_tokens, num_topk),
-                        generator=g, device=device, dtype=torch.int64)
-    sentinel = torch.rand((num_tokens, num_topk), generator=g,
-                          device=device) < 0.05
-    idx = torch.where(sentinel, torch.full_like(idx, -1), idx)
-    topk_idx = idx.to(stream_ep.topk_idx_t)
-    topk_weights = torch.rand((num_tokens, num_topk), generator=g,
-                              device=device, dtype=torch.float32)
-
-    num_local_experts = num_experts // num_ranks
-    rank_idx = torch.where(topk_idx >= 0, topk_idx // num_local_experts,
-                           torch.full_like(topk_idx, -1))
-    is_token_in_rank = torch.zeros((num_tokens, num_ranks),
-                                   dtype=torch.bool, device=device)
-    for r in range(num_ranks):
-        is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
-    return x, topk_idx, topk_weights, is_token_in_rank
+from utils import cleanup_dist, make_inputs
 
 
 def main():
@@ -87,7 +61,7 @@ def main():
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-        seed=123)
+        seed=123, x_kind="randn", plant_sentinels=True)
 
     _, handle, _ = buf.dispatch(
         x, topk_idx, topk_weights, is_token_in_rank, num_experts,

@@ -402,6 +402,12 @@ __device__ __forceinline__ void tma_store_fence() {
 constexpr uint64_t kEvictFirst = 0x12f0000000000000;
 constexpr uint64_t kEvictNormal = 0x1000000000000000;
 
+// Sentinel for the reverse-cumulative head-encoding scan: bigger than any
+// real head index. The actual cap is `T_recv * num_topk` which is well under
+// 2^20 at any production shape, so 2^25 is conservative and still leaves
+// 2^6 = 64x headroom before int overflow in any cumulative arithmetic.
+constexpr int kReverseScanSentinel = 1 << 25;
+
 __device__ __forceinline__ void tma_load_1d(
     const void* smem_ptr, const void* gmem_ptr, uint64_t* mbar_ptr, int num_bytes, bool evict_first = true) {
     auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));

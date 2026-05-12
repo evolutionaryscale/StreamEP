@@ -1207,8 +1207,7 @@ __global__ void cached_notify_combine(
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_recv_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-        // NOTES: `1 << 25` is a heuristic large number
-        int last_head = 1 << 25;
+        int last_head = kReverseScanSentinel;
         #pragma unroll
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
             int token_idx = token_idx_tail - lane_id, expected_head = 0;

@@ -44,44 +44,9 @@ import os
 import torch
 import torch.distributed as dist
 
-import stream_ep
 from stream_ep import Buffer
 
-from utils import cleanup_dist
-
-
-def make_inputs(num_tokens: int, hidden: int, num_topk: int, num_experts: int,
-                num_ranks: int, rank: int, device: torch.device, *,
-                seed: int = 123, plant_empty_expert: int | None = None):
-    """Per-rank inputs: ``x[r] = float(rank)`` everywhere so the combine
-    reduction's expected output is closed-form (sum of contributing ranks'
-    tags). Sentinels + empty-expert plant exercise skip / empty branches.
-    """
-    g = torch.Generator(device=device).manual_seed(seed + rank)
-    x = torch.full((num_tokens, hidden), float(rank),
-                   dtype=torch.bfloat16, device=device)
-
-    idx = torch.randint(0, num_experts, (num_tokens, num_topk),
-                        generator=g, device=device, dtype=torch.int64)
-    sentinel = torch.rand((num_tokens, num_topk), generator=g,
-                          device=device) < 0.05
-    idx = torch.where(sentinel, torch.full_like(idx, -1), idx)
-    if plant_empty_expert is not None:
-        idx = torch.where(idx == plant_empty_expert,
-                          torch.full_like(idx, -1), idx)
-    topk_idx = idx.to(stream_ep.topk_idx_t)
-
-    topk_weights = torch.rand((num_tokens, num_topk), generator=g,
-                              device=device, dtype=torch.float32)
-
-    num_local_experts = num_experts // num_ranks
-    rank_idx = torch.where(topk_idx >= 0, topk_idx // num_local_experts,
-                           torch.full_like(topk_idx, -1))
-    is_token_in_rank = torch.zeros((num_tokens, num_ranks),
-                                   dtype=torch.bool, device=device)
-    for r in range(num_ranks):
-        is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
-    return x, topk_idx, topk_weights, is_token_in_rank
+from utils import cleanup_dist, make_inputs
 
 
 def expected_combine_output(is_token_in_rank: torch.Tensor,
@@ -197,7 +162,7 @@ def main():
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-        seed=123)
+        seed=123, plant_sentinels=True)
     T_recv = run_one_dispatch_combine(
         buf, x, topk_idx, topk_weights, is_token_in_rank,
         num_experts, num_topk, hidden, world_size, rank, tile_m,
@@ -210,7 +175,7 @@ def main():
     for seq, seed in enumerate([456, 789, 1011], start=2):
         x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
             num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-            seed=seed)
+            seed=seed, plant_sentinels=True)
         T_recv = run_one_dispatch_combine(
             buf, x, topk_idx, topk_weights, is_token_in_rank,
             num_experts, num_topk, hidden, world_size, rank, tile_m,
@@ -223,7 +188,7 @@ def main():
     plant_e = 0
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-        seed=2024, plant_empty_expert=plant_e)
+        seed=2024, plant_sentinels=True, plant_empty_expert=plant_e)
     T_recv = run_one_dispatch_combine(
         buf, x, topk_idx, topk_weights, is_token_in_rank,
         num_experts, num_topk, hidden, world_size, rank, tile_m,
