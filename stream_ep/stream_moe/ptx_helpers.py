@@ -4,9 +4,9 @@ Three groups:
 
 1. **Cross-stream signaling** — acquire / release / fence wrappers used to
    pair producers and consumers on different streams. Two scopes:
-   `_gpu_global` for intra-GPU stamps (`pool_arrival_count`, `a_ready`,
-   `y_done_per_token` and their bwd analogs — producer and consumer on the
-   same device, different streams); `_sys_global` for cross-rank stamps
+   `_gpu_global` for intra-GPU signals (per-tile release-add counters and
+   per-token int64 release-stamps — producer and consumer on the same
+   device, different streams); `_sys_global` for cross-rank stamps
    (channel tails over NVLink / RDMA). `threadfence_system` carries
    cross-rank visibility on the producer side where needed.
 
@@ -63,8 +63,11 @@ def st_release_gpu_global(
 ) -> None:
     """Release-store an int64 value to a global pointer with .gpu scope.
 
-    Use for intra-GPU producer→consumer stamps (different streams, same
-    device): ``a_ready`` / ``y_done_per_token`` and their bwd analogs.
+    Use for intra-GPU producer→consumer int64 stamps (different streams,
+    same device): ``y_done_per_token`` and its bwd analog
+    ``bwd_a_done_per_token``. Per-tile signals use
+    ``red_release_gpu_add_s32`` (int32 release-add) instead — they're
+    multi-producer release-adds, not single-producer release-stores.
     Cheaper than ``_sys_global``: stays in L2, no NVLink coherence
     traversal. Cross-rank stamps must keep ``_sys_global``.
 
@@ -224,6 +227,36 @@ def red_add_bf16x2_v4_pred(
 
 
 @dsl_user_op
+def red_release_gpu_add_s32(
+    gmem_ptr: cute.Pointer, val: cutlass.Int32, *, loc=None, ip=None
+) -> None:
+    """``red.release.gpu.global.add.s32 [ptr], val;`` — release-add int32.
+
+    Mirrors `fire_pool_blocks` in csrc/kernels/utils.cuh. Each contributor
+    issues one release-add per tile; the consumer's scheduler-warp spin on
+    ``ld_acquire_gpu_global_i32(count_ptr) == target`` unblocks once all
+    contributors have landed. `.release` semantics pair with the consumer's
+    `.acquire` load to make the contributor's prior writes (TMA stores,
+    SMEM-flushed atomic-scatters, etc.) observable; `.gpu` scope is enough
+    intra-GPU (different streams, same device — same intra-GPU L2 path PR #2
+    established for stamp release-stores).
+
+    Used by `TileReadyRelease` (kernel_a, kernel_y_bwd) to fire `a_ready_count` /
+    `bwd_a_ready_count` per stripe-CTA. Memory clobber semantics identical to
+    `st_release_gpu_global`.
+    """
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr_i64, cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+@dsl_user_op
 def red_add_f32(
     gmem_ptr: cute.Pointer, val: cutlass.Float32, *, loc=None, ip=None
 ) -> None:
@@ -235,8 +268,8 @@ def red_add_f32(
     all hot in L2 — throughput-trivial.
 
     Default ``.gpu``-scope ``.relaxed`` semantics: the cross-stream
-    visibility to combine_grads's sender is carried by the per-tile
-    ``bwd_a_ready`` release-store's ``threadfence_system`` (in the
+    visibility to combine_grads's sender is carried by each stripe-CTA's
+    ``bwd_a_ready_count`` ``red.release.gpu.global.add`` (in the
     ``TileReadyRelease`` epilogue end), not by this atomic itself.
     """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()

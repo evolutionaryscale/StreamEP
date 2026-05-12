@@ -56,9 +56,11 @@ class StreamingHandle:
 
     # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers.
     # All allocated on dispatch_stream; cross-stream visibility carried by the
-    # per-tile release/acquire pairs: count-vs-target spin (dispatch→A),
-    # `a_ready` (A→Y), and `y_done_per_token` (Y→combine).
-    a_ready: torch.Tensor                      # [total_tiles] int64 — A→Y per-tile release stamp (zero-init)
+    # per-tile release/acquire pairs: count-vs-target spin (dispatch→A) on
+    # `pool_arrival_count` / `pool_arrival_target`; same protocol on
+    # `a_ready_count` (A→Y, target = kernel A's num_pid_n filled by host);
+    # int64 `y_done_per_token` (Y→combine).
+    a_ready_count: torch.Tensor                # [total_tiles] int32 — A→Y per-stripe-CTA release-add destination (zero-init)
     k_local_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
     y_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
     o: torch.Tensor                            # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
@@ -381,10 +383,10 @@ class Buffer:
             num_experts: total expert count across all ranks.
             expert_alignment: alignment for per-expert receive counts (default 1).
             tile_m: pool block size (default 128).
-            dispatch_seq: monotonic int (lives on the handle; used by kernel A's
-                `compute_seq`, kernel Y's `combine_seq`, and the NVL gen-stamp
-                protocol). NOT used for the per-tile dispatch→A signal — that
-                pair is the `pool_arrival_count == pool_arrival_target` spin.
+            dispatch_seq: monotonic int (lives on the handle; consumed by
+                kernel Y's `combine_seq` and the NVL gen-stamp protocol).
+                NOT used for the per-tile dispatch→A or A→Y signals — both
+                are count-vs-target spins on int32 release-add counters.
 
         Returns:
             recv: ``handle.pool`` (Tensor).
@@ -430,7 +432,7 @@ class Buffer:
             tile_id_to_expert=out.tile_id_to_expert,
             pool_arrival_target=out.pool_arrival_target,
             pool_arrival_count=out.pool_arrival_count,
-            a_ready=out.a_ready,
+            a_ready_count=out.a_ready_count,
             k_local_remaining=out.k_local_remaining,
             y_done_per_token=out.y_done_per_token,
             o=out.o,
@@ -510,9 +512,10 @@ class Buffer:
         ``combine_seq`` into the same address once all ``K_local(r)``
         contributions to ``x[r]`` (= ``handle.o[r]`` in production) have
         landed. Caller threads the same int through ``Buffer.dispatch``
-        (``dispatch_seq``), kernel A / Y (``compute_seq``, ``combine_seq``),
-        and this call so all four release/acquire pairs key off one layer-
-        monotonic ID.
+        (``dispatch_seq``), kernel Y (``combine_seq``), and this call so the
+        Y → combine release-stamp and the NVL gen-stamp key off one layer-
+        monotonic ID. The dispatch → A and A → Y handoffs use count-vs-target
+        protocols and don't reference this counter.
 
         The per-(r, k) topk-weight payload is loaded via
         ``recv_token_to_slots[r, k] → pool_topk_weight[slot]`` (with 0 for

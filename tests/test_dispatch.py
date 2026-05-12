@@ -168,7 +168,7 @@ def main():
     # ─── (6) Pipeline buffer initialization. k_local_remaining[r] should equal
     #         K_local(r) (the count of local-expert landings for recv-token r),
     #         which is also the count of pool slots for r. y_done_per_token
-    #         and o (and a_ready) should be zero-init.
+    #         and o (and a_ready_count) should be zero-init.
     k_local_remaining = handle.k_local_remaining.cpu()
     assert k_local_remaining.shape == (T_recv,), (
         f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)"
@@ -180,8 +180,11 @@ def main():
     )
     compute_done = handle.y_done_per_token.cpu()
     assert (compute_done == 0).all(), "y_done_per_token should be zero-init"
-    a_ready_t = handle.a_ready[:total_tiles].cpu()
-    assert (a_ready_t == 0).all(), "a_ready should be zero-init"
+    a_ready_count_t = handle.a_ready_count[:total_tiles].cpu()
+    assert (a_ready_count_t == 0).all(), "a_ready_count should be zero-init"
+    assert handle.a_ready_count.dtype == torch.int32, (
+        f"a_ready_count must be int32; got {handle.a_ready_count.dtype}"
+    )
     o_t = handle.o.cpu()
     assert o_t.shape == (T_recv, hidden), f"o shape {o_t.shape} != ({T_recv}, {hidden})"
     assert (o_t == 0).all(), "o should be zero-init"

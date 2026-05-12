@@ -47,12 +47,13 @@ Per tile:
     3. `ColVecReduceAtomic` accumulates `Σ_n postact[m, n] * g[m, n]`
        (UNWEIGHTED g) per row, intra-warp shuffle + cross-warp reduce → one
        fp32 row sum per slot per pid_n CTA, then ``red.global.add.f32`` into
-       a flat ``dL_dweight[slot]`` fp32 buffer. The per-tile ``bwd_a_ready``
-       release-store transitively publishes ``dL_dweight`` writes via
-       system-scope fence — combine_grads's per-token gate
-       (``bwd_a_done_per_token[r]``, fired by kernel_a_bwd which
-       acquires ``bwd_a_ready``) makes them visible to combine's sender so
-       per-recv-token streaming on combine_grads is preserved.
+       a flat ``dL_dweight[slot]`` fp32 buffer. The per-stripe-CTA
+       ``red.release.gpu.global.add.s32(bwd_a_ready_count, 1)`` carries
+       this CTA's ``dL_dweight`` atomic-adds across the release semantics
+       — combine_grads's per-token gate (``bwd_a_done_per_token[r]``, fired
+       by kernel_a_bwd which acquires ``bwd_a_ready_count``) makes them
+       visible to combine's sender so per-recv-token streaming on
+       combine_grads is preserved.
     4. Per-row weight multiply on (dgate, dup, postact): SwiGLU bwd is
        linear in dpostact, so `w * dgate(g) = dgate(w * g)`. Multiplying
        after dswiglu is equivalent and lets the dL/dweight dot product see
@@ -64,13 +65,14 @@ Per tile:
        viewed as fp32 (M, I) — same f32-recast trick on the output side as
        on input). ``postact_a_for_dW2`` rides ``mPostAct`` (TileStore) — bf16
        (M, I) plain TMA-store, same path GemmActMixin uses for fwd postact.
-  * Per-tile end: drain TMA stores (mD + mPostAct), multi-pid_n gate,
-    release-store `bwd_a_ready[tile_id] = dispatch_seq` so kernel_a_bwd on a
-    different stream can acquire-load with cross-stream visibility.
-    Threadfence_system inside TileReadyRelease.end() flushes the per-tile
-    ``dL_dweight`` atomic-adds and ``postact_a_for_dW2`` TMA stores from
-    each participating CTA, so combine_grads's read of dL_dweight and dW2
-    grouped GEMM's read of postact_a_for_dW2 observe them post-fence.
+  * Per-stripe-CTA end: drain TMA stores (mD + mPostAct), then
+    `red.release.gpu.global.add.s32(bwd_a_ready_count[tile_id], 1)`. Each
+    stripe-CTA contributes one add per tile; kernel_a_bwd's count-vs-target
+    spin on `bwd_a_ready_count[tile] == bwd_a_ready_target[tile]` (target
+    tensor pre-filled with `num_pid_n` everywhere) unblocks once all
+    stripes fire. The .release semantics carry each CTA's per-tile
+    ``dL_dweight`` atomic-adds and ``postact_a_for_dW2`` TMA stores
+    across the cross-stream boundary.
 
 Folding SwiGLU bwd here (vs running it as a separate step before kernel_a_bwd)
 saves one read of preact_a from HBM in kernel_a_bwd at the cost of writing
@@ -80,14 +82,14 @@ vanilla streaming GEMM with a pre-materialised A operand — no in-kernel
 SwiGLU bwd, no preact load.
 
 Shares streaming machinery with fwd kernels:
-  * `StreamingTileScheduler` for linear-claim + per-tile ready spin. Kernel
-    Y_bwd uses `SpinKind.COUNT_VS_TARGET` on
-    (`bwd_dispatch_arrival_count`, `pool_arrival_target`) — fired by
-    dispatch_grads's Pass 2 release-adds. Mirrors fwd kernel A's protocol on
-    the bwd dispatch handoff.
-  * `TileReadyRelease` EpiOp from `kernel_a.py` (per-tile drain +
-    multi-pid_n gating + system-scope release-store) — bwd reuses verbatim;
-    only the destination tensor changes (bwd_a_ready instead of a_ready).
+  * `StreamingTileScheduler` for linear-claim + per-tile count-vs-target
+    spin. Kernel Y_bwd plumbs (`bwd_dispatch_arrival_count`,
+    `pool_arrival_target`) in place of fwd kernel A's
+    (`pool_arrival_count`, `pool_arrival_target`); same protocol, different
+    tensors. Fired by dispatch_grads's Pass 2 release-adds.
+  * `TileReadyRelease` EpiOp from `kernel_a.py` (per-stripe-CTA drain +
+    `red.release.gpu.global.add.s32`) — bwd reuses verbatim; only the
+    destination tensor changes (bwd_a_ready_count instead of a_ready_count).
 """
 
 from typing import Callable, NamedTuple, Optional, Type
@@ -124,7 +126,6 @@ from stream_ep.stream_moe.kernel_a import (
     TileReadyRelease,
 )
 from stream_ep.stream_moe.tile_scheduler import (
-    SpinKind,
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -136,7 +137,7 @@ from stream_ep.stream_moe.tile_scheduler import (
 class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     """Streaming-MoE kernel Y bwd: NN GEMM + SwiGLU bwd in epilogue +
     in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store +
-    per-tile bwd_a_ready release.
+    per-stripe-CTA bwd_a_ready_count release-add.
 
     Inherits the standard mD TMA-store path from GemmDefaultEpiMixin (via
     GemmActMixin), plus a SECOND TMA-store path via ``TileStore("mPostAct")``
@@ -153,11 +154,12 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         buffer; eliminates the post-hoc ``.sum(dim=-1)`` torch op + the
         ``weight_grads_ready`` cross-stream event the orchestrator used to
         carry).
-      - TileReadyRelease("tile_ready") for the system-scope `bwd_a_ready[tile_id]`
-        release after mD TMA-store drain + multi-pid_n gating. Its
-        threadfence_system also publishes the per-tile dL/dweight atomic-adds
-        and postact_a_for_dW2 TMA stores to other streams (combine_grads,
-        dW2 grouped GEMM).
+      - TileReadyRelease("tile_ready") for the per-stripe-CTA
+        `red.release.gpu.global.add.s32(bwd_a_ready_count[tile_id], 1)`
+        after mD TMA-store drain. The .release semantics on the add publish
+        this CTA's per-tile dL/dweight atomic-adds and postact_a_for_dW2 TMA
+        stores to other streams (combine_grads's per-token gate fires after
+        kernel_a_bwd acquires bwd_a_ready_count).
 
     `epi_visit_subtile` is fully overridden — runs `dswiglu` against
     UNWEIGHTED `g` (= the GEMM result), gets `(dgate, dup, postact)` in one
@@ -343,15 +345,12 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            pool_arrival_count=scheduler_args.pool_arrival_count,
-            pool_arrival_target=scheduler_args.pool_arrival_target,
-            stamp=scheduler_args.stamp,  # placeholder; elided for COUNT_VS_TARGET
-            dispatch_seq=scheduler_args.dispatch_seq,  # placeholder
+            arrival_count=scheduler_args.pool_arrival_count,
+            arrival_target=scheduler_args.pool_arrival_target,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
-            spin_kind=SpinKind.COUNT_VS_TARGET,
             persistence_mode=PersistenceMode.STREAMING,
         )
 
@@ -473,25 +472,19 @@ def _compile_streaming_moe_y_bwd(
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
-    bwd_a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    tile_n_stripes_done = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    bwd_a_ready_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
 
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
-        pool_arrival_count=bwd_dispatch_arrival_count,  # live for COUNT_VS_TARGET
+        pool_arrival_count=bwd_dispatch_arrival_count,
         pool_arrival_target=pool_arrival_target,
-        stamp=bwd_a_ready,  # placeholder; elided
-        dispatch_seq=Int64(0),
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(0),
     )
 
     tile_ready_params = TileReadyParams(
-        a_ready=bwd_a_ready,
-        tile_n_stripes_done=tile_n_stripes_done,
-        compute_seq=Int64(0),
-        num_pid_n=Int32(0),
+        a_ready_count=bwd_a_ready_count,
         tile_m=tile_m,
     )
 
@@ -549,8 +542,7 @@ def streaming_moe_y_bwd(
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
     bwd_dispatch_arrival_count: torch.Tensor,  # (total_tiles,) int32 — input count from dispatch_grads (live)
     pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — firing target (shared with fwd)
-    bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — output ready stamps (to kernel_a_bwd)
-    dispatch_seq: int,
+    bwd_a_ready_count: torch.Tensor,  # (total_tiles,) int32 — output release-add destination (to kernel_a_bwd)
     *,
     tile_m: int = 128,
     tile_n: int = 256,
@@ -580,11 +572,11 @@ def streaming_moe_y_bwd(
     ``dL_dweight`` is atomic-added in-kernel via ``red.global.add.f32`` —
     each pid_n CTA contributes its in-CTA-reduced row sum to the flat
     ``(TK_padded,)`` fp32 buffer. **Caller MUST zero-init ``dL_dweight``
-    before launch on the same stream.** The per-tile ``bwd_a_ready``
-    release-store transitively publishes ``dL_dweight`` writes to other
-    streams via the system-scope fence inside ``TileReadyRelease.end()``,
-    so combine_grads's per-token gate (``bwd_a_done_per_token[r]``,
-    fired by kernel_a_bwd which acquires ``bwd_a_ready``) makes them
+    before launch on the same stream.** Each stripe-CTA's per-tile
+    `red.release.gpu.global.add.s32(bwd_a_ready_count, 1)` publishes that
+    CTA's ``dL_dweight`` atomic-adds across the release semantics — so
+    combine_grads's per-token gate (``bwd_a_done_per_token[r]``, fired
+    by kernel_a_bwd which acquires ``bwd_a_ready_count``) makes them
     visible to combine's sender — no explicit cross-stream event needed.
 
     ``postact_a_for_dW2`` is TMA-stored via the standard mPostAct path
@@ -597,9 +589,10 @@ def streaming_moe_y_bwd(
 
     Streamed via per-tile count-vs-target spin on
     (`bwd_dispatch_arrival_count`, `pool_arrival_target`) for the input
-    handoff and per-tile int64 release-store on `bwd_a_ready` for the output
-    handoff (mirror of fwd kernel A's `pool_arrival_count` / `a_ready`
-    handshake — different tensors, same protocols).
+    handoff and per-stripe-CTA `red.release.gpu.global.add.s32` into
+    `bwd_a_ready_count` for the output handoff (mirror of fwd kernel A's
+    `pool_arrival_count` / `a_ready_count` handshake — different tensors,
+    same protocol).
 
     ``num_sms`` caps the persistent-grid CTA count. ``None`` (default) fills the
     GPU; smaller caps leave SMs available for the other backward kernels to
@@ -618,17 +611,16 @@ def streaming_moe_y_bwd(
         ``pool_arrival_target[tile_id]``. The per-tile count-vs-target spin
         handles cross-stream visibility.
 
-    The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
-    allocated on the calling stream so their zero-init is naturally ordered
-    with the kernel.
+    The internal ``consumer_head`` counter is allocated on the calling
+    stream so its zero-init is naturally ordered with the kernel.
 
-    Per-tile bwd_a_ready release: at the end of each tile's epilogue (after
-    all pid_n N-stripes have drained their TMA stores AND atomic-added their
-    dL_dweight contributions), the kernel release-stores
-    ``bwd_a_ready[tile_id] = dispatch_seq`` with system scope. Kernel_a_bwd
-    on its compute_a stream acquire-spins on this signal before reading the
-    tile's ``dL_dswiglu_in`` slab. Multi-pid_n gating via an atomic-add to
-    ``tile_n_stripes_done[tile_id]`` ensures the release fires once per
+    Per-stripe-CTA bwd_a_ready_count release-add: at the end of each
+    stripe-CTA's epilogue (after this CTA's TMA stores have drained AND its
+    dL_dweight contribution has been atomic-added), the kernel fires
+    ``red.release.gpu.global.add.s32(bwd_a_ready_count[tile_id], 1)``.
+    Kernel_a_bwd on its compute_a stream count-vs-target spins on
+    ``bwd_a_ready_count[tile_id] == num_pid_n`` (target tensor pre-filled
+    by the orchestrator); the count-vs-target protocol fires once per
     tile, not once per N-stripe.
 
     Storage layouts:
@@ -674,7 +666,10 @@ def streaming_moe_y_bwd(
         pool_arrival_target.shape == (total_tiles,)
         and pool_arrival_target.dtype == torch.int32
     )
-    assert bwd_a_ready.shape == (total_tiles,) and bwd_a_ready.dtype == torch.int64
+    assert (
+        bwd_a_ready_count.shape == (total_tiles,)
+        and bwd_a_ready_count.dtype == torch.int32
+    )
     # preact contract — bf16 (total_tiles, tile_m, 2*I), same dtype as
     # dL_dswiglu_in (both share the f32-recast packing).
     assert preact_a.is_cuda and preact_a.dim() == 3
@@ -792,19 +787,8 @@ def streaming_moe_y_bwd(
     # zero-init is naturally ordered with the kernel's first atomic-claim.
     consumer_head = torch.zeros(1, dtype=torch.int32, device=dL_do_pool.device)
 
-    # Multi-pid_n N-stripe arrival counter. The CTA whose atomic-add returns
-    # `num_pid_n - 1` is the last N-stripe to complete for its tile_id and
-    # fires the per-tile bwd_a_ready release-store.
-    num_pid_n = (I + tile_n - 1) // tile_n
-    tile_n_stripes_done = torch.zeros(
-        total_tiles, dtype=torch.int32, device=dL_do_pool.device
-    )
-
     tile_ready_params = TileReadyParams(
-        a_ready=bwd_a_ready,
-        tile_n_stripes_done=tile_n_stripes_done,
-        compute_seq=Int64(dispatch_seq),
-        num_pid_n=Int32(num_pid_n),
+        a_ready_count=bwd_a_ready_count,
         tile_m=None,  # Constexpr; burned in at compile, pass None at call time
     )
 
@@ -828,10 +812,8 @@ def streaming_moe_y_bwd(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        pool_arrival_count=bwd_dispatch_arrival_count,  # live for COUNT_VS_TARGET
+        pool_arrival_count=bwd_dispatch_arrival_count,
         pool_arrival_target=pool_arrival_target,
-        stamp=bwd_a_ready,  # placeholder
-        dispatch_seq=Int64(dispatch_seq),  # placeholder
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
     )

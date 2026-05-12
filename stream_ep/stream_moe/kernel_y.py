@@ -1,10 +1,14 @@
 """Streaming-MoE kernel Y (CuTeDSL, SM90, pool layout — fused scatter).
 
 Forward kernel Y of the streaming pipeline:
-  * Persistent CTAs pull tiles from a producer-fed queue (`a_ready`).
-  * For each claimed tile_id, the streaming scheduler reads
-    `expert_id = tile_id_to_expert[tile_id]` and computes
-    `pid_m = tile_id - expert_pool_block_offset[expert_id]`.
+  * Persistent CTAs pull tiles via a count-vs-target spin on
+    (`a_ready_count`, `a_ready_target`); kernel A fires
+    `red.release.gpu.global.add.s32` per stripe-CTA into `a_ready_count`,
+    and the host wrapper fills `a_ready_target` with kernel A's `num_pid_n`
+    everywhere.
+  * For each claimed tile_id, the streaming scheduler derives `expert_id`
+    from a warp-cooperative ballot over `expert_pool_block_offset` and
+    computes `pid_m = tile_id - expert_pool_block_offset[expert_id]`.
   * Standard varlen_m strided TMA load of
     `postact_a[tile_id * tile_M : ..., :]` (the row offset
     `cu_seqlens_m[expert_id] + pid_m * tile_m` lands at the right pool-major
@@ -30,14 +34,14 @@ EpiOp `smem_struct_field` mechanism (mirrors `TileStore`, `RowVecLoad`,
 plumbing untouched.
 
 Streaming machinery is shared with kernel A:
-  * `StreamingTileScheduler` for linear-claim + per-tile ready spin. Kernel Y
-    uses `SpinKind.ACQUIRE_VS_SEQ` on (`a_ready`, `compute_seq`) — kernel A
-    fires the int64 stamp once per tile after its multi-stripe drain. Kernel A
-    uses `SpinKind.COUNT_VS_TARGET` on (`pool_arrival_count`,
-    `pool_arrival_target`) for the multi-producer dispatch handoff.
+  * `StreamingTileScheduler` for linear-claim + per-tile count-vs-target spin.
+    One protocol for every per-tile handoff: kernel A's release-add into
+    `a_ready_count` (with `a_ready_target` filled with kernel A's
+    `num_pid_n` everywhere) mirrors dispatch's release-add into
+    `pool_arrival_count` against the per-tile-variable `pool_arrival_target`.
   * Pool-layout `StreamingHandle` carries: `pool_recv_token`, `pool_topk_weight`,
-    `k_local_remaining`, `y_done_per_token`, `o`, `a_ready`,
-    `tile_id_to_expert`, `expert_pool_block_offset` from `Buffer.dispatch`.
+    `k_local_remaining`, `y_done_per_token`, `o`, `a_ready_count`,
+    `expert_pool_block_offset` from `Buffer.dispatch`.
 
 Padding rows (pool_recv_token[s] == -1) and other masked lanes: PTX-level
 `@%p red.global.add.noftz.v4.bf16x2` predication skips the atomic at issue
@@ -80,7 +84,6 @@ from stream_ep.stream_moe.ptx_helpers import (
     threadfence_system,
 )
 from stream_ep.stream_moe.tile_scheduler import (
-    SpinKind,
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -316,20 +319,22 @@ class AtomicScatterStore(EpiOp):
 
 # ---------------------------------------------------------------------------
 # Host-facing scheduler-options NamedTuple. Mirrors kernel A's
-# StreamingTileSchedulerOptions but carries `a_ready` (the int64 release
-# stamp kernel A fires once per tile after its multi-stripe TMA drain).
+# StreamingTileSchedulerOptions but plumbs the (a_ready_count, a_ready_target)
+# pair for the A → Y handoff in place of (pool_arrival_count,
+# pool_arrival_target). Same count-vs-target protocol.
 # ---------------------------------------------------------------------------
 @mlir_namedtuple
 class StreamingMoeYSchedulerOptions(NamedTuple):
     max_active_clusters: Int32
     consumer_head: cute.Tensor
-    # Kernel Y uses SpinKind.ACQUIRE_VS_SEQ on (a_ready, compute_seq).
-    # The count/target pair is placeholder for the dual-protocol scheduler.
-    pool_arrival_count: cute.Tensor   # placeholder (any int32 tensor of [total_tiles])
-    pool_arrival_target: cute.Tensor  # placeholder
-    a_ready: cute.Tensor              # [total_tiles] int64 stamp from kernel A (live)
+    # Per-tile ready spin source for the A → Y handoff.  Kernel A fires
+    # `red.release.gpu.global.add.s32(a_ready_count[tile_id], 1)` once per
+    # stripe-CTA; kernel Y's scheduler spins on
+    # `a_ready_count[tile_id] == a_ready_target[tile_id]`. Host wrapper fills
+    # `a_ready_target` with kernel A's `num_pid_n` everywhere.
+    a_ready_count: cute.Tensor   # [total_tiles] int32 — release-add destination
+    a_ready_target: cute.Tensor  # [total_tiles] int32 — per-tile firing target (= num_pid_n_a)
     expert_pool_block_offset: cute.Tensor
-    compute_seq: Int64                # seq to compare a_ready against (live)
     total_tiles: Int32
 
 
@@ -576,15 +581,12 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            pool_arrival_count=scheduler_args.pool_arrival_count,
-            pool_arrival_target=scheduler_args.pool_arrival_target,
-            stamp=scheduler_args.a_ready,
-            dispatch_seq=scheduler_args.compute_seq,
+            arrival_count=scheduler_args.a_ready_count,
+            arrival_target=scheduler_args.a_ready_target,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
-            spin_kind=SpinKind.ACQUIRE_VS_SEQ,
             persistence_mode=PersistenceMode.STREAMING,
         )
 
@@ -693,9 +695,8 @@ def _compile_streaming_moe_y(
     )
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    a_ready_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    a_ready_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -703,11 +704,9 @@ def _compile_streaming_moe_y(
     scheduler_args = StreamingMoeYSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
-        pool_arrival_count=pool_arrival_count,  # placeholder; elided
-        pool_arrival_target=pool_arrival_target,  # placeholder; elided
-        a_ready=a_ready,
+        a_ready_count=a_ready_count,
+        a_ready_target=a_ready_target,
         expert_pool_block_offset=expert_pool_block_offset,
-        compute_seq=Int64(0),
         total_tiles=Int32(0),
     )
 
@@ -749,10 +748,8 @@ def streaming_moe_y(
     k_local_remaining: torch.Tensor,  # (T_recv,) int32
     y_done_per_token: torch.Tensor,  # (T_recv,) int64
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
-    pool_arrival_count: torch.Tensor,  # (total_tiles,) int32 — placeholder; passed for shape compat with the dual-protocol scheduler
-    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — placeholder
-    a_ready: torch.Tensor,  # (total_tiles,) int64 — kernel A's release stamp (live)
-    compute_seq: int,
+    a_ready_count: torch.Tensor,  # (total_tiles,) int32 — kernel A's release-add destination (live)
+    a_ready_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (= kernel A's num_pid_n everywhere)
     combine_seq: int,
     *,
     tile_m: int = 128,
@@ -776,9 +773,11 @@ def streaming_moe_y(
       - allocating ``k_local_remaining`` with the K_local count for each
         recv-token (DeepEP's dispatch sets this in Pass B's per-pool-slot block).
       - allocating ``y_done_per_token`` zero-initialized.
-      - ensuring ``a_ready`` is populated by kernel A (or a test stub) on a
-        stream that release-stores ``a_ready[tile_id] = compute_seq`` once
-        the tile's postact_a is ready.
+      - ensuring ``a_ready_count`` / ``a_ready_target`` are populated by
+        kernel A (or a test stub) on a stream that release-adds into
+        ``a_ready_count[tile_id]`` until it equals ``a_ready_target[tile_id]``
+        (= kernel A's ``num_pid_n`` everywhere; caller fills it via
+        ``torch.full(..., num_pid_n_a, ...)`` once per dispatch).
     """
     assert postact_a.is_cuda and W2.is_cuda and o.is_cuda
     assert postact_a.dim() == 3
@@ -801,8 +800,10 @@ def streaming_moe_y(
     assert y_done_per_token.shape == (T_recv,)
     assert y_done_per_token.dtype == torch.int64
     assert expert_pool_block_offset.shape == (E_local + 1,)
-    assert a_ready.shape == (total_tiles,)
-    assert a_ready.dtype == torch.int64
+    assert a_ready_count.shape == (total_tiles,)
+    assert a_ready_count.dtype == torch.int32
+    assert a_ready_target.shape == (total_tiles,)
+    assert a_ready_target.dtype == torch.int32
 
     # Caller passes W2 as (E_local, H, I) k-major contiguous. We need the
     # kernel to see shape (H, I, E_local) with leading_dim=1 (I contiguous
@@ -875,11 +876,9 @@ def streaming_moe_y(
     scheduler_args = StreamingMoeYSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        pool_arrival_count=pool_arrival_count,  # placeholder
-        pool_arrival_target=pool_arrival_target,  # placeholder
-        a_ready=a_ready,
+        a_ready_count=a_ready_count,
+        a_ready_target=a_ready_target,
         expert_pool_block_offset=expert_pool_block_offset,
-        compute_seq=Int64(compute_seq),
         total_tiles=Int32(total_tiles),
     )
     varlen_args = VarlenArguments(
@@ -891,79 +890,8 @@ def streaming_moe_y(
     )
 
 
-# ---------------------------------------------------------------------------
-# Test-only producer: walks a_ready slot-by-slot and release-stores
-# compute_seq on each, with delay between fires. Used by tests to validate
-# kernel Y's per-tile spin without kernel A.
-# ---------------------------------------------------------------------------
-class _StreamingTileProducerY:
-    @cute.jit
-    def __call__(
-        self,
-        a_ready: cute.Tensor,
-        total_tiles: cutlass.Int32,
-        compute_seq: cutlass.Int64,
-        delay_clocks: cutlass.Int32,
-        stream: cuda.CUstream,
-    ):
-        self.kernel(a_ready, total_tiles, compute_seq, delay_clocks).launch(
-            grid=[1, 1, 1], block=[1, 1, 1], stream=stream
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        a_ready: cute.Tensor,
-        total_tiles: cutlass.Int32,
-        compute_seq: cutlass.Int64,
-        delay_clocks: cutlass.Int32,
-    ):
-        from cutlass._mlir.dialects import nvvm
-        from cutlass.cutlass_dsl import T
-
-        tidx, _, _ = cute.arch.thread_idx()
-        if tidx == 0:
-            for i in cutlass.range(total_tiles):
-                start = cutlass.Int64(nvvm.read_ptx_sreg_clock64(T.i64()))
-                end = start + cutlass.Int64(delay_clocks)
-                while cutlass.Int64(nvvm.read_ptx_sreg_clock64(T.i64())) < end:
-                    pass
-                ready_ptr = utils.elem_pointer(a_ready, (i,))
-                threadfence_system()
-                st_release_gpu_global(ready_ptr, compute_seq)
-
-
-@jit_cache
-def _compile_streaming_tile_producer_y():
-    total_tiles_sym = cute.sym_int()
-    ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    op = _StreamingTileProducerY()
-    return cute.compile(
-        op,
-        ready,
-        cutlass.Int32(0),
-        cutlass.Int64(0),
-        cutlass.Int32(0),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
-
-
-def fire_a_ready_with_delay(
-    a_ready: torch.Tensor, compute_seq: int, delay_us: int = 50
-) -> None:
-    """Test helper: launches a single-thread producer kernel on the current
-    CUDA stream that release-stores compute_seq into each slot of a_ready
-    with delay_us between fires.
-    """
-    assert a_ready.dtype == torch.int64
-    assert a_ready.is_cuda and a_ready.is_contiguous()
-    total_tiles = a_ready.shape[0]
-    delay_clocks = max(1, int(delay_us * 1500))
-    compiled = _compile_streaming_tile_producer_y()
-    compiled(
-        a_ready,
-        cutlass.Int32(total_tiles),
-        cutlass.Int64(compute_seq),
-        cutlass.Int32(delay_clocks),
-    )
+# Tests for kernel Y's per-tile spin use ``kernel_a.fire_tiles_with_delay``
+# directly (caller pre-fills ``a_ready_target`` with the producer's
+# ``num_pid_n`` everywhere; a single release-add per tile brings count to
+# target). The old int64-stamp test stub was retired with the protocol
+# unification — same primitive for every per-tile handoff.

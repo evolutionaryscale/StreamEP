@@ -1,17 +1,15 @@
 """Tests for the streaming-MoE kernel Y bwd (pool layout).
 
 Mirrors `test_kernel_a.py`'s structure since kernel_y_bwd uses the
-same streaming machinery (linear-claim scheduler, per-tile acquire-spin,
-per-tile release-store after multi-pid_n gating).
+same streaming machinery (linear-claim scheduler, per-tile count-vs-target
+spin, per-stripe-CTA release-add).
 
-**One sequence number, not two.** Backward shares a single `dispatch_seq`
-across acquire-and-release — fwd's
-two-value pattern (`dispatch_seq=1` for the producer, `compute_seq=N` for the
-release) collapses to one `dispatch_seq` in bwd because the orchestrator
-reuses `handle.dispatch_seq` end-to-end. So tests pre-set
-`bwd_y_ready = seq` and pass `dispatch_seq = seq` and assert
-`bwd_a_ready == seq` — same value end-to-end. Mismatched values (the trap
-this comment is here to flag) deadlock the kernel's per-tile acquire-spin.
+**One protocol everywhere.** kernel_y_bwd consumes the dispatch_grads
+handoff via count-vs-target on (`bwd_dispatch_arrival_count`,
+`pool_arrival_target`) and produces the Y_bwd → A_bwd handoff via
+`red.release.gpu.global.add.s32(bwd_a_ready_count, 1)` per stripe-CTA.
+Tests assert `bwd_a_ready_count == num_pid_n` post-launch (every tile
+receives exactly `num_pid_n` adds).
 
 Reference math (SwiGLU bwd folded into the epilogue):
   g[slot, :]                = dL_do_pool[slot] @ W2[e]            (unweighted)
@@ -34,15 +32,12 @@ import pytest
 import torch
 
 
-def _make_ready(
-    total_tiles: int, dispatch_seq: int, device, fired: bool = True
-) -> torch.Tensor:
-    """Allocate a [total_tiles] int64 ready array. If fired=True, pre-set to
-    dispatch_seq (all tiles ready at launch); else zero (test producer fires).
-    Used by kernel_y_bwd's bwd_a_ready (its OUTPUT stamp; kernel_y_bwd still
-    consumes the per-tile count-vs-target signal — see `_make_bwd_arrival`)."""
-    val = dispatch_seq if fired else 0
-    return torch.full((total_tiles,), val, dtype=torch.int64, device=device)
+def _make_bwd_a_ready_count(total_tiles: int, device) -> torch.Tensor:
+    """Allocate a fresh zero-init [total_tiles] int32 release-add destination.
+    kernel_y_bwd fires `red.release.gpu.global.add.s32` per stripe-CTA into
+    this tensor; the test asserts the final count == num_pid_n.
+    """
+    return torch.zeros(total_tiles, dtype=torch.int32, device=device)
 
 
 def _make_bwd_arrival(
@@ -251,7 +246,7 @@ def test_streaming_moe_y_bwd_compiles(device):
     bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
         total_tiles, device=device
     )
-    bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+    bwd_a_ready_count = _make_bwd_a_ready_count(total_tiles, device=device)
 
     import quack.cache_utils as cu
 
@@ -270,8 +265,7 @@ def test_streaming_moe_y_bwd_compiles(device):
             expert_pool_block_offset,
             bwd_dispatch_arrival_count,
             pool_arrival_target,
-            bwd_a_ready,
-            dispatch_seq=seq,
+            bwd_a_ready_count,
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -280,10 +274,10 @@ def test_streaming_moe_y_bwd_compiles(device):
 
 
 def test_streaming_moe_y_bwd_single_tile(device):
-    """total_tiles=1, bwd_y_ready pre-set. Validates the full kernel path:
-    linear claim, scheduler payload, NN GEMM dL_do_pool @ W2[e], per-row
-    pool_topk_weight multiply, pool-layout TMA store, per-tile bwd_a_ready
-    release.
+    """total_tiles=1, dispatch handoff pre-fired. Validates the full kernel
+    path: linear claim, scheduler payload, NN GEMM dL_do_pool @ W2[e],
+    per-row pool_topk_weight multiply, pool-layout TMA store,
+    per-stripe-CTA bwd_a_ready_count release-add.
     """
     from stream_ep.stream_moe.kernel_y_bwd import (
         streaming_moe_y_bwd,
@@ -318,7 +312,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
         total_tiles, device=device
     )
-    bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+    bwd_a_ready_count = _make_bwd_a_ready_count(total_tiles, device=device)
 
     streaming_moe_y_bwd(
         dL_do_pool,
@@ -332,8 +326,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
         expert_pool_block_offset,
         bwd_dispatch_arrival_count,
         pool_arrival_target,
-        bwd_a_ready,
-        dispatch_seq=seq,
+        bwd_a_ready_count,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -382,9 +375,11 @@ def test_streaming_moe_y_bwd_single_tile(device):
         f"rtol=5e-2 and atol=1e-2; max abs {diff_p.max().item():.4f}, "
         f"max rel {rel_p.max().item():.4f}"
     )
-    assert (bwd_a_ready == seq).all(), (
-        f"bwd_a_ready not all set to dispatch_seq={seq} (per-tile release "
-        f"didn't fire); got unique values {bwd_a_ready.unique().tolist()}"
+    num_pid_n_y_bwd = (I + tile_n - 1) // tile_n
+    assert (bwd_a_ready_count == num_pid_n_y_bwd).all(), (
+        f"bwd_a_ready_count not all == num_pid_n_y_bwd={num_pid_n_y_bwd} "
+        f"(per-stripe release-add didn't fire); got unique values "
+        f"{bwd_a_ready_count.unique().tolist()}"
     )
 
 
@@ -438,7 +433,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
         total_tiles, device=device
     )
-    bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+    bwd_a_ready_count = _make_bwd_a_ready_count(total_tiles, device=device)
 
     streaming_moe_y_bwd(
         dL_do_pool,
@@ -452,8 +447,7 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         expert_pool_block_offset,
         bwd_dispatch_arrival_count,
         pool_arrival_target,
-        bwd_a_ready,
-        dispatch_seq=seq,
+        bwd_a_ready_count,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -478,9 +472,11 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         f"max abs diff {diff_w.max().item():.4f}, "
         f"max rel diff {rel_w.max().item():.4f}"
     )
-    assert (bwd_a_ready == seq).all(), (
-        f"bwd_a_ready not all set; bad indices "
-        f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
+    num_pid_n_y_bwd = (I + tile_n - 1) // tile_n
+    assert (bwd_a_ready_count == num_pid_n_y_bwd).all(), (
+        f"bwd_a_ready_count not all == num_pid_n_y_bwd={num_pid_n_y_bwd}; "
+        f"bad indices "
+        f"{(bwd_a_ready_count != num_pid_n_y_bwd).nonzero().squeeze().tolist()}"
     )
 
 
@@ -523,7 +519,7 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
         total_tiles, device=device, fired=False
     )
-    bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+    bwd_a_ready_count = _make_bwd_a_ready_count(total_tiles, device=device)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
     # concurrent launch (one-shot pre-fire then reset).
@@ -550,8 +546,7 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             expert_pool_block_offset,
             bwd_dispatch_arrival_count,
             pool_arrival_target,
-            bwd_a_ready,
-            dispatch_seq=seq,
+            bwd_a_ready_count,
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -581,9 +576,11 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
         f"max rel diff {rel_w.max().item():.4f}"
     )
 
-    assert (bwd_a_ready == seq).all(), (
-        f"bwd_a_ready not all set under producer-consumer; bad indices "
-        f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
+    num_pid_n_y_bwd = (I + tile_n - 1) // tile_n
+    assert (bwd_a_ready_count == num_pid_n_y_bwd).all(), (
+        f"bwd_a_ready_count not all == num_pid_n_y_bwd={num_pid_n_y_bwd} "
+        f"under producer-consumer; bad indices "
+        f"{(bwd_a_ready_count != num_pid_n_y_bwd).nonzero().squeeze().tolist()}"
     )
 
 
@@ -700,7 +697,7 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
         total_tiles, device=device
     )
-    bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+    bwd_a_ready_count = _make_bwd_a_ready_count(total_tiles, device=device)
 
     streaming_moe_y_bwd(
         dL_do_pool,
@@ -714,8 +711,7 @@ def test_streaming_moe_y_bwd_dense_padding(device):
         expert_pool_block_offset,
         bwd_dispatch_arrival_count,
         pool_arrival_target,
-        bwd_a_ready,
-        dispatch_seq=seq,
+        bwd_a_ready_count,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -750,9 +746,11 @@ def test_streaming_moe_y_bwd_dense_padding(device):
             f"max_abs={diff.max().item():.4f} max_rel={rel.max().item():.4f}"
         )
 
-    assert (bwd_a_ready == seq).all(), (
-        f"dense_padding bwd_a_ready not all set; bad indices "
-        f"{(bwd_a_ready != seq).nonzero().squeeze().tolist()}"
+    num_pid_n_y_bwd = (I + tile_n - 1) // tile_n
+    assert (bwd_a_ready_count == num_pid_n_y_bwd).all(), (
+        f"dense_padding bwd_a_ready_count not all == "
+        f"num_pid_n_y_bwd={num_pid_n_y_bwd}; bad indices "
+        f"{(bwd_a_ready_count != num_pid_n_y_bwd).nonzero().squeeze().tolist()}"
     )
 
     # Padding-row predicate check: with the mPaddingMask predicate firing at

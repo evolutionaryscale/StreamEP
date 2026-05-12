@@ -18,10 +18,11 @@ What you should see in the resulting chrome trace
   (substream-end expert-major release-add into pool_arrival_count) inline.
 - `compute_a_stream`: streaming_moe_a launches early, overlapped with the
   tail of dispatch. Its CTAs spin on pool_arrival_count[tile] ==
-  pool_arrival_target[tile] then process. Per-tile a_ready[tile_id]
-  release-stores happen at the end of each tile.
+  pool_arrival_target[tile] then process. Per-tile a_ready_count release-adds
+  happen at the end of each stripe-CTA's epilogue.
 - `compute_y_stream`: streaming_moe_y launches early, overlapped with the
-  tail of kernel A. Its CTAs spin on a_ready[tile_id] then GEMM + per-warp
+  tail of kernel A. Its CTAs spin on
+  `a_ready_count[tile] == a_ready_target[tile]` then GEMM + per-warp
   coalesced atomic-scatter into o[T_recv, H], finishing with per-token
   bookkeeping (k_local_remaining decrement + compute_done release).
 

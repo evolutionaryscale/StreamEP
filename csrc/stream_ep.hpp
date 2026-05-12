@@ -65,7 +65,7 @@ namespace stream_ep {
 //   tile_id_to_expert,
 //   pool_arrival_target,
 //   pool_arrival_count,
-//   a_ready                  per-tile arrays (scheduler + cross-stream signals).
+//   a_ready_count            per-tile arrays (scheduler + cross-stream signals).
 //                            Scheduler spins on
 //                            `pool_arrival_count[tile] == pool_arrival_target[tile]`
 //                            (set by dispatch's Pass 2 `red.release.gpu.add`).
@@ -105,7 +105,7 @@ struct StreamingDispatchOutputs {
     torch::Tensor pool_arrival_target;
     torch::Tensor pool_arrival_count;
 
-    torch::Tensor a_ready;
+    torch::Tensor a_ready_count;
     torch::Tensor k_local_remaining;
     torch::Tensor y_done_per_token;
     torch::Tensor o;

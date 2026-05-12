@@ -125,15 +125,15 @@ class StreamMoEFunc(torch.autograd.Function):
     Cross-stage synchronization is per-tile / per-recv-token via system-scope
     release/acquire stamps fired by each kernel — no `cudaStreamWaitEvent`
     between bwd stages, no host syncs, and no cross-stream events at all.
-    kernel_y_bwd's per-tile ``bwd_a_ready`` release-store
-    (threadfence_system) fences ALL three of its outputs (dL_dswiglu_in,
-    postact_a_for_dW2, dL_dweight) system-scope. combine_grads's sender's
-    per-recv-token gate (``bwd_a_done_per_token[r]``, fired by
-    kernel_a_bwd which acquires bwd_a_ready) transitively makes
-    ``dL_dweight`` visible to the sender — same chain that publishes
-    ``dL_dx_per_r``. Per-recv-token streaming on combine_grads is
-    preserved end-to-end (first packet ships when the first r's tile is
-    done, not when all of compute_y has drained).
+    kernel_y_bwd's per-stripe-CTA
+    ``red.release.gpu.global.add.s32(bwd_a_ready_count, 1)`` carries each
+    CTA's three outputs (dL_dswiglu_in, postact_a_for_dW2, dL_dweight)
+    across the release. combine_grads's sender's per-recv-token gate
+    (``bwd_a_done_per_token[r]``, fired by kernel_a_bwd which acquires
+    ``bwd_a_ready_count``) transitively makes ``dL_dweight`` visible to
+    the sender — same chain that publishes ``dL_dx_per_r``. Per-recv-token
+    streaming on combine_grads is preserved end-to-end (first packet ships
+    when the first r's tile is done, not when all of compute_y has drained).
     """
 
     @staticmethod
@@ -203,7 +203,14 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.pool_arrival_count.record_stream(streams.compute_a)
         handle.pool_arrival_target.record_stream(streams.compute_a)
         handle.expert_pool_block_offset.record_stream(streams.compute_a)
-        handle.a_ready.record_stream(streams.compute_a)
+        handle.a_ready_count.record_stream(streams.compute_a)
+        # Per-tile firing target for the A → Y handoff. Kernel A fires one
+        # `red.release.gpu.global.add.s32` per stripe-CTA per tile; kernel Y
+        # spins on `a_ready_count[tile] == a_ready_target[tile]`. Target is
+        # the producer's num_pid_n (ceil(2I / tile_n_a)) everywhere — same
+        # value for every tile because every tile receives `num_pid_n`
+        # contributions. Fresh per dispatch (CLAUDE.md anti-pattern §2).
+        num_pid_n_a = (w1_local.shape[1] + tile_n_a - 1) // tile_n_a
         with torch.cuda.stream(streams.compute_a):
             postact_a = torch.empty(
                 handle.total_tiles,
@@ -229,6 +236,12 @@ class StreamMoEFunc(torch.autograd.Function):
                 dtype=x.dtype,
                 device=pool.device,
             )
+            a_ready_target = torch.full(
+                (handle.total_tiles,),
+                num_pid_n_a,
+                dtype=torch.int32,
+                device=pool.device,
+            )
             streaming_moe_a(
                 pool,
                 w1_local,
@@ -236,8 +249,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.expert_pool_block_offset,
                 handle.pool_arrival_count,
                 handle.pool_arrival_target,
-                handle.a_ready,
-                compute_seq=handle.dispatch_seq,
+                handle.a_ready_count,
                 preact_a=preact_a,
                 tile_m=tile_m,
                 tile_n=tile_n_a,
@@ -248,12 +260,13 @@ class StreamMoEFunc(torch.autograd.Function):
         # ── Kernel Y path. ``postact_a`` is allocated on streams.compute_a
         # where kernel A writes it, and read by kernel Y on streams.compute_y.
         # Per-tile cross-stream data visibility comes from kernel Y's in-kernel
-        # ``a_ready`` spin; ``record_stream`` only governs the caching
+        # ``a_ready_count`` spin; ``record_stream`` only governs the caching
         # allocator's recycle policy.
         postact_a.record_stream(streams.compute_y)
+        a_ready_target.record_stream(streams.compute_y)
         streams.compute_y.wait_event(metadata_done)
         handle.expert_pool_block_offset.record_stream(streams.compute_y)
-        handle.a_ready.record_stream(streams.compute_y)
+        handle.a_ready_count.record_stream(streams.compute_y)
         handle.pool_recv_token.record_stream(streams.compute_y)
         handle.pool_topk_weight.record_stream(streams.compute_y)
         handle.k_local_remaining.record_stream(streams.compute_y)
@@ -269,10 +282,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.k_local_remaining,
                 handle.y_done_per_token,
                 handle.expert_pool_block_offset,
-                handle.pool_arrival_count,  # placeholder; elided by spin_kind
-                handle.pool_arrival_target,  # placeholder; elided
-                handle.a_ready,
-                compute_seq=handle.dispatch_seq,
+                handle.a_ready_count,
+                a_ready_target,
                 combine_seq=dispatch_seq,
                 tile_m=tile_m,
                 tile_n=tile_n_y,
@@ -385,23 +396,24 @@ class StreamMoEFunc(torch.autograd.Function):
           kernel_a_bwd     on streams.compute_a  (+ dW1 grouped GEMM tail)
           combine_grads    on streams.combine
 
-        Inter-stage waits are per-tile / per-recv-token system-scope
-        release/acquire signals embedded in the kernels: dispatch_grads's
+        Inter-stage waits are per-tile / per-recv-token release/acquire
+        signals embedded in the kernels: dispatch_grads's
         `pool_arrival_count` release-adds → kernel_y_bwd's count-vs-target
-        spin; kernel_y_bwd's `bwd_a_ready` int64 release-stores →
-        kernel_a_bwd's acquire-vs-seq spin; kernel_a_bwd's
-        `bwd_a_done_per_token` → combine_grads. No `cudaStreamWaitEvent`
-        between bwd stages — the per-tile spins inside each kernel handle
-        cross-stream visibility.
+        spin; kernel_y_bwd's per-stripe-CTA `bwd_a_ready_count` release-adds
+        → kernel_a_bwd's count-vs-target spin; kernel_a_bwd's
+        `bwd_a_done_per_token` int64 release-store → combine_grads's
+        per-token gate. No `cudaStreamWaitEvent` between bwd stages — the
+        per-tile spins inside each kernel handle cross-stream visibility.
 
         kernel_y_bwd writes THREE outputs (mD = dL_dswiglu_in,
         mPostAct = postact_a_for_dW2, mColVecReduce = dL_dweight via
-        per-pid_n red.global.add.f32). All three are fenced by the
-        per-tile bwd_a_ready release-store; combine_grads's per-token
-        gate (bwd_a_done_per_token[r], fired by kernel_a_bwd which
-        acquires bwd_a_ready) transitively publishes dL_dweight to
-        combine's sender. No cross-stream events anywhere in the bwd
-        path — purely device-side per-tile / per-token release/acquire.
+        per-pid_n red.global.add.f32). Each stripe-CTA's release-add into
+        `bwd_a_ready_count` carries its three outputs across the release;
+        combine_grads's per-token gate (bwd_a_done_per_token[r], fired by
+        kernel_a_bwd which acquires `bwd_a_ready_count`) transitively
+        publishes dL_dweight to combine's sender. No cross-stream events
+        anywhere in the bwd path — purely device-side per-tile / per-token
+        release/acquire.
 
         Per-stream zero-init setup ops are issued BEFORE the
         `wait_stream(caller_stream)` fan-out so they overlap with the upstream
@@ -455,7 +467,7 @@ class StreamMoEFunc(torch.autograd.Function):
         T_recv = handle.k_local_total.shape[0]
 
         # ── Per-stream setup, in parallel, before any wait_stream ──────────
-        # Fresh-tensor zero-inits + the `bwd_a_ready` cross-stream signal
+        # Fresh-tensor zero-inits + the `bwd_a_ready_count` cross-stream signal
         # (zero-init on its consumer stream so the first kernel_a_bwd
         # acquire-load sees an unfired counter). Nothing here references
         # caller-resident state, so the allocator doesn't need caller_stream
@@ -506,11 +518,14 @@ class StreamMoEFunc(torch.autograd.Function):
             # No more dL_dweight_per_stripe + post-hoc .sum() — collapsed
             # in-kernel via red.global.add.f32 across pid_n stripes.
             dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
-            # bwd_a_ready is produced by kernel_y_bwd on compute_y and acquired
-            # by kernel_a_bwd on compute_a. Allocate + zero-init on the
-            # producer stream so the kernel's first release-store is naturally
-            # ordered with the zero-init.
-            bwd_a_ready = torch.zeros(total_tiles, dtype=torch.int64, device=device)
+            # bwd_a_ready_count is produced by kernel_y_bwd on compute_y
+            # (per-stripe-CTA `red.release.gpu.global.add.s32`) and acquired
+            # by kernel_a_bwd on compute_a (count-vs-target spin). Allocate +
+            # zero-init on the producer stream so the kernel's first release-
+            # add is naturally ordered with the zero-init.
+            bwd_a_ready_count = torch.zeros(
+                total_tiles, dtype=torch.int32, device=device
+            )
 
         # ── Single fan-out gate on caller_stream ───────────────────────────
         streams.dispatch.wait_stream(caller_stream)
@@ -566,9 +581,10 @@ class StreamMoEFunc(torch.autograd.Function):
         #   - mD = dL_dswiglu_in  (bf16 (M, 2I) viewed fp32 (M, I))
         #   - mPostAct = postact_a_for_dW2  (bf16 (M, I) — weighted postact)
         #   - mColVecReduce = dL_dweight  (fp32 (M,) — per-pid_n atomic-add)
-        # Per-tile bwd_a_ready release fences ALL three outputs system-scope,
-        # so consumers on other streams (combine_grads on streams.combine
-        # via the bwd_compute_done chain, dW2 grouped GEMM in-stream below)
+        # Each stripe-CTA's bwd_a_ready_count release-add carries its
+        # three outputs across the release semantics, so consumers on other
+        # streams (combine_grads on streams.combine via the bwd_compute_done
+        # chain, dW2 grouped GEMM in-stream below)
         # see consistent values.
         with torch.cuda.stream(streams.compute_y):
             streaming_moe_y_bwd(
@@ -583,37 +599,46 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.expert_pool_block_offset,
                 bwd_dispatch_arrival_count,
                 handle.pool_arrival_target,
-                bwd_a_ready,
-                dispatch_seq=handle.dispatch_seq,
+                bwd_a_ready_count,
                 tile_m=tile_m,
                 tile_n=tile_n_y_bwd,
                 num_sms=num_sms_a,
             )
+            # Build bwd_a_ready_target on the SAME stream that wrote
+            # bwd_a_ready_count, so the fill is naturally ordered with the
+            # producer's release-adds. Filled with kernel_y_bwd's num_pid_n
+            # (ceil(I / tile_n_y_bwd)) — every tile receives exactly that
+            # many release-adds.
+            num_pid_n_y_bwd = (I + tile_n_y_bwd - 1) // tile_n_y_bwd
+            bwd_a_ready_target = torch.full(
+                (total_tiles,), num_pid_n_y_bwd, dtype=torch.int32, device=device
+            )
 
-        # bwd_a_ready / dL_dswiglu_in are written on compute_y; consumed on
-        # compute_a (kernel_a_bwd) and the dW streams (dW1 reads
+        # bwd_a_ready_count / dL_dswiglu_in are written on compute_y; consumed
+        # on compute_a (kernel_a_bwd) and the dW streams (dW1 reads
         # dL_dswiglu_in, dW2 reads dL_do_pool / postact_a_for_dW2).
-        bwd_a_ready.record_stream(streams.compute_a)
+        bwd_a_ready_count.record_stream(streams.compute_a)
+        bwd_a_ready_target.record_stream(streams.compute_a)
         dL_dswiglu_in.record_stream(streams.compute_a)
         dL_dswiglu_in.record_stream(streams.w1)
         pool.record_stream(streams.w1)
         postact_a_for_dW2.record_stream(streams.w2)
         dL_do_pool.record_stream(streams.w2)
         # dL_dweight is read by combine_grads on streams.combine. The
-        # cross-stream visibility is carried by the per-tile bwd_a_ready
-        # release-store's threadfence_system (kernel_y_bwd) → kernel_a_bwd's
-        # acquire of bwd_a_ready → kernel_a_bwd's release of
-        # bwd_a_done_per_token → combine_grads's per-token gate
-        # acquire. record_stream is just allocator bookkeeping (combine
-        # might free dL_dweight before compute_y has retired its writes
-        # without it).
+        # cross-stream visibility is carried by the device-side release-add
+        # chain: kernel_y_bwd's per-stripe-CTA bwd_a_ready_count release-add
+        # → kernel_a_bwd's count-vs-target acquire → kernel_a_bwd's release
+        # of bwd_a_done_per_token → combine_grads's per-token gate acquire.
+        # record_stream is just allocator bookkeeping.
         dL_dweight.record_stream(streams.combine)
 
         # ── Stage 3 — kernel_a_bwd on streams.compute_a ────────────────────
-        # Acquire-spins on bwd_a_ready[tile] internally. Vanilla streaming GEMM
-        # `dL/dpool = dL/dswiglu_in @ W1` + atomic-scatter into dL_dx_per_r;
-        # per-row stripe-done bookkeeping fires bwd_a_done_per_token[r]
-        # on the last contributor.
+        # Count-vs-target spins on
+        # bwd_a_ready_count[tile] == bwd_a_ready_target[tile] internally; no
+        # cudaStreamWaitEvent between kernel_y_bwd and kernel_a_bwd. Vanilla
+        # streaming GEMM `dL/dpool = dL/dswiglu_in @ W1` + atomic-scatter
+        # into dL_dx_per_r; per-row stripe-done bookkeeping fires
+        # bwd_a_done_per_token[r] on the last contributor.
         with torch.cuda.stream(streams.compute_a):
             streaming_moe_a_bwd(
                 dL_dswiglu_in,
@@ -623,9 +648,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 bwd_k_local_remaining,
                 bwd_a_done_per_token,
                 handle.expert_pool_block_offset,
-                handle.pool_arrival_count,  # placeholder; elided by spin_kind
-                handle.pool_arrival_target,  # placeholder; elided
-                bwd_a_ready,
+                bwd_a_ready_count,
+                bwd_a_ready_target,
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=tile_m,
                 tile_n=tile_n_a_bwd,
@@ -641,10 +665,10 @@ class StreamMoEFunc(torch.autograd.Function):
         # Sender per-warp loop spins on bwd_a_done_per_token[r] >=
         # dispatch_seq before reading dL_dx_per_r[r] AND dL_dweight[slot]
         # (gathered via recv_token_to_slots[r, k]). Cross-stream visibility
-        # of BOTH is carried by the device-side fence chain:
-        #   kernel_y_bwd's per-tile bwd_a_ready release-store
-        #     (threadfence_system fences mPostAct + dL_dweight + dL_dswiglu_in)
-        #   → kernel_a_bwd acquire bwd_a_ready
+        # of BOTH is carried by the device-side release-add chain:
+        #   kernel_y_bwd's per-stripe-CTA bwd_a_ready_count release-add
+        #     (publishes mPostAct + dL_dweight + dL_dswiglu_in)
+        #   → kernel_a_bwd count-vs-target acquire on bwd_a_ready_count
         #   → kernel_a_bwd release-store bwd_a_done_per_token[r]
         #     (per-token, fenced)
         #   → combine_grads sender acquire bwd_a_done_per_token[r]

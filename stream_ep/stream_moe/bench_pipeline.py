@@ -206,14 +206,21 @@ def main():
     TK = int(expert_frequency.sum().item())  # actual (token, k) count, no padding
 
     # Pre-fired ready signals so kernel A / kernel Y can be timed in isolation.
-    # For COUNT_VS_TARGET kernels (A, y_bwd): set count := target so the spin
-    # passes immediately on the first acquire-load.
+    # Every per-tile handoff is the same count-vs-target protocol: set
+    # count := target so the spin passes immediately on the first
+    # acquire-load.
     pool_arrival_count_fired = handle.pool_arrival_target.clone()
-    a_ready_fired = torch.full_like(handle.a_ready, handle.dispatch_seq)
-    # Fresh a_ready for kernel A's own release-store (one isolated kernel A
-    # run writes here; we don't read it). zero-init so the per-tile multi-pid_n
-    # gating's `tile_n_stripes_done` dance fires cleanly.
-    a_ready_for_a = torch.zeros_like(handle.a_ready)
+    # Kernel A's num_pid_n target for the A → Y handoff (= ceil(2I/tile_n_a)).
+    num_pid_n_a = (2 * I + args.tile_n_a - 1) // args.tile_n_a
+    a_ready_target = torch.full(
+        (total_tiles,), num_pid_n_a, dtype=torch.int32, device=device
+    )
+    # Pre-fired a_ready_count: count := target so isolated kernel Y's spin
+    # passes immediately.
+    a_ready_count_fired = a_ready_target.clone()
+    # Fresh a_ready_count for kernel A's own release-add (one isolated kernel
+    # A run writes here; we don't read it). zero-init per dispatch.
+    a_ready_count_for_a = torch.zeros_like(handle.a_ready_count)
 
     # Postact_a (kernel A → kernel Y intermediate). Sized for per-tile slabs.
     postact_a = torch.empty(total_tiles, args.tile_m, I, dtype=DTYPE, device=device)
@@ -249,16 +256,21 @@ def main():
     dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=DTYPE, device=device)
     # Pre-fired bwd ready signals so each bwd kernel can be timed in isolation.
-    # kernel_y_bwd's scheduler is COUNT_VS_TARGET: set count := target. The
-    # target is `handle.pool_arrival_target` (shared with fwd).
+    # All count-vs-target post-C — set count := target so the spin passes
+    # immediately.
     bwd_dispatch_arrival_count_fired = handle.pool_arrival_target.clone()
-    bwd_a_ready_fired = torch.full(
-        (total_tiles,), handle.dispatch_seq, dtype=torch.int64, device=device
+    # kernel_y_bwd's num_pid_n target for the Y_bwd → A_bwd handoff
+    # (= ceil(I / tile_n_y_bwd)).
+    num_pid_n_y_bwd = (I + args.tile_n_y_bwd - 1) // args.tile_n_y_bwd
+    bwd_a_ready_target = torch.full(
+        (total_tiles,), num_pid_n_y_bwd, dtype=torch.int32, device=device
     )
-    # bwd_a_ready_for_y: kernel_y_bwd writes its release-store here. Must
-    # zero-init before each call so multi-pid_n stripe-done gating fires
-    # cleanly. Reset inside run_streaming_y_bwd.
-    bwd_a_ready_for_y = torch.zeros(total_tiles, dtype=torch.int64, device=device)
+    bwd_a_ready_count_fired = bwd_a_ready_target.clone()
+    # bwd_a_ready_count_for_y: kernel_y_bwd writes its release-adds here.
+    # Must zero-init before each call. Reset inside run_streaming_y_bwd.
+    bwd_a_ready_count_for_y = torch.zeros(
+        total_tiles, dtype=torch.int32, device=device
+    )
     bwd_k_local_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
     bwd_k_local_remaining_init = handle.k_local_total.to(torch.int32).clone()
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
@@ -290,6 +302,8 @@ def main():
     # ────────────────────────────────────────────────────────────────────
 
     def run_streaming_a():
+        # Fresh per dispatch (CLAUDE.md anti-pattern §2).
+        a_ready_count_for_a.zero_()
         streaming_moe_a(
             pool,
             w1_local,
@@ -297,8 +311,7 @@ def main():
             handle.expert_pool_block_offset,
             pool_arrival_count_fired,
             handle.pool_arrival_target,
-            a_ready_for_a,
-            compute_seq=handle.dispatch_seq,
+            a_ready_count_for_a,
             tile_m=args.tile_m,
             tile_n=args.tile_n_a,
             cluster_n=2,
@@ -338,10 +351,8 @@ def main():
             handle.k_local_remaining,
             handle.y_done_per_token,
             handle.expert_pool_block_offset,
-            handle.pool_arrival_count,  # placeholder; elided
-            handle.pool_arrival_target,  # placeholder
-            a_ready_fired,
-            compute_seq=handle.dispatch_seq,
+            a_ready_count_fired,
+            a_ready_target,
             combine_seq=1,
             tile_m=args.tile_m,
             tile_n=args.tile_n_y,
@@ -392,11 +403,11 @@ def main():
         torch.cuda.current_stream().wait_stream(streams.dispatch)
 
     def run_streaming_y_bwd():
-        # Reset bwd_a_ready (kernel_y_bwd's release target) so the
-        # multi-pid_n stripe-done gating sees zero on the first stripe.
-        # Zero dL_dweight too — kernel atomic-adds into it; non-zero would
-        # double-count across iterations.
-        bwd_a_ready_for_y.zero_()
+        # Reset bwd_a_ready_count (kernel_y_bwd's release-add destination)
+        # so the next iter starts at zero — fresh per dispatch
+        # (CLAUDE.md anti-pattern §2). Zero dL_dweight too — kernel
+        # atomic-adds into it; non-zero would double-count across iterations.
+        bwd_a_ready_count_for_y.zero_()
         dL_dweight.zero_()
         streaming_moe_y_bwd(
             _dL_do_pool_captured,
@@ -410,8 +421,7 @@ def main():
             handle.expert_pool_block_offset,
             bwd_dispatch_arrival_count_fired,
             handle.pool_arrival_target,
-            bwd_a_ready_for_y,
-            dispatch_seq=handle.dispatch_seq,
+            bwd_a_ready_count_for_y,
             tile_m=args.tile_m,
             tile_n=args.tile_n_y_bwd,
             num_sms=args.num_sms_a,
@@ -459,9 +469,8 @@ def main():
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             handle.expert_pool_block_offset,
-            handle.pool_arrival_count,  # placeholder; elided by spin_kind
-            handle.pool_arrival_target,  # placeholder; elided
-            bwd_a_ready_fired,
+            bwd_a_ready_count_fired,
+            bwd_a_ready_target,
             dispatch_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
             tile_n=args.tile_n_a_bwd,
@@ -651,8 +660,8 @@ def main():
     #     kernel and the dispatch main kernel — consumer streams wait_event on
     #     this to safely read metadata tensors without serializing against
     #     dispatch main, preserving per-tile streaming overlap.
-    # (b) per-tile `pool_arrival_count` (dispatch→A) / `a_ready` (A→Y)
-    #     release/acquire pairs and per-token `y_done_per_token` (Y→combine
+    # (b) per-tile `pool_arrival_count` (dispatch→A) / `a_ready_count` (A→Y)
+    #     count-vs-target spins and per-token `y_done_per_token` (Y→combine
     #     sender) gate.
 
     def run_pipeline_step(seq):
