@@ -1272,7 +1272,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    intranode::cached_notify_combine(buffer_ptrs_gpu,
+    intranode::encode_combine_heads(buffer_ptrs_gpu,
                                      send_head.data_ptr<int>(),
                                      num_channels,
                                      num_recv_tokens,
@@ -1644,7 +1644,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
 // mirroring `Buffer::intranode_combine`'s two-kernel-one-method pattern
 // (`stream_ep.cpp:1218 + 1235`):
 //
-//   1. `internode::cached_notify_combine` — buffer cleanup +
+//   1. `internode::encode_combine_heads` — buffer cleanup +
 //      sentinel-encode `send_rdma_head` / `send_nvl_head` in place.
 //   2. `internode::launch_combine_main` — NVL→RDMA→origin reduction with
 //      streaming gate at kNVLSender (gated by compute_done_per_token).
@@ -1690,7 +1690,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
     // Pre-combine fixup: sentinel-encode heads in place. Forwarder reads
     // recv-side per-(dst_rdma_rank, channel) ranges, so the prefix matrix
     // is the recv-side one.
-    internode::cached_notify_combine(
+    internode::encode_combine_heads(
         hidden_int4, num_topk, num_ranks, num_channels, num_combined_tokens,
         dispatch_out.send_rdma_head.data_ptr<int>(),
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
@@ -1712,8 +1712,8 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         recv_x.data_ptr(), recv_topk_weights_out.data_ptr<float>(),
         x.data_ptr(), per_slot_weights.data_ptr<float>(),
         dispatch_out.recv_token_to_slots.data_ptr<int>(),
-        dispatch_out.send_rdma_head.data_ptr<int>(),       // (now sentinel-encoded by cached_notify_combine)
-        dispatch_out.send_nvl_head.data_ptr<int>(),        // (now sentinel-encoded by cached_notify_combine)
+        dispatch_out.send_rdma_head.data_ptr<int>(),       // (now sentinel-encoded by encode_combine_heads)
+        dispatch_out.send_nvl_head.data_ptr<int>(),        // (now sentinel-encoded by encode_combine_heads)
         dispatch_out.recv_src_meta.data_ptr(),
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),

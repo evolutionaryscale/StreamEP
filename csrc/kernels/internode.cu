@@ -1702,7 +1702,7 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 //
 // `is_token_in_rank` = "this lane's rank actually contributed to this
 // token" — derived from `head_idx >= 0` (sentinel-encoded, set by
-// cached_notify_combine). Lane `i` holds the head + flag for rank `i`;
+// encode_combine_heads). Lane `i` holds the head + flag for rank `i`;
 // the helper warp-shuffles to assemble the per-token (rank, slot) topk
 // list.
 //
@@ -1846,7 +1846,7 @@ __device__ int combine_token(bool is_token_in_rank,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// cached_notify_combine — pre-combine fixup. See api.cuh for the architectural
+// encode_combine_heads — pre-combine fixup. See api.cuh for the architectural
 // contract; this is the kernel body. Block layout (single warp per block):
 //
 //   blocks [0, num_channels):
@@ -1867,7 +1867,7 @@ __device__ int combine_token(bool is_token_in_rank,
 // Independent work items per block — no cross-block sync.
 // ─────────────────────────────────────────────────────────────────────────────
 template <int kNumTMABytesPerWarp>
-__global__ void cached_notify_combine_kernel(
+__global__ void encode_combine_heads_kernel(
     int* combined_rdma_head,
     int num_combined_tokens,
     int num_channels,
@@ -1970,16 +1970,16 @@ __global__ void cached_notify_combine_kernel(
     }
 }
 
-void cached_notify_combine(int hidden_int4,
-                           int num_topk,
-                           int num_ranks,
-                           int num_channels,
-                           int num_combined_tokens,
-                           int* combined_rdma_head,
-                           const int* rdma_channel_prefix_matrix,
-                           const int* rdma_rank_prefix_sum,
-                           int* combined_nvl_head,
-                           cudaStream_t stream) {
+void encode_combine_heads(int hidden_int4,
+                          int num_topk,
+                          int num_ranks,
+                          int num_channels,
+                          int num_combined_tokens,
+                          int* combined_rdma_head,
+                          const int* rdma_channel_prefix_matrix,
+                          const int* rdma_rank_prefix_sum,
+                          int* combined_nvl_head,
+                          cudaStream_t stream) {
     // Block-per-(channel | (channel, dst_rdma_rank)), 1 warp per block.
     // 4096 B SMEM per nvl_head block packs ~127 tokens/batch
     // (= (4096 − 8) / (4 × NUM_MAX_NVL_PEERS)). rdma_head blocks don't use
@@ -1993,7 +1993,7 @@ void cached_notify_combine(int hidden_int4,
 
     EP_HOST_ASSERT(num_channels > 0 and num_rdma_ranks > 0);
 
-    auto kernel = cached_notify_combine_kernel<kNumTMABytesPerWarp>;
+    auto kernel = encode_combine_heads_kernel<kNumTMABytesPerWarp>;
     SETUP_LAUNCH_CONFIG(num_blocks, num_threads, stream);
     SET_SHARED_MEMORY_FOR_TMA(kernel);
     LAUNCH_KERNEL(&cfg, kernel,
@@ -2015,7 +2015,7 @@ void cached_notify_combine(int hidden_int4,
 //
 // Wire format reuses fwd's per-token bytes layout (data + SourceMeta +
 // topk_idx + topk_weights bytes). Bwd writes only the data + SourceMeta
-// regions; topk_* bytes are untouched (zero from cached_notify_combine
+// regions; topk_* bytes are untouched (zero from encode_combine_heads
 // cleanup). Saves layout-divergence complexity at the cost of ~5–10%
 // wasted RDMA + NVL bandwidth per token.
 // ─────────────────────────────────────────────────────────────────────────────

@@ -118,7 +118,7 @@ struct StreamingDispatchOutputs {
     // the dispatch_main kernel's forwarder + NVL receiver (`send_rdma_head` /
     // `send_nvl_head` / `recv_rdma_channel_prefix_matrix` /
     // `recv_gbl_channel_prefix_matrix` / `recv_src_meta`). The combine path
-    // (yet to be refactored) will consume these alongside `cached_notify_combine`'s
+    // (yet to be refactored) will consume these alongside `encode_combine_heads`'s
     // `combined_rdma_head` / `combined_nvl_head` outputs.
     torch::Tensor rdma_channel_prefix_matrix;       // [num_rdma_ranks, num_channels]
     torch::Tensor recv_rdma_rank_prefix_sum;        // [num_rdma_ranks]
@@ -380,7 +380,7 @@ public:
         const Config& config);
 
     // Streaming-MoE combine (internode, pool layout). Two kernels per call:
-    // `internode::cached_notify_combine` (buffer cleanup + reverse-order
+    // `internode::encode_combine_heads` (buffer cleanup + reverse-order
     // sentinel encoding of `send_rdma_head` / `send_nvl_head`) followed by
     // `internode::launch_combine_main` (three-warp-role NVL→RDMA→origin
     // reduction). Mirrors `Buffer::intranode_combine`'s two-kernel-one-method

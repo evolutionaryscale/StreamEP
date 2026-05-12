@@ -417,7 +417,7 @@ def main():
             "streaming_dispatch_metadata_kernel",
             "dispatch_main_kernel",
             "dispatch_grads_main_kernel",
-            "cached_notify_combine_kernel",
+            "encode_combine_heads_kernel",
             "combine_main_kernel",
             # Compute kernels (cross-reference with bench_pipeline isolated rows).
             "streaming_moe_a_bwd",
@@ -434,7 +434,7 @@ def main():
                 "streaming_dispatch_metadata_kernel",
                 "dispatch_grads_main_kernel",
                 "dispatch_main_kernel",
-                "cached_notify_combine_kernel",
+                "encode_combine_heads_kernel",
                 "combine_main_kernel",
             ):
                 if key in ev_key:
@@ -473,14 +473,14 @@ def main():
             return total_us_by_key.get(key, 0.0) / n if n else 0.0
 
         # Per-call avg time for each role. combine_main_kernel and
-        # cached_notify_combine_kernel are invoked twice per training iter
+        # encode_combine_heads_kernel are invoked twice per training iter
         # (once for fwd combine, once for bwd combine_grads) but the per-call
         # avg is the same value, so we use it for both serial sums.
         dispatch_meta_us = per_call("streaming_dispatch_metadata_kernel")
         dispatch_us = per_call("dispatch_main_kernel")
         dispatch_grads_us = per_call("dispatch_grads_main_kernel")
         combine_kernel_us = per_call("combine_main_kernel")
-        cached_notify_us = per_call("cached_notify_combine_kernel")
+        encode_combine_heads_us = per_call("encode_combine_heads_kernel")
         streaming_a_us = per_call("streaming_moe_a")
         streaming_y_us = per_call("streaming_moe_y")
         streaming_a_bwd_us = per_call("streaming_moe_a_bwd")
@@ -498,11 +498,11 @@ def main():
         # streams. Within bwd, dispatch_grads/y_bwd/a_bwd/combine_grads/dW1/dW2
         # theoretically overlap across the bwd streams.
         # buffer.combine fires the dispatch combine_main_kernel preceded by
-        # the cached_notify_combine_kernel — bundle both into the "combine"
+        # the encode_combine_heads_kernel — bundle both into the "combine"
         # serial-sum row to match what bench_pipeline used to call
         # `buffer.combine (alone)`.
-        fwd_combine_us = combine_kernel_us + cached_notify_us
-        bwd_combine_grads_us = combine_kernel_us + cached_notify_us
+        fwd_combine_us = combine_kernel_us + encode_combine_heads_us
+        bwd_combine_grads_us = combine_kernel_us + encode_combine_heads_us
 
         fwd_serial_us = (
             dispatch_meta_us
@@ -536,8 +536,8 @@ def main():
         print(f"    dispatch_main_kernel:                  {dispatch_us:7.1f} μs")
         print(f"  streaming_moe_a:                         {streaming_a_us:7.1f} μs")
         print(f"  streaming_moe_y:                         {streaming_y_us:7.1f} μs")
-        print(f"  buffer.combine (cached_notify + main):   {fwd_combine_us:7.1f} μs")
-        print(f"    cached_notify_combine_kernel:          {cached_notify_us:7.1f} μs")
+        print(f"  buffer.combine (encode_heads + main):    {fwd_combine_us:7.1f} μs")
+        print(f"    encode_combine_heads_kernel:          {encode_combine_heads_us:7.1f} μs")
         print(f"    combine_main_kernel:                   {combine_kernel_us:7.1f} μs")
         print(f"  fwd serial sum of stages:                {fwd_serial_us:7.1f} μs")
         print(f"  fwd e2e (4 streams, real overlap):       {fwd_e2e_us:7.1f} μs")
@@ -547,7 +547,7 @@ def main():
         print(f"  streaming_moe_y_bwd:                     {streaming_y_bwd_us:7.1f} μs")
         print(f"  streaming_moe_a_bwd:                     {streaming_a_bwd_us:7.1f} μs")
         print(
-            f"  buffer.combine_grads (cached_notify+main):{bwd_combine_grads_us:7.1f} μs"
+            f"  buffer.combine_grads (encode_heads+main): {bwd_combine_grads_us:7.1f} μs"
         )
         print(
             f"  gemm_grouped dW1 + dW2 ({gemm_count_per_iter:.0f}× quack.gemm/iter): {2 * gemm_per_call_us:7.1f} μs"

@@ -145,7 +145,7 @@ struct DispatchGradsRouting {
     const int* base_pool;             // [num_channels, num_ranks, E_local]     Pass 2: per-substream slot start
     const int* seen_per_substream;    // [num_channels, num_ranks, E_local]     Pass 2: per-substream-per-expert recv count
     // Passed explicitly (NOT read from IPC slab leading bytes) — fwd combine's
-    // `cached_notify_combine` zeros that region before bwd runs, so the IPC
+    // `encode_combine_heads` zeros that region before bwd runs, so the IPC
     // slab can't be the source. Persistent tensor lives on the StreamingHandle.
     const int* rank_prefix_matrix;    // [num_ranks, num_ranks]                receiver: per-source-rank token offset
 };
@@ -174,7 +174,7 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
                                 cudaStream_t stream,
                                 int num_sms);
 
-void cached_notify_combine(void** buffer_ptrs,
+void encode_combine_heads(void** buffer_ptrs,
                            int* send_head,
                            int num_channels,
                            int num_recv_tokens,
@@ -431,7 +431,7 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // scaled to the RDMA + NVL hierarchy. Reuses fwd dispatch's wire format
 // — the per-token bytes carry data + SourceMeta + topk_* but bwd only
 // writes/reads the data region; metadata bytes are zero from
-// `cached_notify_combine`'s buffer cleanup.
+// `encode_combine_heads`'s buffer cleanup.
 struct DispatchGradsIO {
     int4* dL_do_pool;                 // [TK_padded, hidden_int4] receiver writes K times per recv-token
     const int4* dL_dy;                // [num_tokens, hidden_int4] sender reads
@@ -491,7 +491,7 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 // every polled slot is iter-disambiguated by the cumulative head/tail /
 // RDMA meta sentinel-amo / NVL gen-stamp protocols. Block 0 of the kernel
 // is now an early return to preserve block-id offsets in blocks 1+.)
-void cached_notify_combine(int hidden_int4,
+void encode_combine_heads(int hidden_int4,
                            int num_topk,
                            int num_ranks,
                            int num_channels,

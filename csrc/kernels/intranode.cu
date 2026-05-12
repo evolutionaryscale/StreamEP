@@ -1006,7 +1006,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // Rank prefix matrix is passed explicitly (NOT read from IPC slab):
-        // fwd combine's `cached_notify_combine` zeros the leading bytes of the
+        // fwd combine's `encode_combine_heads` zeros the leading bytes of the
         // slab before bwd runs, so the slab copy is gone by the time we need
         // it. Persistent tensor lives on the StreamingHandle.
         const int* rank_prefix_matrix = routing.rank_prefix_matrix;
@@ -1158,7 +1158,7 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 }
 
 template <int kNumRanks>
-__global__ void cached_notify_combine(
+__global__ void encode_combine_heads_kernel(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     if (sm_id == 0) {
@@ -1205,25 +1205,25 @@ __global__ void cached_notify_combine(
     }
 }
 
-void cached_notify_combine(void** buffer_ptrs,
-                           int* send_head,
-                           int num_channels,
-                           int num_recv_tokens,
-                           int num_memset_int,
-                           int** barrier_signal_ptrs,
-                           int rank,
-                           int num_ranks,
-                           cudaStream_t stream) {
-#define CACHED_NOTIFY_COMBINE(ranks)            \
-    LAUNCH_KERNEL(&cfg,                         \
-                  cached_notify_combine<ranks>, \
-                  buffer_ptrs,                  \
-                  send_head,                    \
-                  num_channels,                 \
-                  num_recv_tokens,              \
-                  num_memset_int,               \
-                  barrier_signal_ptrs,          \
-                  rank);                        \
+void encode_combine_heads(void** buffer_ptrs,
+                          int* send_head,
+                          int num_channels,
+                          int num_recv_tokens,
+                          int num_memset_int,
+                          int** barrier_signal_ptrs,
+                          int rank,
+                          int num_ranks,
+                          cudaStream_t stream) {
+#define ENCODE_COMBINE_HEADS(ranks)                    \
+    LAUNCH_KERNEL(&cfg,                                \
+                  encode_combine_heads_kernel<ranks>,  \
+                  buffer_ptrs,                         \
+                  send_head,                           \
+                  num_channels,                        \
+                  num_recv_tokens,                     \
+                  num_memset_int,                      \
+                  barrier_signal_ptrs,                 \
+                  rank);                               \
     break
 
     const int num_threads = std::max(128, 32 * num_ranks);
@@ -1231,8 +1231,8 @@ void cached_notify_combine(void** buffer_ptrs,
     EP_HOST_ASSERT(num_threads <= 1024);
     EP_HOST_ASSERT(1 + num_channels <= num_channels * 2);
     SETUP_LAUNCH_CONFIG(1 + num_channels, num_threads, stream);
-    SWITCH_RANKS(CACHED_NOTIFY_COMBINE);
-#undef CACHED_NOTIFY_COMBINE
+    SWITCH_RANKS(ENCODE_COMBINE_HEADS);
+#undef ENCODE_COMBINE_HEADS
 }
 
 // Combine kernel — used by BOTH forward combine and backward combine_grads.
