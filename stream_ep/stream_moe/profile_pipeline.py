@@ -15,10 +15,11 @@ What you should see in the resulting chrome trace
 - `dispatch_stream`: streaming_dispatch_metadata → host poll → tile_arrays_init
   → dispatch main kernel. The dispatch kernel's receiver does Pass 1
   (per-batch slot allocation + data copy into pool) and Pass 2
-  (substream-end expert-major tile_ready firing) inline.
+  (substream-end expert-major release-add into pool_arrival_count) inline.
 - `compute_a_stream`: streaming_moe_a launches early, overlapped with the
-  tail of dispatch. Its CTAs spin on tile_ready[tile_id] then process.
-  Per-tile a_ready[tile_id] release-stores happen at the end of each tile.
+  tail of dispatch. Its CTAs spin on pool_arrival_count[tile] ==
+  pool_arrival_target[tile] then process. Per-tile a_ready[tile_id]
+  release-stores happen at the end of each tile.
 - `compute_y_stream`: streaming_moe_y launches early, overlapped with the
   tail of kernel A. Its CTAs spin on a_ready[tile_id] then GEMM + per-warp
   coalesced atomic-scatter into o[T_recv, H], finishing with per-token

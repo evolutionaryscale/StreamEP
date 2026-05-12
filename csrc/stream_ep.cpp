@@ -1315,7 +1315,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
 // launch — RDMA exchange + NVL aggregation + channel matrices + streaming
 // superset). Dispatch_main is `internode::dispatch_main_kernel` — the
 // NVL receiver runs Pass A + Pass B + Pass 2 fire (slot allocation +
-// per-pool-slot scalar writes + tile_ready release-store), mirroring the
+// per-pool-slot scalar writes + pool_arrival_count release-add), mirroring the
 // intranode receiver. RDMA sender + forwarder stages are bulk RDMA→NVL
 // staging only, no slot logic.
 // ─────────────────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ Three groups:
 
 1. **Cross-stream signaling** — acquire / release / fence wrappers used to
    pair producers and consumers on different streams. Two scopes:
-   `_gpu_global` for intra-GPU stamps (`tile_ready`, `a_ready`,
+   `_gpu_global` for intra-GPU stamps (`pool_arrival_count`, `a_ready`,
    `y_done_per_token` and their bwd analogs — producer and consumer on the
    same device, different streams); `_sys_global` for cross-rank stamps
    (channel tails over NVLink / RDMA). `threadfence_system` carries
@@ -64,9 +64,9 @@ def st_release_gpu_global(
     """Release-store an int64 value to a global pointer with .gpu scope.
 
     Use for intra-GPU producer→consumer stamps (different streams, same
-    device): ``tile_ready`` / ``a_ready`` / ``y_done_per_token`` and their
-    bwd analogs. Cheaper than ``_sys_global``: stays in L2, no NVLink
-    coherence traversal. Cross-rank stamps must keep ``_sys_global``.
+    device): ``a_ready`` / ``y_done_per_token`` and their bwd analogs.
+    Cheaper than ``_sys_global``: stays in L2, no NVLink coherence
+    traversal. Cross-rank stamps must keep ``_sys_global``.
 
     Memory clobber semantics identical to ``st_release_sys_global``.
     """

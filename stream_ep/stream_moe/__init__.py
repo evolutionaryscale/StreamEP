@@ -14,8 +14,10 @@ Public surface:
     ``kernel_y.streaming_moe_y`` — host wrappers for kernels A and Y.
   - ``tile_scheduler.StreamingTileScheduler`` /
     ``StreamingTileSchedulerArguments`` — linear-claim + per-tile-ready-spin
-    scheduler shared between A (acquire on ``tile_ready``) and Y (acquire on
-    ``a_ready``).
+    scheduler shared between A (count-vs-target spin on
+    ``pool_arrival_count`` / ``pool_arrival_target``, fired by dispatch's
+    Pass 2 release-add) and Y (acquire-vs-seq spin on ``a_ready``,
+    released by kernel A after its multi-stripe TMA drain).
   - ``kernel_a.fire_tiles_with_delay`` /
     ``kernel_y.fire_a_ready_with_delay`` — test-only producers for
     the cross-stream ready signals.

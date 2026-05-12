@@ -262,7 +262,8 @@ __global__ void streaming_dispatch_metadata_kernel(
     // recv_token_to_slots — so it can't reconstruct fwd's SMEM seen_substream
     // counter. Persisting it here lets bwd Pass 2 reuse fwd's per-block atomic
     // accounting verbatim: walk experts, atomic-add seen_per_substream[cs, e]
-    // worth of writes, fire bwd_y_ready when count == tile_m.
+    // worth of writes, fire pool_arrival_count (release-add) so the bwd-Y
+    // scheduler's count-vs-target spin unblocks once count == target.
     // Cost: ~17 KB int32 at production (66 channels × 8 ranks × 8 experts).
     for (int e = thread_id; e < E; e += num_threads) {
         int acc = smem_pool_blk[e] * tile_m;
@@ -554,9 +555,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         // slot order = (chunk_idx_in_substream, k) lex regardless of how the
         // sender chunked or how the receiver was paced. The data copy still uses
         // 3-warp parallelism reading slot positions from the SMEM batch_slot scratch.
-        // After all batches drain, Pass 2 fires tile_ready in expert-major order
-        // so kernel A sees firings in tile_id-monotonic order (preserves W1[e] L2
-        // caching).
+        // After all batches drain, Pass 2 fires pool_arrival_count (release-add)
+        // in expert-major order so kernel A's count-vs-target spin unblocks in
+        // tile_id-monotonic order (preserves W1[e] L2 caching).
         //
         // Per-iter inner-loop processes at most kReceiverChunkSize chunks (defined
         // at namespace scope); if the sender pushed a larger backlog into the
@@ -724,7 +725,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                     // Intranode: each recv-token is delivered by exactly one
                     // substream, so the K_local count emitted here is final
                     // (no cross-substream accumulation needed). Pass 2's
-                    // __threadfence_system + tile_ready release-store sequence
+                    // __threadfence_system + pool_arrival_count release-add
                     // after this make k_local_remaining[r] visible to kernel Y
                     // before kernel Y's first atomicSub on the same address.
                     //
@@ -772,12 +773,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
             num_tokens_to_recv -= batch_total;
         }
 
-        // ── Pass 2: substream-end expert-major firing of tile_ready.
-        // After all batches drain, walk experts in order; for each pool block this
-        // substream contributed to, atomic-add the substream's per-block count and
-        // (if the block is now full) release-store tile_ready[block] = dispatch_seq.
-        // Iterating experts in order across substream blocks gives the kernel-A
-        // scheduler a tile_id-monotonic firing stream (preserves W1[e] L2 caching).
+        // ── Pass 2: substream-end expert-major firing of pool_arrival_count.
+        // After all batches drain, walk experts in order; for each pool block
+        // this substream contributed to, `red.release.gpu.global.add.s32` the
+        // substream's per-block count into pool_arrival_count[block]. Kernel A's
+        // scheduler spins until count == pool_arrival_target[block]; expert-
+        // major firing makes that unblock happen in tile_id-monotonic order
+        // (preserves W1[e] L2 caching).
 #ifndef DISABLE_SM90_FEATURES
         tma_store_wait<0>();
 #endif
@@ -788,8 +790,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         // ``__threadfence_system()`` on a single thread (a thread-0-only fence)
         // only covers that one thread's writes. Block-scope ``bar.sync`` makes
         // other warps' writes visible WITHIN the block but doesn't propagate them
-        // to system scope. Cross-stream consumers (kernel A acquiring tile_ready,
-        // kernel Y acquiring a_ready) need system-scope visibility for those
+        // to system scope. Cross-stream consumers (kernel A acquiring
+        // pool_arrival_count, kernel Y acquiring a_ready) need system-scope
+        // visibility for those
         // per-warp writes; without this fence they could read stale -1 from the
         // pool's N memset init.
         __threadfence_system();
@@ -854,9 +857,10 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 //   - receiver writes ONLY into dL_do_pool[slot] (K-fanout per packet).
 //     No scalar pool-slot writes (pool_topk_weight / pool_recv_token /
 //     pool_k_slot / k_local_remaining are already populated by fwd).
-//   - Pass 2 atomic-adds into bwd_dispatch_arrival_count and release-stores
-//     bwd_y_ready[block] = dispatch_seq when count == pool_arrival_target
-//     (the same target fwd uses; we re-fire it on the bwd ready signal).
+//   - Pass 2 fires `red.release.gpu.global.add.s32` into
+//     bwd_dispatch_arrival_count; the bwd-Y scheduler spins until count ==
+//     pool_arrival_target[block] (the same target fwd uses, re-fired on the
+//     bwd ready signal).
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         DispatchGradsIO io,
@@ -1102,7 +1106,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
 
         // Pass 2 — same shape as fwd dispatch's Pass 2, but reads
         // `seen_per_substream` from global (instead of fwd's SMEM
-        // `seen_substream`) and fires `bwd_y_ready` instead of `tile_ready`.
+        // `seen_substream`) and fires `bwd_dispatch_arrival_count` instead of
+        // fwd's `pool_arrival_count`.
 #ifndef DISABLE_SM90_FEATURES
         tma_store_wait<0>();
 #endif

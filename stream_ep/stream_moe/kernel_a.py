@@ -1,7 +1,8 @@
 """Streaming-MoE kernel A (CuTeDSL, SM90, pool layout).
 
 Forward kernel A of the problem-tile streaming pipeline:
-  * Persistent CTAs pull tiles from a producer-fed queue (`tile_ready`).
+  * Persistent CTAs pull tiles from a producer-fed queue
+    (`pool_arrival_count[tile] == pool_arrival_target[tile]`).
   * For each claimed tile_id, the scheduler reads `expert_id =
     tile_id_to_expert[tile_id]` and computes `pid_m = tile_id -
     expert_pool_block_offset[expert_id]`.
@@ -535,11 +536,13 @@ def streaming_moe_a(
       - allocating ``postact_a`` ``(total_tiles, tile_M, I)`` ON THE SAME STREAM
         this function is called from (so the kernel's TMA stores are naturally
         ordered with the allocation; otherwise stale memory may leak through).
-      - ensuring ``tile_ready`` is populated by the producer (DeepEP's
-        ``Buffer.dispatch`` Pass 2 or a test stub) on a stream that release-stores
-        ``tile_ready[tile_id] = dispatch_seq`` once the tile is ready. Kernel A's
-        per-tile acquire-spin handles cross-stream visibility for ``tile_ready``
-        and the dispatch metadata it transitively depends on.
+      - ensuring ``pool_arrival_count`` / ``pool_arrival_target`` are
+        populated by the producer (DeepEP's ``Buffer.dispatch`` Pass 2 or a
+        test stub) on a stream that ``red.release.gpu.global.add.s32``s into
+        ``pool_arrival_count[tile_id]`` until it equals
+        ``pool_arrival_target[tile_id]``. Kernel A's per-tile count-vs-target
+        spin handles cross-stream visibility for those tensors and the
+        dispatch metadata they transitively depend on.
 
     The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
     allocated on the calling stream so their zero-init is naturally ordered

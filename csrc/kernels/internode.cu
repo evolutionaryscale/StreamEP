@@ -747,8 +747,8 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 // Streaming dispatch_main: pool-layout, dropless. Mirrors `intranode::
 // dispatch_main_kernel` (intranode.cu:366–819) — same six-struct contract,
 // same Pass A (slot allocation) + Pass B (per-pool-slot scalars + per-recv-
-// token reverse-map) + Pass 2 fire (per-block atomic-add → release-store
-// `tile_ready[block_id] = dispatch_seq`) on the NVL receiver. The internode
+// token reverse-map) + Pass 2 fire (per-block `red.release.gpu.global.add.s32`
+// into `pool_arrival_count[block_id]`) on the NVL receiver. The internode
 // delta is the upstream RDMA→NVL forwarding: kRDMASender / kRDMASender-
 // Coordinator / kRDMAAndNVLForwarder / kForwarderCoordinator stage data
 // across the RDMA + NVL hops with no slot logic; only the NVL receiver
@@ -869,8 +869,9 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     // shared dispatch NVL ring. `tile_signal.dispatch_seq` is the user-
     // supplied per-call counter, monotonic across the training run; the
     // 32-bit window after the phase bit (~2 B distinct iters) is the wrap
-    // horizon. Release stamps (`tile_ready`) and consumer compare values
-    // (`compute_seq` in kernel A) use the unshifted `tile_signal.dispatch_seq`.
+    // horizon. Per-tile release-adds (`pool_arrival_count`) and the kernel-A
+    // count-vs-target spin operate on int32 counts, not the int64 dispatch_seq;
+    // dispatch_seq is consumed only by the NVL ring's nvl_seq generation here.
     const int64_t nvl_seq = tile_signal.dispatch_seq << 1;
 
     // RDMA sender warp synchronization
@@ -1410,8 +1411,9 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         //           cross-NVL-receiver-warp `bar.sync 2` (for system-scope
         //           visibility of other warps' writes contributing to the same
         //           tile via base_pool stacking) → lane-0 expert-major walk
-        //           over (e, src_rdma_rank); atomic-add into pool_arrival_count;
-        //           on completion, release-store tile_ready[block_id] = dispatch_seq.
+        //           over (e, src_rdma_rank); `red.release.gpu.global.add.s32`
+        //           into pool_arrival_count[block_id]. Kernel A's scheduler
+        //           spins until count == pool_arrival_target[block_id].
         const int src_nvl_rank = target_rank;
 
         int total_offset = 0;
@@ -1462,8 +1464,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         const int* seen_for_channel = tile_signal.seen_per_substream + channel_id * num_world_ranks * E_local;
 
         // Eager Pass 2 fire bookkeeping: lane-0 register bitmask of `e_local`s
-        // this warp has already fired tile_ready for (across all src_rdma_rank
-        // src_worlds). Each warp's substream binding is to a specific
+        // this warp has already fired pool_arrival_count for (across all
+        // src_rdma_rank src_worlds). Each warp's substream binding is to a specific
         // src_nvl_rank — `e_local` alone identifies the (src_world, e) tuple
         // we may have already fired, because seen-per-substream completion
         // for a given (src_rdma, e) only fires once across the warp's life,
@@ -1610,20 +1612,19 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 // `warp_local_seen[src_rdma][e_local]` just hit the metadata-
                 // kernel-computed `seen_per_substream[c, src_world, e_local]`.
                 // If yes, this warp has finished its contribution to expert
-                // `e_local` in this substream: fence + atomic-add the writes-
-                // in-block count + release-store `tile_ready` on completion.
+                // `e_local` in this substream: fence + `red.release.gpu.global.add.s32`
+                // the writes-in-block count into pool_arrival_count[block].
                 //
                 // Visibility: each warp's `__threadfence_system()` before its
-                // own atomicAdd orders this warp's pool writes (K-fanout TMA
-                // stores + per-pool-slot scalars) sys-visible before the
-                // atomicAdd. When the count reaches target on some warp's
-                // atomicAdd, that warp's `cnt_before` value reflects every
-                // contributor's add; per atomicAdd's intrinsic ordering, each
-                // contributor's fenced writes are visible by then. So the
-                // release-store of `tile_ready` is safe to be followed by a
-                // consumer-side acquire on `tile_ready`. Mirrors intranode's
-                // single-fusion pattern without the cross-warp `bar.sync 2` —
-                // each warp's own fence-before-atomic carries the invariant.
+                // own release-add orders this warp's pool writes (K-fanout
+                // TMA stores + per-pool-slot scalars) sys-visible before the
+                // add lands. The release semantics of `red.release.gpu.global.add`
+                // then chain with kernel A's acquire-load on the same address;
+                // by the time count reaches pool_arrival_target[block] on the
+                // consumer side, every contributor's fenced pool writes are
+                // observable. Mirrors intranode's single-fusion pattern without
+                // the cross-warp `bar.sync 2` — each warp's own fence-before-
+                // release-add carries the invariant.
                 if (lane_id == 0) {
                     uint64_t newly_complete = 0;
                     for (int k = 0; k < shape.num_topk; ++k) {
@@ -2008,8 +2009,9 @@ void encode_combine_heads(int hidden_int4,
 // dL/dy[t] origin → expert ranks via the same RDMA + NVL hierarchy as fwd
 // dispatch. The receiver SKIPS Pass A — slot lookups come from
 // `recv_token_to_slots[r, :K]` (persisted by fwd Pass B). Pass 2 fires
-// `bwd_y_ready[block] = dispatch_seq` when `bwd_dispatch_arrival_count[block]`
-// reaches `pool_arrival_target[block]` (re-fires the same target fwd uses).
+// `red.release.gpu.global.add.s32` into `bwd_dispatch_arrival_count[block]`;
+// the bwd-Y scheduler spins until count == `pool_arrival_target[block]`
+// (re-uses the same target fwd uses).
 //
 // Wire format reuses fwd's per-token bytes layout (data + SourceMeta +
 // topk_idx + topk_weights bytes). Bwd writes only the data + SourceMeta
@@ -2574,8 +2576,8 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         // ── kNVLReceivers (bwd): drain NVL ring, derive recv_token_id from
         // iteration order (per-src_rdma_rank counter), look up
         // `recv_token_to_slots[r, :K]`, K-fanout-write `dL_do_pool[slot]`.
-        // Pass 2 fires `bwd_y_ready` using `seen_per_substream` from the
-        // routing struct.
+        // Pass 2 fires `bwd_dispatch_arrival_count` using `seen_per_substream`
+        // from the routing struct.
         const int src_nvl_rank = target_rank;
 
         int total_offset = 0;
@@ -2711,10 +2713,11 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
                 // ── Eager Pass 2 fire (bwd).
                 // Same shape as fwd's eager fire (see dispatch_main_kernel for
-                // the visibility argument). Fires `bwd_y_ready[block]` when
-                // this substream's contribution to expert `e_local` is
-                // complete; `seen_per_substream` is the metadata-kernel-
-                // computed expected count, matching fwd's count.
+                // the visibility argument). Release-adds into
+                // `bwd_dispatch_arrival_count[block]` when this substream's
+                // contribution to expert `e_local` is complete;
+                // `seen_per_substream` is the metadata-kernel-computed expected
+                // count, matching fwd's count.
                 if (lane_id == 0) {
                     uint64_t newly_complete = 0;
                     for (int k = 0; k < shape.num_topk; ++k) {

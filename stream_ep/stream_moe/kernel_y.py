@@ -30,8 +30,11 @@ EpiOp `smem_struct_field` mechanism (mirrors `TileStore`, `RowVecLoad`,
 plumbing untouched.
 
 Streaming machinery is shared with kernel A:
-  * `StreamingTileScheduler` for linear-claim + per-tile ready spin.
-    Substitution: `tile_ready` → `a_ready`, `dispatch_seq` → `compute_seq`.
+  * `StreamingTileScheduler` for linear-claim + per-tile ready spin. Kernel Y
+    uses `SpinKind.ACQUIRE_VS_SEQ` on (`a_ready`, `compute_seq`) — kernel A
+    fires the int64 stamp once per tile after its multi-stripe drain. Kernel A
+    uses `SpinKind.COUNT_VS_TARGET` on (`pool_arrival_count`,
+    `pool_arrival_target`) for the multi-producer dispatch handoff.
   * Pool-layout `StreamingHandle` carries: `pool_recv_token`, `pool_topk_weight`,
     `k_local_remaining`, `y_done_per_token`, `o`, `a_ready`,
     `tile_id_to_expert`, `expert_pool_block_offset` from `Buffer.dispatch`.
@@ -313,8 +316,8 @@ class AtomicScatterStore(EpiOp):
 
 # ---------------------------------------------------------------------------
 # Host-facing scheduler-options NamedTuple. Mirrors kernel A's
-# StreamingTileSchedulerOptions but renames `tile_ready` → `a_ready` to
-# reflect the producer (kernel A's per-tile completion stamp).
+# StreamingTileSchedulerOptions but carries `a_ready` (the int64 release
+# stamp kernel A fires once per tile after its multi-stripe TMA drain).
 # ---------------------------------------------------------------------------
 @mlir_namedtuple
 class StreamingMoeYSchedulerOptions(NamedTuple):

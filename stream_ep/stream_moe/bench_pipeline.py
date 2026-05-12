@@ -651,8 +651,9 @@ def main():
     #     kernel and the dispatch main kernel — consumer streams wait_event on
     #     this to safely read metadata tensors without serializing against
     #     dispatch main, preserving per-tile streaming overlap.
-    # (b) per-tile `tile_ready` (dispatch→A) / `a_ready` (A→Y) release/acquire
-    #     pairs and per-token `y_done_per_token` (Y→combine sender) gate.
+    # (b) per-tile `pool_arrival_count` (dispatch→A) / `a_ready` (A→Y)
+    #     release/acquire pairs and per-token `y_done_per_token` (Y→combine
+    #     sender) gate.
 
     def run_pipeline_step(seq):
         stream_moe_func(

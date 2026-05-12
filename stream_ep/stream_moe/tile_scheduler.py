@@ -1,21 +1,30 @@
-"""Linear-claim tile scheduler for streaming-MoE kernel A (pool layout).
+"""Linear-claim tile scheduler for the streaming-MoE pipeline (pool layout).
 
 Persistent CTAs claim work via `atomic_add(consumer_head, 1)`; each linear work
-index decomposes into `(tile_id, pid_n)`. Each CTA acquire-spins on
-`tile_ready[tile_id]` (int64, dispatch_seq stamp) until the producer (DeepEP
-dispatch's Pass 2) releases the tile. Expert/pid_m are derived from `tile_id`
-by a warp-cooperative ballot lookup over `expert_pool_block_offset` — each
-scheduler-warp lane loads one entry (or kNumExpertsPerLane entries for
-E_local > 31), `vote_ballot_sync(cum <= tile_id)` + `popc` returns
-`expert_id + 1`, and a `shuffle_sync` from the matching lane gives the cum
-for `pid_m`. The pool row offset `cu_seqlens_m[expert_id] + pid_m * tile_m`
-lands at the right rows via the standard varlen_m TMA path — no per-tile
-gather.
+index decomposes into `(tile_id, pid_n)`. The per-tile ready spin is selected
+at JIT time via `SpinKind`:
 
-Wave behavior is structural (not enforced): dispatch's Pass 2 fires tile_ready
-in expert-major order at substream end. Linear claim order == tile_id order ==
-expert-major order, so 80 CTAs naturally converge on the same expert at the
-same time and L2 holds 1-2 W1[e] slabs throughout.
+  * `COUNT_VS_TARGET` (kernel A, kernel_y_bwd): spin on
+    `pool_arrival_count[tile] == pool_arrival_target[tile]`. The producer
+    (dispatch's Pass 2 / dispatch_grads's Pass 2) fires
+    `red.release.gpu.global.add.s32` per contribution; multi-producer.
+  * `ACQUIRE_VS_SEQ` (kernel Y, kernel_a_bwd): spin on
+    `ld_acquire_gpu_global(stamp[tile]) >= seq`. The producer (kernel A /
+    kernel_y_bwd) release-stores a monotonic int64 stamp once per tile
+    after its multi-stripe TMA drain; single-producer.
+
+Expert/pid_m are derived from `tile_id` by a warp-cooperative ballot lookup
+over `expert_pool_block_offset` — each scheduler-warp lane loads one entry (or
+kNumExpertsPerLane entries for E_local > 31), `vote_ballot_sync(cum <= tile_id)`
++ `popc` returns `expert_id + 1`, and a `shuffle_sync` from the matching lane
+gives the cum for `pid_m`. The pool row offset `cu_seqlens_m[expert_id] +
+pid_m * tile_m` lands at the right rows via the standard varlen_m TMA path —
+no per-tile gather.
+
+Wave behavior is structural (not enforced): dispatch's Pass 2 fires
+`pool_arrival_count` in expert-major order at substream end. Linear claim
+order == tile_id order == expert-major order, so 80 CTAs naturally converge
+on the same expert at the same time and L2 holds 1-2 W1[e] slabs throughout.
 
 Scheduler payload (sched_smem): the upstream 4-int layout
 ``(pid_m, pid_n, batch_idx, is_valid)``. tile_id is computed locally in the
@@ -138,18 +147,22 @@ class StreamingTileScheduler(TileScheduler):
     Each persistent CTA's scheduler warp atomic-add-claims a linear work index
     `linear_idx = atomic_add(consumer_head, 1)`. The linear index decomposes
     into `(tile_id, pid_n) = divmod(linear_idx, num_pid_n)`. The scheduler
-    spins on `tile_ready[tile_id]` until dispatch's Pass 2 releases
-    (>= dispatch_seq). Expert/pid_m are derived from `tile_id` by a
+    selects the per-tile ready spin via `SpinKind`: count-vs-target on
+    (`pool_arrival_count`, `pool_arrival_target`) for the multi-producer
+    dispatch handoffs, or acquire-vs-seq on (`stamp`, `dispatch_seq`) for
+    the single-producer epilogue handoffs. Expert/pid_m are derived from
+    `tile_id` by a
     warp-cooperative ballot lookup over `expert_pool_block_offset` (replaces
     the per-claim `tile_id_to_expert` + `expert_pool_block_offset` GMEM reads
     with one warp-collective ballot+popc and one shuffle). The standard
     varlen_m path's `cu_seqlens_m[expert_id] + pid_m * tile_m` formula then
     lands the correct pool row.
 
-    Wave behavior for free: dispatch's Pass 2 fires tile_ready in expert-major
-    order at substream end. Linear claim order == tile_id order == expert-major
-    order, so 80 CTAs naturally converge on the same expert at the same time
-    and L2 holds 1-2 W1[e] slabs throughout.
+    Wave behavior for free: dispatch's Pass 2 fires `pool_arrival_count`
+    release-adds in expert-major order at substream end. Linear claim order
+    == tile_id order == expert-major order, so 80 CTAs naturally converge
+    on the same expert at the same time and L2 holds 1-2 W1[e] slabs
+    throughout.
 
     The work tile produced for the consumer warps carries the upstream-shape
     tuple `(pid_m, pid_n, None, batch_idx)`:
@@ -316,18 +329,22 @@ class StreamingTileScheduler(TileScheduler):
              ``pid_m = tile_id - expert_pool_block_offset[expert_id]`` falls out
              of a single ``shuffle_sync`` from the lane holding the matching
              cum.
-          3. Lane 0 spins on ``tile_ready[tile_id]`` until value >= dispatch_seq
-             — dispatch's Pass 2 release-stores it once pool_arrival_count
-             reaches its target for that tile.
+          3. Lane 0 runs the per-tile ready spin selected by ``spin_kind``:
+             either count-vs-target on
+             ``pool_arrival_count[tile] == pool_arrival_target[tile]`` (kernel
+             A / kernel_y_bwd), or acquire-vs-seq on
+             ``ld_acquire(stamp[tile]) >= dispatch_seq`` (kernel Y /
+             kernel_a_bwd).
 
         Combined with the consumer's varlen_m path that reads
         ``cu_seqlens_m = expert_pool_block_offset * tile_m``, the m-offset
         ``cu_seqlens_m[expert_id] + pid_m * tile_m`` lands at the correct
         pool row.
 
-        Because dispatch's Pass 2 fires tile_ready in expert-major order at
-        substream end, linear-claim CTAs naturally walk experts in waves: 80
-        CTAs all start on expert 0's tile range, drain it, advance to expert 1, etc.
+        Because dispatch's Pass 2 fires `pool_arrival_count` release-adds in
+        expert-major order at substream end, linear-claim CTAs naturally walk
+        experts in waves: 80 CTAs all start on expert 0's tile range, drain
+        it, advance to expert 1, etc.
         """
         params = self.params
         total_work = params.total_tiles * params.num_pid_n

@@ -38,9 +38,11 @@ by chain-rule linearity in dpostact). All atomic-scatter mechanics
 release) are inherited verbatim from `kernel_y.py`.
 
 Shares streaming machinery with fwd kernels:
-  * `StreamingTileScheduler` for linear-claim + per-tile ready spin.
-    Substitutions: `tile_ready` → `bwd_a_ready`, `dispatch_seq` from saved
-    handle.
+  * `StreamingTileScheduler` for linear-claim + per-tile ready spin. Kernel
+    A_bwd uses `SpinKind.ACQUIRE_VS_SEQ` on (`bwd_a_ready`, `dispatch_seq`)
+    — kernel_y_bwd fires the int64 stamp once per tile after its
+    multi-stripe TMA drain. Mirrors fwd kernel Y's protocol on the
+    epilogue handoff.
   * Pool-layout `StreamingHandle` carries `pool_recv_token`,
     `bwd_k_local_remaining` (initialized from saved `k_local_total`),
     `bwd_a_done_per_token`, `dL_dx_per_r`,

@@ -386,11 +386,13 @@ class StreamMoEFunc(torch.autograd.Function):
           combine_grads    on streams.combine
 
         Inter-stage waits are per-tile / per-recv-token system-scope
-        release/acquire stamps embedded in the kernels (`bwd_y_ready` →
-        kernel_y_bwd, `bwd_a_ready` → kernel_a_bwd, `bwd_a_done_per_token`
-        → combine_grads). No `cudaStreamWaitEvent` between bwd stages — the
-        per-tile acquire-spins inside each kernel handle cross-stream
-        visibility.
+        release/acquire signals embedded in the kernels: dispatch_grads's
+        `pool_arrival_count` release-adds → kernel_y_bwd's count-vs-target
+        spin; kernel_y_bwd's `bwd_a_ready` int64 release-stores →
+        kernel_a_bwd's acquire-vs-seq spin; kernel_a_bwd's
+        `bwd_a_done_per_token` → combine_grads. No `cudaStreamWaitEvent`
+        between bwd stages — the per-tile spins inside each kernel handle
+        cross-stream visibility.
 
         kernel_y_bwd writes THREE outputs (mD = dL_dswiglu_in,
         mPostAct = postact_a_for_dW2, mColVecReduce = dL_dweight via

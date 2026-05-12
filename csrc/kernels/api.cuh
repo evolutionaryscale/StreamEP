@@ -428,7 +428,8 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // Backward dispatch_grads (internode). Same architectural shape as
 // `intranode::launch_dispatch_grads_main` (sender ships dL/dy → expert
 // ranks; receiver uses fwd-persisted `recv_token_to_slots` to scatter
-// `dL_do_pool[slot]` K times per packet; Pass 2 fires `bwd_y_ready`),
+// `dL_do_pool[slot]` K times per packet; Pass 2 release-adds into
+// `bwd_dispatch_arrival_count`),
 // scaled to the RDMA + NVL hierarchy. Reuses fwd dispatch's wire format
 // — the per-token bytes carry data + SourceMeta + topk_* but bwd only
 // writes/reads the data region; metadata bytes are zero from

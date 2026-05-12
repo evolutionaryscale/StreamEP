@@ -11,7 +11,9 @@ chain rule on `o = postact_a @ W2.T` and `postact_a = silu(gate) * up`:
   postact_a_for_dW2[slot]  = pool_topk_weight[slot] * postact[slot]   (WEIGHTED, fed to dW2)
 
 Per tile:
-  * Streaming scheduler acquire-spins on `bwd_y_ready[tile_id] >= dispatch_seq`.
+  * Streaming scheduler count-vs-target spins on
+    `bwd_dispatch_arrival_count[tile] == pool_arrival_target[tile]` (the same
+    target fwd uses; dispatch_grads's Pass 2 re-fires release-adds against it).
   * Standard varlen_m strided TMA load of `dL_do_pool[tile_id * tile_M : ..., :]`
     (the row offset `cu_seqlens_m[expert_id] + pid_m * tile_m` lands on the
     correct pool-major row by construction — same path fwd kernel A uses on
@@ -78,9 +80,11 @@ vanilla streaming GEMM with a pre-materialised A operand — no in-kernel
 SwiGLU bwd, no preact load.
 
 Shares streaming machinery with fwd kernels:
-  * `StreamingTileScheduler` for linear-claim + per-tile ready spin
-    (substitutions: `tile_ready` → `bwd_y_ready`, `dispatch_seq` from saved
-    handle).
+  * `StreamingTileScheduler` for linear-claim + per-tile ready spin. Kernel
+    Y_bwd uses `SpinKind.COUNT_VS_TARGET` on
+    (`bwd_dispatch_arrival_count`, `pool_arrival_target`) — fired by
+    dispatch_grads's Pass 2 release-adds. Mirrors fwd kernel A's protocol on
+    the bwd dispatch handoff.
   * `TileReadyRelease` EpiOp from `kernel_a.py` (per-tile drain +
     multi-pid_n gating + system-scope release-store) — bwd reuses verbatim;
     only the destination tensor changes (bwd_a_ready instead of a_ready).
@@ -591,9 +595,11 @@ def streaming_moe_y_bwd(
     GEMM and to dW1's grouped GEMM — no separate SwiGLU-bwd materialisation
     step needed.
 
-    Streamed via per-tile acquire-spin on `bwd_y_ready` and per-tile
-    release-store on `bwd_a_ready` (mirror of fwd kernel A's `tile_ready` /
-    `a_ready` handshake — different tensors, identical signaling).
+    Streamed via per-tile count-vs-target spin on
+    (`bwd_dispatch_arrival_count`, `pool_arrival_target`) for the input
+    handoff and per-tile int64 release-store on `bwd_a_ready` for the output
+    handoff (mirror of fwd kernel A's `pool_arrival_count` / `a_ready`
+    handshake — different tensors, same protocols).
 
     ``num_sms`` caps the persistent-grid CTA count. ``None`` (default) fills the
     GPU; smaller caps leave SMs available for the other backward kernels to
@@ -605,10 +611,11 @@ def streaming_moe_y_bwd(
         are naturally ordered with the allocations).
       - **zero-initialising ``dL_dweight``** on the same stream (the kernel
         atomic-adds into it; non-zero starting values would corrupt).
-      - ensuring ``bwd_y_ready`` is populated by the producer
-        (``dispatch_grads_main_kernel``'s Pass 2 or a test stub) on a stream
-        that release-stores ``bwd_y_ready[tile_id] = dispatch_seq`` once the
-        tile's ``dL_do_pool`` rows are ready. The per-tile acquire-spin
+      - ensuring ``bwd_dispatch_arrival_count`` / ``pool_arrival_target`` are
+        populated by the producer (``dispatch_grads_main_kernel``'s Pass 2 or
+        a test stub) on a stream that ``red.release.gpu.global.add.s32``s
+        into ``bwd_dispatch_arrival_count[tile_id]`` until it equals
+        ``pool_arrival_target[tile_id]``. The per-tile count-vs-target spin
         handles cross-stream visibility.
 
     The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
