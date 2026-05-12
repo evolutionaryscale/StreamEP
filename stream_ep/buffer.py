@@ -1,8 +1,8 @@
 import os
 import torch
 import torch.distributed as dist
-from dataclasses import dataclass, field
-from typing import Any, Callable, List, Tuple, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
 import stream_ep_cpp
@@ -333,7 +333,7 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
-    def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    def dispatch(self, x: torch.Tensor,
                  topk_idx: torch.Tensor,
                  topk_weights: torch.Tensor,
                  is_token_in_rank: torch.Tensor,
@@ -343,9 +343,14 @@ class Buffer:
                  tile_m: int = 128,
                  dispatch_seq: int = 1,
                  config: Optional[Config] = None) -> \
-            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
-                  'StreamingHandle', EventHandle]:
-        """Streaming-MoE pool-layout dispatch (intranode).
+            Tuple[torch.Tensor, 'StreamingHandle', EventHandle]:
+        """Streaming-MoE pool-layout dispatch.
+
+        Branches on ``self._is_internode()``: routes through
+        ``intranode_dispatch`` for single-RDMA-rank worlds and
+        ``internode_dispatch`` for multi-RDMA-rank worlds. Both topologies
+        share the same return shape (pool + StreamingHandle + metadata event)
+        and the same per-layer cost model (two kernels + one host sync).
 
         Runs on ``torch.cuda.current_stream()``. The caller is expected to wrap
         this call in ``with torch.cuda.stream(dispatch_stream):`` so dispatch's
@@ -363,7 +368,8 @@ class Buffer:
         and the dispatch main kernel (pool-layout receiver). The returned
         ``metadata_done_event`` is recorded between the two kernels so consumer
         streams can read metadata tensors without serializing against dispatch
-        main. See ``csrc/deep_ep.cpp:intranode_dispatch`` for the full sequence.
+        main. See ``csrc/deep_ep.cpp:intranode_dispatch`` /
+        ``csrc/deep_ep.cpp:internode_dispatch`` for the full sequence.
 
         Arguments:
             x: tokens to dispatch, ``[num_tokens, hidden]`` bf16.
@@ -380,11 +386,12 @@ class Buffer:
             handle: ``StreamingHandle`` carrying pool tensors + per-tile metadata
                 + recv-token-indexed combine inputs.
             metadata_done_event: ``EventHandle`` recorded between
-                ``tile_arrays_init`` and the dispatch main kernel. Use as
-                ``compute_a_stream.wait_event(metadata_done_event)`` (or the
-                equivalent ``metadata_done_event.wait(compute_a_stream)``) to
-                make a consumer stream see metadata-tensor writes without
-                serializing against dispatch main.
+                ``streaming_dispatch_metadata`` and the dispatch main kernel.
+                Use as ``compute_a_stream.wait_event(metadata_done_event)``
+                (or the equivalent
+                ``metadata_done_event.wait(compute_a_stream)``) to make a
+                consumer stream see metadata-tensor writes without serializing
+                against dispatch main.
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
 

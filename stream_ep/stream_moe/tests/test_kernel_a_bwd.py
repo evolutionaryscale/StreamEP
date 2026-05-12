@@ -345,7 +345,7 @@ def test_streaming_moe_a_bwd_padding_rows(device):
     # Each tile: slots 0..99 → recv-tokens 0..99 (valid),
     # slots 100..127 padding (-1). K_local per recv-token = 2.
     pool_recv_token_list = []
-    for t in range(total_tiles):
+    for _ in range(total_tiles):
         for m in range(tile_m):
             if m < T_recv:
                 pool_recv_token_list.append(m)

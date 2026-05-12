@@ -196,6 +196,7 @@ class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
     class EpilogueArguments(NamedTuple):
         tile_ready: TileReadyParams
         mPostAct: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
+        # Unused: overridden `epi_visit_subtile` bypasses `act_fn`. See class docstring.
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None

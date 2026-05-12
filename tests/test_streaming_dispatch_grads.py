@@ -51,7 +51,6 @@ def main():
     num_sms = 24
     Buffer.set_num_sms(num_sms)
     num_experts = 64
-    num_local_experts = num_experts // world_size
     num_topk = 4
     num_tokens = 256
     hidden = 256

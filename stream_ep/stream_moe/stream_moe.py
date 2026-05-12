@@ -1,8 +1,10 @@
-"""Streaming-MoE forward layer: dispatch → kernel A → kernel Y → combine on four streams.
+"""Streaming-MoE layer: dispatch → kernel A → kernel Y → combine on six streams.
 
-Streams are caller-owned — created once via :func:`make_streams` and passed
-in as a :class:`StreamHolder`. Per-call inputs vary (routing changes
-layer-to-layer in production), and so do the per-call intermediate
+Forward runs on four caller-owned streams (dispatch / compute_a / compute_y /
+combine); backward adds two dedicated dW streams (``w1`` / ``w2``) for the
+dW1 / dW2 grouped GEMMs. Streams are created once via :func:`make_streams`
+and passed in as a :class:`StreamHolder`. Per-call inputs vary (routing
+changes layer-to-layer in production), and so do the per-call intermediate
 allocations: ``postact_a`` is sized by ``total_tiles × tile_M × I`` (varies
 with routing). The kernel-Y output ``handle.o`` is allocated by DeepEP inside
 ``Buffer.dispatch`` at ``[T_recv, hidden]`` zero-init; kernel Y atomic-scatters
@@ -11,7 +13,7 @@ separate stream — its per-warp send loop spins on
 ``handle.compute_done_per_token[r] >= dispatch_seq`` (the per-token gate)
 before pushing ``o[r]`` back to ``r``'s origin rank.
 
-Within a layer the four streams overlap (intra-layer); across layers they
+Within a layer the forward streams overlap (intra-layer); across layers they
 serialize via the layer-start ``streams.dispatch.wait_stream(caller)`` and
 layer-end ``caller.wait_stream(...)`` back-edges. See design.md §"Cross-stream
 sync chain per layer".
@@ -27,12 +29,13 @@ collapse the overlap window (the entire dispatch_main is only ~190 µs).
 
 Public surface
 --------------
-* :class:`StreamHolder` — dataclass holding the four caller-owned streams.
+* :class:`StreamHolder` — dataclass holding the six caller-owned streams
+  (four forward, plus ``w1`` / ``w2`` for backward dW1 / dW2).
 * :func:`make_streams` — construct a ``StreamHolder`` for a given device.
 * :class:`StreamMoEFunc` — ``torch.autograd.Function`` running the layer
   forward and backward. Backward orchestrates dispatch_grads → kernel_y_bwd
-  → kernel_a_bwd → combine_grads on the same four streams as forward, with
-  dW1 / dW2 grouped GEMMs in the compute_a / compute_y tails.
+  → kernel_a_bwd → combine_grads on the same four forward streams, with
+  dW1 / dW2 grouped GEMMs on the dedicated ``w1`` / ``w2`` side streams.
 * :func:`stream_moe_func` — thin wrapper around ``StreamMoEFunc.apply`` with
   the public keyword-arg API.
 """
@@ -417,7 +420,6 @@ class StreamMoEFunc(torch.autograd.Function):
         handle = ctx.handle
         tile_m: int = ctx.tile_m
         tile_n_a: int = ctx.tile_n_a
-        tile_n_y: int = ctx.tile_n_y
         tile_n_y_bwd: int = ctx.tile_n_y_bwd
         tile_n_a_bwd: int = ctx.tile_n_a_bwd
         # dW tile overrides — fall back to (tile_m, tile_n_a) when None.
