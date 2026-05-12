@@ -44,10 +44,10 @@ DeepEP-style stand-alone scripts (no pytest):
 
 ```bash
 # Cross-rank streaming-dispatch correctness (8 GPU intranode):
-pixi run --manifest-path .../pixi.toml python tests/test_streaming_dispatch.py
-pixi run --manifest-path .../pixi.toml python tests/test_streaming_combine.py
-pixi run --manifest-path .../pixi.toml python tests/test_streaming_dispatch_grads.py
-pixi run --manifest-path .../pixi.toml python tests/test_streaming_combine_grads.py
+pixi run --manifest-path .../pixi.toml python tests/test_dispatch.py
+pixi run --manifest-path .../pixi.toml python tests/test_combine.py
+pixi run --manifest-path .../pixi.toml python tests/test_dispatch_grads.py
+pixi run --manifest-path .../pixi.toml python tests/test_combine_grads.py
 ```
 
 The streaming-MoE kernel tests at `stream_ep/stream_moe/tests/` are pytest-driven (single-process, small shapes — they exercise the kernel logic, not multi-rank dispatch):
