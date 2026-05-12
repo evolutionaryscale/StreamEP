@@ -3,11 +3,14 @@
 Persistent CTAs claim work via `atomic_add(consumer_head, 1)`; each linear work
 index decomposes into `(tile_id, pid_n)`. Each CTA acquire-spins on
 `tile_ready[tile_id]` (int64, dispatch_seq stamp) until the producer (DeepEP
-dispatch's Pass 2) releases the tile, then reads
-`expert_id = tile_id_to_expert[tile_id]` and computes
-`pid_m = tile_id - expert_pool_block_offset[expert_id]`. Pool layout means the
-pool row offset = `cu_seqlens_m[expert_id] + pid_m * tile_m` lands at the right
-rows via the standard varlen_m TMA path — no per-tile gather.
+dispatch's Pass 2) releases the tile. Expert/pid_m are derived from `tile_id`
+by a warp-cooperative ballot lookup over `expert_pool_block_offset` — each
+scheduler-warp lane loads one entry (or kNumExpertsPerLane entries for
+E_local > 31), `vote_ballot_sync(cum <= tile_id)` + `popc` returns
+`expert_id + 1`, and a `shuffle_sync` from the matching lane gives the cum
+for `pid_m`. The pool row offset `cu_seqlens_m[expert_id] + pid_m * tile_m`
+lands at the right rows via the standard varlen_m TMA path — no per-tile
+gather.
 
 Wave behavior is structural (not enforced): dispatch's Pass 2 fires tile_ready
 in expert-major order at substream end. Linear claim order == tile_id order ==
@@ -63,6 +66,16 @@ class StreamingTileSchedulerArguments:
     GEMM kernel's varlen_m path lands the right rows when given
     ``cu_seqlens_m = expert_pool_block_offset * tile_m`` and the per-tile
     pid_m = tile_id - expert_pool_block_offset[expert_id].
+
+    Expert lookup is warp-cooperative (no per-claim `tile_id_to_expert` GMEM
+    read): each scheduler-warp lane loads one entry of
+    ``expert_pool_block_offset`` (or kNumExpertsPerLane entries for
+    E_local > 31), and a `vote_ballot_sync` + `popc` over `cum <= tile_id`
+    yields ``expert_id + 1`` directly. Drops one GMEM load per claim and
+    retires `tile_id_to_expert` from the scheduler surface. The metadata
+    kernel still emits `tile_id_to_expert` for now; consumers all moved to
+    the ballot lookup, so the array is unread and can be retired in a
+    follow-up cleanup commit.
     """
 
     problem_shape_ntile_mnl: cute.Shape  # (None, num_pid_n, num_local_experts)
@@ -70,10 +83,11 @@ class StreamingTileSchedulerArguments:
     tile_ready: (
         cute.Tensor
     )  # [total_tiles] int64 — release stamps from dispatch's Pass 2
-    tile_id_to_expert: cute.Tensor  # [total_tiles] int32 — per-tile expert lookup
     expert_pool_block_offset: (
         cute.Tensor
-    )  # [E_local + 1] int32 — pool-block prefix-sum (gives pid_m = tile_in_e)
+    )  # [E_local + 1] int32 — pool-block prefix-sum; consulted by the
+    # warp-cooperative ballot lookup below (one entry per scheduler-warp lane,
+    # kNumExpertsPerLane entries for E_local > 31).
     dispatch_seq: Int32  # int64 in real use; kept Int32 here for kernel arg convenience
     total_tiles: Int32  # passed as scalar so launch-time get_grid_shape doesn't deref device tensor
     tile_shape_mn: cutlass.Constexpr[cute.Shape]  # (tile_M, tile_N)
@@ -88,10 +102,12 @@ class StreamingTileScheduler(TileScheduler):
     `linear_idx = atomic_add(consumer_head, 1)`. The linear index decomposes
     into `(tile_id, pid_n) = divmod(linear_idx, num_pid_n)`. The scheduler
     spins on `tile_ready[tile_id]` until dispatch's Pass 2 releases
-    (>= dispatch_seq), then reads `expert_id = tile_id_to_expert[tile_id]` and
-    `pid_m = tile_id - expert_pool_block_offset[expert_id]` (= tile_in_e).
-    The standard varlen_m path's `cu_seqlens_m[expert_id] + pid_m * tile_m`
-    formula then lands the correct pool row.
+    (>= dispatch_seq). Expert/pid_m are derived from `tile_id` by a
+    warp-cooperative ballot lookup over `expert_pool_block_offset` (replaces
+    the per-claim `tile_id_to_expert` + `expert_pool_block_offset` GMEM reads
+    with one warp-collective ballot+popc and one shuffle). The standard
+    varlen_m path's `cu_seqlens_m[expert_id] + pid_m * tile_m` formula then
+    lands the correct pool row.
 
     Wave behavior for free: dispatch's Pass 2 fires tile_ready in expert-major
     order at substream end. Linear claim order == tile_id order == expert-major
@@ -110,7 +126,6 @@ class StreamingTileScheduler(TileScheduler):
     class Params:
         consumer_head: cute.Tensor
         tile_ready: cute.Tensor
-        tile_id_to_expert: cute.Tensor
         expert_pool_block_offset: cute.Tensor
         dispatch_seq: Int32
         total_tiles: Int32
@@ -131,7 +146,6 @@ class StreamingTileScheduler(TileScheduler):
             return StreamingTileScheduler.Params(
                 consumer_head=args.consumer_head,
                 tile_ready=args.tile_ready,
-                tile_id_to_expert=args.tile_id_to_expert,
                 expert_pool_block_offset=args.expert_pool_block_offset,
                 dispatch_seq=args.dispatch_seq,
                 total_tiles=args.total_tiles,
@@ -159,8 +173,10 @@ class StreamingTileScheduler(TileScheduler):
     ):
         # Streaming scheduler state, persisted across the persistent loop's
         # iterations via the MLIR pytree round-trip:
-        #   _current_expert: tile_id_to_expert[tile_id] for the current tile;
-        #     surfaced via tile_coord_mnkl[3] for W1[e] selection.
+        #   _current_expert: the expert containing the current tile (derived
+        #     in _fetch_next_work_idx from the warp-cooperative ballot lookup
+        #     over expert_pool_block_offset). Surfaced via tile_coord_mnkl[3]
+        #     for W1[e] selection.
         #   _current_pid_m: tile_in_e = tile_id - expert_pool_block_offset[expert_id].
         #     Drives the standard varlen_m path's m-offset calculation
         #     (`cu_seqlens_m[expert_id] + pid_m * tile_m`) which lands at the
@@ -248,15 +264,23 @@ class StreamingTileScheduler(TileScheduler):
         the persistent loop. Otherwise:
 
           1. Decompose ``(tile_id, pid_n) = divmod(linear_idx, num_pid_n)``.
-          2. Spin on ``tile_ready[tile_id]`` until value >= dispatch_seq —
-             dispatch's Pass 2 release-stores it once pool_arrival_count
+          2. **Warp-cooperative expert lookup** (overlaps with the spin below).
+             Each scheduler-warp lane loads one entry of
+             ``expert_pool_block_offset`` (or kNumExpertsPerLane entries for
+             E_local > 31). ``vote_ballot_sync(cum <= tile_id)`` + ``popc``
+             returns ``expert_id + 1`` directly (one PTX op of warp-collective
+             work, no per-claim ``tile_id_to_expert`` GMEM read).
+             ``pid_m = tile_id - expert_pool_block_offset[expert_id]`` falls out
+             of a single ``shuffle_sync`` from the lane holding the matching
+             cum.
+          3. Lane 0 spins on ``tile_ready[tile_id]`` until value >= dispatch_seq
+             — dispatch's Pass 2 release-stores it once pool_arrival_count
              reaches its target for that tile.
-          3. Read ``expert_id = tile_id_to_expert[tile_id]``.
-          4. Compute ``pid_m = tile_id - expert_pool_block_offset[expert_id]``
-             (= tile_in_e). Combined with the consumer's varlen_m path that
-             reads ``cu_seqlens_m = expert_pool_block_offset * tile_m``, the
-             m-offset ``cu_seqlens_m[expert_id] + pid_m * tile_m`` lands at
-             the correct pool row.
+
+        Combined with the consumer's varlen_m path that reads
+        ``cu_seqlens_m = expert_pool_block_offset * tile_m``, the m-offset
+        ``cu_seqlens_m[expert_id] + pid_m * tile_m`` lands at the correct
+        pool row.
 
         Because dispatch's Pass 2 fires tile_ready in expert-major order at
         substream end, linear-claim CTAs naturally walk experts in waves: 80
@@ -283,16 +307,72 @@ class StreamingTileScheduler(TileScheduler):
             # the receive side (see write_work_tile_to_smem).
             tile_id, cluster_pid_n = divmod(linear_idx, params.num_pid_n_fdd)
             pid_n = cluster_pid_n * Int32(params.cluster_shape_mnk[1])
+
+            # Lane 0 spins on tile_ready. The acquire-load on `tile_ready` is
+            # release-paired with dispatch's Pass 2 release-store (which fired
+            # AFTER a `threadfence_system` on pool writes AND after metadata's
+            # `expert_pool_block_offset` writes). The acquire here transitively
+            # carries visibility for the subsequent ballot reads of
+            # `expert_pool_block_offset`. Moving the ballot *before* this spin
+            # exposed a coherence window on the first few iters (validated
+            # empirically: ballot-before-spin caused iters 0-4 to read partially
+            # stale values via L1 cache residue from the recycled allocator
+            # slot; ballot-after-spin restores the OLD acquire-fence chain).
             if cute.arch.lane_idx() == 0:
                 ready_ptr = utils.elem_pointer(params.tile_ready, (tile_id,))
                 while ld_acquire_gpu_global(ready_ptr) < cutlass.Int64(
                     params.dispatch_seq
                 ):
                     pass
-                expert_id = params.tile_id_to_expert[tile_id]
-                pid_m = tile_id - params.expert_pool_block_offset[expert_id]
-            expert_id = cute.arch.shuffle_sync(expert_id, 0)
-            pid_m = cute.arch.shuffle_sync(pid_m, 0)
+
+            # Warp-cooperative expert lookup. `expert_pool_block_offset` has
+            # length E_local + 1 (last entry = total_tiles); `kNumExpertsPerLane`
+            # is fixed at 2 here, sized for E_local up to 63 (covers all
+            # configured world sizes: intranode E=384/8=48, internode E=384/16=24).
+            # Out-of-range slots get INT_MAX sentinel so they never match the
+            # ballot; the upper-sentinel cum[E_local]=total_tiles is loaded but
+            # also never matches because tile_id < total_tiles.
+            kNumExpertsPerLane = const_expr(2)
+            # num_local_experts derived from the tensor shape (runtime Int32);
+            # comparison gates per-slot loads to in-range indices.
+            num_local_experts = (
+                cute.size(params.expert_pool_block_offset, mode=[0]) - Int32(1)
+            )
+            lane_idx = cute.arch.lane_idx()
+            INF = Int32(0x7FFFFFFF)
+
+            cum_slots = []
+            for i in cutlass.range_constexpr(kNumExpertsPerLane):
+                e_idx = lane_idx + Int32(i * 32)
+                cum_v = INF
+                if e_idx <= num_local_experts:
+                    cum_v = params.expert_pool_block_offset[e_idx]
+                cum_slots.append(cum_v)
+
+            # Count cums <= tile_id across all slots. Since expert_pool_block_offset
+            # is monotone non-decreasing and INF for out-of-range, the count
+            # equals expert_id + 1 (number of indices 0..expert_id where
+            # cum <= tile_id).
+            n_matched_total = Int32(0)
+            for i in cutlass.range_constexpr(kNumExpertsPerLane):
+                n_matched_total += cute.arch.popc(
+                    cute.arch.vote_ballot_sync(cum_slots[i] <= tile_id)
+                )
+            expert_id = n_matched_total - Int32(1)
+
+            # pid_m = tile_id - expert_pool_block_offset[expert_id].
+            # Shuffle the matching cum from (expert_slot, expert_lane).
+            expert_lane = expert_id % Int32(32)
+            expert_cum = Int32(0)
+            if const_expr(kNumExpertsPerLane == 1):
+                expert_cum = cute.arch.shuffle_sync(cum_slots[0], expert_lane)
+            else:
+                expert_slot = expert_id // Int32(32)
+                for i in cutlass.range_constexpr(kNumExpertsPerLane):
+                    cand = cute.arch.shuffle_sync(cum_slots[i], expert_lane)
+                    if expert_slot == Int32(i):
+                        expert_cum = cand
+            pid_m = tile_id - expert_cum
 
         self._current_expert = expert_id
         self._current_pid_m = pid_m

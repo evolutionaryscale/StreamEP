@@ -201,7 +201,6 @@ class StreamMoEFunc(torch.autograd.Function):
         streams.compute_a.wait_event(metadata_done)
         pool.record_stream(streams.compute_a)
         handle.tile_ready.record_stream(streams.compute_a)
-        handle.tile_id_to_expert.record_stream(streams.compute_a)
         handle.expert_pool_block_offset.record_stream(streams.compute_a)
         handle.a_ready.record_stream(streams.compute_a)
         with torch.cuda.stream(streams.compute_a):
@@ -233,7 +232,6 @@ class StreamMoEFunc(torch.autograd.Function):
                 pool,
                 w1_local,
                 postact_a,
-                handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 handle.tile_ready,
                 handle.a_ready,
@@ -253,7 +251,6 @@ class StreamMoEFunc(torch.autograd.Function):
         # allocator's recycle policy.
         postact_a.record_stream(streams.compute_y)
         streams.compute_y.wait_event(metadata_done)
-        handle.tile_id_to_expert.record_stream(streams.compute_y)
         handle.expert_pool_block_offset.record_stream(streams.compute_y)
         handle.a_ready.record_stream(streams.compute_y)
         handle.pool_recv_token.record_stream(streams.compute_y)
@@ -270,7 +267,6 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.pool_topk_weight,
                 handle.k_local_remaining,
                 handle.y_done_per_token,
-                handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 handle.a_ready,
                 compute_seq=handle.dispatch_seq,
@@ -577,7 +573,6 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.pool_recv_token,
                 preact_a,
                 dL_dweight,
-                handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 bwd_y_ready,
                 bwd_a_ready,
@@ -619,7 +614,6 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.pool_recv_token,
                 bwd_k_local_remaining,
                 bwd_a_done_per_token,
-                handle.tile_id_to_expert,
                 handle.expert_pool_block_offset,
                 bwd_a_ready,
                 dispatch_seq=handle.dispatch_seq,

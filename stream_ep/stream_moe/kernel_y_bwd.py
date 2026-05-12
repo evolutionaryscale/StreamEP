@@ -339,7 +339,6 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
             tile_ready=scheduler_args.tile_ready,
-            tile_id_to_expert=scheduler_args.tile_id_to_expert,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             dispatch_seq=scheduler_args.dispatch_seq,
             total_tiles=scheduler_args.total_tiles,
@@ -460,7 +459,6 @@ def _compile_streaming_moe_y_bwd(
     # Scheduler tensors
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     bwd_y_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    tile_id_to_expert = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -471,7 +469,6 @@ def _compile_streaming_moe_y_bwd(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
         tile_ready=bwd_y_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         dispatch_seq=Int64(0),
         total_tiles=Int32(0),
@@ -536,7 +533,6 @@ def streaming_moe_y_bwd(
     pool_recv_token: torch.Tensor,  # (TK_padded,) int32 — -1 marks padding (from saved handle)
     preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16 — saved from fwd kernel A's mD
     dL_dweight: torch.Tensor,  # (TK_padded,) fp32 — ZERO-INIT; per-pid_n atomic-add target
-    tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
     bwd_y_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps (from dispatch_grads)
     bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — output ready stamps (to kernel_a_bwd)
@@ -653,7 +649,6 @@ def streaming_moe_y_bwd(
         f"got {tuple(pool_recv_token.shape)}"
     )
     assert pool_recv_token.dtype == torch.int32
-    assert tile_id_to_expert.shape == (total_tiles,)
     assert bwd_y_ready.shape == (total_tiles,) and bwd_y_ready.dtype == torch.int64
     assert bwd_a_ready.shape == (total_tiles,) and bwd_a_ready.dtype == torch.int64
     # preact contract — bf16 (total_tiles, tile_m, 2*I), same dtype as
@@ -810,7 +805,6 @@ def streaming_moe_y_bwd(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
         tile_ready=bwd_y_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         dispatch_seq=Int64(dispatch_seq),
         total_tiles=Int32(total_tiles),

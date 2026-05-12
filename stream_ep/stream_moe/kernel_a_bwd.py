@@ -152,7 +152,6 @@ class StreamingMoeABwd(StreamingMoeY):
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
             tile_ready=scheduler_args.tile_ready,
-            tile_id_to_expert=scheduler_args.tile_id_to_expert,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             dispatch_seq=scheduler_args.dispatch_seq,
             total_tiles=scheduler_args.total_tiles,
@@ -267,7 +266,6 @@ def _compile_streaming_moe_a_bwd(
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     bwd_a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    tile_id_to_expert = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -276,7 +274,6 @@ def _compile_streaming_moe_a_bwd(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
         tile_ready=bwd_a_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         dispatch_seq=Int64(0),
         total_tiles=Int32(0),
@@ -316,7 +313,6 @@ def streaming_moe_a_bwd(
     pool_recv_token: torch.Tensor,  # (TK_padded,) int32
     bwd_k_local_remaining: torch.Tensor,  # (T_recv,) int32 — initialised from K_local_count
     bwd_a_done_per_token: torch.Tensor,  # (T_recv,) int64 — zero-init
-    tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
     bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps
     dispatch_seq: int,
@@ -386,7 +382,6 @@ def streaming_moe_a_bwd(
     assert bwd_k_local_remaining.dtype == torch.int32
     assert bwd_a_done_per_token.shape == (T_recv,)
     assert bwd_a_done_per_token.dtype == torch.int64
-    assert tile_id_to_expert.shape == (total_tiles,)
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert bwd_a_ready.shape == (total_tiles,)
     assert bwd_a_ready.dtype == torch.int64
@@ -469,7 +464,6 @@ def streaming_moe_a_bwd(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
         tile_ready=bwd_a_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         dispatch_seq=Int64(dispatch_seq),
         total_tiles=Int32(total_tiles),

@@ -320,7 +320,6 @@ class StreamingMoeYSchedulerOptions(NamedTuple):
     max_active_clusters: Int32
     consumer_head: cute.Tensor
     a_ready: cute.Tensor
-    tile_id_to_expert: cute.Tensor
     expert_pool_block_offset: cute.Tensor
     compute_seq: Int64
     total_tiles: Int32
@@ -570,7 +569,6 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
             tile_ready=scheduler_args.a_ready,
-            tile_id_to_expert=scheduler_args.tile_id_to_expert,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             dispatch_seq=scheduler_args.compute_seq,
             total_tiles=scheduler_args.total_tiles,
@@ -685,7 +683,6 @@ def _compile_streaming_moe_y(
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    tile_id_to_expert = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -694,7 +691,6 @@ def _compile_streaming_moe_y(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
         a_ready=a_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         compute_seq=Int64(0),
         total_tiles=Int32(0),
@@ -737,7 +733,6 @@ def streaming_moe_y(
     pool_topk_weight: torch.Tensor,  # (TK_padded,) float32
     k_local_remaining: torch.Tensor,  # (T_recv,) int32
     y_done_per_token: torch.Tensor,  # (T_recv,) int64
-    tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
     a_ready: torch.Tensor,  # (total_tiles,) int64
     compute_seq: int,
@@ -788,7 +783,6 @@ def streaming_moe_y(
     assert k_local_remaining.dtype == torch.int32
     assert y_done_per_token.shape == (T_recv,)
     assert y_done_per_token.dtype == torch.int64
-    assert tile_id_to_expert.shape == (total_tiles,)
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert a_ready.shape == (total_tiles,)
     assert a_ready.dtype == torch.int64
@@ -865,7 +859,6 @@ def streaming_moe_y(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
         a_ready=a_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         compute_seq=Int64(compute_seq),
         total_tiles=Int32(total_tiles),

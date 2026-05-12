@@ -167,8 +167,10 @@ class StreamingTileSchedulerOptions(NamedTuple):
     tile_ready: (
         cute.Tensor
     )  # [total_tiles] int64 — release stamps from dispatch's Pass 2
-    tile_id_to_expert: cute.Tensor  # [total_tiles] int32 — per-tile expert lookup
-    expert_pool_block_offset: cute.Tensor  # [E_local + 1] int32 — pool-block prefix-sum
+    expert_pool_block_offset: (
+        cute.Tensor
+    )  # [E_local + 1] int32 — pool-block prefix-sum. Source for the
+    # warp-cooperative ballot lookup that retired per-claim `tile_id_to_expert`.
     dispatch_seq: Int64
     total_tiles: Int32  # passed as scalar so get_grid_shape doesn't deref device tensor
 
@@ -261,7 +263,6 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
             tile_ready=scheduler_args.tile_ready,
-            tile_id_to_expert=scheduler_args.tile_id_to_expert,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             dispatch_seq=scheduler_args.dispatch_seq,
             total_tiles=scheduler_args.total_tiles,
@@ -341,7 +342,6 @@ def _compile_streaming_moe_a(
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     tile_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
-    tile_id_to_expert = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -352,7 +352,6 @@ def _compile_streaming_moe_a(
         max_active_clusters=Int32(0),  # set at runtime; 0 here keeps fake compile happy
         consumer_head=consumer_head,
         tile_ready=tile_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         dispatch_seq=Int64(0),
         total_tiles=Int32(0),
@@ -479,7 +478,6 @@ def streaming_moe_a(
     pool: torch.Tensor,  # (TK_padded, H) bf16 — k-major (pool data, expert-major)
     W1: torch.Tensor,  # (E_local, 2I, H) bf16 — k-major per expert
     postact_a: torch.Tensor,  # (total_tiles, tile_M, I) bf16
-    tile_id_to_expert: torch.Tensor,  # (total_tiles,) int32
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
     tile_ready: torch.Tensor,  # (total_tiles,) int64 release stamps (input from dispatch)
     a_ready: torch.Tensor,  # (total_tiles,) int64 release stamps (output to kernel Y)
@@ -539,7 +537,6 @@ def streaming_moe_a(
     assert postact_a.dim() == 3
     total_tiles, postact_tile_m, I = postact_a.shape
     assert postact_tile_m == tile_m
-    assert tile_id_to_expert.shape == (total_tiles,)
     assert tile_ready.shape == (total_tiles,) and tile_ready.dtype == torch.int64
     assert a_ready.shape == (total_tiles,) and a_ready.dtype == torch.int64
     H = pool.shape[1]
@@ -650,7 +647,6 @@ def streaming_moe_a(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
         tile_ready=tile_ready,
-        tile_id_to_expert=tile_id_to_expert,
         expert_pool_block_offset=expert_pool_block_offset,
         dispatch_seq=Int64(dispatch_seq),
         total_tiles=Int32(total_tiles),
