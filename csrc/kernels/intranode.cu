@@ -798,21 +798,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
             for (int e = 0; e < E; ++e) {
                 int n_writes_for_e = seen_substream[e];
                 if (n_writes_for_e == 0) continue;
-                int slot_start_e = base_pool_substream[e];
-                int slot_end_e = slot_start_e + n_writes_for_e;
-                int first_block = slot_start_e / shape.tile_m;
-                int last_block = (slot_end_e - 1) / shape.tile_m;
-                for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                    int block_slot_start = block_id * shape.tile_m;
-                    int block_slot_end = block_slot_start + shape.tile_m;
-                    int writes_in_block =
-                        min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-                    int cnt_before = atomicAdd(&tile_signal.pool_arrival_count[block_id], writes_in_block);
-                    if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
-                        memory_fence();
-                        st_release_sys_global(tile_signal.tile_ready + block_id, tile_signal.dispatch_seq);
-                    }
-                }
+                fire_pool_blocks(base_pool_substream[e], n_writes_for_e, shape.tile_m,
+                                 tile_signal.pool_arrival_count,
+                                 tile_signal.pool_arrival_target,
+                                 tile_signal.tile_ready, tile_signal.dispatch_seq);
             }
         }
     }
@@ -1126,21 +1115,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
             for (int e = 0; e < E; ++e) {
                 int n_writes_for_e = seen_substream[e];
                 if (n_writes_for_e == 0) continue;
-                int slot_start_e = base_pool_substream[e];
-                int slot_end_e = slot_start_e + n_writes_for_e;
-                int first_block = slot_start_e / shape.tile_m;
-                int last_block = (slot_end_e - 1) / shape.tile_m;
-                for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                    int block_slot_start = block_id * shape.tile_m;
-                    int block_slot_end = block_slot_start + shape.tile_m;
-                    int writes_in_block =
-                        min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-                    int cnt_before = atomicAdd(&tile_signal.bwd_dispatch_arrival_count[block_id], writes_in_block);
-                    if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
-                        memory_fence();
-                        st_release_sys_global(tile_signal.bwd_y_ready + block_id, tile_signal.dispatch_seq);
-                    }
-                }
+                fire_pool_blocks(base_pool_substream[e], n_writes_for_e, shape.tile_m,
+                                 tile_signal.bwd_dispatch_arrival_count,
+                                 tile_signal.pool_arrival_target,
+                                 tile_signal.bwd_y_ready, tile_signal.dispatch_seq);
             }
         }
     }

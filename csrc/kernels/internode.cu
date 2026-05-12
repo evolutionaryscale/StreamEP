@@ -1644,20 +1644,10 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                             if (!((newly_complete >> e_local) & 1)) continue;
                             int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
                             int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
-                            int slot_end_e = slot_start_e + my_seen;
-                            int first_block = slot_start_e / shape.tile_m;
-                            int last_block = (slot_end_e - 1) / shape.tile_m;
-                            for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                                int block_slot_start = block_id * shape.tile_m;
-                                int block_slot_end = block_slot_start + shape.tile_m;
-                                int writes_in_block =
-                                    min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-                                int cnt_before = atomicAdd(&tile_signal.pool_arrival_count[block_id], writes_in_block);
-                                if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
-                                    memory_fence();
-                                    st_release_sys_global(tile_signal.tile_ready + block_id, tile_signal.dispatch_seq);
-                                }
-                            }
+                            fire_pool_blocks(slot_start_e, my_seen, shape.tile_m,
+                                             tile_signal.pool_arrival_count,
+                                             tile_signal.pool_arrival_target,
+                                             tile_signal.tile_ready, tile_signal.dispatch_seq);
                         }
                     }
                 }
@@ -2749,20 +2739,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                             if (!((newly_complete >> e_local) & 1)) continue;
                             int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
                             int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
-                            int slot_end_e = slot_start_e + my_seen;
-                            int first_block = slot_start_e / shape.tile_m;
-                            int last_block = (slot_end_e - 1) / shape.tile_m;
-                            for (int block_id = first_block; block_id <= last_block; ++block_id) {
-                                int block_slot_start = block_id * shape.tile_m;
-                                int block_slot_end = block_slot_start + shape.tile_m;
-                                int writes_in_block =
-                                    min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-                                int cnt_before = atomicAdd(&tile_signal.bwd_dispatch_arrival_count[block_id], writes_in_block);
-                                if (cnt_before + writes_in_block == tile_signal.pool_arrival_target[block_id]) {
-                                    memory_fence();
-                                    st_release_sys_global(tile_signal.bwd_y_ready + block_id, tile_signal.dispatch_seq);
-                                }
-                            }
+                            fire_pool_blocks(slot_start_e, my_seen, shape.tile_m,
+                                             tile_signal.bwd_dispatch_arrival_count,
+                                             tile_signal.pool_arrival_target,
+                                             tile_signal.bwd_y_ready, tile_signal.dispatch_seq);
                         }
                     }
                 }

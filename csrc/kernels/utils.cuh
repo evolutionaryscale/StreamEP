@@ -131,6 +131,37 @@ __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int
     return ret;
 }
 
+// Pool-block fire helper. Given a contiguous slot range
+// `[slot_start_e, slot_start_e + n_writes_for_e)` that one substream / warp
+// just landed for some expert, walk the pool blocks the range overlaps,
+// atomic-add this contributor's per-block writes, and release-store
+// `ready[block_id] = dispatch_seq` on the contributor whose add tipped the
+// block to its target. Caller must have already fenced its pool writes to
+// system scope before calling — block-overlap math + release semantics live
+// here; the visibility argument lives at the call site.
+//
+// Used in 4 places (fwd/bwd × intranode/internode) — each picks its own
+// `arrival_count` / `ready` pair to thread per pool-block expert progress.
+__device__ __forceinline__ void fire_pool_blocks(
+    int slot_start_e, int n_writes_for_e, int tile_m,
+    int* arrival_count, const int* arrival_target,
+    int64_t* ready, int64_t dispatch_seq) {
+    int slot_end_e = slot_start_e + n_writes_for_e;
+    int first_block = slot_start_e / tile_m;
+    int last_block = (slot_end_e - 1) / tile_m;
+    for (int block_id = first_block; block_id <= last_block; ++block_id) {
+        int block_slot_start = block_id * tile_m;
+        int block_slot_end = block_slot_start + tile_m;
+        int writes_in_block =
+            min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
+        int cnt_before = atomicAdd(&arrival_count[block_id], writes_in_block);
+        if (cnt_before + writes_in_block == arrival_target[block_id]) {
+            memory_fence();
+            st_release_sys_global(ready + block_id, dispatch_seq);
+        }
+    }
+}
+
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
     int ret;
     asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
