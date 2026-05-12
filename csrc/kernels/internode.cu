@@ -56,7 +56,8 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 // and removes the need for inter-iter cleanup memsets on
 // `nvl_channel_prefix_start/end`, `nvl_channel_head`, and
 // `nvl_channel_tail`. NVLink writes are intra-node coherent, so no amo /
-// L2-line-pack trick is required (unlike the RDMA meta region in C3).
+// L2-line-pack trick is required (unlike the RDMA meta region — see the
+// 128-byte alignment block below for the sentinel-amo coherence rationale).
 //
 // Wrap horizon: 32-bit seq window, one increment per kernel call, so
 // ~2^31 distinct iter tags / phase before aliasing. With the phase bit
@@ -104,8 +105,8 @@ __forceinline__ __device__ void atomicmax_reader_prev_cumulative(uint32_t* prev_
 
 // Round `gbl_ptr` up to a 128-byte boundary in place. Used before allocating
 // the RDMA dispatch meta SymBuffer so each 32-int (=128B) slab aligns to a
-// single H100 L2 cache line — required for the C3 sentinel-amo coherence
-// trick (sender bulk_put → amo_nonfetch_add(slot 30) on the same QP; the
+// single H100 L2 cache line — required for sentinel-amo coherence: sender
+// bulk_put → amo_nonfetch_add(slot 30) on the same QP; the
 // amo invalidates the entire 128B line on the receiver, so subsequent reads
 // of slots 0..17 return HBM values rather than stale L2). The 128B base
 // alignment of `rdma_buffer_ptr` (NUM_BUFFER_ALIGNMENT_BYTES) is preserved
@@ -182,7 +183,7 @@ __global__ void streaming_dispatch_metadata_kernel(
         int num_channels,
         int expert_alignment,
         int tile_m,
-        // Streaming SymBuffer offset within rdma_buffer_ptr (post notify_dispatch's payload)
+        // Streaming SymBuffer offset within rdma_buffer_ptr (post the leading count-exchange payload)
         int64_t streaming_rdma_offset,
         // Env
         void* rdma_buffer_ptr,
@@ -352,14 +353,13 @@ __global__ void streaming_dispatch_metadata_kernel(
     }
     __syncthreads();
 
-    // ── Phase A4: build + send notify_dispatch's count payload via RDMA.
-    // (Phase A3 retired in C4: the inter-iter IBGDA quiet + nvshmem_sync +
-    // NVL barrier — formerly required because the dispatch ring slots
-    // reset to 0 each iter and needed all peer WRs drained before the
-    // memset — are unnecessary now that every polled slot is iter-
-    // disambiguated by its cumulative protocol. The metadata kernel's own
-    // RDMA puts in this phase remain bracketed by their own quiet + sync
-    // below; only the upfront cross-iter drain is gone.)
+    // ── Phase A4: build + send the count payload via RDMA.
+    // No upfront inter-iter IBGDA quiet + nvshmem_sync + NVL barrier is
+    // needed — every polled slot is iter-disambiguated by its cumulative
+    // protocol (RDMA head/tail and NVL gen-stamp), so dispatch ring slots
+    // no longer need a pre-iter cross-rank drain. The metadata kernel's
+    // own RDMA puts in this phase remain bracketed by their own quiet +
+    // sync below; only the upfront cross-iter drain is gone.
     auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr,
         NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
 
@@ -511,9 +511,8 @@ __global__ void streaming_dispatch_metadata_kernel(
     //
     // Layout the per-rank NVL slab: per writer (src_nvl) slot of
     //   [kNumRDMARanks][num_channels][E_local] int32.
-    // (Mirrors notify_dispatch's nvl_send/recv pattern: writer w writes to
-    //  peer m's region at slot indexed by w; receiver reads its own region
-    //  at slot=src_nvl.)
+    // Per-NVL-slot send/recv pattern: writer w writes to peer m's region at
+    // slot indexed by w; receiver reads its own region at slot=src_nvl.
     const int kNvlSlotInts = kNumRDMARanks * num_channels * E_local;
     auto nvl_streaming_send = AsymBuffer<int>(nvl_send_buffer, kNvlSlotInts, NUM_MAX_NVL_PEERS);
     auto nvl_streaming_recv = AsymBuffer<int>(nvl_recv_buffer, kNvlSlotInts, NUM_MAX_NVL_PEERS);
@@ -2151,8 +2150,8 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         get_channel_task_range(shape.num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
         // See dispatch_main_kernel kRDMASender for the sentinel-amo / 128B
-        // L2-line packing rationale (C3). Mirrored here verbatim — fwd
-        // dispatch and bwd dispatch_grads share the meta SymBuffer + the
+        // L2-line packing rationale. Mirrored here verbatim — fwd dispatch
+        // and bwd dispatch_grads share the meta SymBuffer + the
         // dispatch_meta_sentinel_prev array (both run on streams.dispatch).
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
@@ -2977,7 +2976,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     break;
 
                 if (lane_id < kNumRDMARanks and token_start_idx < token_end_idx) {
-                    // C4 gen-stamp read: head is iter-tagged by the coordinator's
+                    // NVL gen-stamp read: head is iter-tagged by the coordinator's
                     // force-write + per-progress writes. Pre-force-write reads
                     // carry the prior iter's seq and are ignored; cached_head
                     // stays at its last-valid value (initial 0) until a matching
@@ -3222,7 +3221,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
 
                     start_time = clock64();
                     while (cached_nvl_channel_tail_idx <= expected_head) {
-                        // C4 gen-stamp read: only accept seq-matching tail
+                        // NVL gen-stamp read: only accept seq-matching tail
                         // values. The sender's iter-entry force-write +
                         // per-chunk packed writes ensure the slot eventually
                         // carries this iter's tag; pre-tag residue is ignored.

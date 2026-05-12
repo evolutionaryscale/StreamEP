@@ -254,9 +254,10 @@ static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
 // Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
 // Folded single-kernel architecture mirroring `intranode::streaming_dispatch_metadata`'s
 // shape phase-for-phase, with NVL primitives replaced by RDMA equivalents
-// where the topology demands it. Absorbs `notify_dispatch`'s count exchange
-// + channel prefix matrices + host-mapped recv counters, then runs the
-// streaming-superset phases at the end of the same launch.
+// where the topology demands it. Runs cross-rank count exchange + channel
+// prefix matrices + host-mapped recv counters in the leading phases, then
+// the streaming-superset phases (expert frequency, base_pool,
+// seen_per_substream, per-tile arrays) at the end of the same launch.
 //
 // Outputs (per-rank, on the dispatch stream):
 //   - rdma_channel_prefix_matrix[num_rdma_ranks, num_channels]
@@ -276,7 +277,7 @@ static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
 //   - total_tiles_device[1]
 //
 // RDMA-payload layout for the streaming-superset histogram exchange (new
-// SymBuffer alongside notify_dispatch's count payload):
+// SymBuffer alongside the leading count-exchange payload):
 //   per (src_world_rank → dst_rdma_rank) slab, contiguous as
 //     [num_channels][NUM_MAX_NVL_PEERS][E_local] int32
 //   Size per slab: num_channels * NUM_MAX_NVL_PEERS * E_local * 4 bytes.
@@ -291,7 +292,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* moe_recv_rdma_counter_mapped,
                                  int* moe_recv_expert_counter_mapped,
                                  int* streaming_total_tiles_mapped,
-                                 // Channel prefix matrices (kept from notify_dispatch)
+                                 // Channel prefix matrices
                                  int* rdma_channel_prefix_matrix,
                                  int* recv_rdma_rank_prefix_sum,
                                  int* gbl_channel_prefix_matrix,
@@ -314,7 +315,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int expert_alignment,
                                  int tile_m,
                                  // Streaming SymBuffer offset within rdma_buffer_ptr
-                                 // (placed AFTER notify_dispatch's existing payload).
+                                 // (placed AFTER the leading count-exchange payload).
                                  int64_t streaming_rdma_offset,
                                  // Env
                                  void* rdma_buffer_ptr,
@@ -486,11 +487,10 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 // to skip cleanly past gaps without re-reading the counter region.
 //
 // (The legacy buffer-cleanup half of this kernel — IBGDA quiet + RDMA team
-// sync + NVL barrier + memset of dispatch ring-control regions — was
-// retired in C4: every polled slot is iter-disambiguated by the cumulative
-// head/tail / RDMA meta sentinel-amo / NVL gen-stamp protocols. Block 0 of
-// the kernel is now an early return to preserve block-id offsets in
-// blocks 1+.)
+// sync + NVL barrier + memset of dispatch ring-control regions — is gone:
+// every polled slot is iter-disambiguated by the cumulative head/tail /
+// RDMA meta sentinel-amo / NVL gen-stamp protocols. Block 0 of the kernel
+// is now an early return to preserve block-id offsets in blocks 1+.)
 void cached_notify_combine(int hidden_int4,
                            int num_topk,
                            int num_ranks,

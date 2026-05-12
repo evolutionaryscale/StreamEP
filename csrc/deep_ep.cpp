@@ -1581,9 +1581,9 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
     auto bwd_y_ready = torch::zeros({total_tiles}, i64_opts);
     auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
 
-    // No pre-bwd-dispatch cleanup: under the C2/C3/C4 cumulative protocols
-    // (head/tail amo, RDMA meta sentinel-amo, NVL gen-stamp), every polled
-    // ring-control slot disambiguates this iter's value from prior-iter
+    // No pre-bwd-dispatch cleanup: under the cumulative ring-control
+    // protocols (RDMA head/tail amo, RDMA meta sentinel-amo, NVL gen-stamp),
+    // every polled slot disambiguates this iter's value from prior-iter
     // residue without an inter-iter memset. The dispatch stream's sequencing
     // (fwd dispatch → cleanup_dispatch_buffers → bwd dispatch_grads in the
     // legacy flow) is now just (fwd dispatch → bwd dispatch_grads).
