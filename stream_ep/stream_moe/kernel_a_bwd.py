@@ -73,7 +73,7 @@ from stream_ep.stream_moe.kernel_a import (
 from stream_ep.stream_moe.kernel_y import (
     AtomicScatterStore,
     ScatterParams,
-    StreamingMoeYSm90,
+    StreamingMoeY,
 )
 from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
@@ -84,7 +84,7 @@ from stream_ep.stream_moe.tile_scheduler import (
 # ---------------------------------------------------------------------------
 # Streaming kernel A bwd class.
 # ---------------------------------------------------------------------------
-class StreamingMoeABwdSm90(StreamingMoeYSm90):
+class StreamingMoeABwd(StreamingMoeY):
     """Streaming-MoE kernel A bwd: NN GEMM `dL/dswiglu_in @ W1` with fused
     atomic-scatter epilogue into `dL_dx_per_r`.
 
@@ -282,12 +282,12 @@ def _compile_streaming_moe_a_bwd(
         total_tiles=Int32(0),
     )
 
-    epi_args = StreamingMoeABwdSm90.EpilogueArguments(scatter=scatter)
+    epi_args = StreamingMoeABwd.EpilogueArguments(scatter=scatter)
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
 
     return compile_gemm_kernel(
-        StreamingMoeABwdSm90,
+        StreamingMoeABwd,
         a_dtype,
         (tile_m, tile_n),
         (cluster_m, cluster_n, 1),
@@ -464,7 +464,7 @@ def streaming_moe_a_bwd(
         combine_seq=Int64(dispatch_seq),
         num_pid_n=Int32(num_pid_n),
     )
-    epi_args = StreamingMoeABwdSm90.EpilogueArguments(scatter=scatter)
+    epi_args = StreamingMoeABwd.EpilogueArguments(scatter=scatter)
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,

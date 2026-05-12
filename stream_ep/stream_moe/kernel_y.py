@@ -120,7 +120,7 @@ class AtomicScatterStore(EpiOp):
       - `recv_token`: int32 tensor of shape `(tile_M,)` — pool_recv_token slice
         for this tile. Loaded once per tile in `begin()` from gmem.
 
-    The actual scatter logic lives in `StreamingMoeYSm90.epi_subtile_store`
+    The actual scatter logic lives in `StreamingMoeY.epi_subtile_store`
     (the override of GemmSm90's hook). This op handles SMEM allocation,
     per-tile recv_token load, and the per-tile end bookkeeping.
     """
@@ -330,7 +330,7 @@ class StreamingMoeYSchedulerOptions(NamedTuple):
 # Streaming kernel Y class. Subclass GemmSm90 directly (not GemmDefaultEpiMixin
 # or GemmActMixin) so we control which EpiOps participate.
 # ---------------------------------------------------------------------------
-class StreamingMoeYSm90(ComposableEpiMixin, GemmSm90):
+class StreamingMoeY(ComposableEpiMixin, GemmSm90):
     """Streaming-MoE kernel Y: streaming GEMM with fused atomic-scatter epilogue.
 
     Composition:
@@ -700,14 +700,14 @@ def _compile_streaming_moe_y(
         total_tiles=Int32(0),
     )
 
-    epi_args = StreamingMoeYSm90.EpilogueArguments(
+    epi_args = StreamingMoeY.EpilogueArguments(
         scatter=scatter, mColVecBroadcast=pool_topk_weight
     )
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
 
     return compile_gemm_kernel(
-        StreamingMoeYSm90,
+        StreamingMoeY,
         a_dtype,
         (tile_m, tile_n),
         (cluster_m, cluster_n, 1),
@@ -858,7 +858,7 @@ def streaming_moe_y(
         combine_seq=Int64(combine_seq),
         num_pid_n=Int32(num_pid_n),
     )
-    epi_args = StreamingMoeYSm90.EpilogueArguments(
+    epi_args = StreamingMoeY.EpilogueArguments(
         scatter=scatter, mColVecBroadcast=pool_topk_weight
     )
     scheduler_args = StreamingMoeYSchedulerOptions(

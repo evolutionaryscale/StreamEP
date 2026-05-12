@@ -404,7 +404,7 @@ def main():
         # Logical roles we attribute each profiler event to. C++ kernels match
         # by their natural symbol substring; CuTeDSL-emitted kernels (kernel A,
         # Y, A_bwd, Y_bwd, dW grouped GEMM) get mangled to names like
-        # `kernel_cutlass_kernel_stream_epstream_moekernel_aStreamingMoeASm90_
+        # `kernel_cutlass_kernel_stream_epstream_moekernel_aStreamingMoeA_
         # object_at__TiledMM...`, so we normalize via a case-insensitive,
         # underscore-stripped probe of CamelCase class fragments.
         #
@@ -440,7 +440,7 @@ def main():
                 if key in ev_key:
                     return key
             # CuTeDSL-emitted kernels: probe a normalized form so the mangled
-            # `kernel_cutlass_kernel_..._StreamingMoeABwdSm90_...` symbols
+            # `kernel_cutlass_kernel_..._StreamingMoeABwd_...` symbols
             # resolve back to their logical role. Case + underscore stripped
             # so future name shuffles in the JIT layer don't break the match.
             norm = ev_key.lower().replace("_", "")

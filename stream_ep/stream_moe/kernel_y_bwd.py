@@ -128,7 +128,7 @@ from stream_ep.stream_moe.tile_scheduler import (
 # ---------------------------------------------------------------------------
 # Streaming kernel Y bwd class.
 # ---------------------------------------------------------------------------
-class StreamingMoeYBwdSm90(GemmActMixin, GemmSm90):
+class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     """Streaming-MoE kernel Y bwd: NN GEMM + SwiGLU bwd in epilogue +
     in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store +
     per-tile bwd_a_ready release.
@@ -485,7 +485,7 @@ def _compile_streaming_moe_y_bwd(
         tile_m=tile_m,
     )
 
-    epi_args = StreamingMoeYBwdSm90.EpilogueArguments(
+    epi_args = StreamingMoeYBwd.EpilogueArguments(
         tile_ready=tile_ready_params,
         mPostAct=mPostAct,
         act_fn=None,
@@ -504,7 +504,7 @@ def _compile_streaming_moe_y_bwd(
         gemm_obj.implicit_dtype = implicit_dtype
 
     return compile_gemm_kernel(
-        StreamingMoeYBwdSm90,
+        StreamingMoeYBwd,
         a_dtype,
         (tile_m, tile_n),
         (cluster_m, cluster_n, 1),
@@ -797,7 +797,7 @@ def streaming_moe_y_bwd(
         f"{tuple(postact_a_for_dW2_flat.shape)}, expected {(total_tiles * tile_m, I)}"
     )
 
-    epi_args = StreamingMoeYBwdSm90.EpilogueArguments(
+    epi_args = StreamingMoeYBwd.EpilogueArguments(
         tile_ready=tile_ready_params,
         mPostAct=postact_a_for_dW2_flat,
         act_fn=None,  # weighted-postact computed inline in epi_visit_subtile

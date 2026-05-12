@@ -176,7 +176,7 @@ class StreamingTileSchedulerOptions(NamedTuple):
 # ---------------------------------------------------------------------------
 # Streaming kernel A class.
 # ---------------------------------------------------------------------------
-class StreamingMoeASm90(GemmGatedMixin, GemmSm90):
+class StreamingMoeA(GemmGatedMixin, GemmSm90):
     """Streaming-MoE kernel A: standard strided varlen_m GEMM + SwiGLU with
     queue-pull scheduler. Pool layout means kernel A uses the base GEMM
     mainloop's varlen_m path verbatim — no per-tile gather indirection.
@@ -366,7 +366,7 @@ def _compile_streaming_moe_a(
         tile_m=tile_m,
     )
 
-    epi_args = StreamingMoeASm90.EpilogueArguments(
+    epi_args = StreamingMoeA.EpilogueArguments(
         mPostAct=mPostAct,
         tile_ready=tile_ready_params,
         act_fn=gate_fn_map[activation],
@@ -376,7 +376,7 @@ def _compile_streaming_moe_a(
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
 
     return compile_gemm_kernel(
-        StreamingMoeASm90,
+        StreamingMoeA,
         a_dtype,
         (tile_m, tile_n),
         (cluster_m, cluster_n, 1),
@@ -640,7 +640,7 @@ def streaming_moe_a(
         tile_m=None,  # Constexpr; burned in at compile, pass None at call time
     )
 
-    epi_args = StreamingMoeASm90.EpilogueArguments(
+    epi_args = StreamingMoeA.EpilogueArguments(
         mPostAct=postact_flat,
         tile_ready=tile_ready_params,
         act_fn=None,  # Constexpr; pass None at call time
