@@ -116,13 +116,29 @@ def compute_reference(topk_idx_all: torch.Tensor,
                             expert_alignment) * expert_alignment).to(torch.int32)
 
     # ── base_pool[c, src_world, e_local] = expert_block_offset[e]*tile_m
-    #     + Σ over (c', s') < (c, s) lex of seen[c', s', e]   ──────────────────
-    # Walk each expert's substreams in (c, s) lex order: per-expert running
-    # accumulator; at each (c, s) write current acc, then add seen[c, s, e].
-    # Vectorized as a per-expert cumsum along the flattened (c, s) axis.
+    #     + (exclusive prefix over substreams, NVL-local FIRST then RDMA-remote)
+    # The kernel partitions substream order by transport class so that low
+    # tile_id slots (fast to land via NVL) come before high tile_id slots
+    # (slow via RDMA). See internode.cu:609-647 — Pass 1 walks (c, src_world)
+    # lex but only writes when src_rdma == rdma_rank; Pass 2 walks the same
+    # lex order but only writes when src_rdma != rdma_rank. Per-expert
+    # accumulator carries across both passes.
+    cs_grid = torch.arange(num_channels * S)                               # [C*S]
+    cs_src_world = cs_grid % S
+    cs_src_rdma  = cs_src_world // NUM_NVL
+    is_nvl_local = (cs_src_rdma == this_rdma)
+    # ordered_cs = [NVL-local cs in lex order] ++ [RDMA-remote cs in lex order]
+    nvl_cs   = cs_grid[is_nvl_local]
+    rdma_cs  = cs_grid[~is_nvl_local]
+    ordered_cs = torch.cat([nvl_cs, rdma_cs])                              # [C*S]
+
     seen_cs_e = seen.permute(2, 0, 1).reshape(E_local, num_channels * S)   # [E, C*S]
-    cs_cumsum = torch.cumsum(seen_cs_e, dim=1).to(torch.int32)             # [E, C*S]
-    cs_pre   = cs_cumsum - seen_cs_e                                       # exclusive prefix
+    seen_ord  = seen_cs_e[:, ordered_cs]                                   # [E, C*S]
+    cs_cumsum_ord = torch.cumsum(seen_ord, dim=1).to(torch.int32)
+    cs_pre_ord    = cs_cumsum_ord - seen_ord                               # exclusive prefix
+    cs_pre = torch.empty_like(seen_cs_e, dtype=torch.int32)
+    cs_pre[:, ordered_cs] = cs_pre_ord                                     # scatter back
+
     block_off_e = (expert_pool_block_offset[:-1].to(torch.int32) * tile_m) \
                   .view(E_local, 1)
     base_pool_E_CS = block_off_e + cs_pre                                  # [E, C*S]

@@ -90,15 +90,15 @@ def rank_zero_only(fn):
     return wrapper
 
 H = 2048
-I = 2048
-NUM_EXPERTS = 64
+I = 384
+NUM_EXPERTS = 384
 SEQ_LEN_PER_RANK = 8192
-TOPK = 4
+TOPK = 13
 DTYPE = torch.bfloat16
 NUM_SMS = 80  # See bench_pipeline.py for sweep justification.
 TILE_M = 128
-TILE_N_A = 256
-TILE_N_Y = 128
+TILE_N_A = 192
+TILE_N_Y = 256
 
 
 def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
@@ -162,6 +162,22 @@ def main():
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
+    p.add_argument("--tile_n_a_bwd", type=int, default=256)
+    p.add_argument("--tile_n_y_bwd", type=int, default=256)
+    # dW grouped-GEMM tile knobs. None → fall back to (tile_m, tile_n_a) at the
+    # bwd call site, matching pre-decouple behaviour.
+    p.add_argument("--tile_m_dW1", type=int, default=None)
+    p.add_argument("--tile_n_dW1", type=int, default=256)
+    p.add_argument("--tile_m_dW2", type=int, default=None)
+    p.add_argument("--tile_n_dW2", type=int, default=None)
+    p.add_argument("--cluster_m_dW1", type=int, default=2)
+    p.add_argument("--cluster_n_dW1", type=int, default=2)
+    p.add_argument("--cluster_m_dW2", type=int, default=1)
+    p.add_argument("--cluster_n_dW2", type=int, default=1)
+    p.add_argument("--pingpong_dW1", action="store_true")
+    p.add_argument("--pingpong_dW2", action="store_true")
+    p.add_argument("--swizzle_dW1", type=int, default=8)
+    p.add_argument("--swizzle_dW2", type=int, default=8)
     p.add_argument(
         "--skew_hot_frac",
         type=float,
@@ -262,6 +278,20 @@ def main():
             tile_m=args.tile_m,
             tile_n_a=args.tile_n_a,
             tile_n_y=args.tile_n_y,
+            tile_n_a_bwd=args.tile_n_a_bwd,
+            tile_n_y_bwd=args.tile_n_y_bwd,
+            tile_m_dW1=args.tile_m_dW1,
+            tile_n_dW1=args.tile_n_dW1,
+            tile_m_dW2=args.tile_m_dW2,
+            tile_n_dW2=args.tile_n_dW2,
+            cluster_m_dW1=args.cluster_m_dW1,
+            cluster_n_dW1=args.cluster_n_dW1,
+            cluster_m_dW2=args.cluster_m_dW2,
+            cluster_n_dW2=args.cluster_n_dW2,
+            pingpong_dW1=args.pingpong_dW1,
+            pingpong_dW2=args.pingpong_dW2,
+            swizzle_dW1=args.swizzle_dW1,
+            swizzle_dW2=args.swizzle_dW2,
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
         )
@@ -312,6 +342,20 @@ def main():
                     tile_m=args.tile_m,
                     tile_n_a=args.tile_n_a,
                     tile_n_y=args.tile_n_y,
+                    tile_n_a_bwd=args.tile_n_a_bwd,
+                    tile_n_y_bwd=args.tile_n_y_bwd,
+                    tile_m_dW1=args.tile_m_dW1,
+                    tile_n_dW1=args.tile_n_dW1,
+                    tile_m_dW2=args.tile_m_dW2,
+                    tile_n_dW2=args.tile_n_dW2,
+                    cluster_m_dW1=args.cluster_m_dW1,
+                    cluster_n_dW1=args.cluster_n_dW1,
+                    cluster_m_dW2=args.cluster_m_dW2,
+                    cluster_n_dW2=args.cluster_n_dW2,
+                    pingpong_dW1=args.pingpong_dW1,
+                    pingpong_dW2=args.pingpong_dW2,
+                    swizzle_dW1=args.swizzle_dW1,
+                    swizzle_dW2=args.swizzle_dW2,
                     num_sms_a=args.num_sms_a,
                     num_sms_y=args.num_sms_y,
                 )

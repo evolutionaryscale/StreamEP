@@ -151,6 +151,18 @@ class StreamMoEFunc(torch.autograd.Function):
         tile_n_y: int,
         tile_n_y_bwd: int,
         tile_n_a_bwd: int,
+        tile_m_dW1: int | None,
+        tile_n_dW1: int | None,
+        tile_m_dW2: int | None,
+        tile_n_dW2: int | None,
+        cluster_m_dW1: int,
+        cluster_n_dW1: int,
+        cluster_m_dW2: int,
+        cluster_n_dW2: int,
+        pingpong_dW1: bool,
+        pingpong_dW2: bool,
+        swizzle_dW1: int,
+        swizzle_dW2: int,
         num_sms_a: int | None,
         num_sms_y: int | None,
     ) -> torch.Tensor:
@@ -341,6 +353,20 @@ class StreamMoEFunc(torch.autograd.Function):
         ctx.tile_n_y = tile_n_y
         ctx.tile_n_y_bwd = tile_n_y_bwd
         ctx.tile_n_a_bwd = tile_n_a_bwd
+        # dW tile overrides — None falls back to (tile_m, tile_n_a) at the
+        # bwd call site. Stored as-is on ctx; bwd resolves the fallback.
+        ctx.tile_m_dW1 = tile_m_dW1
+        ctx.tile_n_dW1 = tile_n_dW1
+        ctx.tile_m_dW2 = tile_m_dW2
+        ctx.tile_n_dW2 = tile_n_dW2
+        ctx.cluster_m_dW1 = cluster_m_dW1
+        ctx.cluster_n_dW1 = cluster_n_dW1
+        ctx.cluster_m_dW2 = cluster_m_dW2
+        ctx.cluster_n_dW2 = cluster_n_dW2
+        ctx.pingpong_dW1 = pingpong_dW1
+        ctx.pingpong_dW2 = pingpong_dW2
+        ctx.swizzle_dW1 = swizzle_dW1
+        ctx.swizzle_dW2 = swizzle_dW2
         ctx.num_sms_a = num_sms_a
         ctx.num_sms_y = num_sms_y
         ctx.bwd_cu_seqlens_k = bwd_cu_seqlens_k
@@ -394,6 +420,19 @@ class StreamMoEFunc(torch.autograd.Function):
         tile_n_y: int = ctx.tile_n_y
         tile_n_y_bwd: int = ctx.tile_n_y_bwd
         tile_n_a_bwd: int = ctx.tile_n_a_bwd
+        # dW tile overrides — fall back to (tile_m, tile_n_a) when None.
+        tile_m_dW1: int = ctx.tile_m_dW1 if ctx.tile_m_dW1 is not None else tile_m
+        tile_n_dW1: int = ctx.tile_n_dW1 if ctx.tile_n_dW1 is not None else tile_n_a
+        tile_m_dW2: int = ctx.tile_m_dW2 if ctx.tile_m_dW2 is not None else tile_m
+        tile_n_dW2: int = ctx.tile_n_dW2 if ctx.tile_n_dW2 is not None else tile_n_a
+        cluster_m_dW1: int = ctx.cluster_m_dW1
+        cluster_n_dW1: int = ctx.cluster_n_dW1
+        cluster_m_dW2: int = ctx.cluster_m_dW2
+        cluster_n_dW2: int = ctx.cluster_n_dW2
+        pingpong_dW1: bool = ctx.pingpong_dW1
+        pingpong_dW2: bool = ctx.pingpong_dW2
+        swizzle_dW1: int = ctx.swizzle_dW1
+        swizzle_dW2: int = ctx.swizzle_dW2
         num_sms_a: int | None = ctx.num_sms_a
         num_sms_y: int | None = ctx.num_sms_y
 
@@ -659,10 +698,12 @@ class StreamMoEFunc(torch.autograd.Function):
                 dW2_local,
                 None,
                 None,
-                tile_M=tile_m,
-                tile_N=tile_n_a,
-                cluster_M=2,
-                cluster_N=1,
+                tile_M=tile_m_dW2,
+                tile_N=tile_n_dW2,
+                cluster_M=cluster_m_dW2,
+                cluster_N=cluster_n_dW2,
+                pingpong=pingpong_dW2,
+                max_swizzle_size=swizzle_dW2,
                 cu_seqlens_k=cu_seqlens_k,
                 lens_k=lens_k_dW,
             )
@@ -679,10 +720,12 @@ class StreamMoEFunc(torch.autograd.Function):
                 dW1_local,
                 None,
                 None,
-                tile_M=tile_m,
-                tile_N=tile_n_a,
-                cluster_M=2,
-                cluster_N=1,
+                tile_M=tile_m_dW1,
+                tile_N=tile_n_dW1,
+                cluster_M=cluster_m_dW1,
+                cluster_N=cluster_n_dW1,
+                pingpong=pingpong_dW1,
+                max_swizzle_size=swizzle_dW1,
                 cu_seqlens_k=cu_seqlens_k,
                 lens_k=lens_k_dW,
             )
@@ -703,10 +746,7 @@ class StreamMoEFunc(torch.autograd.Function):
         dW1_local.record_stream(caller_stream)
         dW2_local.record_stream(caller_stream)
 
-        # Gradient tuple matches forward's 15 args, in order:
-        #   (streams, buffer, x, topk_idx, topk_weights, is_token_in_rank,
-        #    w1_local, w2_local, num_experts, dispatch_seq, tile_m, tile_n_a,
-        #    tile_n_y, num_sms_a, num_sms_y)
+        # Gradient tuple matches forward's args, in order.
         return (
             None,  # streams
             None,  # buffer
@@ -723,6 +763,18 @@ class StreamMoEFunc(torch.autograd.Function):
             None,  # tile_n_y
             None,  # tile_n_y_bwd
             None,  # tile_n_a_bwd
+            None,  # tile_m_dW1
+            None,  # tile_n_dW1
+            None,  # tile_m_dW2
+            None,  # tile_n_dW2
+            None,  # cluster_m_dW1
+            None,  # cluster_n_dW1
+            None,  # cluster_m_dW2
+            None,  # cluster_n_dW2
+            None,  # pingpong_dW1
+            None,  # pingpong_dW2
+            None,  # swizzle_dW1
+            None,  # swizzle_dW2
             None,  # num_sms_a
             None,  # num_sms_y
         )
@@ -741,14 +793,32 @@ def stream_moe_func(
     num_experts: int,
     dispatch_seq: int,
     tile_m: int = 128,
-    tile_n_a: int = 256,
+    tile_n_a: int = 192,
     tile_n_y: int = 256,
-    tile_n_y_bwd: int = 128,
+    tile_n_y_bwd: int = 256,
     tile_n_a_bwd: int = 256,
+    tile_m_dW1: int | None = None,
+    tile_n_dW1: int | None = 256,
+    tile_m_dW2: int | None = None,
+    tile_n_dW2: int | None = None,
+    cluster_m_dW1: int = 2,
+    cluster_n_dW1: int = 2,
+    cluster_m_dW2: int = 1,
+    cluster_n_dW2: int = 1,
+    pingpong_dW1: bool = False,
+    pingpong_dW2: bool = False,
+    swizzle_dW1: int = 8,
+    swizzle_dW2: int = 8,
     num_sms_a: int | None = None,
     num_sms_y: int | None = None,
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
+
+    The dW1/dW2 tile knobs (``tile_m_dW1``, ``tile_n_dW1``, ``tile_m_dW2``,
+    ``tile_n_dW2``) override the dW grouped GEMM tile shape. ``None`` falls
+    back to the fwd kernel A tile (``tile_m`` / ``tile_n_a``). The dW2 GEMM
+    has output N = ``moe_intermediate_size`` while dW1 has N = ``hidden_size``,
+    so optimal tiles are usually different per side.
 
     Returns the cross-rank-reduced output of shape ``[num_tokens, hidden]``
     produced by the combine receiver — the standard MoE forward output for
@@ -770,6 +840,18 @@ def stream_moe_func(
         tile_n_y,
         tile_n_y_bwd,
         tile_n_a_bwd,
+        tile_m_dW1,
+        tile_n_dW1,
+        tile_m_dW2,
+        tile_n_dW2,
+        cluster_m_dW1,
+        cluster_n_dW1,
+        cluster_m_dW2,
+        cluster_n_dW2,
+        pingpong_dW1,
+        pingpong_dW2,
+        swizzle_dW1,
+        swizzle_dW2,
         num_sms_a,
         num_sms_y,
     )
