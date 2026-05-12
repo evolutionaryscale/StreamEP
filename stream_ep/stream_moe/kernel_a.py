@@ -58,6 +58,7 @@ from stream_ep.stream_moe.ptx_helpers import (
     threadfence_system,
 )
 from stream_ep.stream_moe.tile_scheduler import (
+    SpinKind,
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -164,14 +165,17 @@ class TileReadyRelease(EpiOp):
 class StreamingTileSchedulerOptions(NamedTuple):
     max_active_clusters: Int32
     consumer_head: cute.Tensor  # [1] int32 — global linear claim counter
-    tile_ready: (
-        cute.Tensor
-    )  # [total_tiles] int64 — release stamps from dispatch's Pass 2
+    # Kernel A uses SpinKind.COUNT_VS_TARGET on (count, target). The other
+    # field pair (stamp, dispatch_seq) is placeholder for the dual-protocol
+    # scheduler — set to any valid tensors; the constexpr branch elides them.
+    pool_arrival_count: cute.Tensor   # [total_tiles] int32 — release-add target (live)
+    pool_arrival_target: cute.Tensor  # [total_tiles] int32 — firing target  (live)
+    stamp: cute.Tensor                # placeholder (use any int64 tensor)
+    dispatch_seq: Int64               # placeholder
     expert_pool_block_offset: (
         cute.Tensor
     )  # [E_local + 1] int32 — pool-block prefix-sum. Source for the
     # warp-cooperative ballot lookup that retired per-claim `tile_id_to_expert`.
-    dispatch_seq: Int64
     total_tiles: Int32  # passed as scalar so get_grid_shape doesn't deref device tensor
 
 
@@ -262,12 +266,15 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            tile_ready=scheduler_args.tile_ready,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
+            pool_arrival_count=scheduler_args.pool_arrival_count,
+            pool_arrival_target=scheduler_args.pool_arrival_target,
+            stamp=scheduler_args.stamp,
             dispatch_seq=scheduler_args.dispatch_seq,
+            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
+            spin_kind=SpinKind.COUNT_VS_TARGET,
             persistence_mode=PersistenceMode.STREAMING,
         )
 
@@ -341,7 +348,8 @@ def _compile_streaming_moe_a(
     )
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    tile_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -351,9 +359,11 @@ def _compile_streaming_moe_a(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),  # set at runtime; 0 here keeps fake compile happy
         consumer_head=consumer_head,
-        tile_ready=tile_ready,
+        pool_arrival_count=pool_arrival_count,
+        pool_arrival_target=pool_arrival_target,
+        stamp=a_ready,        # placeholder; elided by spin_kind=COUNT_VS_TARGET
+        dispatch_seq=Int64(0),  # placeholder
         expert_pool_block_offset=expert_pool_block_offset,
-        dispatch_seq=Int64(0),
         total_tiles=Int32(0),
     )
 
@@ -395,30 +405,32 @@ def _compile_streaming_moe_a(
 
 
 # ---------------------------------------------------------------------------
-# Test-only producer: walks tile_ready slot-by-slot and release-stores
-# dispatch_seq on each, with a delay between fires. Used by tests to validate
-# kernel A's per-tile spin without DeepEP.
+# Test-only producer: walks pool_arrival_count slot-by-slot and writes the
+# matching `pool_arrival_target[i]` value (single-producer simulation of
+# dispatch's Pass 2 release-add chain — when count == target, kernel A's
+# scheduler spin unblocks). Used by tests to validate kernel A's per-tile
+# count-vs-target spin without DeepEP.
 # ---------------------------------------------------------------------------
 class _StreamingTileProducer:
     @cute.jit
     def __call__(
         self,
-        tile_ready: cute.Tensor,  # [total_tiles] int64
+        pool_arrival_count: cute.Tensor,  # [total_tiles] int32
+        pool_arrival_target: cute.Tensor,  # [total_tiles] int32
         total_tiles: cutlass.Int32,
-        dispatch_seq: cutlass.Int64,
         delay_clocks: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(tile_ready, total_tiles, dispatch_seq, delay_clocks).launch(
-            grid=[1, 1, 1], block=[1, 1, 1], stream=stream
-        )
+        self.kernel(
+            pool_arrival_count, pool_arrival_target, total_tiles, delay_clocks
+        ).launch(grid=[1, 1, 1], block=[1, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
         self,
-        tile_ready: cute.Tensor,
+        pool_arrival_count: cute.Tensor,
+        pool_arrival_target: cute.Tensor,
         total_tiles: cutlass.Int32,
-        dispatch_seq: cutlass.Int64,
         delay_clocks: cutlass.Int32,
     ):
         from cutlass._mlir.dialects import nvvm
@@ -432,21 +444,35 @@ class _StreamingTileProducer:
                 end = start + cutlass.Int64(delay_clocks)
                 while cutlass.Int64(nvvm.read_ptx_sreg_clock64(T.i64())) < end:
                     pass
-                ready_ptr = utils.elem_pointer(tile_ready, (i,))
+                target = pool_arrival_target[i]
+                count_ptr = utils.elem_pointer(pool_arrival_count, (i,))
                 threadfence_system()
-                st_release_gpu_global(ready_ptr, dispatch_seq)
+                # `red.release.gpu.global.add.s32 [ptr], target` — single PTX
+                # mirroring the real fire_pool_blocks. Pre-set the target so
+                # one shot brings count to it.
+                from cutlass._mlir.dialects import llvm
+                count_ptr_i64 = count_ptr.toint().ir_value()
+                llvm.inline_asm(
+                    None,
+                    [count_ptr_i64, target.ir_value()],
+                    "red.release.gpu.global.add.s32 [$0], $1;",
+                    "l,r,~{memory}",
+                    has_side_effects=True,
+                    is_align_stack=False,
+                )
 
 
 @jit_cache
 def _compile_streaming_tile_producer():
     total_tiles_sym = cute.sym_int()
-    ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     op = _StreamingTileProducer()
     return cute.compile(
         op,
-        ready,
+        count,
+        target,
         cutlass.Int32(0),
-        cutlass.Int64(0),
         cutlass.Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -454,22 +480,28 @@ def _compile_streaming_tile_producer():
 
 
 def fire_tiles_with_delay(
-    tile_ready: torch.Tensor, dispatch_seq: int, delay_us: int = 50
+    pool_arrival_count: torch.Tensor,
+    pool_arrival_target: torch.Tensor,
+    delay_us: int = 50,
 ) -> None:
     """Test helper: launches a single-thread producer kernel on the current
-    CUDA stream that release-stores dispatch_seq into each slot of `tile_ready`
-    with `delay_us` between fires.
+    CUDA stream that `red.release.gpu.global.add.s32`s
+    ``pool_arrival_target[i]`` into ``pool_arrival_count[i]`` for each tile
+    (one fire per tile, ``delay_us`` between fires). Mirrors dispatch's
+    Pass 2 protocol exactly; tests can wait on the standard scheduler spin.
     """
-    assert tile_ready.dtype == torch.int64
-    assert tile_ready.is_cuda and tile_ready.is_contiguous()
-    total_tiles = tile_ready.shape[0]
+    assert pool_arrival_count.dtype == torch.int32
+    assert pool_arrival_target.dtype == torch.int32
+    assert pool_arrival_count.is_cuda and pool_arrival_count.is_contiguous()
+    assert pool_arrival_target.shape == pool_arrival_count.shape
+    total_tiles = pool_arrival_count.shape[0]
     # H100 clock ~1.5 GHz → 1500 cycles/μs.
     delay_clocks = max(1, int(delay_us * 1500))
     compiled = _compile_streaming_tile_producer()
     compiled(
-        tile_ready,
+        pool_arrival_count,
+        pool_arrival_target,
         cutlass.Int32(total_tiles),
-        cutlass.Int64(dispatch_seq),
         cutlass.Int32(delay_clocks),
     )
 
@@ -479,9 +511,9 @@ def streaming_moe_a(
     W1: torch.Tensor,  # (E_local, 2I, H) bf16 — k-major per expert
     postact_a: torch.Tensor,  # (total_tiles, tile_M, I) bf16
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
-    tile_ready: torch.Tensor,  # (total_tiles,) int64 release stamps (input from dispatch)
+    pool_arrival_count: torch.Tensor,  # (total_tiles,) int32 — dispatch Pass 2 release-add target
+    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target
     a_ready: torch.Tensor,  # (total_tiles,) int64 release stamps (output to kernel Y)
-    dispatch_seq: int,
     compute_seq: int,
     *,
     preact_a: torch.Tensor | None = None,
@@ -537,7 +569,14 @@ def streaming_moe_a(
     assert postact_a.dim() == 3
     total_tiles, postact_tile_m, I = postact_a.shape
     assert postact_tile_m == tile_m
-    assert tile_ready.shape == (total_tiles,) and tile_ready.dtype == torch.int64
+    assert (
+        pool_arrival_count.shape == (total_tiles,)
+        and pool_arrival_count.dtype == torch.int32
+    )
+    assert (
+        pool_arrival_target.shape == (total_tiles,)
+        and pool_arrival_target.dtype == torch.int32
+    )
     assert a_ready.shape == (total_tiles,) and a_ready.dtype == torch.int64
     H = pool.shape[1]
     E_local = W1.shape[0]
@@ -646,9 +685,11 @@ def streaming_moe_a(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        tile_ready=tile_ready,
+        pool_arrival_count=pool_arrival_count,
+        pool_arrival_target=pool_arrival_target,
+        stamp=a_ready,        # placeholder; elided by spin_kind=COUNT_VS_TARGET
+        dispatch_seq=Int64(0),  # placeholder
         expert_pool_block_offset=expert_pool_block_offset,
-        dispatch_seq=Int64(dispatch_seq),
         total_tiles=Int32(total_tiles),
     )
     varlen_args = VarlenArguments(

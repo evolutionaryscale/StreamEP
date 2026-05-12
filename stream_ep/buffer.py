@@ -46,16 +46,18 @@ class StreamingHandle:
     # ── Per-tile arrays.
     tile_id_to_expert: torch.Tensor            # [total_tiles] int32 — per-tile expert lookup
     pool_arrival_target: torch.Tensor          # [total_tiles] int32 (per-tile firing-target)
-    # Per-tile ready signal: dispatch's Pass 2 release-stores `dispatch_seq` into
-    # `tile_ready[tile_id]` once pool_arrival_count[tile_id] reaches its target.
-    # Pass 2 walks experts in order, so tile fires arrive in expert-monotonic
-    # order across substream blocks — preserves wave caching of W1[e].
-    tile_ready: torch.Tensor                   # [total_tiles] int64
+    # Per-tile arrival counter: dispatch's Pass 2 `red.release.gpu.add.s32`s
+    # contributors' per-block writes into `pool_arrival_count[tile_id]`; kernel A's
+    # scheduler spins on `pool_arrival_count[tile_id] == pool_arrival_target[tile_id]`.
+    # Pass 2 walks experts in order, so tile counts hit their target in
+    # expert-monotonic order across substream blocks — preserves wave caching
+    # of W1[e].
+    pool_arrival_count: torch.Tensor           # [total_tiles] int32
 
     # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers.
     # All allocated on dispatch_stream; cross-stream visibility carried by the
-    # per-tile release/acquire pairs `tile_ready` (dispatch→A), `a_ready` (A→Y),
-    # and `y_done_per_token` (Y→combine).
+    # per-tile release/acquire pairs: count-vs-target spin (dispatch→A),
+    # `a_ready` (A→Y), and `y_done_per_token` (Y→combine).
     a_ready: torch.Tensor                      # [total_tiles] int64 — A→Y per-tile release stamp (zero-init)
     k_local_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
     y_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
@@ -379,7 +381,10 @@ class Buffer:
             num_experts: total expert count across all ranks.
             expert_alignment: alignment for per-expert receive counts (default 1).
             tile_m: pool block size (default 128).
-            dispatch_seq: monotonic int64 release-stamp on tile_ready.
+            dispatch_seq: monotonic int (lives on the handle; used by kernel A's
+                `compute_seq`, kernel Y's `combine_seq`, and the NVL gen-stamp
+                protocol). NOT used for the per-tile dispatch→A signal — that
+                pair is the `pool_arrival_count == pool_arrival_target` spin.
 
         Returns:
             recv: ``handle.pool`` (Tensor).
@@ -424,7 +429,7 @@ class Buffer:
             seen_per_substream=out.seen_per_substream,
             tile_id_to_expert=out.tile_id_to_expert,
             pool_arrival_target=out.pool_arrival_target,
-            tile_ready=out.tile_ready,
+            pool_arrival_count=out.pool_arrival_count,
             a_ready=out.a_ready,
             k_local_remaining=out.k_local_remaining,
             y_done_per_token=out.y_done_per_token,
@@ -462,7 +467,7 @@ class Buffer:
         num_experts = num_local_experts * self.group_size
 
         if self._is_internode():
-            dL_do_pool, bwd_y_ready = self.runtime.internode_dispatch_grads(
+            dL_do_pool, bwd_dispatch_arrival_count = self.runtime.internode_dispatch_grads(
                 dL_dy,
                 handle.is_token_in_rank,
                 handle._dispatch_out,
@@ -471,7 +476,7 @@ class Buffer:
                 config,
             )
         else:
-            dL_do_pool, bwd_y_ready = self.runtime.intranode_dispatch_grads(
+            dL_do_pool, bwd_dispatch_arrival_count = self.runtime.intranode_dispatch_grads(
                 dL_dy,
                 handle.is_token_in_rank,
                 handle.recv_token_to_slots,
@@ -486,7 +491,7 @@ class Buffer:
                 seq,
                 config,
             )
-        return dL_do_pool, bwd_y_ready
+        return dL_do_pool, bwd_dispatch_arrival_count
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',

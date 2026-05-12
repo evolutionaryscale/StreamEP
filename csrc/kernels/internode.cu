@@ -1644,9 +1644,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                             int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
                             int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
                             fire_pool_blocks(slot_start_e, my_seen, shape.tile_m,
-                                             tile_signal.pool_arrival_count,
-                                             tile_signal.pool_arrival_target,
-                                             tile_signal.tile_ready, tile_signal.dispatch_seq);
+                                             tile_signal.pool_arrival_count);
                         }
                     }
                 }
@@ -2739,9 +2737,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                             int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
                             int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
                             fire_pool_blocks(slot_start_e, my_seen, shape.tile_m,
-                                             tile_signal.bwd_dispatch_arrival_count,
-                                             tile_signal.pool_arrival_target,
-                                             tile_signal.bwd_y_ready, tile_signal.dispatch_seq);
+                                             tile_signal.bwd_dispatch_arrival_count);
                         }
                     }
                 }

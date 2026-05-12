@@ -76,6 +76,7 @@ from stream_ep.stream_moe.kernel_y import (
     StreamingMoeY,
 )
 from stream_ep.stream_moe.tile_scheduler import (
+    SpinKind,
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -151,12 +152,15 @@ class StreamingMoeABwd(StreamingMoeY):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            tile_ready=scheduler_args.tile_ready,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
+            pool_arrival_count=scheduler_args.pool_arrival_count,  # placeholder
+            pool_arrival_target=scheduler_args.pool_arrival_target,  # placeholder
+            stamp=scheduler_args.stamp,
             dispatch_seq=scheduler_args.dispatch_seq,
+            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
+            spin_kind=SpinKind.ACQUIRE_VS_SEQ,
             persistence_mode=PersistenceMode.STREAMING,
         )
 
@@ -266,6 +270,8 @@ def _compile_streaming_moe_a_bwd(
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     bwd_a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -273,9 +279,11 @@ def _compile_streaming_moe_a_bwd(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
-        tile_ready=bwd_a_ready,
-        expert_pool_block_offset=expert_pool_block_offset,
+        pool_arrival_count=pool_arrival_count,  # placeholder; elided
+        pool_arrival_target=pool_arrival_target,  # placeholder; elided
+        stamp=bwd_a_ready,  # live for ACQUIRE_VS_SEQ
         dispatch_seq=Int64(0),
+        expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(0),
     )
 
@@ -314,7 +322,9 @@ def streaming_moe_a_bwd(
     bwd_k_local_remaining: torch.Tensor,  # (T_recv,) int32 — initialised from K_local_count
     bwd_a_done_per_token: torch.Tensor,  # (T_recv,) int64 — zero-init
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
-    bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps
+    pool_arrival_count: torch.Tensor,  # (total_tiles,) int32 — placeholder; passed for shape compat with the dual-protocol scheduler
+    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — placeholder
+    bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps (live)
     dispatch_seq: int,
     *,
     tile_m: int = 128,
@@ -463,9 +473,11 @@ def streaming_moe_a_bwd(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        tile_ready=bwd_a_ready,
-        expert_pool_block_offset=expert_pool_block_offset,
+        pool_arrival_count=pool_arrival_count,  # placeholder
+        pool_arrival_target=pool_arrival_target,  # placeholder
+        stamp=bwd_a_ready,
         dispatch_seq=Int64(dispatch_seq),
+        expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
     )
     varlen_args = VarlenArguments(

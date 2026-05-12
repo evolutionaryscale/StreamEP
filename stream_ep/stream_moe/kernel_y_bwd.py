@@ -120,6 +120,7 @@ from stream_ep.stream_moe.kernel_a import (
     TileReadyRelease,
 )
 from stream_ep.stream_moe.tile_scheduler import (
+    SpinKind,
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -338,12 +339,15 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            tile_ready=scheduler_args.tile_ready,
+            pool_arrival_count=scheduler_args.pool_arrival_count,
+            pool_arrival_target=scheduler_args.pool_arrival_target,
+            stamp=scheduler_args.stamp,  # placeholder; elided for COUNT_VS_TARGET
+            dispatch_seq=scheduler_args.dispatch_seq,  # placeholder
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
-            dispatch_seq=scheduler_args.dispatch_seq,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
+            spin_kind=SpinKind.COUNT_VS_TARGET,
             persistence_mode=PersistenceMode.STREAMING,
         )
 
@@ -458,7 +462,10 @@ def _compile_streaming_moe_y_bwd(
 
     # Scheduler tensors
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    bwd_y_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    bwd_dispatch_arrival_count = fake_tensor(
+        cutlass.Int32, (total_tiles_sym,), divisibility=1
+    )
+    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -468,9 +475,11 @@ def _compile_streaming_moe_y_bwd(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
-        tile_ready=bwd_y_ready,
-        expert_pool_block_offset=expert_pool_block_offset,
+        pool_arrival_count=bwd_dispatch_arrival_count,  # live for COUNT_VS_TARGET
+        pool_arrival_target=pool_arrival_target,
+        stamp=bwd_a_ready,  # placeholder; elided
         dispatch_seq=Int64(0),
+        expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(0),
     )
 
@@ -534,7 +543,8 @@ def streaming_moe_y_bwd(
     preact_a: torch.Tensor,  # (total_tiles, tile_m, 2*I) bf16 — saved from fwd kernel A's mD
     dL_dweight: torch.Tensor,  # (TK_padded,) fp32 — ZERO-INIT; per-pid_n atomic-add target
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
-    bwd_y_ready: torch.Tensor,  # (total_tiles,) int64 — input ready stamps (from dispatch_grads)
+    bwd_dispatch_arrival_count: torch.Tensor,  # (total_tiles,) int32 — input count from dispatch_grads (live)
+    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — firing target (shared with fwd)
     bwd_a_ready: torch.Tensor,  # (total_tiles,) int64 — output ready stamps (to kernel_a_bwd)
     dispatch_seq: int,
     *,
@@ -649,7 +659,14 @@ def streaming_moe_y_bwd(
         f"got {tuple(pool_recv_token.shape)}"
     )
     assert pool_recv_token.dtype == torch.int32
-    assert bwd_y_ready.shape == (total_tiles,) and bwd_y_ready.dtype == torch.int64
+    assert (
+        bwd_dispatch_arrival_count.shape == (total_tiles,)
+        and bwd_dispatch_arrival_count.dtype == torch.int32
+    )
+    assert (
+        pool_arrival_target.shape == (total_tiles,)
+        and pool_arrival_target.dtype == torch.int32
+    )
     assert bwd_a_ready.shape == (total_tiles,) and bwd_a_ready.dtype == torch.int64
     # preact contract — bf16 (total_tiles, tile_m, 2*I), same dtype as
     # dL_dswiglu_in (both share the f32-recast packing).
@@ -804,9 +821,11 @@ def streaming_moe_y_bwd(
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        tile_ready=bwd_y_ready,
+        pool_arrival_count=bwd_dispatch_arrival_count,  # live for COUNT_VS_TARGET
+        pool_arrival_target=pool_arrival_target,
+        stamp=bwd_a_ready,  # placeholder
+        dispatch_seq=Int64(dispatch_seq),  # placeholder
         expert_pool_block_offset=expert_pool_block_offset,
-        dispatch_seq=Int64(dispatch_seq),
         total_tiles=Int32(total_tiles),
     )
     varlen_args = VarlenArguments(

@@ -149,21 +149,26 @@ __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int
 // Pool-block fire helper. Given a contiguous slot range
 // `[slot_start_e, slot_start_e + n_writes_for_e)` that one substream / warp
 // just landed for some expert, walk the pool blocks the range overlaps,
-// atomic-add this contributor's per-block writes, and release-store
-// `ready[block_id] = dispatch_seq` on the contributor whose add tipped the
-// block to its target. Caller must have already fenced its pool writes to
-// system scope before calling — block-overlap math + release semantics live
-// here; the visibility argument lives at the call site.
+// and `red.release.gpu.global.add.s32 arrival_count[block_id] +=
+// writes_in_block` for each. The release semantics on the add pair with
+// the consumer's acquire-spin on `arrival_count[tile_id] ==
+// arrival_target[tile_id]` (see `tile_scheduler.py:_fetch_next_work_idx`)
+// — when the count hits target, all contributors have landed AND the
+// release-pair makes their pool writes visible.
 //
-// Used in 4 places (fwd/bwd × intranode/internode) — each picks its own
-// `arrival_count` / `ready` pair to thread per pool-block expert progress.
-// All 4 consumers (kernel A / Y_bwd) run on the same GPU as the dispatch
-// receiver, so the release-store uses `.gpu` scope. The caller's
-// `threadfence_system` carries pool-write visibility cross-rank.
+// Single PTX op per atomic (no separate tip-check + stamp-store pair); the
+// per-tile "ready" signal is the count reaching its target, not a separate
+// int64 stamp. Caller still must `threadfence_system` BEFORE calling so
+// pool writes are system-visible for the eventual cross-rank combine send;
+// `red.release.gpu` provides only intra-GPU acquire/release pairing with
+// the on-device consumer (kernel A / kernel_y_bwd).
+//
+// Used in 4 places (fwd/bwd × intranode/internode) — each passes its own
+// per-tile `arrival_count` tensor (fwd: pool_arrival_count;
+// bwd: bwd_dispatch_arrival_count).
 __device__ __forceinline__ void fire_pool_blocks(
     int slot_start_e, int n_writes_for_e, int tile_m,
-    int* arrival_count, const int* arrival_target,
-    int64_t* ready, int64_t dispatch_seq) {
+    int* arrival_count) {
     int slot_end_e = slot_start_e + n_writes_for_e;
     int first_block = slot_start_e / tile_m;
     int last_block = (slot_end_e - 1) / tile_m;
@@ -172,11 +177,8 @@ __device__ __forceinline__ void fire_pool_blocks(
         int block_slot_end = block_slot_start + tile_m;
         int writes_in_block =
             min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-        int cnt_before = atomicAdd(&arrival_count[block_id], writes_in_block);
-        if (cnt_before + writes_in_block == arrival_target[block_id]) {
-            memory_fence();
-            st_release_gpu_global(ready + block_id, dispatch_seq);
-        }
+        asm volatile("red.release.gpu.global.add.s32 [%0], %1;"
+                     ::"l"(&arrival_count[block_id]), "r"(writes_in_block));
     }
 }
 

@@ -31,18 +31,47 @@ FastDivmod, the upstream PersistenceMode enum) are imported from quack as-is.
 """
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 import quack.utils as utils
-from cutlass import Boolean, Int32, const_expr
+from cutlass import Boolean, Int32, Int64, const_expr
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
 from quack.tile_scheduler import PersistenceMode, TileScheduler
 from quack.utils import store_shared_remote_x4
 
-from stream_ep.stream_moe.ptx_helpers import ld_acquire_gpu_global
+from stream_ep.stream_moe.ptx_helpers import (
+    ld_acquire_gpu_global,
+    ld_acquire_gpu_global_i32,
+)
+
+
+class SpinKind(IntEnum):
+    """How `_fetch_next_work_idx` synchronizes with the producer of a tile.
+
+    Both kinds use the same warp-cooperative ballot expert-lookup; only the
+    per-tile "is this tile ready" spin differs.
+
+    COUNT_VS_TARGET: spin on
+        `pool_arrival_count[tile_id] == pool_arrival_target[tile_id]`.
+        Producer fires a `red.release.gpu.global.add.s32` per contribution
+        (multi-producer); consumer terminates once count hits the firing
+        target. Used by kernel A (consumes dispatch's Pass 2) and
+        `kernel_y_bwd` (consumes dispatch_grads' Pass 2).
+
+    ACQUIRE_VS_SEQ: spin on `ld_acquire_gpu_global(stamp[tile_id]) >= seq`.
+        Producer release-stores a monotonic int64 seq stamp (single-producer
+        per tile, with multi-stripe gating done inside the producer epilogue);
+        consumer terminates once the stamp catches up. Used by kernel Y
+        (consumes kernel A's `a_ready`) and `kernel_a_bwd` (consumes
+        `kernel_y_bwd`'s `bwd_a_ready`).
+    """
+
+    COUNT_VS_TARGET = 0
+    ACQUIRE_VS_SEQ = 1
 
 
 @dataclass
@@ -50,15 +79,22 @@ class StreamingTileSchedulerArguments:
     """Arguments for the streaming-MoE tile scheduler (pool layout). Produced by
     DeepEP's Buffer.dispatch and consumed by the QuACK streaming kernel.
 
-    Linear-claim layout with per-tile ready signal:
-      * tile_ready[total_tiles] int64 — dispatch's Pass 2 release-stores
-        dispatch_seq into tile_ready[tile_id] once pool_arrival_count hits its
-        target for that tile. Pass 2 walks experts in order across substream
-        blocks, so tile_ready flips (becomes >= dispatch_seq) in expert-monotonic
-        order — kernel A's linear-claim CTAs naturally converge on the same
-        expert at the same time.
-      * consumer_head is a single [1] int32 — one global atomic-add counter.
-        Linear claim order = tile_id order = expert-major order.
+    The scheduler supports two per-tile spin protocols, selected at compile
+    time via the `spin_kind` constexpr:
+      * `SpinKind.COUNT_VS_TARGET` (kernel A, kernel_y_bwd): spin on
+        `pool_arrival_count[tile_id] == pool_arrival_target[tile_id]`.
+        Multi-producer release-add protocol; producer fires
+        `red.release.gpu.global.add.s32` per contribution.
+      * `SpinKind.ACQUIRE_VS_SEQ` (kernel Y, kernel_a_bwd): spin on
+        `ld_acquire_gpu_global(stamp[tile_id]) >= seq`. Single-producer
+        release-stamp protocol; producer issues one `st_release_gpu_global`
+        per tile after the in-kernel multi-stripe gating.
+
+    Both kinds share the warp-cooperative ballot expert-lookup. The unused
+    field set (count/target for ACQUIRE_VS_SEQ kernels; stamp/seq for
+    COUNT_VS_TARGET kernels) gets placeholder tensors; the constexpr branch
+    in `_fetch_next_work_idx` dead-code-eliminates the unused path at JIT
+    compile time.
 
     Pool layout: kernel A reads `pool` (expert-major, BLOCK_M-padded) via
     standard strided TMA — no per-tile gather indirection. Each tile's m-row
@@ -71,27 +107,28 @@ class StreamingTileSchedulerArguments:
     read): each scheduler-warp lane loads one entry of
     ``expert_pool_block_offset`` (or kNumExpertsPerLane entries for
     E_local > 31), and a `vote_ballot_sync` + `popc` over `cum <= tile_id`
-    yields ``expert_id + 1`` directly. Drops one GMEM load per claim and
-    retires `tile_id_to_expert` from the scheduler surface. The metadata
-    kernel still emits `tile_id_to_expert` for now; consumers all moved to
-    the ballot lookup, so the array is unread and can be retired in a
-    follow-up cleanup commit.
+    yields ``expert_id + 1`` directly.
     """
 
     problem_shape_ntile_mnl: cute.Shape  # (None, num_pid_n, num_local_experts)
     consumer_head: cute.Tensor  # [1] int32 — global linear claim counter
-    tile_ready: (
-        cute.Tensor
-    )  # [total_tiles] int64 — release stamps from dispatch's Pass 2
+    # Per-tile spin source. Exactly one of (count, target) vs (stamp, seq) is
+    # live per kernel; the other pair carries placeholder tensors. Selected
+    # by `spin_kind` constexpr.
+    pool_arrival_count: cute.Tensor  # [total_tiles] int32  — COUNT_VS_TARGET
+    pool_arrival_target: cute.Tensor  # [total_tiles] int32  — COUNT_VS_TARGET
+    stamp: cute.Tensor  # [total_tiles] int64                  — ACQUIRE_VS_SEQ
+    dispatch_seq: Int64  # the int the consumer compares stamp against
+    # Common.
     expert_pool_block_offset: (
         cute.Tensor
     )  # [E_local + 1] int32 — pool-block prefix-sum; consulted by the
     # warp-cooperative ballot lookup below (one entry per scheduler-warp lane,
     # kNumExpertsPerLane entries for E_local > 31).
-    dispatch_seq: Int32  # int64 in real use; kept Int32 here for kernel arg convenience
     total_tiles: Int32  # passed as scalar so launch-time get_grid_shape doesn't deref device tensor
     tile_shape_mn: cutlass.Constexpr[cute.Shape]  # (tile_M, tile_N)
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+    spin_kind: cutlass.Constexpr[SpinKind] = SpinKind.COUNT_VS_TARGET
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STREAMING
 
 
@@ -125,14 +162,17 @@ class StreamingTileScheduler(TileScheduler):
     @dataclass
     class Params:
         consumer_head: cute.Tensor
-        tile_ready: cute.Tensor
+        pool_arrival_count: cute.Tensor
+        pool_arrival_target: cute.Tensor
+        stamp: cute.Tensor
+        dispatch_seq: Int64
         expert_pool_block_offset: cute.Tensor
-        dispatch_seq: Int32
         total_tiles: Int32
         num_pid_n: Int32
         num_pid_n_fdd: FastDivmod
         tile_shape_mn: cutlass.Constexpr[cute.Shape]
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+        spin_kind: cutlass.Constexpr[SpinKind]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
 
         @staticmethod
@@ -145,14 +185,17 @@ class StreamingTileScheduler(TileScheduler):
             )
             return StreamingTileScheduler.Params(
                 consumer_head=args.consumer_head,
-                tile_ready=args.tile_ready,
-                expert_pool_block_offset=args.expert_pool_block_offset,
+                pool_arrival_count=args.pool_arrival_count,
+                pool_arrival_target=args.pool_arrival_target,
+                stamp=args.stamp,
                 dispatch_seq=args.dispatch_seq,
+                expert_pool_block_offset=args.expert_pool_block_offset,
                 total_tiles=args.total_tiles,
                 num_pid_n=num_pid_n,
                 num_pid_n_fdd=FastDivmod(num_pid_n),
                 tile_shape_mn=args.tile_shape_mn,
                 cluster_shape_mnk=args.cluster_shape_mnk,
+                spin_kind=args.spin_kind,
                 persistence_mode=args.persistence_mode,
             )
 
@@ -308,22 +351,31 @@ class StreamingTileScheduler(TileScheduler):
             tile_id, cluster_pid_n = divmod(linear_idx, params.num_pid_n_fdd)
             pid_n = cluster_pid_n * Int32(params.cluster_shape_mnk[1])
 
-            # Lane 0 spins on tile_ready. The acquire-load on `tile_ready` is
-            # release-paired with dispatch's Pass 2 release-store (which fired
-            # AFTER a `threadfence_system` on pool writes AND after metadata's
-            # `expert_pool_block_offset` writes). The acquire here transitively
-            # carries visibility for the subsequent ballot reads of
-            # `expert_pool_block_offset`. Moving the ballot *before* this spin
-            # exposed a coherence window on the first few iters (validated
-            # empirically: ballot-before-spin caused iters 0-4 to read partially
-            # stale values via L1 cache residue from the recycled allocator
-            # slot; ballot-after-spin restores the OLD acquire-fence chain).
+            # Lane 0 spins on the per-tile ready signal. Spin-then-ballot
+            # ordering is load-bearing (the acquire-load fences the subsequent
+            # ballot reads of `expert_pool_block_offset`; validated
+            # empirically — ballot-before-spin exposed a stale-L1 coherence
+            # window for the first ~5 iters).
             if cute.arch.lane_idx() == 0:
-                ready_ptr = utils.elem_pointer(params.tile_ready, (tile_id,))
-                while ld_acquire_gpu_global(ready_ptr) < cutlass.Int64(
-                    params.dispatch_seq
-                ):
-                    pass
+                if const_expr(params.spin_kind == SpinKind.COUNT_VS_TARGET):
+                    # Multi-producer release-add: each producer fires
+                    # `red.release.gpu.global.add.s32`; consumer terminates
+                    # once count hits target.
+                    count_ptr = utils.elem_pointer(
+                        params.pool_arrival_count, (tile_id,)
+                    )
+                    target = params.pool_arrival_target[tile_id]
+                    while ld_acquire_gpu_global_i32(count_ptr) != target:
+                        pass
+                else:
+                    # ACQUIRE_VS_SEQ: single-producer release-stamp; consumer
+                    # terminates once the int64 stamp >= the seq this kernel
+                    # was launched with.
+                    stamp_ptr = utils.elem_pointer(params.stamp, (tile_id,))
+                    while ld_acquire_gpu_global(stamp_ptr) < cutlass.Int64(
+                        params.dispatch_seq
+                    ):
+                        pass
 
             # Warp-cooperative expert lookup. `expert_pool_block_offset` has
             # length E_local + 1 (last entry = total_tiles); `kNumExpertsPerLane`

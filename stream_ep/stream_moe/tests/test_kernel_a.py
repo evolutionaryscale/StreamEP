@@ -39,13 +39,25 @@ def _swiglu_ref(h_two_I: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
-def _make_tile_ready(
-    total_tiles: int, dispatch_seq: int, device, fired: bool = True
-) -> torch.Tensor:
-    """Allocate tile_ready[total_tiles] int64. If fired=True, pre-set to
-    dispatch_seq (all tiles ready at launch); else zero (test producer fires)."""
-    val = dispatch_seq if fired else 0
-    return torch.full((total_tiles,), val, dtype=torch.int64, device=device)
+def _make_pool_arrival(
+    total_tiles: int, device, fired: bool = True, target_val: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate (pool_arrival_count, pool_arrival_target) int32 pair.
+
+    pool_arrival_target is set to ``target_val`` (per-tile firing target).
+    pool_arrival_count is ``target_val`` if fired=True (scheduler spin
+    passes immediately) or zero otherwise (test producer fires by
+    `red.release.gpu.global.add.s32`'ing ``target_val`` into each slot
+    with a delay between fires — see ``fire_tiles_with_delay``).
+    """
+    pool_arrival_target = torch.full(
+        (total_tiles,), target_val, dtype=torch.int32, device=device
+    )
+    init = target_val if fired else 0
+    pool_arrival_count = torch.full(
+        (total_tiles,), init, dtype=torch.int32, device=device
+    )
+    return pool_arrival_count, pool_arrival_target
 
 
 def _make_tile_metadata(tile_to_expert_list, E_local, device):
@@ -107,7 +119,9 @@ def test_streaming_moe_a_compiles(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
     )
-    tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
+        total_tiles, device=device
+    )
     a_ready = _make_a_ready(total_tiles, device)
 
     import quack.cache_utils as cu
@@ -120,9 +134,9 @@ def test_streaming_moe_a_compiles(device):
             W1,
             postact_a,
             expert_pool_block_offset,
-            tile_ready,
+            pool_arrival_count,
+            pool_arrival_target,
             a_ready,
-            dispatch_seq=1,
             compute_seq=1,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -155,7 +169,9 @@ def test_streaming_moe_a_single_tile(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [chosen_expert], E_local, device
     )
-    tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
+        total_tiles, device=device
+    )
     a_ready = _make_a_ready(total_tiles, device)
 
     streaming_moe_a(
@@ -163,9 +179,9 @@ def test_streaming_moe_a_single_tile(device):
         W1,
         postact_a,
         expert_pool_block_offset,
-        tile_ready,
+        pool_arrival_count,
+        pool_arrival_target,
         a_ready,
-        dispatch_seq=1,
         compute_seq=7,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -218,7 +234,9 @@ def test_streaming_moe_a_multi_tile_static(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
+        total_tiles, device=device
+    )
     a_ready = _make_a_ready(total_tiles, device)
 
     streaming_moe_a(
@@ -226,9 +244,9 @@ def test_streaming_moe_a_multi_tile_static(device):
         W1,
         postact_a,
         expert_pool_block_offset,
-        tile_ready,
+        pool_arrival_count,
+        pool_arrival_target,
         a_ready,
-        dispatch_seq=1,
         compute_seq=11,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -285,7 +303,9 @@ def test_streaming_moe_a_with_preact(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    tile_ready = _make_tile_ready(total_tiles, dispatch_seq=1, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
+        total_tiles, device=device
+    )
     a_ready = _make_a_ready(total_tiles, device)
 
     streaming_moe_a(
@@ -293,9 +313,9 @@ def test_streaming_moe_a_with_preact(device):
         W1,
         postact_a,
         expert_pool_block_offset,
-        tile_ready,
+        pool_arrival_count,
+        pool_arrival_target,
         a_ready,
-        dispatch_seq=1,
         compute_seq=17,
         preact_a=preact_a,
         tile_m=tile_m,
@@ -361,16 +381,16 @@ def test_streaming_moe_a_producer_consumer(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    tile_ready = _make_tile_ready(
-        total_tiles, dispatch_seq=1, device=device, fired=False
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
+        total_tiles, device=device, fired=False
     )
     a_ready = _make_a_ready(total_tiles, device)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
-    # concurrent launch (use dispatch_seq=999 then reset).
-    fire_tiles_with_delay(tile_ready, dispatch_seq=999, delay_us=0)
+    # concurrent launch (one-shot pre-fire then reset).
+    fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=0)
     torch.cuda.synchronize()
-    tile_ready.zero_()
+    pool_arrival_count.zero_()
     torch.cuda.synchronize()
 
     compute_a_stream = torch.cuda.Stream()
@@ -382,15 +402,15 @@ def test_streaming_moe_a_producer_consumer(device):
             W1,
             postact_a,
             expert_pool_block_offset,
-            tile_ready,
+            pool_arrival_count,
+            pool_arrival_target,
             a_ready,
-            dispatch_seq=1,
             compute_seq=13,
             tile_m=tile_m,
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(tile_ready, dispatch_seq=1, delay_us=50)
+        fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=50)
 
     torch.cuda.synchronize()
 

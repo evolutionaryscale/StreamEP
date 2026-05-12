@@ -200,7 +200,8 @@ class StreamMoEFunc(torch.autograd.Function):
         # push its launch ~50 µs later and collapse the overlap window.
         streams.compute_a.wait_event(metadata_done)
         pool.record_stream(streams.compute_a)
-        handle.tile_ready.record_stream(streams.compute_a)
+        handle.pool_arrival_count.record_stream(streams.compute_a)
+        handle.pool_arrival_target.record_stream(streams.compute_a)
         handle.expert_pool_block_offset.record_stream(streams.compute_a)
         handle.a_ready.record_stream(streams.compute_a)
         with torch.cuda.stream(streams.compute_a):
@@ -233,9 +234,9 @@ class StreamMoEFunc(torch.autograd.Function):
                 w1_local,
                 postact_a,
                 handle.expert_pool_block_offset,
-                handle.tile_ready,
+                handle.pool_arrival_count,
+                handle.pool_arrival_target,
                 handle.a_ready,
-                dispatch_seq=handle.dispatch_seq,
                 compute_seq=handle.dispatch_seq,
                 preact_a=preact_a,
                 tile_m=tile_m,
@@ -268,6 +269,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.k_local_remaining,
                 handle.y_done_per_token,
                 handle.expert_pool_block_offset,
+                handle.pool_arrival_count,  # placeholder; elided by spin_kind
+                handle.pool_arrival_target,  # placeholder; elided
                 handle.a_ready,
                 compute_seq=handle.dispatch_seq,
                 combine_seq=dispatch_seq,
@@ -539,22 +542,24 @@ class StreamMoEFunc(torch.autograd.Function):
 
         # ── Stage 1 — dispatch_grads on streams.dispatch ───────────────────
         # Ships dL/dy origin → expert ranks along fwd's routing, K-fans into
-        # dL_do_pool[slot] via recv_token_to_slots[r, k]. Fires
-        # bwd_y_ready[tile] when each pool block's writes drain.
+        # dL_do_pool[slot] via recv_token_to_slots[r, k]. Pass 2's
+        # `red.release.gpu.add.s32` builds bwd_dispatch_arrival_count;
+        # kernel_y_bwd's scheduler spins on count == pool_arrival_target.
         with torch.cuda.stream(streams.dispatch):
-            dL_do_pool, bwd_y_ready = buffer.dispatch_grads(
+            dL_do_pool, bwd_dispatch_arrival_count = buffer.dispatch_grads(
                 handle, dL_dy, dispatch_seq=handle.dispatch_seq
             )
 
-        # dL_do_pool / bwd_y_ready were allocated on streams.dispatch by the
-        # runtime; mark cross-stream readers so the allocator doesn't recycle
-        # them prematurely.
+        # dL_do_pool / bwd_dispatch_arrival_count were allocated on streams.dispatch
+        # by the runtime; mark cross-stream readers so the allocator doesn't
+        # recycle them prematurely.
         dL_do_pool.record_stream(streams.compute_y)
-        bwd_y_ready.record_stream(streams.compute_y)
+        bwd_dispatch_arrival_count.record_stream(streams.compute_y)
 
         # ── Stage 2 — kernel_y_bwd on streams.compute_y ────────────────────
-        # Acquire-spins on bwd_y_ready[tile] internally; no cudaStreamWaitEvent
-        # between dispatch_grads and kernel_y_bwd. SwiGLU bwd folded into the
+        # Acquire-spins on bwd_dispatch_arrival_count[tile] == pool_arrival_target[tile]
+        # internally; no cudaStreamWaitEvent between dispatch_grads and kernel_y_bwd.
+        # SwiGLU bwd folded into the
         # epilogue. The kernel writes THREE outputs in one tile-streamed pass:
         #   - mD = dL_dswiglu_in  (bf16 (M, 2I) viewed fp32 (M, I))
         #   - mPostAct = postact_a_for_dW2  (bf16 (M, I) — weighted postact)
@@ -574,7 +579,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 preact_a,
                 dL_dweight,
                 handle.expert_pool_block_offset,
-                bwd_y_ready,
+                bwd_dispatch_arrival_count,
+                handle.pool_arrival_target,
                 bwd_a_ready,
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=tile_m,
@@ -615,6 +621,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 bwd_k_local_remaining,
                 bwd_a_done_per_token,
                 handle.expert_pool_block_offset,
+                handle.pool_arrival_count,  # placeholder; elided by spin_kind
+                handle.pool_arrival_target,  # placeholder; elided
                 bwd_a_ready,
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=tile_m,

@@ -136,6 +136,11 @@ def test_streaming_moe_y_compiles(device):
             k_local_remaining,
             y_done_per_token,
             expert_pool_block_offset,
+            # placeholder pool_arrival_count / pool_arrival_target (elided by
+            # kernel Y's spin_kind=ACQUIRE_VS_SEQ; any int32 [total_tiles] tensors
+            # of the right shape are fine — reuse a_ready's int32 sibling).
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
             a_ready,
             compute_seq=1,
             combine_seq=1,
@@ -189,6 +194,10 @@ def test_streaming_moe_y_single_tile(device):
         k_local_remaining,
         y_done_per_token,
         expert_pool_block_offset,
+        # placeholder pool_arrival_count / pool_arrival_target (elided by
+        # kernel Y's spin_kind=ACQUIRE_VS_SEQ).
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
         a_ready,
         compute_seq=1,
         combine_seq=42,
@@ -279,6 +288,10 @@ def test_streaming_moe_y_multi_tile_static(device):
         k_local_remaining,
         y_done_per_token,
         expert_pool_block_offset,
+        # placeholder pool_arrival_count / pool_arrival_target (elided by
+        # kernel Y's spin_kind=ACQUIRE_VS_SEQ).
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
         a_ready,
         compute_seq=1,
         combine_seq=99,
@@ -381,6 +394,10 @@ def test_streaming_moe_y_padding_rows(device):
         k_local_remaining,
         y_done_per_token,
         expert_pool_block_offset,
+        # placeholder pool_arrival_count / pool_arrival_target (elided by
+        # kernel Y's spin_kind=ACQUIRE_VS_SEQ).
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
         a_ready,
         compute_seq=1,
         combine_seq=7,
@@ -464,6 +481,11 @@ def test_streaming_moe_y_producer_consumer(device):
             k_local_remaining,
             y_done_per_token,
             expert_pool_block_offset,
+            # placeholder pool_arrival_count / pool_arrival_target (elided by
+            # kernel Y's spin_kind=ACQUIRE_VS_SEQ; any int32 [total_tiles] tensors
+            # of the right shape are fine — reuse a_ready's int32 sibling).
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
             a_ready,
             compute_seq=1,
             combine_seq=5,

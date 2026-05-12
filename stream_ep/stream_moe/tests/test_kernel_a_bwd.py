@@ -137,6 +137,10 @@ def test_streaming_moe_a_bwd_compiles(device):
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             expert_pool_block_offset,
+            # placeholder pool_arrival_count / pool_arrival_target (elided
+            # by kernel_a_bwd's spin_kind=ACQUIRE_VS_SEQ).
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
             bwd_a_ready,
             dispatch_seq=1,
             tile_m=tile_m,
@@ -190,6 +194,10 @@ def test_streaming_moe_a_bwd_single_tile(device):
         bwd_k_local_remaining,
         bwd_a_done_per_token,
         expert_pool_block_offset,
+        # placeholder pool_arrival_count / pool_arrival_target (elided by
+        # kernel_a_bwd's spin_kind=ACQUIRE_VS_SEQ).
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
         bwd_a_ready,
         dispatch_seq=dispatch_seq,
         tile_m=tile_m,
@@ -275,6 +283,10 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
         bwd_k_local_remaining,
         bwd_a_done_per_token,
         expert_pool_block_offset,
+        # placeholder pool_arrival_count / pool_arrival_target (elided by
+        # kernel_a_bwd's spin_kind=ACQUIRE_VS_SEQ).
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
         bwd_a_ready,
         dispatch_seq=dispatch_seq,
         tile_m=tile_m,
@@ -371,6 +383,10 @@ def test_streaming_moe_a_bwd_padding_rows(device):
         bwd_k_local_remaining,
         bwd_a_done_per_token,
         expert_pool_block_offset,
+        # placeholder pool_arrival_count / pool_arrival_target (elided by
+        # kernel_a_bwd's spin_kind=ACQUIRE_VS_SEQ).
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
+        torch.zeros(total_tiles, dtype=torch.int32, device=device),
         bwd_a_ready,
         dispatch_seq=dispatch_seq,
         tile_m=tile_m,
@@ -405,7 +421,7 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
     identical (per-tile int64 release-store with system scope).
     """
     from stream_ep.stream_moe.kernel_a import (
-        fire_tiles_with_delay,
+        fire_a_ready_with_delay as fire_stamps_with_delay,
     )
     from stream_ep.stream_moe.kernel_a_bwd import (
         streaming_moe_a_bwd,
@@ -439,7 +455,7 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
     )
 
     # Pre-warm the producer JIT.
-    fire_tiles_with_delay(bwd_a_ready, dispatch_seq=999, delay_us=0)
+    fire_stamps_with_delay(bwd_a_ready, compute_seq=999, delay_us=0)
     torch.cuda.synchronize()
     bwd_a_ready.zero_()
     torch.cuda.synchronize()
@@ -456,13 +472,17 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             expert_pool_block_offset,
+            # placeholder pool_arrival_count / pool_arrival_target (elided
+            # by kernel_a_bwd's spin_kind=ACQUIRE_VS_SEQ).
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
+            torch.zeros(total_tiles, dtype=torch.int32, device=device),
             bwd_a_ready,
             dispatch_seq=5,
             tile_m=tile_m,
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(bwd_a_ready, dispatch_seq=5, delay_us=50)
+        fire_stamps_with_delay(bwd_a_ready, compute_seq=5, delay_us=50)
 
     torch.cuda.synchronize()
 

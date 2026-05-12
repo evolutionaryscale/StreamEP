@@ -206,7 +206,9 @@ def main():
     TK = int(expert_frequency.sum().item())  # actual (token, k) count, no padding
 
     # Pre-fired ready signals so kernel A / kernel Y can be timed in isolation.
-    tile_ready_fired = torch.full_like(handle.tile_ready, handle.dispatch_seq)
+    # For COUNT_VS_TARGET kernels (A, y_bwd): set count := target so the spin
+    # passes immediately on the first acquire-load.
+    pool_arrival_count_fired = handle.pool_arrival_target.clone()
     a_ready_fired = torch.full_like(handle.a_ready, handle.dispatch_seq)
     # Fresh a_ready for kernel A's own release-store (one isolated kernel A
     # run writes here; we don't read it). zero-init so the per-tile multi-pid_n
@@ -230,7 +232,7 @@ def main():
 
     # ── Bwd-side buffers for isolated bwd-kernel timing ───────────────────
     # The bwd path doesn't allocate via the same cached handle — each
-    # `dispatch_grads` call returns fresh `dL_do_pool` / `bwd_y_ready`.
+    # `dispatch_grads` call returns fresh `dL_do_pool` / `bwd_dispatch_arrival_count`.
     # For isolated kernel_y_bwd / kernel_a_bwd / combine_grads timing we
     # capture one set from a single dispatch_grads call below and reuse it
     # across timed iters.
@@ -247,9 +249,9 @@ def main():
     dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=DTYPE, device=device)
     # Pre-fired bwd ready signals so each bwd kernel can be timed in isolation.
-    bwd_y_ready_fired = torch.full(
-        (total_tiles,), handle.dispatch_seq, dtype=torch.int64, device=device
-    )
+    # kernel_y_bwd's scheduler is COUNT_VS_TARGET: set count := target. The
+    # target is `handle.pool_arrival_target` (shared with fwd).
+    bwd_dispatch_arrival_count_fired = handle.pool_arrival_target.clone()
     bwd_a_ready_fired = torch.full(
         (total_tiles,), handle.dispatch_seq, dtype=torch.int64, device=device
     )
@@ -293,9 +295,9 @@ def main():
             w1_local,
             postact_a,
             handle.expert_pool_block_offset,
-            tile_ready_fired,
+            pool_arrival_count_fired,
+            handle.pool_arrival_target,
             a_ready_for_a,
-            dispatch_seq=handle.dispatch_seq,
             compute_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
             tile_n=args.tile_n_a,
@@ -336,6 +338,8 @@ def main():
             handle.k_local_remaining,
             handle.y_done_per_token,
             handle.expert_pool_block_offset,
+            handle.pool_arrival_count,  # placeholder; elided
+            handle.pool_arrival_target,  # placeholder
             a_ready_fired,
             compute_seq=handle.dispatch_seq,
             combine_seq=1,
@@ -374,12 +378,15 @@ def main():
     # sub-ms cadence (cross-rank wall-time drift races ahead and clobbers
     # the meta slot the lagging rank is still polling).
     _dL_do_pool_captured: torch.Tensor | None = None
-    _bwd_y_ready_captured: torch.Tensor | None = None
+    _bwd_dispatch_arrival_count_captured: torch.Tensor | None = None
 
     def materialize_dispatch_grads():
-        nonlocal _dL_do_pool_captured, _bwd_y_ready_captured
+        nonlocal _dL_do_pool_captured, _bwd_dispatch_arrival_count_captured
         with torch.cuda.stream(streams.dispatch):
-            _dL_do_pool_captured, _bwd_y_ready_captured = buffer.dispatch_grads(
+            (
+                _dL_do_pool_captured,
+                _bwd_dispatch_arrival_count_captured,
+            ) = buffer.dispatch_grads(
                 handle, dL_dy_in, dispatch_seq=handle.dispatch_seq
             )
         torch.cuda.current_stream().wait_stream(streams.dispatch)
@@ -401,7 +408,8 @@ def main():
             preact_a,
             dL_dweight,
             handle.expert_pool_block_offset,
-            bwd_y_ready_fired,
+            bwd_dispatch_arrival_count_fired,
+            handle.pool_arrival_target,
             bwd_a_ready_for_y,
             dispatch_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
@@ -451,6 +459,8 @@ def main():
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             handle.expert_pool_block_offset,
+            handle.pool_arrival_count,  # placeholder; elided by spin_kind
+            handle.pool_arrival_target,  # placeholder; elided
             bwd_a_ready_fired,
             dispatch_seq=handle.dispatch_seq,
             tile_m=args.tile_m,

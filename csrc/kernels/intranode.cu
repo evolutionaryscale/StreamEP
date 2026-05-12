@@ -799,9 +799,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                 int n_writes_for_e = seen_substream[e];
                 if (n_writes_for_e == 0) continue;
                 fire_pool_blocks(base_pool_substream[e], n_writes_for_e, shape.tile_m,
-                                 tile_signal.pool_arrival_count,
-                                 tile_signal.pool_arrival_target,
-                                 tile_signal.tile_ready, tile_signal.dispatch_seq);
+                                 tile_signal.pool_arrival_count);
             }
         }
     }
@@ -1116,9 +1114,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
                 int n_writes_for_e = seen_substream[e];
                 if (n_writes_for_e == 0) continue;
                 fire_pool_blocks(base_pool_substream[e], n_writes_for_e, shape.tile_m,
-                                 tile_signal.bwd_dispatch_arrival_count,
-                                 tile_signal.pool_arrival_target,
-                                 tile_signal.bwd_y_ready, tile_signal.dispatch_seq);
+                                 tile_signal.bwd_dispatch_arrival_count);
             }
         }
     }

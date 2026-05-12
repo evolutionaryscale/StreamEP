@@ -129,6 +129,30 @@ def ld_acquire_gpu_global(
 
 
 @dsl_user_op
+def ld_acquire_gpu_global_i32(
+    gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> cutlass.Int32:
+    """Acquire-load an int32 value from a global pointer with .gpu scope.
+
+    Used by the tile scheduler's spin on
+    `pool_arrival_count[tile_id] == pool_arrival_target[tile_id]` — the
+    acquire pairs with dispatch's Pass 2 `red.release.gpu.global.add.s32`
+    so pool writes are visible once the count hits target.
+    """
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [gmem_ptr_i64],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
+
+
+@dsl_user_op
 def threadfence_system(*, loc=None, ip=None) -> None:
     """System-scope memory fence (membar.sys)."""
     llvm.inline_asm(

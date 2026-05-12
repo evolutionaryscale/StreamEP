@@ -77,6 +77,7 @@ from stream_ep.stream_moe.ptx_helpers import (
     threadfence_system,
 )
 from stream_ep.stream_moe.tile_scheduler import (
+    SpinKind,
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
@@ -319,9 +320,13 @@ class AtomicScatterStore(EpiOp):
 class StreamingMoeYSchedulerOptions(NamedTuple):
     max_active_clusters: Int32
     consumer_head: cute.Tensor
-    a_ready: cute.Tensor
+    # Kernel Y uses SpinKind.ACQUIRE_VS_SEQ on (a_ready, compute_seq).
+    # The count/target pair is placeholder for the dual-protocol scheduler.
+    pool_arrival_count: cute.Tensor   # placeholder (any int32 tensor of [total_tiles])
+    pool_arrival_target: cute.Tensor  # placeholder
+    a_ready: cute.Tensor              # [total_tiles] int64 stamp from kernel A (live)
     expert_pool_block_offset: cute.Tensor
-    compute_seq: Int64
+    compute_seq: Int64                # seq to compare a_ready against (live)
     total_tiles: Int32
 
 
@@ -568,12 +573,15 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            tile_ready=scheduler_args.a_ready,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
+            pool_arrival_count=scheduler_args.pool_arrival_count,
+            pool_arrival_target=scheduler_args.pool_arrival_target,
+            stamp=scheduler_args.a_ready,
             dispatch_seq=scheduler_args.compute_seq,
+            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
+            spin_kind=SpinKind.ACQUIRE_VS_SEQ,
             persistence_mode=PersistenceMode.STREAMING,
         )
 
@@ -683,6 +691,8 @@ def _compile_streaming_moe_y(
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     a_ready = fake_tensor(cutlass.Int64, (total_tiles_sym,), divisibility=1)
+    pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
@@ -690,6 +700,8 @@ def _compile_streaming_moe_y(
     scheduler_args = StreamingMoeYSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
+        pool_arrival_count=pool_arrival_count,  # placeholder; elided
+        pool_arrival_target=pool_arrival_target,  # placeholder; elided
         a_ready=a_ready,
         expert_pool_block_offset=expert_pool_block_offset,
         compute_seq=Int64(0),
@@ -734,7 +746,9 @@ def streaming_moe_y(
     k_local_remaining: torch.Tensor,  # (T_recv,) int32
     y_done_per_token: torch.Tensor,  # (T_recv,) int64
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
-    a_ready: torch.Tensor,  # (total_tiles,) int64
+    pool_arrival_count: torch.Tensor,  # (total_tiles,) int32 — placeholder; passed for shape compat with the dual-protocol scheduler
+    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — placeholder
+    a_ready: torch.Tensor,  # (total_tiles,) int64 — kernel A's release stamp (live)
     compute_seq: int,
     combine_seq: int,
     *,
@@ -858,6 +872,8 @@ def streaming_moe_y(
     scheduler_args = StreamingMoeYSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
+        pool_arrival_count=pool_arrival_count,  # placeholder
+        pool_arrival_target=pool_arrival_target,  # placeholder
         a_ready=a_ready,
         expert_pool_block_offset=expert_pool_block_offset,
         compute_seq=Int64(compute_seq),

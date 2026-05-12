@@ -64,7 +64,11 @@ namespace stream_ep {
 //   expert_*, base_pool      pool-shape metadata (kernel A scheduler).
 //   tile_id_to_expert,
 //   pool_arrival_target,
-//   tile_ready, a_ready      per-tile arrays (scheduler + cross-stream signals).
+//   pool_arrival_count,
+//   a_ready                  per-tile arrays (scheduler + cross-stream signals).
+//                            Scheduler spins on
+//                            `pool_arrival_count[tile] == pool_arrival_target[tile]`
+//                            (set by dispatch's Pass 2 `red.release.gpu.add`).
 //   k_local_remaining,
 //   y_done_per_token,
 //   o                        kernel Y atomic-scatter destination + Y→combine gate.
@@ -99,7 +103,7 @@ struct StreamingDispatchOutputs {
 
     torch::Tensor tile_id_to_expert;
     torch::Tensor pool_arrival_target;
-    torch::Tensor tile_ready;
+    torch::Tensor pool_arrival_count;
 
     torch::Tensor a_ready;
     torch::Tensor k_local_remaining;
@@ -304,8 +308,9 @@ public:
     // (populated by fwd Pass B) to look up slots without rerunning Pass A.
     // No metadata kernel, no host poll, no IPC barrier on the metadata path —
     // the only cross-rank sync is the small barrier between the channel-control
-    // memset and the kernel launch. Returns (dL_do_pool, bwd_y_ready); caller
-    // (orchestrator) holds bwd_y_ready for kernel_y_bwd to acquire-spin on.
+    // memset and the kernel launch. Returns (dL_do_pool,
+    // bwd_dispatch_arrival_count); caller (orchestrator) holds the count for
+    // kernel_y_bwd to spin on (count == pool_arrival_target).
     std::tuple<torch::Tensor, torch::Tensor> intranode_dispatch_grads(
         const torch::Tensor& dL_dy,
         const torch::Tensor& is_token_in_rank,
@@ -365,7 +370,8 @@ public:
     // `Buffer::intranode_dispatch_grads`: ships dL/dy[t] origin → expert ranks
     // along the same (t, dst_rank) routing as fwd dispatch. Receiver writes
     // dL_do_pool[slot] K times per packet using `recv_token_to_slots`
-    // (populated by fwd Pass B), no Pass A. Returns (dL_do_pool, bwd_y_ready).
+    // (populated by fwd Pass B), no Pass A. Returns
+    // (dL_do_pool, bwd_dispatch_arrival_count).
     //
     // No metadata kernel, no host poll — the routing tensors live on
     // `StreamingDispatchOutputs` from the fwd dispatch and are reused here.

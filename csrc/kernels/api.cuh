@@ -99,10 +99,12 @@ struct DispatchInputs {
 struct DispatchTileSignal {
     int* channel_prefix_matrix;    // [num_ranks, num_channels]  sender-side cumulative
     const int* base_pool;          // [num_channels, num_ranks, E_local]
-    int* pool_arrival_count;       // [total_tiles]   atomic-add target during pass 2
-    const int* pool_arrival_target;  // [total_tiles] firing target
-    int64_t* tile_ready;           // [total_tiles]   per-tile release stamp
-    int64_t dispatch_seq;
+    int* pool_arrival_count;       // [total_tiles]   release-add target during Pass 2
+                                   //                 (consumer spins on count == arrival_target)
+    const int* pool_arrival_target;  // [total_tiles] firing target (per-tile expected count)
+    int64_t dispatch_seq;          // used for NVL gen-stamp (`nvl_seq = dispatch_seq << 1`).
+                                   //   NOT used for the per-tile ready signal — that pair was
+                                   //   retired in favor of `pool_arrival_count == pool_arrival_target`.
 };
 
 struct DispatchShape {
@@ -151,10 +153,10 @@ struct DispatchGradsRouting {
 };
 
 struct DispatchGradsTileSignal {
-    int* bwd_dispatch_arrival_count;  // [total_tiles] int32  atomic-add target during Pass 2
+    int* bwd_dispatch_arrival_count;  // [total_tiles] int32  release-add target during Pass 2
+                                      //   (consumer spins on count == arrival_target)
     const int* pool_arrival_target;   // [total_tiles] int32  firing target (same as fwd's)
-    int64_t* bwd_y_ready;             // [total_tiles] int64  per-tile release stamp (consumed by kernel_y_bwd)
-    int64_t dispatch_seq;
+    int64_t dispatch_seq;             // NVL gen-stamp only (`nvl_seq = (seq << 1) | 1`).
 };
 
 struct DispatchGradsShape {
@@ -371,13 +373,12 @@ struct DispatchTileSignal {
     const int* seen_per_substream;   // [num_channels, num_world_ranks, E_local]
                                      //   eager-fire target: NVL receiver compares its
                                      //   per-warp `seen[src_rdma][e_local]` against this
-                                     //   per-iter; on match, fires `tile_ready` for the
-                                     //   completed expert's blocks (vs the substream-end
-                                     //   walk intranode still uses).
+                                     //   per-iter; on match, releases an add to
+                                     //   `pool_arrival_count` for the completed expert's
+                                     //   blocks (consumer spins on count == target).
     int* pool_arrival_count;         // [total_tiles]
     const int* pool_arrival_target;  // [total_tiles]
-    int64_t* tile_ready;             // [total_tiles]
-    int64_t dispatch_seq;
+    int64_t dispatch_seq;            // NVL gen-stamp only; not used for tile-ready.
 };
 
 struct DispatchShape {
@@ -456,10 +457,10 @@ struct DispatchGradsRouting {
 };
 
 struct DispatchGradsTileSignal {
-    int* bwd_dispatch_arrival_count;  // [total_tiles] int32  atomic-add target during Pass 2
+    int* bwd_dispatch_arrival_count;  // [total_tiles] int32  release-add target during Pass 2
+                                      //   (consumer spins on count == arrival_target)
     const int* pool_arrival_target;   // [total_tiles] int32  firing target (same as fwd's)
-    int64_t* bwd_y_ready;             // [total_tiles] int64  per-tile release stamp (consumed by kernel_y_bwd)
-    int64_t dispatch_seq;
+    int64_t dispatch_seq;             // NVL gen-stamp only (`nvl_seq = (seq << 1) | 1`).
 };
 
 struct DispatchGradsShape {

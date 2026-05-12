@@ -38,9 +38,27 @@ def _make_ready(
     total_tiles: int, dispatch_seq: int, device, fired: bool = True
 ) -> torch.Tensor:
     """Allocate a [total_tiles] int64 ready array. If fired=True, pre-set to
-    dispatch_seq (all tiles ready at launch); else zero (test producer fires)."""
+    dispatch_seq (all tiles ready at launch); else zero (test producer fires).
+    Used by kernel_y_bwd's bwd_a_ready (its OUTPUT stamp; kernel_y_bwd still
+    consumes the per-tile count-vs-target signal — see `_make_bwd_arrival`)."""
     val = dispatch_seq if fired else 0
     return torch.full((total_tiles,), val, dtype=torch.int64, device=device)
+
+
+def _make_bwd_arrival(
+    total_tiles: int, device, fired: bool = True, target_val: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate (bwd_dispatch_arrival_count, pool_arrival_target) int32 pair
+    for kernel_y_bwd's scheduler (COUNT_VS_TARGET on bwd_dispatch_arrival_count).
+    """
+    pool_arrival_target = torch.full(
+        (total_tiles,), target_val, dtype=torch.int32, device=device
+    )
+    init = target_val if fired else 0
+    bwd_dispatch_arrival_count = torch.full(
+        (total_tiles,), init, dtype=torch.int32, device=device
+    )
+    return bwd_dispatch_arrival_count, pool_arrival_target
 
 
 def _make_tile_metadata(tile_to_expert_list, E_local, device):
@@ -230,7 +248,9 @@ def test_streaming_moe_y_bwd_compiles(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
     )
-    bwd_y_ready = _make_ready(total_tiles, dispatch_seq=seq, device=device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
+        total_tiles, device=device
+    )
     bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
 
     import quack.cache_utils as cu
@@ -248,7 +268,8 @@ def test_streaming_moe_y_bwd_compiles(device):
             preact_a,
             dL_dweight,
             expert_pool_block_offset,
-            bwd_y_ready,
+            bwd_dispatch_arrival_count,
+            pool_arrival_target,
             bwd_a_ready,
             dispatch_seq=seq,
             tile_m=tile_m,
@@ -294,7 +315,9 @@ def test_streaming_moe_y_bwd_single_tile(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    bwd_y_ready = _make_ready(total_tiles, dispatch_seq=seq, device=device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
+        total_tiles, device=device
+    )
     bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
 
     streaming_moe_y_bwd(
@@ -307,7 +330,8 @@ def test_streaming_moe_y_bwd_single_tile(device):
         preact_a,
         dL_dweight,
         expert_pool_block_offset,
-        bwd_y_ready,
+        bwd_dispatch_arrival_count,
+        pool_arrival_target,
         bwd_a_ready,
         dispatch_seq=seq,
         tile_m=tile_m,
@@ -411,7 +435,9 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    bwd_y_ready = _make_ready(total_tiles, dispatch_seq=seq, device=device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
+        total_tiles, device=device
+    )
     bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
 
     streaming_moe_y_bwd(
@@ -424,7 +450,8 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
         preact_a,
         dL_dweight,
         expert_pool_block_offset,
-        bwd_y_ready,
+        bwd_dispatch_arrival_count,
+        pool_arrival_target,
         bwd_a_ready,
         dispatch_seq=seq,
         tile_m=tile_m,
@@ -493,14 +520,18 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    bwd_y_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
+        total_tiles, device=device, fired=False
+    )
     bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
-    # concurrent launch (use dispatch_seq=999 then reset).
-    fire_tiles_with_delay(bwd_y_ready, dispatch_seq=999, delay_us=0)
+    # concurrent launch (one-shot pre-fire then reset).
+    fire_tiles_with_delay(
+        bwd_dispatch_arrival_count, pool_arrival_target, delay_us=0
+    )
     torch.cuda.synchronize()
-    bwd_y_ready.zero_()
+    bwd_dispatch_arrival_count.zero_()
     torch.cuda.synchronize()
 
     consumer_stream = torch.cuda.Stream()
@@ -517,14 +548,17 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             preact_a,
             dL_dweight,
             expert_pool_block_offset,
-            bwd_y_ready,
+            bwd_dispatch_arrival_count,
+            pool_arrival_target,
             bwd_a_ready,
             dispatch_seq=seq,
             tile_m=tile_m,
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(bwd_y_ready, dispatch_seq=seq, delay_us=50)
+        fire_tiles_with_delay(
+            bwd_dispatch_arrival_count, pool_arrival_target, delay_us=50
+        )
 
     torch.cuda.synchronize()
 
@@ -663,7 +697,9 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    bwd_y_ready = _make_ready(total_tiles, dispatch_seq=seq, device=device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
+        total_tiles, device=device
+    )
     bwd_a_ready = _make_ready(total_tiles, dispatch_seq=0, device=device, fired=False)
 
     streaming_moe_y_bwd(
@@ -676,7 +712,8 @@ def test_streaming_moe_y_bwd_dense_padding(device):
         preact_a,
         dL_dweight,
         expert_pool_block_offset,
-        bwd_y_ready,
+        bwd_dispatch_arrival_count,
+        pool_arrival_target,
         bwd_a_ready,
         dispatch_seq=seq,
         tile_m=tile_m,
