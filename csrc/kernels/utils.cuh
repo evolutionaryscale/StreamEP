@@ -89,6 +89,15 @@ __device__ __forceinline__ void st_release_sys_global(const int64_t* ptr, int64_
     asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
 }
 
+// GPU-scope release-store for intra-GPU producer→consumer stamps (different
+// streams, same device). Cheaper than `_sys_global`: stays in L2, no NVLink
+// coherence traversal. Use for `tile_ready` / `a_ready` / `y_done_per_token`.
+// Cross-rank stamps (channel_tail_idx, nvl_channel_tail, rdma_channel_tail)
+// must keep `_sys_global`. See markdowns/optimizations.md §2.
+__device__ __forceinline__ void st_release_gpu_global(const int64_t* ptr, int64_t val) {
+    asm volatile("st.release.gpu.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
 __device__ __forceinline__ void st_relaxed_sys_global(const uint64_t* ptr, uint64_t val) {
     asm volatile("st.relaxed.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
 }
@@ -100,6 +109,12 @@ __device__ __forceinline__ void st_release_sys_global(const uint64_t* ptr, uint6
 __device__ __forceinline__ int64_t ld_acquire_sys_global(const int64_t* ptr) {
     int64_t ret;
     asm volatile("ld.acquire.sys.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ int64_t ld_acquire_gpu_global(const int64_t* ptr) {
+    int64_t ret;
+    asm volatile("ld.acquire.gpu.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
     return ret;
 }
 
@@ -142,6 +157,9 @@ __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int
 //
 // Used in 4 places (fwd/bwd × intranode/internode) — each picks its own
 // `arrival_count` / `ready` pair to thread per pool-block expert progress.
+// All 4 consumers (kernel A / Y_bwd) run on the same GPU as the dispatch
+// receiver, so the release-store uses `.gpu` scope. The caller's
+// `threadfence_system` carries pool-write visibility cross-rank.
 __device__ __forceinline__ void fire_pool_blocks(
     int slot_start_e, int n_writes_for_e, int tile_m,
     int* arrival_count, const int* arrival_target,
@@ -157,7 +175,7 @@ __device__ __forceinline__ void fire_pool_blocks(
         int cnt_before = atomicAdd(&arrival_count[block_id], writes_in_block);
         if (cnt_before + writes_in_block == arrival_target[block_id]) {
             memory_fence();
-            st_release_sys_global(ready + block_id, dispatch_seq);
+            st_release_gpu_global(ready + block_id, dispatch_seq);
         }
     }
 }
@@ -466,7 +484,12 @@ __device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* g
 
 template <int N>
 __device__ __forceinline__ void tma_store_wait() {
-    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
+    // Non-`.read` variant waits for proxy-async store completion, not just
+    // L2 read-visibility. Required when followed by `threadfence_system` +
+    // a release-store on `tile_ready` / `a_ready` — the `.read` form does
+    // not order against a consumer on another stream issuing `cp.async.bulk`
+    // loads. DeepEPV2 and DeepGEMM both use this stronger form.
+    asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
 
 #endif

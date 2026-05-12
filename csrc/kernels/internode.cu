@@ -3015,7 +3015,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     int64_t first_token_idx = token_idx;
                     if (elect_one_sync()) {
                         auto gate_start = clock64();
-                        while (ld_acquire_sys_global(&y_done_per_token[first_token_idx]) < combine_seq) {
+                        while (ld_acquire_gpu_global(&y_done_per_token[first_token_idx]) < combine_seq) {
                             if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                 printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                        "token: %ld, seq: %ld\n",
@@ -3077,7 +3077,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         int64_t next_token_idx = token_idx + 1;
                         if (elect_one_sync()) {
                             auto gate_start = clock64();
-                            while (ld_acquire_sys_global(&y_done_per_token[next_token_idx]) < combine_seq) {
+                            while (ld_acquire_gpu_global(&y_done_per_token[next_token_idx]) < combine_seq) {
                                 if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                     printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                            "token: %ld, seq: %ld\n",

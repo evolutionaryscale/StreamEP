@@ -2,10 +2,13 @@
 
 Three groups:
 
-1. **Cross-stream signaling** (kernel A scheduler) — system-scope acquire /
-   release / fence pair so the linear-claim scheduler can spin on
-   `tile_ready[tile_id]` written by DeepEP dispatch's Pass 2 on a different
-   stream.
+1. **Cross-stream signaling** — acquire / release / fence wrappers used to
+   pair producers and consumers on different streams. Two scopes:
+   `_gpu_global` for intra-GPU stamps (`tile_ready`, `a_ready`,
+   `y_done_per_token` and their bwd analogs — producer and consumer on the
+   same device, different streams); `_sys_global` for cross-rank stamps
+   (channel tails over NVLink / RDMA). `threadfence_system` carries
+   cross-rank visibility on the producer side where needed.
 
 2. **bf16-pair packing** — `pack_bf16x2` reads two bf16 from SMEM and packs
    them into a single Int32 (bf16x2 layout). Sidesteps the
@@ -55,6 +58,30 @@ def st_release_sys_global(
 
 
 @dsl_user_op
+def st_release_gpu_global(
+    gmem_ptr: cute.Pointer, val: cutlass.Int64, *, loc=None, ip=None
+) -> None:
+    """Release-store an int64 value to a global pointer with .gpu scope.
+
+    Use for intra-GPU producer→consumer stamps (different streams, same
+    device): ``tile_ready`` / ``a_ready`` / ``y_done_per_token`` and their
+    bwd analogs. Cheaper than ``_sys_global``: stays in L2, no NVLink
+    coherence traversal. Cross-rank stamps must keep ``_sys_global``.
+
+    Memory clobber semantics identical to ``st_release_sys_global``.
+    """
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr_i64, cutlass.Int64(val).ir_value(loc=loc, ip=ip)],
+        "st.release.gpu.global.b64 [$0], $1;",
+        "l,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+@dsl_user_op
 def ld_acquire_sys_global(
     gmem_ptr: cute.Pointer, *, loc=None, ip=None
 ) -> cutlass.Int64:
@@ -72,6 +99,28 @@ def ld_acquire_sys_global(
             T.i64(),
             [gmem_ptr_i64],
             "ld.acquire.sys.global.b64 $0, [$1];",
+            "=l,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
+
+
+@dsl_user_op
+def ld_acquire_gpu_global(
+    gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> cutlass.Int64:
+    """Acquire-load an int64 value from a global pointer with .gpu scope.
+
+    Pair with ``st_release_gpu_global`` for intra-GPU producer→consumer
+    stamps. Memory clobber semantics identical to ``ld_acquire_sys_global``.
+    """
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [gmem_ptr_i64],
+            "ld.acquire.gpu.global.b64 $0, [$1];",
             "=l,l,~{memory}",
             has_side_effects=True,
             is_align_stack=False,

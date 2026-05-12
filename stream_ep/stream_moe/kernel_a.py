@@ -54,7 +54,7 @@ from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
 from stream_ep.stream_moe.ptx_helpers import (
-    st_release_sys_global,
+    st_release_gpu_global,
     threadfence_system,
 )
 from stream_ep.stream_moe.tile_scheduler import (
@@ -75,7 +75,7 @@ from stream_ep.stream_moe.tile_scheduler import (
 # per N-stripe). The release-store fires ONCE per tile, when the last
 # N-stripe completes. Atomic-add on `tile_n_stripes_done[tile_id]` provides
 # the gating; the CTA whose atomic-add returns `num_pid_n - 1` is the last,
-# fires `threadfence_system` + `st_release_sys_global(a_ready[tile_id], compute_seq)`.
+# fires `threadfence_system` + `st_release_gpu_global(a_ready[tile_id], compute_seq)`.
 # ---------------------------------------------------------------------------
 @mlir_namedtuple
 class TileReadyParams(NamedTuple):
@@ -153,7 +153,7 @@ class TileReadyRelease(EpiOp):
                 # stream can acquire-load with cross-stream visibility.
                 threadfence_system()
                 a_ready_ptr = utils.elem_pointer(param.a_ready, (tile_id,))
-                st_release_sys_global(a_ready_ptr, param.compute_seq)
+                st_release_gpu_global(a_ready_ptr, param.compute_seq)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +435,7 @@ class _StreamingTileProducer:
                     pass
                 ready_ptr = utils.elem_pointer(tile_ready, (i,))
                 threadfence_system()
-                st_release_sys_global(ready_ptr, dispatch_seq)
+                st_release_gpu_global(ready_ptr, dispatch_seq)
 
 
 @jit_cache

@@ -1356,12 +1356,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 // y_done_per_token[my_token] once k_local_remaining[my_token]
                 // hits zero (all K_local(my_token) contributions to o[my_token] have
                 // landed). Spin until the gate clears, then issue the warp-cooperative
-                // copy below — the acquire pairs with kernel Y's `.sys`-scope release
-                // and makes o[my_token]'s writes globally visible to this warp.
+                // copy below — the acquire pairs with kernel Y's `.gpu`-scope release
+                // (intra-GPU: kernel Y and combine sender on the same device).
+                // Kernel Y's `threadfence_system` before the release carries
+                // o[my_token]'s writes to system scope for the downstream NVL send.
                 auto my_token = token_idx + i;
                 if (elect_one_sync()) {
                     auto gate_start = clock64();
-                    while (ld_acquire_sys_global(&y_done_per_token[my_token]) < combine_seq) {
+                    while (ld_acquire_gpu_global(&y_done_per_token[my_token]) < combine_seq) {
                         if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                             printf("DeepEP timeout for combine sender gate, rank %d, channel %d, token %d\n",
                                    rank, responsible_channel, static_cast<int>(my_token));

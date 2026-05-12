@@ -39,7 +39,7 @@ from quack.pipeline import PipelineStateWAdvance
 from quack.tile_scheduler import PersistenceMode, TileScheduler
 from quack.utils import store_shared_remote_x4
 
-from stream_ep.stream_moe.ptx_helpers import ld_acquire_sys_global
+from stream_ep.stream_moe.ptx_helpers import ld_acquire_gpu_global
 
 
 @dataclass
@@ -285,7 +285,7 @@ class StreamingTileScheduler(TileScheduler):
             pid_n = cluster_pid_n * Int32(params.cluster_shape_mnk[1])
             if cute.arch.lane_idx() == 0:
                 ready_ptr = utils.elem_pointer(params.tile_ready, (tile_id,))
-                while ld_acquire_sys_global(ready_ptr) < cutlass.Int64(
+                while ld_acquire_gpu_global(ready_ptr) < cutlass.Int64(
                     params.dispatch_seq
                 ):
                     pass
