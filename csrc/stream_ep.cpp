@@ -1,4 +1,4 @@
-#include "deep_ep.hpp"
+#include "stream_ep.hpp"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
@@ -392,7 +392,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
         internode::barrier();
 
         // Allocate. Total = 2 * num_rdma_bytes; first half for dispatch-side
-        // SymBuffers, second half for combine-side. See `deep_ep.hpp`.
+        // SymBuffers, second half for combine-side. See `stream_ep.hpp`.
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes * 2, NUM_BUFFER_ALIGNMENT_BYTES);
         rdma_buffer_ptr_combine = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
 
@@ -400,7 +400,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes * 2));
 
         // Persistent reader_prev arrays for the RDMA head/tail slots. See
-        // `deep_ep.hpp` for layout / role. Sized for the worst case
+        // `stream_ep.hpp` for layout / role. Sized for the worst case
         // (max_num_channels × num_rdma_ranks). Local memory (not symmetric);
         // each rank tracks its own reader's last-observed slot value (uint32
         // matching the NIC's 4-byte AMO; cross-iter wrap absorbed by
@@ -1171,7 +1171,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
 
     // Reset IPC ring control bytes (start_offset / end_offset / head_idx /
     // tail_idx) — same 4×num_channels×num_ranks region fwd dispatch zeros at
-    // the start of each call (deep_ep.cpp:863-867). Cross-rank barrier ensures
+    // the start of each call (stream_ep.cpp:863-867). Cross-rank barrier ensures
     // peer ranks finished their own memset before any sender writes begin.
     int num_memset_int = num_channels * num_ranks * 4;
     EP_HOST_ASSERT((num_ranks * num_ranks + num_memset_int) * sizeof(int) <= num_nvl_bytes);
@@ -1642,7 +1642,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
 // ─────────────────────────────────────────────────────────────────────────────
 // Streaming-MoE combine (internode, pool layout). Two kernels per call,
 // mirroring `Buffer::intranode_combine`'s two-kernel-one-method pattern
-// (`deep_ep.cpp:1218 + 1235`):
+// (`stream_ep.cpp:1218 + 1235`):
 //
 //   1. `internode::cached_notify_combine` — buffer cleanup +
 //      sentinel-encode `send_rdma_head` / `send_nvl_head` in place.

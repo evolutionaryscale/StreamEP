@@ -41,7 +41,7 @@ if __name__ == '__main__':
     # so compute-sanitizer / nsight can map kernel PCs back to .cu source
     # lines. Cost: ~5% larger .so + ~negligible launch overhead. Always on.
     nvcc_flags.append('-lineinfo')
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu']
+    sources = ['csrc/stream_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu']
     include_dirs = ['csrc/']
     library_dirs = []
     nvcc_dlink = []

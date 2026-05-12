@@ -52,7 +52,7 @@ private:
 namespace stream_ep {
 
 // All outputs of `Buffer::intranode_dispatch`. Bound to Python via pybind11
-// with attribute access (see PYBIND11_MODULE in deep_ep.cpp); the Python-side
+// with attribute access (see PYBIND11_MODULE in stream_ep.cpp); the Python-side
 // `Buffer.dispatch` repacks these into the public `StreamingHandle` dataclass.
 //
 // Field grouping:
@@ -384,7 +384,7 @@ public:
     // sentinel encoding of `send_rdma_head` / `send_nvl_head`) followed by
     // `internode::launch_combine_main` (three-warp-role NVL→RDMA→origin
     // reduction). Mirrors `Buffer::intranode_combine`'s two-kernel-one-method
-    // pattern (`deep_ep.cpp:1218 + 1235`); same arg semantics for the
+    // pattern (`stream_ep.cpp:1218 + 1235`); same arg semantics for the
     // unified surface (x = handle.o for fwd / dL/dx_per_r for bwd;
     // per_slot_weights = pool_topk_weight for fwd / weight_grads for bwd;
     // compute_done_per_token / combine_seq drive the streaming gate at

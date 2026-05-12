@@ -399,7 +399,7 @@ struct DispatchEnv {
     // Persistent reader_prev arrays for the RDMA head/tail SymBuffer slots.
     // [num_channels × num_rdma_ranks] uint32 each — matches the NIC's
     // 4-byte AMO width. Read at warp entry, written back at kernel exit by
-    // `atomicmax_reader_prev_cumulative`. See `Buffer` in `deep_ep.hpp` for
+    // `atomicmax_reader_prev_cumulative`. See `Buffer` in `stream_ep.hpp` for
     // the role / lifetime. Shared by fwd dispatch + bwd dispatch_grads
     // (both on streams.dispatch — stream-ordered, so the writeback at the
     // end of fwd is visible at the start of bwd).

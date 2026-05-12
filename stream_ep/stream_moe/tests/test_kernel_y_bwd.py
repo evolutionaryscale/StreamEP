@@ -643,7 +643,7 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=124)
 
     # pool_topk_weight: real-slot rows have nonzero values (matching Pass B),
-    # padding rows are 0 (matching the Z_pre memset in deep_ep.cpp).
+    # padding rows are 0 (matching the Z_pre memset in stream_ep.cpp).
     pool_topk_weight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
     pool_topk_weight[real_mask] = torch.linspace(
         -0.5, 1.5, real_mask.sum().item(), dtype=torch.float32, device=device

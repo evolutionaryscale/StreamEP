@@ -368,8 +368,8 @@ class Buffer:
         and the dispatch main kernel (pool-layout receiver). The returned
         ``metadata_done_event`` is recorded between the two kernels so consumer
         streams can read metadata tensors without serializing against dispatch
-        main. See ``csrc/deep_ep.cpp:intranode_dispatch`` /
-        ``csrc/deep_ep.cpp:internode_dispatch`` for the full sequence.
+        main. See ``csrc/stream_ep.cpp:intranode_dispatch`` /
+        ``csrc/stream_ep.cpp:internode_dispatch`` for the full sequence.
 
         Arguments:
             x: tokens to dispatch, ``[num_tokens, hidden]`` bf16.

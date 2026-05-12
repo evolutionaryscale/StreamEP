@@ -40,7 +40,7 @@ int get_source_meta_bytes() {
 }
 
 // `get_num_bytes_per_token` is declared as an inline __host__ __device__
-// helper in api.cuh so deep_ep.cpp can reuse it for buffer sizing.
+// helper in api.cuh so stream_ep.cpp can reuse it for buffer sizing.
 
 template <bool kLowLatencyMode>
 __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, const int nvl_rank) {
