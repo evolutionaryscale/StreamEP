@@ -706,15 +706,13 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     out.pool_recv_token            = at::from_blob(base + off_pool_recv_token,     {TK_padded},                          keep, i32_opts);
     out.pool_k_slot                = at::from_blob(base + off_pool_k_slot,         {TK_padded},                          keep, i32_opts);
 
-    // Record the metadata-done event between the Z_pre/N memsets and the Z_post
-    // memset. Consumer streams (kernel A, kernel Y, combine sender) wait on
-    // this event to safely read metadata tensors without serializing against
-    // the dispatch main kernel — preserving the per-tile dispatch→A streaming
-    // overlap.
-    out.metadata_done_event = EventHandle(stream);
-
-    // Z_post memset (queued AFTER metadata_done event recording).
+    // FIX FOR CDMC>1: queue Z_post memset BEFORE metadata_done event.
+    // The original design deferred Z_post for streaming overlap, relying on
+    // CDMC=1 FIFO ordering. Under CDMC>1, consumer kernels on separate HW
+    // queues can race against this memset and have their writes clobbered.
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
+
+    out.metadata_done_event = EventHandle(stream);
 
     out.k_local_remaining    = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                        keep, i32_opts);
     out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                        keep, i64_opts);
@@ -893,11 +891,10 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     out.pool_k_slot                     = at::from_blob(base + off_pool_k_slot,            {TK_padded},                                  keep, i32_opts);
     out.recv_token_to_slots             = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},                  keep, i32_opts);
 
-    // Record between pre-event memsets and Z_post memset (mirrors intranode).
-    out.metadata_done_event = EventHandle(stream);
-
-    // Z_post memset (queued AFTER metadata_done event recording).
+    // FIX FOR CDMC>1: queue Z_post memset BEFORE metadata_done event.
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
+
+    out.metadata_done_event = EventHandle(stream);
 
     out.k_local_remaining             = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                            keep, i32_opts);
     out.y_done_per_token          = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                            keep, i64_opts);
@@ -1209,7 +1206,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
     return std::make_tuple(dL_do_pool, bwd_dispatch_arrival_count);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combine(
     const torch::Tensor& x,
     const torch::Tensor& per_slot_weights,
     const torch::Tensor& recv_token_to_slots,
@@ -1218,6 +1215,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
     const torch::Tensor& send_head,
     const torch::Tensor& y_done_per_token,
     int64_t combine_seq,
+    bool is_fwd,
     const Config& config) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and
@@ -1259,8 +1257,15 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
     // All kernels + allocations run on the caller's current stream.
     auto stream = at::cuda::getCurrentCUDAStream();
 
+    // Fwd combine: no per-K weight output. Kernel Y already pre-multiplies
+    // pool_topk_weight per row before the atomic scatter, so `recv_x[t]` =
+    // Σ_k w_k·y_k is reconstructed from the data reduce alone. C++ returns
+    // `c10::nullopt`; Python surfaces it as `None`.
     auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
-    auto recv_topk_weights_out = torch::empty({num_recv_tokens, num_topk}, f32_opts);
+    c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
+        ? c10::nullopt
+        : c10::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, f32_opts));
+    float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
@@ -1283,7 +1288,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                    <= num_nvl_bytes);
     intranode::launch_combine_main(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
-                       recv_topk_weights_out.data_ptr<float>(),
+                       recv_topk_weights_ptr,
                        x.data_ptr(),
                        per_slot_weights.data_ptr<float>(),
                        recv_token_to_slots.data_ptr<int>(),
@@ -1292,6 +1297,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_combine(
                        send_head.data_ptr<int>(),
                        y_done_per_token.data_ptr<int64_t>(),
                        combine_seq,
+                       is_fwd,
                        num_tokens,
                        num_recv_tokens,
                        hidden,
@@ -1640,13 +1646,14 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
 // Both run on the caller's current stream; stream-order causality
 // guarantees the sentinel-encoded heads are visible to combine_main.
 // ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combine(
     const torch::Tensor& x,
     const torch::Tensor& per_slot_weights,
     const StreamingDispatchOutputs& dispatch_out,
     const torch::Tensor& y_done_per_token,
     int64_t combine_seq,
     int64_t combine_phase,
+    bool is_fwd,
     const Config& config) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
@@ -1686,10 +1693,15 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         dispatch_out.send_nvl_head.data_ptr<int>(),
         stream);
 
-    // Combine output tensors.
+    // Combine output tensors. Fwd: no per-K weight output (kernel Y already
+    // pre-multiplies pool_topk_weight per row); C++ returns `c10::nullopt`
+    // and Python surfaces as `None`.
     auto recv_x = torch::empty({num_combined_tokens, hidden}, x.options());
     auto f32_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto recv_topk_weights_out = torch::empty({num_combined_tokens, num_topk}, f32_opts);
+    c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
+        ? c10::nullopt
+        : c10::optional<torch::Tensor>(torch::empty({num_combined_tokens, num_topk}, f32_opts));
+    float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
 
     // kNVLSender ships recv-side `x` back to source ranks → it needs the
     // *recv*-side per-(src_world, channel) prefix (`recv_gbl_channel_prefix_matrix`),
@@ -1697,7 +1709,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
     // as Phase D's intranode combine fix (see logbook 2026-05-04).
     internode::launch_combine_main(
         at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
-        recv_x.data_ptr(), recv_topk_weights_out.data_ptr<float>(),
+        recv_x.data_ptr(), recv_topk_weights_ptr,
         x.data_ptr(), per_slot_weights.data_ptr<float>(),
         dispatch_out.recv_token_to_slots.data_ptr<int>(),
         dispatch_out.send_rdma_head.data_ptr<int>(),       // (now sentinel-encoded by encode_combine_heads)
@@ -1708,6 +1720,7 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_combine(
         dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
         y_done_per_token.data_ptr<int64_t>(), combine_seq,
         static_cast<int>(combine_phase),
+        is_fwd,
         num_tokens, num_combined_tokens, hidden, num_topk,
         rdma_buffer_ptr_combine,
         config.num_max_rdma_chunked_send_tokens,

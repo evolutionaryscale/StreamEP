@@ -161,6 +161,9 @@ def main():
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
+    p.add_argument("--num_sms_a_bwd", type=int, default=None)
+    p.add_argument("--num_sms_y_bwd", type=int, default=None)
+    p.add_argument("--prioritize_dispatch_combine", action="store_true")
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
@@ -251,7 +254,7 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    streams = make_streams()
+    streams = make_streams(prioritize_dispatch_combine=args.prioritize_dispatch_combine)
 
     os.makedirs(args.profile_dir, exist_ok=True)
     if rank == 0:
@@ -296,6 +299,8 @@ def main():
             swizzle_dW2=args.swizzle_dW2,
             num_sms_a=args.num_sms_a,
             num_sms_y=args.num_sms_y,
+            num_sms_a_bwd=args.num_sms_a_bwd,
+            num_sms_y_bwd=args.num_sms_y_bwd,
         )
         out.sum().backward()
     torch.cuda.synchronize()
@@ -360,6 +365,8 @@ def main():
                     swizzle_dW2=args.swizzle_dW2,
                     num_sms_a=args.num_sms_a,
                     num_sms_y=args.num_sms_y,
+                    num_sms_a_bwd=args.num_sms_a_bwd,
+                    num_sms_y_bwd=args.num_sms_y_bwd,
                 )
             fwd_ends[step].record()
             bwd_starts[step].record()

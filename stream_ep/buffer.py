@@ -500,7 +500,7 @@ class Buffer:
                 *,
                 combine_seq: int = 1,
                 config: Optional[Config] = None) -> \
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, None]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
         returned by ``Buffer.dispatch``. Intranode only.
 
@@ -517,15 +517,19 @@ class Buffer:
         monotonic ID. The dispatch → A and A → Y handoffs use count-vs-target
         protocols and don't reference this counter.
 
-        The per-(r, k) topk-weight payload is loaded via
-        ``recv_token_to_slots[r, k] → pool_topk_weight[slot]`` (with 0 for
-        non-local k). Same wire format as backward ``combine_grads``; the
-        underlying kernel is shared.
+        Forward combine drops the per-K topk-weight wire payload + receiver
+        reduce entirely: kernel Y already pre-multiplies
+        ``pool_topk_weight[slot]`` per row before the atomic scatter into
+        ``o[r]``, so ``recv_x[t]`` = Σ_k w_k·y_k is reconstructed from the
+        data reduce alone. The second tuple slot is ``None`` (vs the
+        ``recv_topk_weights`` tensor returned by backward ``combine_grads``,
+        which still ships per-K dL/dweight). The underlying kernel is
+        shared, gated by ``is_fwd``.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
 
         if self._is_internode():
-            return self.runtime.internode_combine(
+            recv_x, _ = self.runtime.internode_combine(
                 x, handle.pool_topk_weight, handle._dispatch_out,
                 handle.y_done_per_token, combine_seq,
                 # `combine_phase=0` = fwd combine. Phase-distinguishes the NVL
@@ -533,13 +537,17 @@ class Buffer:
                 # phases of one layer (which share `combine_seq`) can't alias
                 # on the shared combine NVL ring slots.
                 0,
+                True,  # is_fwd
                 config)
-        return self.runtime.intranode_combine(
-            x, handle.pool_topk_weight, handle.recv_token_to_slots,
-            handle.rank_prefix_matrix,
-            handle.recv_channel_prefix_matrix, handle.send_head,
-            handle.y_done_per_token, combine_seq,
-            config)
+        else:
+            recv_x, _ = self.runtime.intranode_combine(
+                x, handle.pool_topk_weight, handle.recv_token_to_slots,
+                handle.rank_prefix_matrix,
+                handle.recv_channel_prefix_matrix, handle.send_head,
+                handle.y_done_per_token, combine_seq,
+                True,  # is_fwd
+                config)
+        return recv_x, None
 
     # noinspection PyTypeChecker
     def combine_grads(self, dL_dx_per_r: torch.Tensor, handle: 'StreamingHandle',
@@ -589,12 +597,14 @@ class Buffer:
                 # NVL gen-stamp tags differ in the low bit, despite sharing
                 # the `seq` value within a layer.
                 1,
+                False,  # is_fwd — bwd path ships + reduces per-K dL/dweight
                 config)
         return self.runtime.intranode_combine(
             dL_dx_per_r, weight_grads, handle.recv_token_to_slots,
             handle.rank_prefix_matrix,
             handle.recv_channel_prefix_matrix, handle.send_head,
             bwd_a_done_per_token, seq,
+            False,  # is_fwd — bwd path ships + reduces per-K dL/dweight
             config)
 
 

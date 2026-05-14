@@ -337,7 +337,13 @@ public:
     //   bias_0 / bias_1       optional (fwd only)             nullopt for bwd
     //   y_done_per_token  fwd: kernel_y release stamp   bwd: kernel_a_bwd release stamp
     //   combine_seq           caller's monotonic int (`dispatch_seq`)
-    std::tuple<torch::Tensor, torch::Tensor> intranode_combine(
+    // `is_fwd` = true (fwd combine): drops the per-K topk-weight wire
+    // payload + receiver reduce; returns `c10::nullopt` in the second slot
+    // (Python surfaces as `None`). Kernel Y already pre-multiplies
+    // pool_topk_weight per row, so `recv_x[t]` is the full Σ_k w_k·y_k.
+    // `is_fwd` = false (bwd combine_grads): unchanged — ships dL/dweight
+    // per K, receiver sums into `recv_topk_weights_out`.
+    std::tuple<torch::Tensor, c10::optional<torch::Tensor>> intranode_combine(
         const torch::Tensor& x,
         const torch::Tensor& per_slot_weights,
         const torch::Tensor& recv_token_to_slots,
@@ -346,6 +352,7 @@ public:
         const torch::Tensor& send_head,
         const torch::Tensor& y_done_per_token,
         int64_t combine_seq,
+        bool is_fwd,
         const Config& config);
 
     // Streaming-MoE consolidated dispatch (internode, pool layout). Mirrors
@@ -402,7 +409,8 @@ public:
     // consumed after this call.
     //
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()`.
-    std::tuple<torch::Tensor, torch::Tensor> internode_combine(
+    // See `intranode_combine` for `is_fwd` semantics — same contract.
+    std::tuple<torch::Tensor, c10::optional<torch::Tensor>> internode_combine(
         const torch::Tensor& x,
         const torch::Tensor& per_slot_weights,
         const StreamingDispatchOutputs& dispatch_out,
@@ -412,6 +420,7 @@ public:
         // `internode::launch_combine_main` to phase-distinguish the NVL
         // gen-stamp tag on the combine ring.
         int64_t combine_phase,
+        bool is_fwd,
         const Config& config);
 
 };

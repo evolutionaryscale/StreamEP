@@ -278,8 +278,6 @@ def main():
             tile_n_a=TILE_N_A,
             tile_n_y=TILE_N_Y,
         )
-        # Drive the bwd path during warmup too — exercises the bwd kernels'
-        # JIT cache and the cross-iter signal-clear hygiene.
         torch.autograd.grad(
             out_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out
         )
@@ -313,10 +311,6 @@ def main():
             tile_n_a=TILE_N_A,
             tile_n_y=TILE_N_Y,
         )
-        # Drive StreamMoEFunc.backward via autograd.grad — yields all four
-        # per-rank gradients in one call. Doing this via .backward() would
-        # accumulate into .grad slots; .grad is cleaner and never depends on
-        # the user's optimizer-state hygiene.
         dL_dx_actual, dL_dtopk_w_actual, dL_dW1_local_actual, dL_dW2_local_actual = (
             torch.autograd.grad(
                 out_actual,

@@ -1255,7 +1255,8 @@ void encode_combine_heads(void** buffer_ptrs,
 // token and sums both halves. For bwd weight-grads, only one sender's packet
 // has the actual non-zero weight for each (t, k) — the sum reduces correctly
 // since the rest are zero.
-template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
+template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
+          bool kSendTopkWeights>
 __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* recv_x,
                                                           float* recv_topk_weights_out,
                                                           const dtype_t* x,
@@ -1382,16 +1383,19 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 auto shifted_x = x_int4 + my_token * hidden_int4;
                 UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
-                // Send the per-(my_token, k) weight via slot lookup. Fwd:
-                // pool_topk_weight[slot] = topk_weights[t, k]; bwd:
-                // weight_grads[slot] = dL/dweight at that (r, k_local). For
-                // non-local k (slot == -1) we ship 0 — receiver's K-way sum
-                // then yields the correct (t, k) value, since exactly one
-                // sender has the non-zero contribution per (t, k).
-                if (num_topk > 0 and lane_id < num_topk) {
-                    int slot = recv_token_to_slots[my_token * num_topk + lane_id];
-                    float w = (slot >= 0) ? __ldg(per_slot_weights + slot) : 0.0f;
-                    channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = w;
+                // Send the per-(my_token, k) weight via slot lookup. Bwd
+                // only: weight_grads[slot] = dL/dweight at that (r, k_local).
+                // For non-local k (slot == -1) we ship 0 — receiver's K-way
+                // sum then yields the correct (t, k) value, since exactly
+                // one sender has the non-zero contribution per (t, k). Fwd
+                // combine drops this payload entirely (kernel Y already
+                // pre-multiplies pool_topk_weight per row).
+                if constexpr (kSendTopkWeights) {
+                    if (num_topk > 0 and lane_id < num_topk) {
+                        int slot = recv_token_to_slots[my_token * num_topk + lane_id];
+                        float w = (slot >= 0) ? __ldg(per_slot_weights + slot) : 0.0f;
+                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = w;
+                    }
                 }
             }
             token_idx += num_round_tokens;
@@ -1575,14 +1579,17 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
 #endif
                 }
 
-                // Reduce `topk_weights` (fwd: combined topk_weights output;
-                // bwd: dL/dtopk_weights output — same code, different sink).
-                if (lane_id < num_topk) {
-                    float value = 0;
-                    #pragma unroll
-                    for (int i = 0; i < num_topk_ranks; ++i)
-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
-                    recv_topk_weights_out[token_idx * num_topk + lane_id] = value;
+                // Reduce `topk_weights` — bwd combine_grads only. Sink is
+                // dL/dtopk_weights[t, k]. Fwd combine omits the K-weight
+                // wire payload + this reduce (see header `kSendTopkWeights`).
+                if constexpr (kSendTopkWeights) {
+                    if (lane_id < num_topk) {
+                        float value = 0;
+                        #pragma unroll
+                        for (int i = 0; i < num_topk_ranks; ++i)
+                            value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                        recv_topk_weights_out[token_idx * num_topk + lane_id] = value;
+                    }
                 }
 
                 // Update head
@@ -1609,6 +1616,7 @@ void launch_combine_main(cudaDataType_t type,
              int* send_head,
              const int64_t* y_done_per_token,
              int64_t combine_seq,
+             bool is_fwd,
              int num_tokens,
              int num_recv_tokens,
              int hidden,
@@ -1626,9 +1634,9 @@ void launch_combine_main(cudaDataType_t type,
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
 
-#define COMBINE_LAUNCH_CASE(dtype, ranks)                                                  \
-    {                                                                                      \
-        auto kernel = combine_main_kernel<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
+#define COMBINE_LAUNCH_CASE_IMPL(dtype, ranks, kSendTopkWeights)                                                  \
+    {                                                                                                             \
+        auto kernel = combine_main_kernel<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, kSendTopkWeights>;      \
         SET_SHARED_MEMORY_FOR_TMA(kernel);                                     \
         LAUNCH_KERNEL(&cfg,                                                    \
                       kernel,                                                  \
@@ -1640,7 +1648,7 @@ void launch_combine_main(cudaDataType_t type,
                       rank_prefix_matrix,                                      \
                       channel_prefix_matrix,                                   \
                       send_head,                                               \
-                      y_done_per_token,                                  \
+                      y_done_per_token,                                        \
                       combine_seq,                                             \
                       num_tokens,                                              \
                       num_recv_tokens,                                         \
@@ -1650,7 +1658,15 @@ void launch_combine_main(cudaDataType_t type,
                       rank,                                                    \
                       num_max_send_tokens,                                     \
                       num_recv_buffer_tokens);                                 \
-    }                                                                          \
+    }
+#define COMBINE_LAUNCH_CASE(dtype, ranks)                                          \
+    {                                                                              \
+        if (is_fwd) {                                                              \
+            COMBINE_LAUNCH_CASE_IMPL(dtype, ranks, false)                          \
+        } else {                                                                   \
+            COMBINE_LAUNCH_CASE_IMPL(dtype, ranks, true)                           \
+        }                                                                          \
+    }                                                                              \
     break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype)                 \
     SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); \
@@ -1663,6 +1679,7 @@ void launch_combine_main(cudaDataType_t type,
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE
+#undef COMBINE_LAUNCH_CASE_IMPL
 }
 
 }  // namespace intranode

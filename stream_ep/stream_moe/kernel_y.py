@@ -78,9 +78,11 @@ from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
 from stream_ep.stream_moe.ptx_helpers import (
+    ld_acquire_gpu_global_i32,
     pack_bf16x2,
     red_add_bf16x2_v4_pred,
     st_release_gpu_global,
+    st_release_sys_global,
     threadfence_system,
 )
 from stream_ep.stream_moe.tile_scheduler import (
@@ -314,7 +316,9 @@ class AtomicScatterStore(EpiOp):
                 prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
                 if prev == Int32(1):
                     done_ptr = utils.elem_pointer(param.y_done_per_token, (r,))
-                    st_release_gpu_global(done_ptr, combine_seq)
+                    # DIAGNOSTIC: use .sys scope instead of .gpu for cross-HW-queue
+                    # visibility under CDMC>1
+                    st_release_sys_global(done_ptr, combine_seq)
 
 
 # ---------------------------------------------------------------------------

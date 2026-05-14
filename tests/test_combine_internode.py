@@ -14,8 +14,10 @@ semantics. Test verifies:
      ``x[r] = float(rank)``, ``combined_x[t]`` should equal the sum of
      contributing ranks' tags (exactly the contributing set encoded in
      ``is_token_in_rank[t, :]``).
-  2. ``recv_topk_weights[t, k]`` should match ``topk_weights[t, k]`` for
-     every (t, k) routing to a local expert on any rank, and 0 otherwise.
+  2. Fwd ``Buffer.combine`` returns ``None`` for the per-K weight slot —
+     fwd combine drops the K-weight wire payload entirely (kernel Y
+     pre-multiplies in production). Bwd combine_grads coverage of
+     ``dL/dtopk_weights`` lives in ``test_combine_grads.py``.
   3. Multi-iter ``combine_seq`` reuse (1 → 2 → 3) with different routing
      seeds — each combine sees its own dispatch's state, no cross-iter
      contamination.
@@ -64,24 +66,6 @@ def expected_combine_output(is_token_in_rank: torch.Tensor,
     return out_per_token.expand(num_tokens, hidden).to(dtype).contiguous()
 
 
-def expected_recv_topk_weights(topk_idx: torch.Tensor,
-                               topk_weights: torch.Tensor,
-                               num_local_experts_per_rank: int) -> torch.Tensor:
-    """For (t, k) routing to *any* rank's local expert (i.e. topk_idx[t, k]
-    >= 0 in our convention; sentinels = -1), recv side should reconstruct
-    topk_weights[t, k]. For sentinel slots, expected is 0.
-
-    The combine kernel ships ``per_slot_weights[recv_token_to_slots[r, k]]``
-    back to the source per (t, k); for non-local k on a particular sender
-    rank the slot is -1 so 0 is shipped. Across the K destination ranks
-    that hold (t, k)'s expert, exactly one ships the real weight; the
-    sum equals topk_weights[t, k] for valid k, 0 for sentinel.
-    """
-    expected = torch.where(topk_idx >= 0, topk_weights,
-                           torch.zeros_like(topk_weights))
-    return expected
-
-
 def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
                              topk_idx: torch.Tensor,
                              topk_weights: torch.Tensor,
@@ -116,15 +100,12 @@ def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
         f"  expected[0:4, 0]: {expected[:4, 0].cpu().tolist()}\n"
         f"  actual[0:4, 0]:   {recv_x[:4, 0].cpu().tolist()}")
 
-    num_local_experts_per_rank = num_experts // world_size
-    expected_w = expected_recv_topk_weights(
-        topk_idx, topk_weights, num_local_experts_per_rank)
-    diff_w = (recv_topk - expected_w).abs().max().item()
-    assert diff_w < 1e-4, (
-        f"recv_topk_weights mismatch (max abs diff = {diff_w:.4e}); "
-        f"rank={rank} dispatch_seq={dispatch_seq}\n"
-        f"  expected[0:4]: {expected_w[:4].cpu().tolist()}\n"
-        f"  actual[0:4]:   {recv_topk[:4].cpu().tolist()}")
+    # Fwd combine doesn't produce per-K topk-weight output (kernel Y
+    # pre-multiplies in production; the test fills handle.o directly so this
+    # is fine to skip). The bwd combine_grads path still computes
+    # dL/dtopk_weights — covered by test_combine_grads.py.
+    assert recv_topk is None, (
+        f"fwd combine should return None for recv_topk_weights; got {recv_topk!r}")
 
     return T_recv
 

@@ -95,12 +95,32 @@ class StreamHolder:
     w2: torch.cuda.Stream
 
 
-def make_streams(device: torch.device | int | None = None) -> StreamHolder:
+def make_streams(
+    device: torch.device | int | None = None,
+    prioritize_dispatch_combine: bool = False,
+) -> StreamHolder:
     """Allocate the six streams the layer expects.
 
     Caller creates this once (per training process) and reuses it across all
     layers and iterations — streams are not per-call state.
+
+    When ``prioritize_dispatch_combine`` is True, dispatch and combine streams
+    are created at the highest available priority (per Megatron-style pattern
+    for comm/compute overlap under CUDA_DEVICE_MAX_CONNECTIONS>1). Lower
+    priority number = higher priority in PyTorch's Stream API.
     """
+    if prioritize_dispatch_combine:
+        # torch clamps `priority` to the device's valid range; -99 → highest.
+        hi = -99
+        lo = 0
+        return StreamHolder(
+            dispatch=torch.cuda.Stream(device=device, priority=hi),
+            compute_a=torch.cuda.Stream(device=device, priority=lo),
+            compute_y=torch.cuda.Stream(device=device, priority=lo),
+            combine=torch.cuda.Stream(device=device, priority=hi),
+            w1=torch.cuda.Stream(device=device, priority=lo),
+            w2=torch.cuda.Stream(device=device, priority=lo),
+        )
     return StreamHolder(
         dispatch=torch.cuda.Stream(device=device),
         compute_a=torch.cuda.Stream(device=device),
@@ -168,6 +188,8 @@ class StreamMoEFunc(torch.autograd.Function):
         swizzle_dW2: int,
         num_sms_a: int | None,
         num_sms_y: int | None,
+        num_sms_a_bwd: int | None,
+        num_sms_y_bwd: int | None,
     ) -> torch.Tensor:
         caller_stream = torch.cuda.current_stream()
 
@@ -190,6 +212,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 tile_m=tile_m,
                 dispatch_seq=dispatch_seq,
             )
+
 
         # ── Kernel A path (queued FIRST so its launch hits the GPU before
         # dispatch_main's persistent CTAs have all exited). dispatch_main runs
@@ -304,6 +327,18 @@ class StreamMoEFunc(torch.autograd.Function):
         # themselves issue; ``streams.combine``'s only cross-stream sync is the
         # ``metadata_done`` event (one-shot, before dispatch main).
         streams.combine.wait_event(metadata_done)
+        # FWD INTERNODE CDMC>1 FIX (markdowns/cdmc-bugnew.md §"Fwd combine ↔
+        # dispatch_main prefix-matrix race"): combine_main_kernel reads
+        # `recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels +
+        # channel]` at kernel entry, but dispatch_main writes that entry
+        # mid-kernel. Under CDMC=1 the single HW queue serializes combine
+        # after dispatch_main; under CDMC>1 they overlap and combine reads
+        # in-flight data, producing wrong token routing → numerical errors.
+        # Hypothesis-test fix: serialize combine fully behind dispatch's tail.
+        # Kills dispatch↔combine streaming overlap; proper fix is a
+        # per-(channel,dst_rdma_rank) signal released by dispatch_main after
+        # the prefix-matrix write and acquired by each combine CTA at entry.
+        streams.combine.wait_stream(streams.dispatch)
         handle.y_done_per_token.record_stream(streams.combine)
         handle.o.record_stream(streams.combine)
         handle.rank_prefix_matrix.record_stream(streams.combine)
@@ -382,6 +417,8 @@ class StreamMoEFunc(torch.autograd.Function):
         ctx.swizzle_dW2 = swizzle_dW2
         ctx.num_sms_a = num_sms_a
         ctx.num_sms_y = num_sms_y
+        ctx.num_sms_a_bwd = num_sms_a_bwd if num_sms_a_bwd is not None else num_sms_a
+        ctx.num_sms_y_bwd = num_sms_y_bwd if num_sms_y_bwd is not None else num_sms_y
         ctx.bwd_cu_seqlens_k = bwd_cu_seqlens_k
         ctx.bwd_lens_k_dW = bwd_lens_k_dW
         return out
@@ -450,6 +487,8 @@ class StreamMoEFunc(torch.autograd.Function):
         swizzle_dW2: int = ctx.swizzle_dW2
         num_sms_a: int | None = ctx.num_sms_a
         num_sms_y: int | None = ctx.num_sms_y
+        num_sms_a_bwd: int | None = ctx.num_sms_a_bwd
+        num_sms_y_bwd: int | None = ctx.num_sms_y_bwd
 
         # Upstream may pass a non-contiguous grad (e.g. `out.sum().backward()`
         # produces a stride-(0,0) broadcast view); `dispatch_grads` asserts
@@ -567,6 +606,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle, dL_dy, dispatch_seq=handle.dispatch_seq
             )
 
+        streams.compute_y.wait_stream(streams.dispatch)
+
         # dL_do_pool / bwd_dispatch_arrival_count were allocated on streams.dispatch
         # by the runtime; mark cross-stream readers so the allocator doesn't
         # recycle them prematurely.
@@ -602,7 +643,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 bwd_a_ready_count,
                 tile_m=tile_m,
                 tile_n=tile_n_y_bwd,
-                num_sms=num_sms_a,
+                num_sms=num_sms_y_bwd,
             )
             # Build bwd_a_ready_target on the SAME stream that wrote
             # bwd_a_ready_count, so the fill is naturally ordered with the
@@ -613,6 +654,8 @@ class StreamMoEFunc(torch.autograd.Function):
             bwd_a_ready_target = torch.full(
                 (total_tiles,), num_pid_n_y_bwd, dtype=torch.int32, device=device
             )
+
+        streams.compute_a.wait_stream(streams.compute_y)
 
         # bwd_a_ready_count / dL_dswiglu_in are written on compute_y; consumed
         # on compute_a (kernel_a_bwd) and the dW streams (dW1 reads
@@ -653,8 +696,10 @@ class StreamMoEFunc(torch.autograd.Function):
                 dispatch_seq=handle.dispatch_seq,
                 tile_m=tile_m,
                 tile_n=tile_n_a_bwd,
-                num_sms=num_sms_y,
+                num_sms=num_sms_a_bwd,
             )
+
+        streams.combine.wait_stream(streams.compute_a)
 
         # dL_dx_per_r / bwd_a_done_per_token are written on compute_a,
         # consumed by combine_grads on streams.combine.
@@ -807,6 +852,8 @@ class StreamMoEFunc(torch.autograd.Function):
             None,  # swizzle_dW2
             None,  # num_sms_a
             None,  # num_sms_y
+            None,  # num_sms_a_bwd
+            None,  # num_sms_y_bwd
         )
 
 
@@ -841,6 +888,8 @@ def stream_moe_func(
     swizzle_dW2: int = 8,
     num_sms_a: int | None = None,
     num_sms_y: int | None = None,
+    num_sms_a_bwd: int | None = None,
+    num_sms_y_bwd: int | None = None,
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
@@ -884,4 +933,6 @@ def stream_moe_func(
         swizzle_dW2,
         num_sms_a,
         num_sms_y,
+        num_sms_a_bwd,
+        num_sms_y_bwd,
     )

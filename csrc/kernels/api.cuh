@@ -201,6 +201,13 @@ void launch_combine_main(cudaDataType_t type,
              int* send_head,
              const int64_t* y_done_per_token,
              int64_t combine_seq,
+             // true → fwd combine: drop per-K topk-weight wire payload +
+             // skip the receiver-side reduce + skip writing
+             // `recv_topk_weights_out` (caller passes nullptr). Kernel Y
+             // already pre-multiplies pool_topk_weight per row so `out` is
+             // the full weighted sum. false → bwd combine_grads: ships per-K
+             // dL/dweight, receiver sums into `recv_topk_weights_out`.
+             bool is_fwd,
              int num_tokens,
              int num_recv_tokens,
              int hidden,
@@ -532,6 +539,13 @@ void launch_combine_main(cudaDataType_t type,
                          // where `combine_seq` is shared between the two
                          // phases.
                          int combine_phase,
+                         // true → fwd combine: drop per-K topk-weight wire
+                         // payload + skip both forwarder/receiver per-K
+                         // reduces + skip writing `recv_topk_weights_out`
+                         // (caller passes nullptr). false → bwd combine_grads:
+                         // ships per-K dL/dweight, receivers sum into
+                         // `recv_topk_weights_out`.
+                         bool is_fwd,
                          int num_tokens,
                          int num_combined_tokens,
                          int hidden,
