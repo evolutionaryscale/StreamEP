@@ -1994,6 +1994,13 @@ __global__ void encode_combine_heads_kernel(
             __syncwarp();
         }
     }
+
+    // PDL trigger — the next kernel on this stream (combine_main) is marked
+    // as a programmatic consumer. Releasing here, after all combined_*_head
+    // writes are drained (TMA store waits above + reverse-scan sentinel pass
+    // for rdma_head completes before reaching this point per block), lets
+    // combine_main's CTAs start dispatching while encode's last CTAs drain.
+    griddepcontrol_launch_dependents();
 }
 
 void encode_combine_heads(int hidden_int4,
@@ -2894,6 +2901,15 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     uint32_t* combine_reader_prev_tail) {
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
+    // PDL barrier — encode_combine_heads (immediately preceding kernel on
+    // this stream) called `griddepcontrol.launch_dependents` at its tail.
+    // Wait here so any subsequent read of `combined_rdma_head` /
+    // `combined_nvl_head` sees the encoded sentinels, not stale values from
+    // before encode's reverse-scan pass. CTAs scheduled into idle SMs while
+    // encode's tail drains spend the wait on launch + initial register
+    // setup — no useful work is lost.
+    griddepcontrol_wait();
+
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
@@ -3586,7 +3602,14 @@ void launch_combine_main(cudaDataType_t type,
     EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens >= num_warps_per_forwarder);
     EP_HOST_ASSERT(type == CUDA_R_16BF);
 
-    SETUP_LAUNCH_CONFIG(num_channels * 2, (num_forwarder_warps + 1) * 32, stream);
+    // PDL consumer of `encode_combine_heads` (same stream, FIFO-preceding
+    // launch). encode triggers `griddepcontrol.launch_dependents` at its
+    // tail; combine's CTAs start dispatching from the SM scheduler while
+    // encode's last CTAs drain, hiding combine's launch overhead. The
+    // entry-point `griddepcontrol.wait` in `combine_main_kernel` blocks
+    // until encode signals completion, so any read of combined_*_head
+    // sees the encoded sentinels.
+    SETUP_LAUNCH_CONFIG_PDL_CONSUMER(num_channels * 2, (num_forwarder_warps + 1) * 32, stream);
     SWITCH_RDMA_RANKS(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE_IMPL

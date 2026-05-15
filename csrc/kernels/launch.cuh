@@ -24,6 +24,56 @@
 #endif
 #endif
 
+// PDL (Programmatic Dependent Launch) variant: marks the launched kernel
+// as a consumer of the *immediately preceding kernel on the same stream*.
+// CUDA scheduler will start launching the consumer's CTAs while the
+// preceding producer is still draining its tail (mid-grid retire),
+// hiding launch + cold-cache latency. Producer must call
+// `griddepcontrol.launch_dependents` near its tail to release the
+// consumer's launch; consumer must call `griddepcontrol.wait` before
+// reading any of the producer's outputs.
+//
+// SM90+ only. The `cudaLaunchAttributeProgrammaticStreamSerialization`
+// flag is a no-op on pre-SM90 hardware but the producer's PTX hooks
+// only compile on SM90+, so this whole stack is gated by
+// DISABLE_SM90_FEATURES.
+#ifndef SETUP_LAUNCH_CONFIG_PDL_CONSUMER
+#ifndef DISABLE_SM90_FEATURES
+#define SETUP_LAUNCH_CONFIG_PDL_CONSUMER(num_sms, num_threads, stream)          \
+    cudaLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
+    cudaLaunchAttribute attr[3];                                                \
+    attr[0].id = cudaLaunchAttributeCooperative;                                \
+    attr[0].val.cooperative = 1;                                                \
+    attr[1].id = cudaLaunchAttributeClusterDimension;                           \
+    attr[1].val.clusterDim.x = (num_sms % 2 == 0 ? 2 : 1);                      \
+    attr[1].val.clusterDim.y = 1;                                               \
+    attr[1].val.clusterDim.z = 1;                                               \
+    attr[2].id = cudaLaunchAttributeProgrammaticStreamSerialization;            \
+    attr[2].val.programmaticStreamSerializationAllowed = 1;                     \
+    cfg.attrs = attr;                                                           \
+    cfg.numAttrs = 3
+#else
+#define SETUP_LAUNCH_CONFIG_PDL_CONSUMER(sms, threads, stream) \
+    SETUP_LAUNCH_CONFIG(sms, threads, stream)
+#endif
+#endif
+
+// PTX intrinsics for PDL hooks. Producer calls `griddepcontrol_launch_dependents()`
+// near its tail (after all writes the consumer might read have been issued
+// + fenced); consumer calls `griddepcontrol_wait()` before its first read
+// of producer outputs. Both are no-ops on pre-SM90 hardware.
+#ifndef DISABLE_SM90_FEATURES
+__device__ __forceinline__ void griddepcontrol_launch_dependents() {
+    asm volatile("griddepcontrol.launch_dependents;");
+}
+__device__ __forceinline__ void griddepcontrol_wait() {
+    asm volatile("griddepcontrol.wait;");
+}
+#else
+__device__ __forceinline__ void griddepcontrol_launch_dependents() {}
+__device__ __forceinline__ void griddepcontrol_wait() {}
+#endif
+
 #ifndef LAUNCH_KERNEL
 #ifndef DISABLE_SM90_FEATURES
 #define LAUNCH_KERNEL(config, kernel, ...) CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
