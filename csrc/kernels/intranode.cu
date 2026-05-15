@@ -725,7 +725,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                     // Intranode: each recv-token is delivered by exactly one
                     // substream, so the K_local count emitted here is final
                     // (no cross-substream accumulation needed). Pass 2's
-                    // __threadfence_system + pool_arrival_count release-add
+                    // __threadfence (.gpu) + pool_arrival_count release-add
                     // after this make k_local_remaining[r] visible to kernel Y
                     // before kernel Y's first atomicSub on the same address.
                     //
@@ -784,18 +784,19 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         tma_store_wait<0>();
 #endif
         asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
-        // Every thread in the rank-group fences its own prior writes at system
-        // scope. ``pool_recv_token`` / ``pool_topk_weight`` / ``pool_k_slot`` are
-        // written by lane 0 of EVERY receiver warp during the batch loop;
-        // ``__threadfence_system()`` on a single thread (a thread-0-only fence)
-        // only covers that one thread's writes. Block-scope ``bar.sync`` makes
-        // other warps' writes visible WITHIN the block but doesn't propagate them
-        // to system scope. Cross-stream consumers (kernel A acquiring
-        // pool_arrival_count, kernel Y acquiring a_ready) need system-scope
-        // visibility for those
-        // per-warp writes; without this fence they could read stale -1 from the
-        // pool's N memset init.
-        __threadfence_system();
+        // Every thread in the rank-group fences its own prior pool writes at
+        // device scope. ``pool_recv_token`` / ``pool_topk_weight`` /
+        // ``pool_k_slot`` / ``k_local_remaining`` / ``recv_token_to_slots`` /
+        // ``k_local_total`` are written by lane 0 of EVERY receiver warp
+        // during the batch loop; a thread-0-only fence would only cover that
+        // one thread's writes, and block-scope ``bar.sync`` doesn't propagate
+        // beyond the block. ``__threadfence()`` (device-scope) is sufficient
+        // because all consumers (kernel A acquiring ``pool_arrival_count``;
+        // kernel Y reading the pool scalars after Y_started) run on the SAME
+        // GPU. ``.sys`` scope was previously used as a carry-over from
+        // before the 2-stream graph cleanup — cheaper to fence within L2
+        // than across the PCIe / NVLink boundary.
+        __threadfence();
         asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
         if (recv_thread_id_in_rank == 0) {
             for (int e = 0; e < E; ++e) {
@@ -1112,7 +1113,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         tma_store_wait<0>();
 #endif
         asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
-        __threadfence_system();
+        // Device-scope fence: dL_do_pool is local and consumed by
+        // kernel_y_bwd on the same GPU. See the matching comment in
+        // ``dispatch_main_kernel`` above for the full rationale.
+        __threadfence();
         asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
         if (recv_thread_id_in_rank == 0) {
             for (int e = 0; e < E; ++e) {

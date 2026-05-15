@@ -1409,8 +1409,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         //           per-recv-token reverse-map (recv_token_to_slots[r, :K],
         //           k_local_remaining[r], k_local_total[r]); lane-0 writes
         //           recv_src_meta (combine plumbing).
-        //   Pass 2 fire (substream-end): per-warp `__threadfence_system()` +
-        //           cross-NVL-receiver-warp `bar.sync 2` (for system-scope
+        //   Pass 2 fire (substream-end): per-warp `__threadfence()` (.gpu) +
+        //           cross-NVL-receiver-warp `bar.sync 2` (for device-scope
         //           visibility of other warps' writes contributing to the same
         //           tile via base_pool stacking) → lane-0 expert-major walk
         //           over (e, src_rdma_rank); `red.release.gpu.global.add.s32`
@@ -1618,16 +1618,20 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 // `e_local` in this substream: fence + `red.release.gpu.global.add.s32`
                 // the writes-in-block count into pool_arrival_count[block].
                 //
-                // Visibility: each warp's `__threadfence_system()` before its
-                // own release-add orders this warp's pool writes (K-fanout
-                // TMA stores + per-pool-slot scalars) sys-visible before the
+                // Visibility: each warp's `__threadfence()` before its own
+                // release-add orders this warp's pool writes (K-fanout TMA
+                // stores + per-pool-slot scalars) GPU-visible before the
                 // add lands. The release semantics of `red.release.gpu.global.add`
                 // then chain with kernel A's acquire-load on the same address;
                 // by the time count reaches pool_arrival_target[block] on the
                 // consumer side, every contributor's fenced pool writes are
-                // observable. Mirrors intranode's single-fusion pattern without
-                // the cross-warp `bar.sync 2` — each warp's own fence-before-
-                // release-add carries the invariant.
+                // observable. ``.gpu`` scope suffices — the forwarder writes
+                // into LOCAL pool (its own GPU) and the consumer (kernel A)
+                // runs on the same GPU; the cross-rank NVL channel head is
+                // a separate explicit ``st.relaxed.sys`` store, not covered
+                // by this fence. Mirrors intranode's single-fusion pattern
+                // without the cross-warp `bar.sync 2` — each warp's own
+                // fence-before-release-add carries the invariant.
                 if (lane_id == 0) {
                     uint64_t newly_complete = 0;
                     for (int k = 0; k < shape.num_topk; ++k) {
@@ -1642,7 +1646,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
                     if (newly_complete != 0) {
                         completed_mask[src_rdma_rank] |= newly_complete;
-                        __threadfence_system();
+                        __threadfence();
                         for (int e_local = 0; e_local < E_local; ++e_local) {
                             if (!((newly_complete >> e_local) & 1)) continue;
                             int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
@@ -2763,7 +2767,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
                     if (newly_complete != 0) {
                         completed_mask[src_rdma_rank] |= newly_complete;
-                        __threadfence_system();
+                        // Device-scope fence: dL_do_pool is local and
+                        // consumed by kernel_y_bwd on the same GPU.
+                        __threadfence();
                         int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
                         for (int e_local = 0; e_local < E_local; ++e_local) {
                             if (!((newly_complete >> e_local) & 1)) continue;
