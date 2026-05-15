@@ -4,6 +4,7 @@
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
+#include <cooperative_groups.h>
 
 namespace stream_ep {
 
@@ -69,10 +70,10 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 }
 
 
-// Streaming-MoE consolidated dispatch metadata. Single-block kernel that does
-// the cross-rank (token, k) count exchange and emits the pool-shape outputs the
-// dispatch hot path consumes (everything sized by E_local + R + (c, src, e),
-// known before the host poll).
+// Streaming-MoE consolidated dispatch metadata kernel. Cooperative-grid:
+// launched with `num_blocks_v2` blocks × kNumThreadsV2 threads. Block 0 owns
+// the cross-rank IPC exchange (Phases 1-5, single-warp / single-block work);
+// all blocks participate in the wide-parallel post-exchange phases (6-8).
 //
 // IPC slab at `buffer_ptrs[R] + streaming_section_offset` carries two adjacent
 // inboxes (zeroed on Buffer construction; cross-rank stores via per-(c, src)
@@ -80,24 +81,26 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 //   - e_inbox[c, src, e]: per-(channel, src, local_expert) (token, k) count
 //   - u_inbox[c, src]:    per-(channel, src) UNIQUE token count
 //
-// Phases:
-//   1. Zero local SMEM histograms (per-(dst, c, e) and per-(dst, c)).
-//   2. barrier_block — peers' kernels are running, IPC slabs ready to write.
-//   3. Local SMEM histograms by scanning topk_idx (with dst_mask to dedupe k
-//      slots that share the same dst).
-//   4. Bulk store local histograms to peers' IPC inboxes — each (sender, dst)
-//      pair writes a unique region (no contention, no atomics).
-//   5. barrier_block — peers' phase-4 stores observable.
-//   6. Read own inbox, derive pool-shape outputs:
-//        expert_frequency[E_local], expert_pool_block_offset[E_local + 1],
-//        base_pool[c, src, e_local], rank_prefix_matrix[R, R] (this rank's column),
-//        total_tiles (host + device), num_recv (host),
-//        num_recv_per_expert[E_local] (host).
-//   7. base_pool fill: per-expert serial accumulation over (c, src) lex order.
-//   8. Per-tile arrays: `tile_id_to_expert[total_tiles]` and
-//      `pool_arrival_target[total_tiles]`. Pre-allocated at `total_tiles_max`
-//      by the host (sized by num_tokens × num_topk × num_ranks / tile_m + E,
-//      ~8 KB at production); only the prefix [0, total_tiles) is written.
+// Phases (vs v1: 1-5 are the same single-block path; 6-8 are now grid-wide):
+//   1-5 (block 0): build local SMEM histogram from topk_idx, bulk-store to
+//        peers' IPC inboxes, bracketed by two `barrier_block` calls so peer
+//        writes are observable on the post-barrier read.
+//   GRID SYNC.
+//   6 (all blocks, grid-stride): copy inbox -> seen_per_substream, then a
+//      grid-stride atomicAdd reduce into expert_frequency. Replaces v1's
+//      thread-per-expert serial sum (E_local threads, the rest idle).
+//   GRID SYNC.
+//   7 (block 0 thread 0): smem_pool_blk prefix, total_tiles, mapped counters,
+//      rank_prefix_matrix column. Small serial work — O(E + kNumRanks).
+//   GRID SYNC.
+//   8 (one block per expert, round-robin): base_pool parallel prefix-scan
+//      over (c, src) lex order. Per expert: SMEM-staged scan with cooperative
+//      threads. Replaces v1's per-thread `acc += seen[cs, e]` 320-iter serial
+//      dependency loop. E ≤ num_blocks at production, so all experts run in
+//      parallel in one grid wave.
+//   GRID SYNC.
+//   9 (all blocks, grid-stride): tile_id_to_expert + pool_arrival_target —
+//      one thread per tile. Replaces v1's per-expert serial tile walk.
 //
 // Pool layout: each expert's region in `pool` starts at
 // `expert_pool_block_offset[e] * BLOCK_M` (BLOCK_M = tile_m) and is padded up to
@@ -127,11 +130,20 @@ __global__ void streaming_dispatch_metadata_kernel(
         int rank,
         int tile_m,
         int expert_alignment) {
-    auto thread_id = static_cast<int>(threadIdx.x);
-    auto num_threads = static_cast<int>(blockDim.x);
-    auto warp_id = thread_id / 32;
-    auto lane_id = thread_id % 32;
-    auto num_warps = num_threads / 32;
+    namespace cg = cooperative_groups;
+    auto grid = cg::this_grid();
+
+    constexpr int kNumWarpsV2 = 256 / 32;  // matches kNumThreadsV2 in launcher.
+
+    const int block_id = static_cast<int>(blockIdx.x);
+    const int num_blocks = static_cast<int>(gridDim.x);
+    const int thread_id = static_cast<int>(threadIdx.x);
+    const int num_threads = static_cast<int>(blockDim.x);
+    const int warp_id = thread_id / 32;
+    const int lane_id = thread_id % 32;
+    const int num_warps = num_threads / 32;
+    const int grid_tid = block_id * num_threads + thread_id;
+    const int grid_threads = num_blocks * num_threads;
 
     const int E = num_experts_per_rank;
     const int e_inbox_size = num_channels * kNumRanks * E;
@@ -140,159 +152,260 @@ __global__ void streaming_dispatch_metadata_kernel(
 
     extern __shared__ int smem[];
     int* smem_local_e = smem;                                          // [kNumRanks * slab_e_size]
-    int* smem_local_u = smem_local_e + kNumRanks * slab_e_size;             // [kNumRanks * slab_u_size]
+    int* smem_local_u = smem_local_e + kNumRanks * slab_e_size;        // [kNumRanks * slab_u_size]
 
-    // Phase 1: zero local histograms.
-    for (int i = thread_id; i < kNumRanks * slab_e_size; i += num_threads)
-        smem_local_e[i] = 0;
-    for (int i = thread_id; i < kNumRanks * slab_u_size; i += num_threads)
-        smem_local_u[i] = 0;
-    __syncthreads();
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASES 1-5: block 0 only. Cross-rank histogram exchange via IPC.
+    // Other blocks idle here — they can't help (cross-rank IPC + barrier_block
+    // are coordinated through peer-rank atomic counters that don't shard
+    // across blocks). They'll join the grid-wide reduction in Phase 6+.
+    // ──────────────────────────────────────────────────────────────────────
+    if (block_id == 0) {
+        // Phase 1: zero local histograms.
+        for (int i = thread_id; i < kNumRanks * slab_e_size; i += num_threads)
+            smem_local_e[i] = 0;
+        for (int i = thread_id; i < kNumRanks * slab_u_size; i += num_threads)
+            smem_local_u[i] = 0;
+        __syncthreads();
 
-    // Phase 2: cross-rank handshake.
-    barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
+        // Phase 2: cross-rank handshake.
+        barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
-    // Phase 3: build local histograms.
-    int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
-    for (int t = thread_id; t < num_tokens; t += num_threads) {
-        int channel_id = t / num_tokens_per_channel;
-        uint64_t dst_mask = 0;
-        for (int k = 0; k < num_topk; ++k) {
-            int e_global = static_cast<int>(topk_idx[t * num_topk + k]);
-            if (e_global < 0)
-                continue;
-            int dst_rank = e_global / E;
-            int e_local = e_global - dst_rank * E;
-            atomicAdd(&smem_local_e[dst_rank * slab_e_size + channel_id * E + e_local], 1);
-            uint64_t bit = 1ULL << dst_rank;
-            if (!(dst_mask & bit)) {
-                dst_mask |= bit;
-                atomicAdd(&smem_local_u[dst_rank * slab_u_size + channel_id], 1);
+        // Phase 3: build local histograms.
+        int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
+        for (int t = thread_id; t < num_tokens; t += num_threads) {
+            int channel_id = t / num_tokens_per_channel;
+            uint64_t dst_mask = 0;
+            for (int k = 0; k < num_topk; ++k) {
+                int e_global = static_cast<int>(topk_idx[t * num_topk + k]);
+                if (e_global < 0)
+                    continue;
+                int dst_rank = e_global / E;
+                int e_local = e_global - dst_rank * E;
+                atomicAdd(&smem_local_e[dst_rank * slab_e_size + channel_id * E + e_local], 1);
+                uint64_t bit = 1ULL << dst_rank;
+                if (!(dst_mask & bit)) {
+                    dst_mask |= bit;
+                    atomicAdd(&smem_local_u[dst_rank * slab_u_size + channel_id], 1);
+                }
             }
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // Phase 4: bulk store to peers' inboxes (each (sender, dst) writes unique slots).
-    for (int dst = warp_id; dst < kNumRanks; dst += num_warps) {
-        auto* peer_e = reinterpret_cast<int*>(
-            static_cast<uint8_t*>(buffer_ptrs[dst]) + streaming_section_offset);
-        auto* peer_u = peer_e + e_inbox_size;
-        for (int i = lane_id; i < slab_e_size; i += 32) {
-            int c = i / E;
-            int e = i - c * E;
-            peer_e[c * kNumRanks * E + rank * E + e] = smem_local_e[dst * slab_e_size + i];
+        // Phase 4: bulk store to peers' inboxes (each (sender, dst) writes unique slots).
+        for (int dst = warp_id; dst < kNumRanks; dst += num_warps) {
+            auto* peer_e = reinterpret_cast<int*>(
+                static_cast<uint8_t*>(buffer_ptrs[dst]) + streaming_section_offset);
+            auto* peer_u = peer_e + e_inbox_size;
+            for (int i = lane_id; i < slab_e_size; i += 32) {
+                int c = i / E;
+                int e = i - c * E;
+                peer_e[c * kNumRanks * E + rank * E + e] = smem_local_e[dst * slab_e_size + i];
+            }
+            for (int c = lane_id; c < num_channels; c += 32)
+                peer_u[c * kNumRanks + rank] = smem_local_u[dst * slab_u_size + c];
         }
-        for (int c = lane_id; c < num_channels; c += 32)
-            peer_u[c * kNumRanks + rank] = smem_local_u[dst * slab_u_size + c];
+        __syncthreads();
+
+        // Phase 5: cross-rank barrier — peers' phase-4 stores observable on
+        // post-barrier read.
+        barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     }
-    __syncthreads();
 
-    // Phase 5: cross-rank barrier — peers' phase-4 stores now observable.
-    barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
+    // Grid-wide barrier #1: all blocks see post-phase-5 inbox state.
+    grid.sync();
 
-    // Phase 6: read own inbox, derive metadata. Reuse the (now-stale) local SMEM.
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE 6: seen_per_substream copy + expert_frequency warp-reduce.
+    //
+    // Two grid-parallel work items folded into one block of work:
+    //   - seen_per_substream[idx] = my_e_inbox[idx] (grid-stride, all blocks).
+    //   - expert_frequency[e] = warp-reduce sum over (c, src) of inbox[c,src,e].
+    //     One warp owns one expert; the warp's lanes stride over cs_total,
+    //     accumulating partials in a register, then a 5-step __shfl_down_sync
+    //     reduces to the warp leader which writes expert_frequency[e].
+    //
+    // No need for atomicAdd or pre-zero of expert_frequency — each (block,
+    // warp) writes a disjoint (e) slot. Saves one grid.sync vs the
+    // atomic-reduce pattern.
+    // ──────────────────────────────────────────────────────────────────────
     auto* my_e_inbox = reinterpret_cast<int*>(
         static_cast<uint8_t*>(buffer_ptrs[rank]) + streaming_section_offset);
     auto* my_u_inbox = my_e_inbox + e_inbox_size;
 
-    int* smem_freq     = smem;                       // [E]
-    int* smem_pool_blk = smem_freq + E;                 // [E + 1]
-    int* smem_per_src  = smem_pool_blk + (E + 1);       // [kNumRanks]
+    const int seen_total = num_channels * kNumRanks * E;
 
-    // expert_frequency[e] = sum over (c, src) of e_inbox[c, src, e].
-    for (int e = thread_id; e < E; e += num_threads) {
+    // 6a: copy inbox -> seen_per_substream (contiguous, all blocks grid-stride).
+    for (int idx = grid_tid; idx < seen_total; idx += grid_threads)
+        seen_per_substream[idx] = my_e_inbox[idx];
+
+    // 6b: warp-per-expert reduce over (c, src) -> expert_frequency[e].
+    // Block handles num_warps experts; iterate if E > num_blocks * num_warps.
+    const int cs_total_phase6 = num_channels * kNumRanks;
+    const int experts_per_iter6 = num_blocks * kNumWarpsV2;
+    for (int e_iter = 0; ; ++e_iter) {
+        int e = block_id * kNumWarpsV2 + warp_id + e_iter * experts_per_iter6;
+        if (e >= E) break;
+
         int sum = 0;
-        for (int cs = 0; cs < num_channels * kNumRanks; ++cs)
+        for (int cs = lane_id; cs < cs_total_phase6; cs += 32)
             sum += my_e_inbox[cs * E + e];
-        smem_freq[e] = sum;
-        expert_frequency[e] = sum;
+        // Warp-level reduction (sum across lanes).
+        sum += __shfl_down_sync(0xffffffff, sum, 16);
+        sum += __shfl_down_sync(0xffffffff, sum, 8);
+        sum += __shfl_down_sync(0xffffffff, sum, 4);
+        sum += __shfl_down_sync(0xffffffff, sum, 2);
+        sum += __shfl_down_sync(0xffffffff, sum, 1);
+        if (lane_id == 0)
+            expert_frequency[e] = sum;
     }
-    // smem_per_src[src] = sum over c of u_inbox[c, src].
-    for (int src = thread_id; src < kNumRanks; src += num_threads) {
-        int total = 0;
-        for (int c = 0; c < num_channels; ++c)
-            total += my_u_inbox[c * kNumRanks + src];
-        smem_per_src[src] = total;
-    }
-    __syncthreads();
 
-    if (thread_id == 0) {
+    // Grid-wide barrier #2: seen_per_substream + expert_frequency fully
+    // written before Phase 7 reads expert_frequency for the prefix.
+    grid.sync();
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE 7: smem_pool_blk prefix, total_tiles, mapped counters,
+    // rank_prefix_matrix column. Block 0 thread 0 — small serial work.
+    // ──────────────────────────────────────────────────────────────────────
+    if (block_id == 0 && thread_id == 0) {
         int cum_blocks = 0;
-        smem_pool_blk[0] = 0;
+        expert_pool_block_offset[0] = 0;
         for (int e = 0; e < E; ++e) {
-            int n_blocks_e = (smem_freq[e] + tile_m - 1) / tile_m;
+            int n_blocks_e = (expert_frequency[e] + tile_m - 1) / tile_m;
             cum_blocks += n_blocks_e;
-            smem_pool_blk[e + 1] = cum_blocks;
+            expert_pool_block_offset[e + 1] = cum_blocks;
         }
         *total_tiles_out = cum_blocks;
         *total_tiles_mapped = cum_blocks;
 
-        int total_unique = 0;
-        for (int i = 0; i < kNumRanks; ++i)
-            total_unique += smem_per_src[i];
-        *num_recv_mapped = total_unique;
-
+        // num_recv_per_expert_mapped (host-mapped, alignment).
         for (int e = 0; e < E; ++e) {
-            int aligned = (smem_freq[e] + expert_alignment - 1) / expert_alignment * expert_alignment;
+            int aligned = (expert_frequency[e] + expert_alignment - 1) / expert_alignment * expert_alignment;
             num_recv_per_expert_mapped[e] = aligned;
         }
 
-        // rank_prefix_matrix: this rank fills its own column. Cumulative unique
-        // tokens from senders 0..i to this rank — read by combine on rank j.
+        // rank_prefix_matrix column for this rank + total recv counter.
+        // smem_per_src[i] = sum over c of u_inbox[c, i] — total unique tokens
+        // from sender i to this rank.
         int cum_src = 0;
         for (int i = 0; i < kNumRanks; ++i) {
-            cum_src += smem_per_src[i];
+            int per_src = 0;
+            for (int c = 0; c < num_channels; ++c)
+                per_src += my_u_inbox[c * kNumRanks + i];
+            cum_src += per_src;
             rank_prefix_matrix[i * kNumRanks + rank] = cum_src;
         }
+        *num_recv_mapped = cum_src;
     }
-    __syncthreads();
-    for (int e = thread_id; e < E + 1; e += num_threads)
-        expert_pool_block_offset[e] = smem_pool_blk[e];
 
-    // Phase 7: base_pool[c, src, e] = pool slot start (in pool-row units) for
-    // substream (c, src) writes for expert e:
-    //   base_pool[c, src, e] = smem_pool_blk[e] * tile_m
-    //                          + Σ over (c', src') < (c, src) lex of e_inbox[c', src', e].
-    // E ≤ NUM_MAX_LOCAL_EXPERTS so we can run one thread per expert in parallel.
+    // Grid-wide barrier #4: expert_pool_block_offset / total_tiles / mapped
+    // counters visible to all blocks for phases 8-9.
+    grid.sync();
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE 8: base_pool — per-expert exclusive prefix-scan over (c, src)
+    // lex order, starting from `expert_pool_block_offset[e] * tile_m`.
     //
-    // Also persist seen_per_substream[c, src, e] = my_e_inbox[c, src, e]
-    // (the per-substream-per-expert recv count) for the backward path. The
-    // bwd dispatch_grads receiver doesn't run Pass A — it gathers slots from
-    // recv_token_to_slots — so it can't reconstruct fwd's SMEM seen_substream
-    // counter. Persisting it here lets bwd Pass 2 reuse fwd's per-block atomic
-    // accounting verbatim: walk experts, atomic-add seen_per_substream[cs, e]
-    // worth of writes, fire pool_arrival_count (release-add) so the bwd-Y
-    // scheduler's count-vs-target spin unblocks once count == target.
-    // Cost: ~17 KB int32 at production (66 channels × 8 ranks × 8 experts).
-    for (int e = thread_id; e < E; e += num_threads) {
-        int acc = smem_pool_blk[e] * tile_m;
-        for (int cs = 0; cs < num_channels * kNumRanks; ++cs) {
-            base_pool[cs * E + e] = acc;
-            int n = my_e_inbox[cs * E + e];
-            seen_per_substream[cs * E + e] = n;
-            acc += n;
+    // One block per expert (round-robin if E > num_blocks). Within a block:
+    // chunked warp-parallel scan (Kogge-Stone within warp + warp 0 scans
+    // warp sums). Replaces the per-thread acc-serial-dep loop of v1.
+    // ──────────────────────────────────────────────────────────────────────
+    const int cs_total = num_channels * kNumRanks;
+    int* s_scan = smem;                          // [cs_total] scan workspace.
+    int* s_warp_sums = s_scan + cs_total;        // [kNumWarpsV2] warp-sum scratch.
+
+    for (int e_iter = 0; ; ++e_iter) {
+        int e = block_id + e_iter * num_blocks;
+        if (e >= E) break;
+
+        const int e_start_offset = expert_pool_block_offset[e] * tile_m;
+
+        // 8a: load seen[cs, e] into SMEM in (c, src) lex order.
+        for (int cs = thread_id; cs < cs_total; cs += num_threads)
+            s_scan[cs] = seen_per_substream[cs * E + e];
+        __syncthreads();
+
+        // 8b: chunked warp-parallel exclusive scan with initial carry =
+        // e_start_offset. For cs_total > num_threads, scan in chunks of
+        // num_threads, propagating a running carry between chunks.
+        int carry = e_start_offset;
+        for (int chunk_start = 0; chunk_start < cs_total; chunk_start += num_threads) {
+            int idx = chunk_start + thread_id;
+            int orig_x = (idx < cs_total) ? s_scan[idx] : 0;
+
+            // Warp-level inclusive scan via Kogge-Stone shuffle.
+            int x = orig_x;
+            int y;
+            y = __shfl_up_sync(0xffffffff, x, 1);  if (lane_id >= 1)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 2);  if (lane_id >= 2)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 4);  if (lane_id >= 4)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 8);  if (lane_id >= 8)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 16); if (lane_id >= 16) x += y;
+            // x is now the inclusive scan within the warp.
+
+            // Last lane of each warp writes warp_sum.
+            if (lane_id == 31)
+                s_warp_sums[warp_id] = x;
+            __syncthreads();
+
+            // Warp 0 does inclusive scan over warp_sums (kNumWarpsV2 = 8 entries).
+            if (warp_id == 0) {
+                int ws = (lane_id < kNumWarpsV2) ? s_warp_sums[lane_id] : 0;
+                int wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 1); if (lane_id >= 1) ws += wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 2); if (lane_id >= 2) ws += wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 4); if (lane_id >= 4) ws += wy;
+                if (lane_id < kNumWarpsV2) s_warp_sums[lane_id] = ws;
+            }
+            __syncthreads();
+
+            // Compose exclusive scan output:
+            //   exclusive_at_idx = (warp_inclusive - orig_x) + warp_prefix + carry
+            int warp_prefix = (warp_id > 0) ? s_warp_sums[warp_id - 1] : 0;
+            int exclusive_x = (x - orig_x) + warp_prefix + carry;
+
+            if (idx < cs_total)
+                s_scan[idx] = exclusive_x;
+
+            // Update carry for the next chunk: full block sum is the last
+            // warp's inclusive total, which sits at s_warp_sums[kNumWarpsV2 - 1].
+            __syncthreads();
+            carry += s_warp_sums[kNumWarpsV2 - 1];
+            __syncthreads();
         }
+
+        // 8c: write base_pool from SMEM.
+        for (int cs = thread_id; cs < cs_total; cs += num_threads)
+            base_pool[cs * E + e] = s_scan[cs];
+        __syncthreads();
     }
 
-    // Phase 8: per-tile arrays for the dispatch hot path. Each thread owns one
-    // expert and walks its tile range [smem_pool_blk[e], smem_pool_blk[e+1]) writing
-    //   tile_id_to_expert[tile_id]   = e
-    //   pool_arrival_target[tile_id] = tile_m for full tiles,
-    //                                  smem_freq[e] - tile_in_e * tile_m for the
-    //                                  last (possibly partial) tile per expert.
-    // No sync required vs. phase 7: writes target disjoint global regions and
-    // smem_pool_blk / smem_freq remain valid in SMEM since phase 6 (the only writers).
-    for (int e = thread_id; e < E; e += num_threads) {
-        int e_start = smem_pool_blk[e];
-        int e_end = smem_pool_blk[e + 1];
-        int n_tiles = e_end - e_start;
-        int n_e = smem_freq[e];
-        for (int t = 0; t < n_tiles; ++t) {
-            int tile_id = e_start + t;
-            tile_id_to_expert[tile_id] = e;
-            pool_arrival_target[tile_id] = (t == n_tiles - 1) ? (n_e - t * tile_m) : tile_m;
+    // Phase 9 reads expert_pool_block_offset (already synced in barrier #3)
+    // and expert_frequency (synced in barrier #2). Phase 8 writes base_pool
+    // and Phase 9 writes tile_id_to_expert + pool_arrival_target — disjoint
+    // outputs, so no sync needed between Phase 8 and Phase 9.
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE 9: tile_id_to_expert + pool_arrival_target — grid-stride.
+    // One thread per tile. Linear search over E to find owning expert (E ≤ 64,
+    // cheap; could be binary search if E grows).
+    // ──────────────────────────────────────────────────────────────────────
+    int total_tiles = *total_tiles_out;
+    for (int tile_id = grid_tid; tile_id < total_tiles; tile_id += grid_threads) {
+        int e_found = 0;
+        for (int e = 0; e < E; ++e) {
+            if (tile_id < expert_pool_block_offset[e + 1]) {
+                e_found = e;
+                break;
+            }
         }
+        int e_start = expert_pool_block_offset[e_found];
+        int n_tiles_e = expert_pool_block_offset[e_found + 1] - e_start;
+        int n_e = expert_frequency[e_found];
+        int t = tile_id - e_start;
+        tile_id_to_expert[tile_id] = e_found;
+        pool_arrival_target[tile_id] = (t == n_tiles_e - 1) ? (n_e - t * tile_m) : tile_m;
     }
 }
 
@@ -351,13 +464,39 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                   expert_alignment);                                                         \
     break
 
-    SETUP_LAUNCH_CONFIG(1, 256, stream);
-    // SMEM: phase-3 histograms dominate (kNumRanks × num_channels × (E + 1) ints).
-    // At production E=384, R=8, num_sms=80 this is ~62KB — above H100's default
-    // 48KB dynamic-SMEM cap, so we must opt up via cudaFuncSetAttribute before
-    // the launch (otherwise the launch fails with the misleading
-    // cudaErrorCooperativeLaunchTooLarge: "too many blocks in cooperative launch").
+    // Cooperative-grid launch: ~32 blocks × 256 threads. Block 0 owns the
+    // cross-rank IPC exchange (Phases 1-5, single-block by protocol);
+    // all blocks participate in the wide-parallel post-exchange phases (6-9).
+    // Grid.sync() between phases requires cooperative launch — already set
+    // in SETUP_LAUNCH_CONFIG via cudaLaunchAttributeCooperative=1.
+    //
+    // SMEM: block 0 uses kNumRanks × num_channels × (E + 1) ints for its
+    // phase-1-5 local histogram (~62KB at production E=384, R=8, num_sms=80).
+    // Other blocks share the same allocation but use only a smaller slice
+    // (Phase 8's per-expert scan SMEM = cs_total ints, ~1.3KB at intranode
+    // production). The unused SMEM in non-block-0 SMs doesn't affect
+    // occupancy on the rest of the pipeline (those SMs are idle in this
+    // kernel's lifetime).
+    //
+    // num_blocks_v2 = min(32, ceil(E / 1)) — one block per expert is enough
+    // for Phase 8 to run in a single wave at production E_local=8-48.
+    constexpr int kNumThreadsV2 = 256;
+    constexpr int kNumBlocksV2 = 32;
     int smem_bytes = num_ranks * num_channels * (num_experts_per_rank + 1) * sizeof(int);
+    // SETUP_LAUNCH_CONFIG sets cluster_dim from num_sms%2 — for 32 blocks
+    // that picks cluster_dim=2. Cooperative + cluster has stricter occupancy
+    // requirements (clusters must co-reside on adjacent SMs); use cluster=1
+    // explicitly to avoid resident-block-count surprises with cooperative.
+    cudaLaunchConfig_t cfg = {kNumBlocksV2, kNumThreadsV2, 0, stream, nullptr, 0};
+    cudaLaunchAttribute attr[2];
+    attr[0].id = cudaLaunchAttributeCooperative;
+    attr[0].val.cooperative = 1;
+    attr[1].id = cudaLaunchAttributeClusterDimension;
+    attr[1].val.clusterDim.x = 1;
+    attr[1].val.clusterDim.y = 1;
+    attr[1].val.clusterDim.z = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 2;
     cfg.dynamicSmemBytes = smem_bytes;
     SWITCH_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
 #undef STREAMING_DISPATCH_METADATA_LAUNCH_CASE
