@@ -164,7 +164,7 @@ def main():
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
     p.add_argument("--tile_n_a_bwd", type=int, default=256)
-    p.add_argument("--tile_n_y_bwd", type=int, default=256)
+    p.add_argument("--tile_n_y_bwd", type=int, default=128)
     # dW grouped-GEMM tile knobs. None → fall back to (tile_m, tile_n_a) at the
     # bwd call site, matching pre-decouple behaviour.
     p.add_argument("--tile_m_dW1", type=int, default=None)
