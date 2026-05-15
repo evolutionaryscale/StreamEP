@@ -8,6 +8,7 @@
 #include "ibgda_device.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
+#include <cooperative_groups.h>
 
 namespace stream_ep {
 
@@ -191,12 +192,18 @@ __global__ void streaming_dispatch_metadata_kernel(
         int** barrier_signal_ptrs,
         int rank,
         const nvshmem_team_t rdma_team) {
+    namespace cg = cooperative_groups;
+    auto grid = cg::this_grid();
+
     auto sm_id = static_cast<int>(blockIdx.x);
+    const int num_blocks = static_cast<int>(gridDim.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto warp_id = thread_id / 32;
     auto lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x);
     auto num_warps = num_threads / 32;
+    const int grid_tid = sm_id * num_threads + thread_id;
+    const int grid_threads = num_blocks * num_threads;
 
     auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
     auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
@@ -216,9 +223,11 @@ __global__ void streaming_dispatch_metadata_kernel(
     // (sender-side). Computes `gbl_channel_prefix_matrix[dst_world, c]` and
     // `rdma_channel_prefix_matrix[dst_rdma, c]` from THIS rank's topk_idx
     // (the routing-bitmap derivation that get_dispatch_layout used to
-    // perform host-side; folded into this kernel now).
+    // perform host-side; folded into this kernel now). Higher-index blocks
+    // (sm_id > kNumRDMARanks) sit idle here and join the wide-parallel
+    // Phase B work after the grid.sync below.
     // ─────────────────────────────────────────────────────────────────────
-    if (sm_id != 0) {
+    if (sm_id != 0 && sm_id <= kNumRDMARanks) {
         int dst_rdma_rank = sm_id - 1;
         int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
@@ -276,11 +285,16 @@ __global__ void streaming_dispatch_metadata_kernel(
             for (int i = 1; i < num_channels; ++i)
                 prefix_row[i] += prefix_row[i - 1];
         }
-        return;
-    }
+        // NOTE: no `return` — blocks 1..kNumRDMARanks fall through to grid.sync
+        // and join the wide-parallel Phase B work below.
+    } else if (sm_id == 0) {
 
     // ─────────────────────────────────────────────────────────────────────
-    // Block 0: cross-rank exchange + counters + streaming superset.
+    // Block 0: cross-rank exchange + counters + Phase B0 (NVL exchange).
+    // Phase B1+ (build seen / expert_frequency / base_pool / tile_id_to_expert /
+    // pool_arrival_target) was originally here; it's now post-grid.sync,
+    // parallelized across all blocks. See after the `} // end if (sm_id == 0)`
+    // block below.
     // ─────────────────────────────────────────────────────────────────────
 
     EP_DEVICE_ASSERT(num_warps > 1);
@@ -546,117 +560,230 @@ __global__ void streaming_dispatch_metadata_kernel(
     __syncthreads();
     barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
 
-    // ── Build seen_per_substream from this rank's NVL recv buffer.
-    // After exchange, this rank's nvl_streaming_recv has NUM_MAX_NVL_PEERS
-    // slots (one per writer src_nvl). Slot[w] = [src_rdma][c][e_local]
-    // contributions from sender (src_rdma, src_nvl=w) going to this rank.
+    }  // end if (sm_id == 0) — Phase A1-A5 + Phase B0 completed by block 0.
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Grid-wide barrier #1: block 0's NVL exchange + barrier_block ensures
+    // seen-side peer slots are observable. All other blocks (1..N) can now
+    // read peer-write outputs for the rest of Phase B.
+    // ──────────────────────────────────────────────────────────────────────
+    grid.sync();
+
+    // Recompute the NVL recv-buffer offset of `nvl_streaming_recv` in EVERY
+    // block (it's cheap — pure pointer arithmetic on `buffer_ptrs[nvl_rank]`).
+    // The cross-rank writes already happened in block 0; downstream phases
+    // only READ from these slabs. Layout mirrors the v1 block-0 derivation
+    // — same advance sequence (Buffer<int> + 4 × AsymBuffer<int>) so the
+    // streaming_recv slot lands at exactly the same offset block 0 wrote to.
+    auto* nvl_recv_buffer_all = buffer_ptrs[nvl_rank];
+    const int kNvlSlotInts_all = kNumRDMARanks * num_channels * E_local;
+    // Skip past Phase A5 slabs:
+    // - Buffer<int>(num_rdma_experts):                advances by num_rdma_experts × 4 bytes
+    // - AsymBuffer<int>(kNumRDMARanks,  NUM_NVL):     advances by kNumRDMARanks × NUM_NVL × 4 bytes
+    // - AsymBuffer<int>(E_local,         NUM_NVL):     advances by E_local × NUM_NVL × 4 bytes
+    auto _skip_reduced_per_expert =
+        Buffer<int>(nvl_recv_buffer_all, num_rdma_experts);
+    auto _skip_per_rank = AsymBuffer<int>(nvl_recv_buffer_all, kNumRDMARanks, NUM_MAX_NVL_PEERS);
+    auto _skip_per_expert = AsymBuffer<int>(nvl_recv_buffer_all, E_local, NUM_MAX_NVL_PEERS);
+    auto nvl_streaming_recv_all =
+        AsymBuffer<int>(nvl_recv_buffer_all, kNvlSlotInts_all, NUM_MAX_NVL_PEERS);
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE B1 + B3-reduce (fused): warp-per-expert sweep that BOTH writes
+    // seen_per_substream and accumulates expert_frequency[e]. Each warp owns
+    // one expert; lanes stride over the (c, src_world) cs axis, reading from
+    // the NVL peer slots (peer_buffer.buffer(src_nvl) + (src_rdma * num_channels + c) * E_local + e),
+    // writing seen_per_substream[cs * E_local + e], and accumulating into
+    // a per-lane register `sum` that gets warp-reduced to expert_frequency[e].
     //
-    // seen_per_substream[c, src_world, e_local] where src_world = src_rdma*8+w.
-    for (int idx = thread_id; idx < num_channels * num_ranks * E_local; idx += num_threads) {
-        int c = idx / (num_ranks * E_local);
-        int rem = idx - c * (num_ranks * E_local);
-        int src_world = rem / E_local;
-        int e = rem - src_world * E_local;
-        int src_rdma = src_world / NUM_MAX_NVL_PEERS;
-        int src_nvl = src_world - src_rdma * NUM_MAX_NVL_PEERS;
-        int* slot_w = nvl_streaming_recv.buffer(src_nvl);
-        int v = ld_volatile_global(slot_w + (src_rdma * num_channels + c) * E_local + e);
-        seen_per_substream[idx] = v;
-    }
-    __syncthreads();
+    // Fusing the two phases eliminates the read-after-write hazard between
+    // them (Phase B3 reading entries Phase B1 just wrote) — both pass
+    // through registers, no GMEM round-trip needed between read source and
+    // reduce. Also saves one grid.sync vs the split version.
+    //
+    // E_local ≤ num_blocks × kNumWarpsV2_inter at production (12 ≤ 512),
+    // so all experts are handled in a single pass — most warps idle.
+    // ──────────────────────────────────────────────────────────────────────
+    constexpr int kNumWarpsV2_inter = 512 / 32;  // matches kNumThreads launch param.
+    const int experts_per_iter_inter = num_blocks * kNumWarpsV2_inter;
+    const int cs_total_inter = num_channels * num_ranks;
+    constexpr int NUM_NVL_b1 = NUM_MAX_NVL_PEERS;
+    for (int e_iter = 0; ; ++e_iter) {
+        int e = sm_id * kNumWarpsV2_inter + warp_id + e_iter * experts_per_iter_inter;
+        if (e >= E_local) break;
 
-    // ── Phase B3: derive expert_frequency, expert_pool_block_offset,
-    // base_pool, rank_prefix_matrix, total_tiles.
-    int* smem_freq = smem_buf;                 // reuse scratch
-    int* smem_pool_blk = smem_freq + E_local;
-    // (smem_buf is already past use of streaming_hist; safe to reuse.)
-    __syncthreads();
-
-    // expert_frequency[e] = sum over (c, src_world) of seen_per_substream[c, src_world, e].
-    for (int e = thread_id; e < E_local; e += num_threads) {
         int sum = 0;
-        for (int cs = 0; cs < num_channels * num_ranks; ++cs)
-            sum += seen_per_substream[cs * E_local + e];
-        smem_freq[e] = sum;
-        expert_frequency[e] = sum;
+        for (int cs = lane_id; cs < cs_total_inter; cs += 32) {
+            int c = cs / num_ranks;
+            int src_world = cs - c * num_ranks;
+            int src_rdma = src_world / NUM_NVL_b1;
+            int src_nvl = src_world - src_rdma * NUM_NVL_b1;
+            int* slot_w = nvl_streaming_recv_all.buffer(src_nvl);
+            int v = ld_volatile_global(slot_w + (src_rdma * num_channels + c) * E_local + e);
+            seen_per_substream[cs * E_local + e] = v;
+            sum += v;
+        }
+        sum += __shfl_down_sync(0xffffffff, sum, 16);
+        sum += __shfl_down_sync(0xffffffff, sum, 8);
+        sum += __shfl_down_sync(0xffffffff, sum, 4);
+        sum += __shfl_down_sync(0xffffffff, sum, 2);
+        sum += __shfl_down_sync(0xffffffff, sum, 1);
+        if (lane_id == 0)
+            expert_frequency[e] = sum;
     }
-    __syncthreads();
 
-    if (thread_id == 0) {
+    // Grid-wide barrier #2: seen_per_substream + expert_frequency fully
+    // populated before Phase B3 prefix and Phase B4 scan read them.
+    grid.sync();
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE B3 (prefix + counters + rank_prefix_matrix): block 0 thread 0.
+    // Small serial work.
+    // ──────────────────────────────────────────────────────────────────────
+    if (sm_id == 0 && thread_id == 0) {
         int cum_blocks = 0;
-        smem_pool_blk[0] = 0;
+        expert_pool_block_offset[0] = 0;
         for (int e = 0; e < E_local; ++e) {
-            int n_blocks = (smem_freq[e] + tile_m - 1) / tile_m;
-            cum_blocks += n_blocks;
-            smem_pool_blk[e + 1] = cum_blocks;
+            int n_blocks_e = (expert_frequency[e] + tile_m - 1) / tile_m;
+            cum_blocks += n_blocks_e;
+            expert_pool_block_offset[e + 1] = cum_blocks;
         }
         *total_tiles_device = cum_blocks;
         *streaming_total_tiles_mapped = cum_blocks;
 
-        // rank_prefix_matrix[i, rank]: cumulative unique tokens from senders 0..i.
-        // (NUM_NVL × kNumRDMARanks ranks, all in the same world view.)
+        // rank_prefix_matrix[i, rank]: cumulative unique tokens from senders
+        // 0..i (NUM_NVL × kNumRDMARanks ranks, all in the same world view).
         int cum = 0;
         for (int i = 0; i < num_ranks; ++i) {
             cum = recv_gbl_rank_prefix_sum[i];
             rank_prefix_matrix[i * num_ranks + rank] = cum;
         }
     }
-    __syncthreads();
-    for (int e = thread_id; e < E_local + 1; e += num_threads)
-        expert_pool_block_offset[e] = smem_pool_blk[e];
 
-    // base_pool[c, src_world, e]: per-expert, partition the slot range
-    // into NVL-local substreams (`src_rdma == rdma_rank`) first, then
-    // RDMA-remote substreams (`src_rdma != rdma_rank`). Within each
-    // partition the order is `(c, src_world)` lex.
+    // Grid-wide barrier #3: expert_pool_block_offset + total_tiles visible
+    // to all blocks for Phases B4 + B5.
+    grid.sync();
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE B4: base_pool — per-expert parallel prefix-scan over the
+    // NVL-local-first / RDMA-remote-second partition. One block per expert
+    // (round-robin if E_local > num_blocks). cs_perm maps partition position
+    // back to (c, src_world) cs index.
     //
-    // Rationale: `pool_arrival_count[block]` waits on the slowest contributor
-    // to that block. NVL-local substreams complete ~µs after dispatch start;
-    // RDMA-routed substreams complete after the round-trip + forwarder cost.
-    // Without this partition, slow RDMA tiles can land at low `tile_id`s and
-    // HOL-block the linear-claim CTAs in kernel A. With it, low `tile_id`s
-    // within each expert are NVL-only paths (low latency) and high `tile_id`s
-    // are RDMA-routed paths (high latency); producer fire order and consumer
-    // claim order stay aligned with transport heterogeneity. Determinism is
-    // preserved (the NVL-local set is a deterministic function of
-    // `src_rdma == rdma_rank`).
-    //
-    // Tile-boundary cost: if `tile_m` doesn't divide the NVL-local count for
-    // an expert, exactly one tile per expert straddles the partition and
-    // contains both NVL and RDMA slots; that tile is RDMA-bound (waits on
-    // the slowest contributor as before). Accepted as-is — bounding to one
-    // tile per expert is a small upper bound on pool overhead.
-    for (int e = thread_id; e < E_local; e += num_threads) {
-        int acc = smem_pool_blk[e] * tile_m;
-        // Pass 1: NVL-local substreams.
-        for (int cs = 0; cs < num_channels * num_ranks; ++cs) {
-            int src_world = cs % num_ranks;
-            int src_rdma = src_world / NUM_MAX_NVL_PEERS;
-            if (src_rdma != rdma_rank) continue;
-            base_pool[cs * E_local + e] = acc;
-            acc += seen_per_substream[cs * E_local + e];
+    // Partition rationale preserved (see v1 comment): NVL-local substreams
+    // complete first, RDMA-remote substreams last; this keeps low tile_ids
+    // NVL-only so the linear-claim consumer doesn't HOL-block on slow RDMA.
+    // ──────────────────────────────────────────────────────────────────────
+    constexpr int NUM_NVL = NUM_MAX_NVL_PEERS;
+    const int N_nvl = num_channels * NUM_NVL;
+    const int rmt_per_channel = num_ranks - NUM_NVL;
+
+    // The kernel's dynamic SMEM allocation is sized for block 0's Phase A1-A2
+    // histogram (~60 KB); we reuse the first cs_total + kNumWarpsV2_inter
+    // ints of it as scan workspace here. Each block has its own SMEM
+    // allocation, so this is safe across blocks.
+    extern __shared__ int smem_buf_v2[];
+    int* s_scan = smem_buf_v2;                               // [cs_total] scan workspace.
+    int* s_warp_sums = s_scan + cs_total_inter;              // [kNumWarpsV2_inter] warp-sum scratch.
+
+    auto partition_pos_to_cs = [&] (int pos) -> int {
+        int c, src_world;
+        if (pos < N_nvl) {
+            c = pos / NUM_NVL;
+            int src_nvl = pos - c * NUM_NVL;
+            src_world = rdma_rank * NUM_NVL + src_nvl;
+        } else {
+            int rmt = pos - N_nvl;
+            c = rmt / rmt_per_channel;
+            int rmt_pos = rmt - c * rmt_per_channel;
+            // Skip over rdma_rank's slice when listing RDMA-remote src_worlds.
+            int src_rdma = rmt_pos / NUM_NVL;
+            int src_nvl = rmt_pos - src_rdma * NUM_NVL;
+            if (src_rdma >= rdma_rank) src_rdma += 1;
+            src_world = src_rdma * NUM_NVL + src_nvl;
         }
-        // Pass 2: RDMA-remote substreams.
-        for (int cs = 0; cs < num_channels * num_ranks; ++cs) {
-            int src_world = cs % num_ranks;
-            int src_rdma = src_world / NUM_MAX_NVL_PEERS;
-            if (src_rdma == rdma_rank) continue;
-            base_pool[cs * E_local + e] = acc;
-            acc += seen_per_substream[cs * E_local + e];
+        return c * num_ranks + src_world;
+    };
+
+    for (int e_iter = 0; ; ++e_iter) {
+        int e = sm_id + e_iter * num_blocks;
+        if (e >= E_local) break;
+
+        const int e_start_offset = expert_pool_block_offset[e] * tile_m;
+
+        // B4a: load seen[cs_perm[pos], e] into SMEM in partition order.
+        for (int pos = thread_id; pos < cs_total_inter; pos += num_threads) {
+            int cs = partition_pos_to_cs(pos);
+            s_scan[pos] = seen_per_substream[cs * E_local + e];
         }
+        __syncthreads();
+
+        // B4b: chunked warp-parallel exclusive scan with carry = e_start_offset.
+        int carry = e_start_offset;
+        for (int chunk_start = 0; chunk_start < cs_total_inter; chunk_start += num_threads) {
+            int idx_in_block = chunk_start + thread_id;
+            int orig_x = (idx_in_block < cs_total_inter) ? s_scan[idx_in_block] : 0;
+
+            int x = orig_x;
+            int y;
+            y = __shfl_up_sync(0xffffffff, x, 1);  if (lane_id >= 1)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 2);  if (lane_id >= 2)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 4);  if (lane_id >= 4)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 8);  if (lane_id >= 8)  x += y;
+            y = __shfl_up_sync(0xffffffff, x, 16); if (lane_id >= 16) x += y;
+
+            if (lane_id == 31)
+                s_warp_sums[warp_id] = x;
+            __syncthreads();
+
+            if (warp_id == 0) {
+                int ws = (lane_id < kNumWarpsV2_inter) ? s_warp_sums[lane_id] : 0;
+                int wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 1); if (lane_id >= 1) ws += wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 2); if (lane_id >= 2) ws += wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 4); if (lane_id >= 4) ws += wy;
+                wy = __shfl_up_sync(0xffffffff, ws, 8); if (lane_id >= 8) ws += wy;
+                if (lane_id < kNumWarpsV2_inter) s_warp_sums[lane_id] = ws;
+            }
+            __syncthreads();
+
+            int warp_prefix = (warp_id > 0) ? s_warp_sums[warp_id - 1] : 0;
+            int exclusive_x = (x - orig_x) + warp_prefix + carry;
+            if (idx_in_block < cs_total_inter)
+                s_scan[idx_in_block] = exclusive_x;
+
+            __syncthreads();
+            carry += s_warp_sums[kNumWarpsV2_inter - 1];
+            __syncthreads();
+        }
+
+        // B4c: write base_pool through the permutation.
+        for (int pos = thread_id; pos < cs_total_inter; pos += num_threads) {
+            int cs = partition_pos_to_cs(pos);
+            base_pool[cs * E_local + e] = s_scan[pos];
+        }
+        __syncthreads();
     }
 
-    // tile_id_to_expert + pool_arrival_target.
-    for (int e = thread_id; e < E_local; e += num_threads) {
-        int e_start = smem_pool_blk[e];
-        int e_end = smem_pool_blk[e + 1];
-        int n_tiles = e_end - e_start;
-        int n_e = smem_freq[e];
-        for (int t = 0; t < n_tiles; ++t) {
-            int tile_id = e_start + t;
-            tile_id_to_expert[tile_id] = e;
-            pool_arrival_target[tile_id] = (t == n_tiles - 1) ? (n_e - t * tile_m) : tile_m;
+    // ──────────────────────────────────────────────────────────────────────
+    // PHASE B5: tile_id_to_expert + pool_arrival_target — grid-stride, one
+    // thread per tile_id. Linear search over E_local experts to find owner.
+    // ──────────────────────────────────────────────────────────────────────
+    int total_tiles_inter = *total_tiles_device;
+    for (int tile_id = grid_tid; tile_id < total_tiles_inter; tile_id += grid_threads) {
+        int e_found = 0;
+        for (int e = 0; e < E_local; ++e) {
+            if (tile_id < expert_pool_block_offset[e + 1]) {
+                e_found = e;
+                break;
+            }
         }
+        int e_start = expert_pool_block_offset[e_found];
+        int n_tiles_e = expert_pool_block_offset[e_found + 1] - e_start;
+        int n_e = expert_frequency[e_found];
+        int t = tile_id - e_start;
+        tile_id_to_expert[tile_id] = e_found;
+        pool_arrival_target[tile_id] = (t == n_tiles_e - 1) ? (n_e - t * tile_m) : tile_m;
     }
 }
 
@@ -734,7 +861,24 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
     }                                                                                                  \
     break
 
-    SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
+    // Cooperative-grid launch: block 0 owns Phase A1-A5 + Phase B0 (cross-rank
+    // IPC + RDMA puts), blocks 1..kNumRDMARanks own per-dst_rdma channel
+    // prefix matrix, remaining blocks idle until the post-Phase-B0 grid.sync
+    // then all blocks join the wide-parallel Phase B1-B5 work. ~32 blocks at
+    // production gives enough Phase B parallelism while staying well within
+    // the cooperative-launch occupancy ceiling.
+    const int kMinBlocks = 1 + num_rdma_ranks;
+    const int num_blocks = std::max(kMinBlocks, 32);
+    cudaLaunchConfig_t cfg = {(unsigned)num_blocks, (unsigned)kNumThreads, 0, stream, nullptr, 0};
+    cudaLaunchAttribute attr[2];
+    attr[0].id = cudaLaunchAttributeCooperative;
+    attr[0].val.cooperative = 1;
+    attr[1].id = cudaLaunchAttributeClusterDimension;
+    attr[1].val.clusterDim.x = 1;
+    attr[1].val.clusterDim.y = 1;
+    attr[1].val.clusterDim.z = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 2;
     SWITCH_RDMA_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
 #undef STREAMING_DISPATCH_METADATA_LAUNCH_CASE
 }
