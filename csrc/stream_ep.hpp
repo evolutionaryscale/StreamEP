@@ -192,6 +192,62 @@ private:
     // dispatch_grads (same dispatch stream).
     int* dispatch_meta_sentinel_prev = nullptr;
 
+    // Per-(channel, peer) "prefix-matrix ready" sentinel. Fwd dispatch_main
+    // releases `dispatch_seq` into this slot the moment it writes the
+    // corresponding channel_prefix_matrix entry (intranode: sender warp;
+    // internode: forwarder warp after the RDMA meta-sentinel trips); fwd
+    // combine and bwd combine_grads acquire-spin on `slot >= combine_seq`
+    // at kernel entry before reading the matrix. Closes the
+    // dispatch_main → combine prefix-matrix race under CDMC>1 without
+    // serializing the streams (cdmc-bugnew.md §"Fwd combine ↔ dispatch_main
+    // prefix-matrix race"). Indexed by `peer * num_channels + channel`,
+    // where `peer` is `dst_nvl_rank` intranode / `dst_rdma_rank` internode
+    // — a given Buffer is built for exactly one path so the two index
+    // spaces don't coexist. Sized [max_num_channels × max_peers] int64,
+    // ~5 KB at worst. Persistent across iters via monotonic dispatch_seq
+    // (consumer's `>= seq` test rejects stale residue without per-iter
+    // memset). Allocated zero-init in `Buffer::Buffer`; freed in destructor.
+    int64_t* combine_routing_ready = nullptr;
+
+    // Second prefix-matrix ready sentinel — internode only. Covers the
+    // `recv_gbl_channel_prefix_matrix` slot written by dispatch_main's NVL
+    // receiver warp (internode.cu:1457) and read by combine's kNVLSender
+    // warp (internode.cu:3000). Same role and protocol as
+    // `combine_routing_ready` above but at finer granularity: indexed by
+    // `(src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels +
+    // channel`. Sized [num_rdma_ranks × NUM_MAX_NVL_PEERS × max_num_channels]
+    // int64, ~10 KB at production internode. Empirically required to make
+    // fwd `out` stable across runs with `combine.wait_stream(dispatch)`
+    // removed — gating only `combine_routing_ready` left a 60% flake rate
+    // on `out`. Nullptr on intranode path (no analog read).
+    int64_t* combine_routing_ready_gbl = nullptr;
+
+    // Sender-side "send_rdma_head ready" sentinel — internode only.
+    // Covers `send_rdma_head` writes by dispatch_main's kRDMASender warps
+    // (internode.cu:1011), read by encode_combine_heads's rdma_head branch
+    // (internode.cu:1924). kNumDispatchRDMASenderWarps warps per channel
+    // share the per-token loop (each warp owns 1/kNum tokens); each warp
+    // releases its own slot at end of its loop. Indexed by
+    // `channel * kNumDispatchRDMASenderWarps + sender_warp_id`. Sized
+    // [max_num_channels × kNumDispatchRDMASenderWarps] int64, ~2 KB.
+    // Nullptr on intranode path.
+    //
+    // TODO(fuse): when encode_combine_heads is fused into combine_main
+    // (Stage 1 follow-up), the consumer side moves into combine_main's
+    // kRDMAReceiver warp. Same producer side, same granularity.
+    int64_t* combine_send_rdma_ready = nullptr;
+
+    // Sender-side "send_nvl_head ready" sentinel — internode only.
+    // Covers `send_nvl_head` writes by dispatch_main's kRDMAAndNVLForwarder
+    // warps (internode.cu:1297), read by encode_combine_heads's nvl_head
+    // branch (internode.cu via TMA at line ~1968). One forwarder warp per
+    // (channel, dst_nvl_rank) writes its column; each releases its own
+    // slot at end of the forwarder main loop. Indexed by
+    // `channel * NUM_MAX_NVL_PEERS + dst_nvl_rank`. Sized
+    // [max_num_channels × NUM_MAX_NVL_PEERS] int64, ~3 KB. Nullptr on
+    // intranode path.
+    int64_t* combine_send_nvl_ready = nullptr;
+
     // Shrink mode buffer
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;

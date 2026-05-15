@@ -476,6 +476,16 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                 st_relaxed_sys_global(channel_end_offset.buffer(), -end_count - 1);
                 // Persist inclusive cumulative through this channel for combine.
                 tile_signal.channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = end_count;
+                // Release `dispatch_seq` into the per-(rank, channel) ready
+                // sentinel so combine's sender warp for this (send_rank,
+                // channel) pair can stop spinning. `.release` publishes the
+                // prior prefix-matrix store; combine's `.acquire` load makes
+                // it visible. Same `.gpu` scope as the per-tile signals —
+                // intra-GPU, stays in L2. See markdowns/cdmc-partial-fix.md
+                // §"Stage 1 — Prefix-matrix sentinel".
+                st_release_gpu_global(&tile_signal.combine_routing_ready[
+                                          responsible_rank * num_channels + responsible_channel],
+                                      tile_signal.dispatch_seq);
             }
         }
         __syncwarp();
@@ -1266,6 +1276,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                                           const int* channel_prefix_matrix,
                                                           int* send_head,
                                                           const int64_t* y_done_per_token,
+                                                          const int64_t* combine_routing_ready,
                                                           int64_t combine_seq,
                                                           int num_tokens,
                                                           int num_recv_tokens,
@@ -1328,6 +1339,41 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                       num_channels_total * num_recv_buffer_tokens * sizeof(int));
         auto channel_topk_weights_buffers = Buffer<float>(
             ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+
+        // Per-(send_rank_id, channel) prefix-matrix ready gate. dispatch_main's
+        // sender warp for this (send_rank_id, channel) wrote `channel_prefix_matrix`
+        // and then released `combine_seq` into `combine_routing_ready[...]`.
+        // Under CDMC=1 the single HW queue serializes us behind dispatch_main
+        // for free; under CDMC>1 we must wait per-slot here, else stale
+        // matrix residue produces wrong token routing → numerical errors
+        // (cdmc-bugnew.md §"Fwd combine ↔ dispatch_main prefix-matrix race").
+        // Combine reads two adjacent slots on the same row (current channel
+        // and, if not the last, the next channel for the range end), so we
+        // gate on both. Single-thread spin per warp, then __syncwarp to
+        // propagate the acquire's happens-before to the other lanes.
+        if (elect_one_sync()) {
+            auto gate_start = clock64();
+            while (ld_acquire_gpu_global(&combine_routing_ready[
+                       send_rank_id * num_channels + responsible_channel]) < combine_seq) {
+                if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP timeout for combine routing-ready gate (slot 0), rank %d, channel %d, send_rank %d\n",
+                           rank, responsible_channel, send_rank_id);
+                    trap();
+                }
+            }
+            if (responsible_channel < num_channels - 1) {
+                gate_start = clock64();
+                while (ld_acquire_gpu_global(&combine_routing_ready[
+                           send_rank_id * num_channels + responsible_channel + 1]) < combine_seq) {
+                    if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP timeout for combine routing-ready gate (slot +1), rank %d, channel %d, send_rank %d\n",
+                               rank, responsible_channel, send_rank_id);
+                        trap();
+                    }
+                }
+            }
+        }
+        __syncwarp();
 
         // Get tasks
         // NOTES: `channel_offset` is already shifted
@@ -1615,6 +1661,7 @@ void launch_combine_main(cudaDataType_t type,
              const int* channel_prefix_matrix,
              int* send_head,
              const int64_t* y_done_per_token,
+             const int64_t* combine_routing_ready,
              int64_t combine_seq,
              bool is_fwd,
              int num_tokens,
@@ -1649,6 +1696,7 @@ void launch_combine_main(cudaDataType_t type,
                       channel_prefix_matrix,                                   \
                       send_head,                                               \
                       y_done_per_token,                                        \
+                      combine_routing_ready,                                   \
                       combine_seq,                                             \
                       num_tokens,                                              \
                       num_recv_tokens,                                         \

@@ -1093,6 +1093,19 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 env.reader_prev_head + channel_id * kNumRDMARanks + lane_id,
                 static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))));
         }
+
+        // Release this warp's `combine_send_rdma_ready` slot. All
+        // kRDMASender warps collectively cover the channel's token range
+        // (warp_id strided), so encode_combine_heads's rdma_head branch
+        // must wait for ALL kNumDispatchRDMASenderWarps slots for this
+        // channel before reading. `.release` publishes this warp's prior
+        // `per_token_out.send_rdma_head[...]` writes; consumer's `.acquire`
+        // observes them once the slot's value reaches `dispatch_seq`.
+        if (lane_id == 0) {
+            st_release_gpu_global(&tile_signal.combine_send_rdma_ready[
+                                      channel_id * kNumDispatchRDMASenderWarps + warp_id],
+                                  tile_signal.dispatch_seq);
+        }
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
         EP_DEVICE_ASSERT(env.num_max_rdma_chunked_recv_tokens % env.num_max_rdma_chunked_send_tokens == 0);
 
@@ -1201,6 +1214,16 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     auto src_rdma_channel_prefix_1 = meta_3;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
                     per_token_out.recv_rdma_channel_prefix_matrix[lane_id * num_channels + channel_id] = src_rdma_channel_prefix_1;
+                    // Release `dispatch_seq` into the per-(src_rdma_rank,
+                    // channel) ready sentinel so combine's forwarder warp
+                    // for (channel, dst_rdma_rank=lane_id) can stop spinning.
+                    // `.release` publishes the prefix-matrix store above;
+                    // combine's `.acquire` load makes it visible. `.gpu`
+                    // scope — intra-GPU, stays in L2. See
+                    // markdowns/cdmc-partial-fix.md §"Stage 1".
+                    st_release_gpu_global(&tile_signal.combine_routing_ready[
+                                              lane_id * num_channels + channel_id],
+                                          tile_signal.dispatch_seq);
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : inputs.recv_rdma_rank_prefix_sum[lane_id - 1];
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
                     break;
@@ -1360,6 +1383,19 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
             atomicMax(env.dispatch_meta_sentinel_prev + channel_id * kNumRDMARanks + lane_id, latest_sentinel);
         }
+
+        // Release this warp's `combine_send_nvl_ready` slot. Each forwarder
+        // warp owns one `dst_nvl_rank` and has written all per-token
+        // `send_nvl_head_for_lane[...]` entries for this (channel,
+        // dst_nvl_rank) pair by now. encode_combine_heads's nvl_head branch
+        // must wait for all NUM_MAX_NVL_PEERS slots for this channel before
+        // its TMA load of `combined_nvl_head`. `.release` publishes the
+        // prior send_nvl_head writes; consumer's `.acquire` observes them.
+        if (lane_id == 0) {
+            st_release_gpu_global(&tile_signal.combine_send_nvl_ready[
+                                      channel_id * NUM_MAX_NVL_PEERS + dst_nvl_rank],
+                                  tile_signal.dispatch_seq);
+        }
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
         if (target_rank > 0)
             return;
@@ -1443,8 +1479,19 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
 
         // Save for combine usage (per-(src_world, channel) recv-token cumulative).
-        if (lane_id < kNumRDMARanks)
+        if (lane_id < kNumRDMARanks) {
             per_token_out.recv_gbl_channel_prefix_matrix[(lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id] = total_offset;
+            // Release `dispatch_seq` into the per-(src_rdma, src_nvl,
+            // channel) ready sentinel so combine's kNVLSender warp for
+            // `(channel, src_rdma=lane_id, dst_nvl=src_nvl_rank)` can stop
+            // spinning. `.release` publishes the matrix store above; the
+            // consumer's `.acquire` load makes it visible. `.gpu` scope —
+            // intra-GPU. Closes the kNVLSender ↔ NVL receiver
+            // prefix-matrix race left uncovered by the first sentinel.
+            st_release_gpu_global(&tile_signal.combine_routing_ready_gbl[
+                                      (lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id],
+                                  tile_signal.dispatch_seq);
+        }
         __syncwarp();
 
         // ── Per-warp Pass A counter table: warp_local_seen[src_rdma][e_local].
@@ -1872,6 +1919,19 @@ __device__ int combine_token(bool is_token_in_rank,
 // Block-per-(channel | (channel, dst_rdma_rank)) avoids the warp-per-
 // channel packing that capped num_channels ≤ 32 (one block ≤ 32 warps).
 // Independent work items per block — no cross-block sync.
+//
+// TODO(fuse-into-combine): the reverse-scan logic in this kernel could
+// move into `combine_main_kernel` at the same per-(channel)/per-(channel,
+// dst_rdma_rank) granularity — combine's kRDMAReceiver and kNVLAndRDMA
+// Forwarder warps already own those scopes. Fusing eliminates the
+// separate kernel launch (~10-15 µs), the HBM round-trip on send_*_head
+// (combine could read once, encode in registers/SMEM, consume), and the
+// FIFO-implies-gate reasoning currently linking the two kernels. The four
+// sender-side / prefix-matrix sentinels we acquire here would move into
+// combine_main verbatim. Cost: ~50-80 LOC of reverse-scan logic + a SMEM
+// scratch in combine_main (which already runs near its SMEM budget — need
+// to measure). Tracked at Stage 1 acceptance time as a follow-up; see
+// markdowns/cdmc-partial-fix.md §"Stage 1 — Prefix-matrix sentinel".
 // ─────────────────────────────────────────────────────────────────────────────
 template <int kNumTMABytesPerWarp>
 __global__ void encode_combine_heads_kernel(
@@ -1881,6 +1941,27 @@ __global__ void encode_combine_heads_kernel(
     const int* rdma_channel_prefix_matrix,
     const int* rdma_rank_prefix_sum,
     int* combined_nvl_head,
+    // Per-(dst_rdma_rank, channel) "prefix-matrix ready" sentinel released
+    // by dispatch_main's forwarder warp. This kernel's nvl_head branch
+    // reads `rdma_channel_prefix_matrix` (the recv-side matrix) at kernel
+    // entry; under CDMC>1 we must wait per-slot here, else stale matrix
+    // residue corrupts the in-place sentinel encoding of `combined_nvl_head`
+    // and combine reads garbage routing. combine_main's kNVLAndRDMAForwarder
+    // reads the same matrix later — same-stream FIFO with this kernel
+    // covers that read, so combine_main doesn't need its own gate for the
+    // rdma matrix. See markdowns/cdmc-partial-fix.md §"Stage 1".
+    const int64_t* combine_routing_ready,
+    // Per-(channel, sender_warp_id) sentinel released by each kRDMASender
+    // warp at end of its token loop; the rdma_head branch acquires all
+    // kNumDispatchRDMASenderWarps slots before reading combined_rdma_head.
+    const int64_t* combine_send_rdma_ready,
+    // Per-(channel, dst_nvl_rank) sentinel released by each
+    // kRDMAAndNVLForwarder warp at end of its main loop; the nvl_head
+    // branch acquires all NUM_MAX_NVL_PEERS slots before its TMA load of
+    // combined_nvl_head.
+    const int64_t* combine_send_nvl_ready,
+    int kNumDispatchRDMASenderWarps,
+    int64_t combine_seq,
     int num_ranks) {
     auto block_id = static_cast<int>(blockIdx.x);
     auto lane_id = get_lane_id();
@@ -1891,8 +1972,31 @@ __global__ void encode_combine_heads_kernel(
         // rdma_head reverse pass for `channel = block_id`. lane_id = dst_rdma_rank.
         EP_DEVICE_ASSERT(num_rdma_ranks <= 32);
 
+        int channel = block_id;
+
+        // Per-(channel, sender_warp_id) "send_rdma_head ready" gate. The
+        // kNumDispatchRDMASenderWarps kRDMASender warps in dispatch_main
+        // collectively cover this channel's token range; each writes its
+        // 1/kNum share of `send_rdma_head[token, *]` and releases its slot
+        // at end-of-loop. We must wait for ALL slots before reading
+        // `combined_rdma_head` here. Single-thread acquires (lane 0 of
+        // each lane group) then __syncwarp propagates the happens-before.
+        if (elect_one_sync()) {
+            for (int wid = 0; wid < kNumDispatchRDMASenderWarps; ++wid) {
+                auto gate_start = clock64();
+                while (ld_acquire_gpu_global(&combine_send_rdma_ready[
+                           channel * kNumDispatchRDMASenderWarps + wid]) < combine_seq) {
+                    if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP timeout for encode_combine_heads send_rdma_ready gate, channel %d, sender_warp %d\n",
+                               channel, wid);
+                        trap();
+                    }
+                }
+            }
+        }
+        __syncwarp();
+
         if (lane_id < num_rdma_ranks) {
-            int channel = block_id;
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_combined_tokens, num_channels, channel, token_start_idx, token_end_idx);
 
@@ -1930,6 +2034,52 @@ __global__ void encode_combine_heads_kernel(
         if (elect_one_sync()) {
             mbarrier_init(tma_mbarrier, 1);
             fence_barrier_init();
+        }
+        __syncwarp();
+
+        // Per-(dst_rdma_rank, channel) prefix-matrix ready gate. Block's reads
+        // touch slots `[dst_rdma_rank, channel]` and (if channel > 0)
+        // `[dst_rdma_rank, channel - 1]`. Single-thread spin then __syncwarp
+        // to publish the acquire's happens-before to the rest of the warp.
+        //
+        // Also gate on all NUM_MAX_NVL_PEERS `combine_send_nvl_ready` slots
+        // for this channel — the TMA load of `combined_nvl_head` below
+        // pulls all NVL columns per token, written by the NUM_MAX_NVL_PEERS
+        // kRDMAAndNVLForwarder warps on the channel's forwarder SM. All
+        // must have finished their per-token writes for this channel
+        // before we read.
+        if (elect_one_sync()) {
+            auto gate_start = clock64();
+            while (ld_acquire_gpu_global(&combine_routing_ready[
+                       dst_rdma_rank * num_channels + channel]) < combine_seq) {
+                if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP timeout for encode_combine_heads routing-ready gate (slot 0), channel %d, dst RDMA %d\n",
+                           channel, dst_rdma_rank);
+                    trap();
+                }
+            }
+            if (channel > 0) {
+                gate_start = clock64();
+                while (ld_acquire_gpu_global(&combine_routing_ready[
+                           dst_rdma_rank * num_channels + channel - 1]) < combine_seq) {
+                    if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP timeout for encode_combine_heads routing-ready gate (slot -1), channel %d, dst RDMA %d\n",
+                               channel, dst_rdma_rank);
+                        trap();
+                    }
+                }
+            }
+            for (int nvl = 0; nvl < NUM_MAX_NVL_PEERS; ++nvl) {
+                gate_start = clock64();
+                while (ld_acquire_gpu_global(&combine_send_nvl_ready[
+                           channel * NUM_MAX_NVL_PEERS + nvl]) < combine_seq) {
+                    if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP timeout for encode_combine_heads send_nvl_ready gate, channel %d, dst NVL %d\n",
+                               channel, nvl);
+                        trap();
+                    }
+                }
+            }
         }
         __syncwarp();
 
@@ -1986,6 +2136,10 @@ void encode_combine_heads(int hidden_int4,
                           const int* rdma_channel_prefix_matrix,
                           const int* rdma_rank_prefix_sum,
                           int* combined_nvl_head,
+                          const int64_t* combine_routing_ready,
+                          const int64_t* combine_send_rdma_ready,
+                          const int64_t* combine_send_nvl_ready,
+                          int64_t combine_seq,
                           cudaStream_t stream) {
     // Block-per-(channel | (channel, dst_rdma_rank)), 1 warp per block.
     // 4096 B SMEM per nvl_head block packs ~127 tokens/batch
@@ -2003,10 +2157,20 @@ void encode_combine_heads(int hidden_int4,
     auto kernel = encode_combine_heads_kernel<kNumTMABytesPerWarp>;
     SETUP_LAUNCH_CONFIG(num_blocks, num_threads, stream);
     SET_SHARED_MEMORY_FOR_TMA(kernel);
+    // kNumDispatchRDMASenderWarps is defined in launch_dispatch_main below
+    // (= 7). Pass it as a runtime arg so the gate loop in the kernel uses
+    // the right count. See note in stream_ep.cpp's Buffer constructor
+    // about keeping these in sync.
+    constexpr int kNumDispatchRDMASenderWarps = 7;
     LAUNCH_KERNEL(&cfg, kernel,
                   combined_rdma_head, num_combined_tokens, num_channels,
                   rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
                   combined_nvl_head,
+                  combine_routing_ready,
+                  combine_send_rdma_ready,
+                  combine_send_nvl_ready,
+                  kNumDispatchRDMASenderWarps,
+                  combine_seq,
                   num_ranks);
 }
 
@@ -2864,6 +3028,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     const int* recv_rdma_rank_prefix_sum,
     const int* gbl_channel_prefix_matrix,
     const int64_t* y_done_per_token,
+    // Per-(src_rdma, src_nvl, channel) ready sentinel for the recv-gbl
+    // prefix matrix read by kNVLSender. The recv-rdma matrix used by
+    // kNVLAndRDMAForwarder is gated inside `encode_combine_heads` (same
+    // combine stream, FIFO-ordered before this kernel), so no separate
+    // signal is needed for it here.
+    const int64_t* combine_routing_ready_gbl,
     int64_t combine_seq,
     int combine_phase,
     int num_tokens,
@@ -2983,9 +3153,35 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         __syncwarp();
 
         // Per-RDMA-source token range for this (channel, dst_nvl_rank).
+        // Acquire-spin on `combine_routing_ready_gbl` first — dispatch_main's
+        // kNVLReceivers warp released `dispatch_seq` into the slot right
+        // after writing the matrix entry. Under CDMC>1 we must wait
+        // per-slot here, else the kNVLSender reads stale prefix-matrix
+        // residue and produces wrong token routing on `out` (empirically
+        // ~60% flake rate at 4-node CDMC=8 before this gate). Read also
+        // touches `prefix_idx + 1` for the range end (when not at the last
+        // slot), so gate on both.
         int token_start_idx = 0, token_end_idx = 0;
         if (lane_id < kNumRDMARanks) {
             int prefix_idx = (lane_id * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_channels + channel_id;
+            auto gate_start = clock64();
+            while (ld_acquire_gpu_global(&combine_routing_ready_gbl[prefix_idx]) < combine_seq) {
+                if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP timeout for combine gbl routing-ready gate (slot 0), channel %d, RDMA %d, nvl %d, src RDMA %d, dst NVL %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
+                    trap();
+                }
+            }
+            if (prefix_idx != num_channels * num_ranks - 1) {
+                gate_start = clock64();
+                while (ld_acquire_gpu_global(&combine_routing_ready_gbl[prefix_idx + 1]) < combine_seq) {
+                    if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP timeout for combine gbl routing-ready gate (slot +1), channel %d, RDMA %d, nvl %d, src RDMA %d, dst NVL %d\n",
+                               channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
+                        trap();
+                    }
+                }
+            }
             token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
             token_end_idx = (prefix_idx == num_channels * num_ranks - 1) ? num_tokens : gbl_channel_prefix_matrix[prefix_idx + 1];
         }
@@ -3238,6 +3434,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             // Combine head slot accumulates across iters; seed prev_at_entry.
             uint32_t prev_rdma_channel_head_at_entry =
                 combine_reader_prev_head[channel_id * kNumRDMARanks + dst_rdma_rank];
+
+            // `recv_rdma_channel_prefix_matrix` was gated by
+            // `encode_combine_heads` (which runs first on the same combine
+            // stream) — same-stream FIFO covers our read here. The gbl
+            // matrix gate inside kNVLSender (above) is independent and
+            // remains. See markdowns/cdmc-partial-fix.md §"Stage 1".
             int num_tokens_to_combine = recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
             int num_tokens_prefix = channel_id == 0 ? 0 : recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
             num_tokens_to_combine -= num_tokens_prefix;
@@ -3498,6 +3700,7 @@ void launch_combine_main(cudaDataType_t type,
                          const int* recv_rdma_rank_prefix_sum,
                          const int* gbl_channel_prefix_matrix,
                          const int64_t* y_done_per_token,
+                         const int64_t* combine_routing_ready_gbl,
                          int64_t combine_seq,
                          int combine_phase,
                          bool is_fwd,
@@ -3544,7 +3747,9 @@ void launch_combine_main(cudaDataType_t type,
                       recv_rdma_channel_prefix_matrix,                               \
                       recv_rdma_rank_prefix_sum,                                     \
                       gbl_channel_prefix_matrix,                                     \
-                      y_done_per_token, combine_seq, combine_phase,                  \
+                      y_done_per_token,                                              \
+                      combine_routing_ready_gbl,                                     \
+                      combine_seq, combine_phase,                                    \
                       num_tokens, num_combined_tokens, hidden, num_topk,             \
                       rdma_buffer_ptr,                                               \
                       num_max_rdma_chunked_send_tokens,                              \

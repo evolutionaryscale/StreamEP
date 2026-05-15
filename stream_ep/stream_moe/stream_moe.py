@@ -327,18 +327,19 @@ class StreamMoEFunc(torch.autograd.Function):
         # themselves issue; ``streams.combine``'s only cross-stream sync is the
         # ``metadata_done`` event (one-shot, before dispatch main).
         streams.combine.wait_event(metadata_done)
-        # FWD INTERNODE CDMC>1 FIX (markdowns/cdmc-bugnew.md §"Fwd combine ↔
-        # dispatch_main prefix-matrix race"): combine_main_kernel reads
-        # `recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels +
-        # channel]` at kernel entry, but dispatch_main writes that entry
-        # mid-kernel. Under CDMC=1 the single HW queue serializes combine
-        # after dispatch_main; under CDMC>1 they overlap and combine reads
-        # in-flight data, producing wrong token routing → numerical errors.
-        # Hypothesis-test fix: serialize combine fully behind dispatch's tail.
-        # Kills dispatch↔combine streaming overlap; proper fix is a
-        # per-(channel,dst_rdma_rank) signal released by dispatch_main after
-        # the prefix-matrix write and acquired by each combine CTA at entry.
-        streams.combine.wait_stream(streams.dispatch)
+        # CDMC>1 dispatch_main ↔ combine data races are closed device-side
+        # by four per-(channel, peer) sentinels released by dispatch_main
+        # warps after their respective writes, gated either inside combine
+        # (kNVLSender on recv_gbl_channel_prefix_matrix) or inside
+        # encode_combine_heads (recv_rdma_channel_prefix_matrix +
+        # send_rdma_head + send_nvl_head; downstream combine_main reads
+        # are FIFO-covered on the same combine stream). Buffer fields:
+        # `combine_routing_ready`, `combine_routing_ready_gbl`,
+        # `combine_send_rdma_ready`, `combine_send_nvl_ready`. See
+        # markdowns/cdmc-partial-fix.md §"Stage 1 — Prefix-matrix sentinel".
+        # No stream-level serialization against dispatch needed —
+        # `combine.wait_event(metadata_done)` above suffices for metadata
+        # tensor visibility, and the per-slot device gates handle the rest.
         handle.y_done_per_token.record_stream(streams.combine)
         handle.o.record_stream(streams.combine)
         handle.rank_prefix_matrix.record_stream(streams.combine)
@@ -606,6 +607,16 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle, dL_dy, dispatch_seq=handle.dispatch_seq
             )
 
+        # BWD CDMC>1 SM-starvation cascade workaround (cdmc-bugnew.md §"Bwd
+        # root cause"): under CDMC>1, the 4 bwd persistent-CTA kernels race
+        # for SMs at launch; consumers that grab SMs first spin on signals
+        # their producer hasn't fired, starving the producer of SMs →
+        # circular deadlock. The fwd-side prefix-matrix / sender-head
+        # sentinels we just added don't address this — they close data
+        # races in fwd's dispatch_main → encode → combine chain, not the
+        # bwd CTA-scheduler race. Removing this line hangs deterministically
+        # at iter 1. Proper fix is the "dispatch_main_started"-style signal
+        # for each bwd producer — Stage 2+ in markdowns/cdmc-partial-fix.md.
         streams.compute_y.wait_stream(streams.dispatch)
 
         # dL_do_pool / bwd_dispatch_arrival_count were allocated on streams.dispatch
@@ -655,6 +666,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 (total_tiles,), num_pid_n_y_bwd, dtype=torch.int32, device=device
             )
 
+        # BWD SM-starvation cascade workaround — see the comment on the
+        # first such wait_stream above.
         streams.compute_a.wait_stream(streams.compute_y)
 
         # bwd_a_ready_count / dL_dswiglu_in are written on compute_y; consumed
@@ -699,6 +712,8 @@ class StreamMoEFunc(torch.autograd.Function):
                 num_sms=num_sms_a_bwd,
             )
 
+        # BWD SM-starvation cascade workaround — see the comment on the
+        # first such wait_stream above.
         streams.combine.wait_stream(streams.compute_a)
 
         # dL_dx_per_r / bwd_a_done_per_token are written on compute_a,

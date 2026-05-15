@@ -323,14 +323,16 @@ def main():
         # Compare every (actual, ref) pair under per-tensor (atol, rtol).
         # Fail iff BOTH absolute and relative diff thresholds are violated.
         diagnostics = []
-        ok = True
-        for name, actual, ref in [
+        per_tensor_names = [
             ("out", out_actual, out_ref),
             ("dL/dx", dL_dx_actual, dL_dx_ref),
             ("dL/dtopk_weights", dL_dtopk_w_actual, dL_dtopk_w_ref),
             ("dL/dW1_local", dL_dW1_local_actual, dL_dW1_local_ref),
             ("dL/dW2_local", dL_dW2_local_actual, dL_dW2_local_ref),
-        ]:
+        ]
+        n_bad_per_tensor_local = []
+        ok = True
+        for name, actual, ref in per_tensor_names:
             atol, rtol = TOL_DEFAULT[name]
             actual_f = actual.to(torch.float32)
             ref_f = ref.to(torch.float32)
@@ -343,8 +345,17 @@ def main():
             diagnostics.append(
                 (name, max_abs_t, max_rel_t, n_bad_t, ref_f.abs().max().item())
             )
+            n_bad_per_tensor_local.append(n_bad_t)
             if n_bad_t > 0:
                 ok = False
+
+        # Per-tensor world-wide n_bad sum (so we can see WHICH tensor
+        # triggered the FAIL even when this rank's local n_bad is 0).
+        n_bad_world_t = torch.tensor(
+            n_bad_per_tensor_local, device=device, dtype=torch.int64
+        )
+        torch_dist.all_reduce(n_bad_world_t, op=torch_dist.ReduceOp.SUM)
+        n_bad_world = n_bad_world_t.tolist()
 
         # All-reduce ok across ranks so all ranks see the same outcome.
         ok_t = torch.tensor([1 if ok else 0], device=device, dtype=torch.int32)
@@ -354,12 +365,15 @@ def main():
         tag = "PASS" if all_ok else "FAIL"
         rank_zero_print(f"[validate] iter {step:3d} seq={seq}: {tag}")
         if not all_ok:
-            for name, max_abs_t, max_rel_t, n_bad_t, ref_max in diagnostics:
-                marker = "  " if n_bad_t == 0 else "!!"
+            for (name, max_abs_t, max_rel_t, n_bad_t, ref_max), n_bad_w in zip(
+                diagnostics, n_bad_world
+            ):
+                marker = "  " if n_bad_w == 0 else "!!"
                 rank_zero_print(
                     f"  {marker} {name:20s}  max_abs={max_abs_t:.4g} "
                     f"max_rel={max_rel_t:.4g} n_bad={n_bad_t} "
-                    f"(ref_max={ref_max:.4g}) (this rank)"
+                    f"(ref_max={ref_max:.4g}) (this rank) "
+                    f"n_bad_world={n_bad_w}"
                 )
             fail_count += 1
 
