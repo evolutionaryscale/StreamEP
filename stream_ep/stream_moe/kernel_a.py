@@ -11,9 +11,12 @@ Forward kernel A of the problem-tile streaming pipeline:
     the correct expert-major pool row by construction).
   * GEMM against W1[expert_id], SwiGLU register-resident epilogue, TMA-store
     the I-half post-activation to `postact_a[tile_id * tile_M : ..., :]`.
-  * Per-stripe-CTA end: `red.release.gpu.global.add.s32(a_ready_count[tile], 1)`
-    after TMA-store drain → kernel Y's count-vs-target spin on
-    `a_ready_count[tile] == num_pid_n` unblocks once all stripes fire.
+
+Kernel A's downstream consumer (kernel Y) runs on the SAME compute stream and
+is FIFO-ordered after A: by the time Y issues its first instruction, A has
+fully retired and its TMA stores are drained. No per-tile A→Y release/acquire
+signal is needed — the historical `a_ready_count` / TileReadyRelease pair was
+deleted in the 3-stream collapse (see logbook entry).
 
 Inherits the GEMM mainloop, SwiGLU epilogue, scheduler-warp + pipeline-state
 machinery from `quack.gemm_act.GemmGatedSm90`. Streaming-specific behavior is
@@ -30,15 +33,13 @@ locally inside the scheduler warp's queue-pull and used only for the
 ready-spin and to derive expert_id/pid_m.
 """
 
-from dataclasses import MISSING
 from typing import Callable, NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import quack.utils as utils
 import torch
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Float32, Int32, Int64
 from quack.activation import gate_fn_map
 from quack.cache_utils import COMPILE_ONLY, jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -49,7 +50,6 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import EpiOp
 from quack.gemm_act import GemmGatedMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
@@ -57,89 +57,11 @@ from quack.rounding import RoundingMode
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from stream_ep.stream_moe.ptx_helpers import red_release_gpu_add_s32
+from stream_ep.stream_moe.ptx_helpers import threadfence_system
 from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
 )
-
-
-# ---------------------------------------------------------------------------
-# Per-tile a_ready_count release-add. Kernel A's downstream consumer (kernel Y)
-# count-vs-target spins on a_ready_count[tile_id] == num_pid_n before reading
-# postact_a's per-tile slab. Each stripe-CTA fires one
-# `red.release.gpu.global.add.s32` once its own TMA stores have drained — no
-# tip-check, no separate stamp store. The .release on the add chains with the
-# consumer's .acquire load to make postact_a observable; .gpu scope is enough
-# intra-GPU (different streams, same device — same intra-GPU L2 path PR #2
-# established for stamp release-stores).
-# ---------------------------------------------------------------------------
-@mlir_namedtuple
-class TileReadyParams(NamedTuple):
-    a_ready_count: cute.Tensor  # [total_tiles] int32 — per-tile release-add destination
-    tile_m: cutlass.Constexpr[
-        int
-    ]  # for tile_id = cu_seqlens_m[batch_idx] // tile_m + pid_m
-
-
-class TileReadyRelease(EpiOp):
-    """Per-tile `red.release.gpu.global.add.s32(a_ready_count[tile_id], 1)`
-    after this stripe-CTA's TMA-store drain. Mirrors `fire_pool_blocks` on the
-    dispatch side; multi-producer release-add semantics.
-
-    No SMEM, no cross-CTA arrival counter — each stripe-CTA fires once.
-    The consumer's count-vs-target spin terminates after all stripes have
-    fired.
-    """
-
-    def __init__(self, name: str = "tile_ready"):
-        super().__init__(name)
-
-    def param_fields(self):
-        return [(self.name, object, MISSING)]
-
-    def to_params(self, gemm, args):
-        return {self.name: getattr(args, self.name)}
-
-    @cute.jit
-    def end(
-        self,
-        gemm,
-        param,
-        state,
-        epi_tile,
-        tiled_copy_t2r,
-        tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
-        tidx,
-    ):
-        if const_expr(param is None):
-            return
-        # Drain THIS CTA's TMA stores (cp.async.bulk.wait_group<0>) so that
-        # postact_a is observable to kernel Y once this CTA's release-add lands.
-        # The release-acquire pair on `a_ready_count` accumulates contributors:
-        # when count reaches num_pid_n on the consumer side, the consumer's
-        # acquire-load observes every stripe-CTA's drained TMA stores.
-        cute.arch.cp_async_bulk_wait_group(0, read=False)
-
-        # Reconstruct tile_id from (batch_idx, pid_m).
-        # cu_seqlens_m carries `expert_pool_block_offset * tile_m`, so
-        # tile_id = expert_pool_block_offset[batch_idx] + pid_m
-        #        = cu_seqlens_m[batch_idx] // tile_m + pid_m.
-        batch_idx = tile_coord_mnkl[3]
-        pid_m = tile_coord_mnkl[0]
-        tile_id = (
-            varlen_manager.params.cu_seqlens_m[batch_idx] // Int32(param.tile_m) + pid_m
-        )
-
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        lane_idx = cute.arch.lane_idx()
-        is_thread0 = (warp_idx == Int32(0)) & (lane_idx == Int32(0))
-
-        if is_thread0:
-            count_ptr = utils.elem_pointer(param.a_ready_count, (tile_id,))
-            red_release_gpu_add_s32(count_ptr, Int32(1))
 
 
 # ---------------------------------------------------------------------------
@@ -171,24 +93,17 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
     queue-pull scheduler. Pool layout means kernel A uses the base GEMM
     mainloop's varlen_m path verbatim — no per-tile gather indirection.
 
-    Adds a per-tile `red.release.gpu.global.add.s32(a_ready_count[tile_id], 1)`
-    at the end of each stripe-CTA's epilogue (after TMA-store drain) so
-    kernel Y's per-tile count-vs-target spin observes the contribution
-    cross-stream. Each tile receives `num_pid_n` adds total; kernel Y's
-    target tensor is filled with `num_pid_n` everywhere.
+    Kernel Y runs on the SAME compute stream and is FIFO-ordered after A
+    fully retires — same-stream FIFO covers cross-stage visibility, no
+    per-tile release/acquire is needed.
     """
 
-    # Append TileReadyRelease to GemmGatedMixin's _epi_ops chain. Order
-    # matters: the framework iterates ops for begin/end; the postact TileStore
-    # must run before our release-drain so postact_a's TMA stores have been
-    # COMMITTED before our wait_group(0) drains them.
-    _epi_ops = (*GemmGatedMixin._epi_ops, TileReadyRelease("tile_ready"))
+    _epi_ops = GemmGatedMixin._epi_ops
     _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
-        tile_ready: TileReadyParams
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
@@ -336,7 +251,6 @@ def _compile_streaming_moe_a(
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
-    a_ready_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
 
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),  # set at runtime; 0 here keeps fake compile happy
@@ -347,14 +261,8 @@ def _compile_streaming_moe_a(
         total_tiles=Int32(0),
     )
 
-    tile_ready_params = TileReadyParams(
-        a_ready_count=a_ready_count,
-        tile_m=tile_m,
-    )
-
     epi_args = StreamingMoeA.EpilogueArguments(
         mPostAct=mPostAct,
-        tile_ready=tile_ready_params,
         act_fn=gate_fn_map[activation],
         rounding_mode=RoundingMode.RN,
     )
@@ -490,7 +398,6 @@ def streaming_moe_a(
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
     pool_arrival_count: torch.Tensor,  # (total_tiles,) int32 — dispatch Pass 2 release-add destination
     pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target
-    a_ready_count: torch.Tensor,  # (total_tiles,) int32 — per-tile release-add destination (A → Y handoff; zero-init per dispatch)
     *,
     preact_a: torch.Tensor | None = None,
     tile_m: int = 128,
@@ -504,8 +411,6 @@ def streaming_moe_a(
 
     ``num_sms`` caps the persistent-grid CTA count to the given value. When
     ``None`` (default) the kernel fills the GPU via ``get_max_active_clusters``.
-    Smaller caps leave SMs available for kernel Y to run concurrently — see
-    design.md §"SM budget".
 
     Caller is responsible for:
       - allocating ``postact_a`` ``(total_tiles, tile_M, I)`` ON THE SAME STREAM
@@ -518,19 +423,12 @@ def streaming_moe_a(
         ``pool_arrival_target[tile_id]``. Kernel A's per-tile count-vs-target
         spin handles cross-stream visibility for those tensors and the
         dispatch metadata they transitively depend on.
-      - **zero-initialising ``a_ready_count``** on the same stream as kernel A
-        (the kernel release-adds into it; non-zero starting values would
-        corrupt the consumer's count-vs-target spin).
 
     The internal ``consumer_head`` counter is allocated on the calling stream
     so its zero-init is naturally ordered with the kernel.
 
-    Per-tile A → Y handoff: at the end of each tile's epilogue (after this
-    stripe-CTA's TMA stores have drained), kernel A fires
-    ``red.release.gpu.global.add.s32(a_ready_count[tile_id], 1)``. Each
-    stripe-CTA contributes one add per tile; kernel Y on ``compute_y_stream``
-    count-vs-target spins on ``a_ready_count[tile_id] == num_pid_n`` before
-    reading the tile's postact_a slab.
+    Kernel Y runs on the same compute stream and is FIFO-ordered after A
+    fully retires — no per-tile A→Y signal is needed.
 
     Optional ``preact_a`` ``(total_tiles, tile_M, 2*I) bf16`` is the pre-SwiGLU
     accumulator destination for bwd. When passed, kernel A's standard mD
@@ -555,10 +453,6 @@ def streaming_moe_a(
     assert (
         pool_arrival_target.shape == (total_tiles,)
         and pool_arrival_target.dtype == torch.int32
-    )
-    assert (
-        a_ready_count.shape == (total_tiles,)
-        and a_ready_count.dtype == torch.int32
     )
     H = pool.shape[1]
     E_local = W1.shape[0]
@@ -642,14 +536,8 @@ def streaming_moe_a(
     # values from a recycled allocator slot, causing CTAs to early-exit.
     consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
-    tile_ready_params = TileReadyParams(
-        a_ready_count=a_ready_count,
-        tile_m=None,  # Constexpr; burned in at compile, pass None at call time
-    )
-
     epi_args = StreamingMoeA.EpilogueArguments(
         mPostAct=postact_flat,
-        tile_ready=tile_ready_params,
         act_fn=None,  # Constexpr; pass None at call time
         rounding_mode=None,  # Constexpr; pass None at call time
     )

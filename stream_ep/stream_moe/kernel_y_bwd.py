@@ -47,13 +47,11 @@ Per tile:
     3. `ColVecReduceAtomic` accumulates `Σ_n postact[m, n] * g[m, n]`
        (UNWEIGHTED g) per row, intra-warp shuffle + cross-warp reduce → one
        fp32 row sum per slot per pid_n CTA, then ``red.global.add.f32`` into
-       a flat ``dL_dweight[slot]`` fp32 buffer. The per-stripe-CTA
-       ``red.release.gpu.global.add.s32(bwd_a_ready_count, 1)`` carries
-       this CTA's ``dL_dweight`` atomic-adds across the release semantics
-       — combine_grads's per-token gate (``bwd_a_done_per_token[r]``, fired
-       by kernel_a_bwd which acquires ``bwd_a_ready_count``) makes them
-       visible to combine's sender so per-recv-token streaming on
-       combine_grads is preserved.
+       a flat ``dL_dweight[slot]`` fp32 buffer. kernel_a_bwd runs on the
+       same compute stream and is FIFO-ordered after Y_bwd retires, so the
+       ``dL_dweight`` atomic-adds are visible to A_bwd (and through it to
+       combine_grads's per-token gate) without any per-tile cross-stream
+       release.
     4. Per-row weight multiply on (dgate, dup, postact): SwiGLU bwd is
        linear in dpostact, so `w * dgate(g) = dgate(w * g)`. Multiplying
        after dswiglu is equivalent and lets the dL/dweight dot product see
@@ -65,14 +63,6 @@ Per tile:
        viewed as fp32 (M, I) — same f32-recast trick on the output side as
        on input). ``postact_a_for_dW2`` rides ``mPostAct`` (TileStore) — bf16
        (M, I) plain TMA-store, same path GemmActMixin uses for fwd postact.
-  * Per-stripe-CTA end: drain TMA stores (mD + mPostAct), then
-    `red.release.gpu.global.add.s32(bwd_a_ready_count[tile_id], 1)`. Each
-    stripe-CTA contributes one add per tile; kernel_a_bwd's count-vs-target
-    spin on `bwd_a_ready_count[tile] == bwd_a_ready_target[tile]` (target
-    tensor pre-filled with `num_pid_n` everywhere) unblocks once all
-    stripes fire. The .release semantics carry each CTA's per-tile
-    ``dL_dweight`` atomic-adds and ``postact_a_for_dW2`` TMA stores
-    across the cross-stream boundary.
 
 Folding SwiGLU bwd here (vs running it as a separate step before kernel_a_bwd)
 saves one read of preact_a from HBM in kernel_a_bwd at the cost of writing
@@ -83,13 +73,10 @@ SwiGLU bwd, no preact load.
 
 Shares streaming machinery with fwd kernels:
   * `StreamingTileScheduler` for linear-claim + per-tile count-vs-target
-    spin. Kernel Y_bwd plumbs (`bwd_dispatch_arrival_count`,
-    `pool_arrival_target`) in place of fwd kernel A's
-    (`pool_arrival_count`, `pool_arrival_target`); same protocol, different
-    tensors. Fired by dispatch_grads's Pass 2 release-adds.
-  * `TileReadyRelease` EpiOp from `kernel_a.py` (per-stripe-CTA drain +
-    `red.release.gpu.global.add.s32`) — bwd reuses verbatim; only the
-    destination tensor changes (bwd_a_ready_count instead of a_ready_count).
+    spin. Kernel Y_bwd plumbs (``bwd_dispatch_arrival_count``,
+    ``pool_arrival_target``) — fired by dispatch_grads's Pass 2 release-adds.
+  * kernel_a_bwd runs on the same compute stream and is FIFO-ordered after
+    Y_bwd retires; no per-tile Y_bwd → A_bwd device-side signal is needed.
 """
 
 from typing import Callable, NamedTuple, Optional, Type
@@ -120,11 +107,7 @@ from quack.varlen_utils import VarlenArguments
 from stream_ep.stream_moe.epi_ops import (
     ColVecReduceAtomic,
 )
-from stream_ep.stream_moe.kernel_a import (
-    StreamingTileSchedulerOptions,
-    TileReadyParams,
-    TileReadyRelease,
-)
+from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
     StreamingTileSchedulerArguments,
@@ -136,8 +119,7 @@ from stream_ep.stream_moe.tile_scheduler import (
 # ---------------------------------------------------------------------------
 class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     """Streaming-MoE kernel Y bwd: NN GEMM + SwiGLU bwd in epilogue +
-    in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store +
-    per-stripe-CTA bwd_a_ready_count release-add.
+    in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store.
 
     Inherits the standard mD TMA-store path from GemmDefaultEpiMixin (via
     GemmActMixin), plus a SECOND TMA-store path via ``TileStore("mPostAct")``
@@ -146,7 +128,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     Both mC (preact) and mD (dL/dswiglu_in) still use the f32-recast trick —
     host-side storage is bf16 (M, 2I), kernel sees fp32 (M, I) and recasts
     back to bf16x2 in-epilogue (`implicit_dtype = bf16`, mirroring quack's
-    `gemm_dgated`). Compose the additional bwd-side EpiOps onto the inherited
+    `gemm_dgated`). Compose the additional bwd-side EpiOp onto the inherited
     chain:
       - ColVecReduceAtomic("mColVecReduce") for in-kernel atomic-add of the
         per-slot dL/dweight dot product (per-pid_n CTAs reduce intra-warp /
@@ -154,12 +136,10 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         buffer; eliminates the post-hoc ``.sum(dim=-1)`` torch op + the
         ``weight_grads_ready`` cross-stream event the orchestrator used to
         carry).
-      - TileReadyRelease("tile_ready") for the per-stripe-CTA
-        `red.release.gpu.global.add.s32(bwd_a_ready_count[tile_id], 1)`
-        after mD TMA-store drain. The .release semantics on the add publish
-        this CTA's per-tile dL/dweight atomic-adds and postact_a_for_dW2 TMA
-        stores to other streams (combine_grads's per-token gate fires after
-        kernel_a_bwd acquires bwd_a_ready_count).
+
+    kernel_a_bwd runs on the same compute stream and FIFO-orders after Y_bwd
+    retires, so dL_dweight's atomic-adds and the mPostAct TMA stores are
+    automatically visible — no per-stripe-CTA release-add is needed.
 
     `epi_visit_subtile` is fully overridden — runs `dswiglu` against
     UNWEIGHTED `g` (= the GEMM result), gets `(dgate, dup, postact)` in one
@@ -195,13 +175,11 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         # was the MVP workaround.
         ColVecLoad("mPaddingMask"),
         ColVecReduceAtomic("mColVecReduce"),
-        TileReadyRelease("tile_ready"),
     )
     _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
-        tile_ready: TileReadyParams
         mPostAct: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
         # Unused: overridden `epi_visit_subtile` bypasses `act_fn`. See class docstring.
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
@@ -472,7 +450,6 @@ def _compile_streaming_moe_y_bwd(
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
-    bwd_a_ready_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
 
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
@@ -483,13 +460,7 @@ def _compile_streaming_moe_y_bwd(
         total_tiles=Int32(0),
     )
 
-    tile_ready_params = TileReadyParams(
-        a_ready_count=bwd_a_ready_count,
-        tile_m=tile_m,
-    )
-
     epi_args = StreamingMoeYBwd.EpilogueArguments(
-        tile_ready=tile_ready_params,
         mPostAct=mPostAct,
         act_fn=None,
         mColVecBroadcast=pool_topk_weight,
@@ -542,7 +513,6 @@ def streaming_moe_y_bwd(
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32 — pool-block prefix sum
     bwd_dispatch_arrival_count: torch.Tensor,  # (total_tiles,) int32 — input count from dispatch_grads (live)
     pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — firing target (shared with fwd)
-    bwd_a_ready_count: torch.Tensor,  # (total_tiles,) int32 — output release-add destination (to kernel_a_bwd)
     *,
     tile_m: int = 128,
     tile_n: int = 256,
@@ -589,10 +559,8 @@ def streaming_moe_y_bwd(
 
     Streamed via per-tile count-vs-target spin on
     (`bwd_dispatch_arrival_count`, `pool_arrival_target`) for the input
-    handoff and per-stripe-CTA `red.release.gpu.global.add.s32` into
-    `bwd_a_ready_count` for the output handoff (mirror of fwd kernel A's
-    `pool_arrival_count` / `a_ready_count` handshake — different tensors,
-    same protocol).
+    handoff. The Y_bwd → A_bwd output handoff is implicit: same compute
+    stream FIFO covers visibility.
 
     ``num_sms`` caps the persistent-grid CTA count. ``None`` (default) fills the
     GPU; smaller caps leave SMs available for the other backward kernels to
@@ -614,14 +582,8 @@ def streaming_moe_y_bwd(
     The internal ``consumer_head`` counter is allocated on the calling
     stream so its zero-init is naturally ordered with the kernel.
 
-    Per-stripe-CTA bwd_a_ready_count release-add: at the end of each
-    stripe-CTA's epilogue (after this CTA's TMA stores have drained AND its
-    dL_dweight contribution has been atomic-added), the kernel fires
-    ``red.release.gpu.global.add.s32(bwd_a_ready_count[tile_id], 1)``.
-    Kernel_a_bwd on its compute_a stream count-vs-target spins on
-    ``bwd_a_ready_count[tile_id] == num_pid_n`` (target tensor pre-filled
-    by the orchestrator); the count-vs-target protocol fires once per
-    tile, not once per N-stripe.
+    kernel_a_bwd reads dL_dswiglu_in, dL_dweight, and postact_a_for_dW2
+    after Y_bwd retires (same-stream FIFO).
 
     Storage layouts:
       - ``preact_a``: bf16 (total_tiles, tile_m, 2*I), viewed as fp32
@@ -665,10 +627,6 @@ def streaming_moe_y_bwd(
     assert (
         pool_arrival_target.shape == (total_tiles,)
         and pool_arrival_target.dtype == torch.int32
-    )
-    assert (
-        bwd_a_ready_count.shape == (total_tiles,)
-        and bwd_a_ready_count.dtype == torch.int32
     )
     # preact contract — bf16 (total_tiles, tile_m, 2*I), same dtype as
     # dL_dswiglu_in (both share the f32-recast packing).
@@ -787,11 +745,6 @@ def streaming_moe_y_bwd(
     # zero-init is naturally ordered with the kernel's first atomic-claim.
     consumer_head = torch.zeros(1, dtype=torch.int32, device=dL_do_pool.device)
 
-    tile_ready_params = TileReadyParams(
-        a_ready_count=bwd_a_ready_count,
-        tile_m=None,  # Constexpr; burned in at compile, pass None at call time
-    )
-
     # Flatten postact_a_for_dW2 (total_tiles, tile_m, I) → (Mflat, I) bf16
     # for the mPostAct TMA path. No f32-recast — plain bf16 store.
     postact_a_for_dW2_flat = postact_a_for_dW2.view(total_tiles * tile_m, I)
@@ -801,7 +754,6 @@ def streaming_moe_y_bwd(
     )
 
     epi_args = StreamingMoeYBwd.EpilogueArguments(
-        tile_ready=tile_ready_params,
         mPostAct=postact_a_for_dW2_flat,
         act_fn=None,  # weighted-postact computed inline in epi_visit_subtile
         mColVecBroadcast=pool_topk_weight,

@@ -55,12 +55,13 @@ class StreamingHandle:
     pool_arrival_count: torch.Tensor           # [total_tiles] int32
 
     # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers.
-    # All allocated on dispatch_stream; cross-stream visibility carried by the
-    # per-tile release/acquire pairs: count-vs-target spin (dispatch→A) on
-    # `pool_arrival_count` / `pool_arrival_target`; same protocol on
-    # `a_ready_count` (A→Y, target = kernel A's num_pid_n filled by host);
-    # int64 `y_done_per_token` (Y→combine).
-    a_ready_count: torch.Tensor                # [total_tiles] int32 — A→Y per-stripe-CTA release-add destination (zero-init)
+    # Cross-stream visibility for dispatch→A is the count-vs-target spin on
+    # `pool_arrival_count` / `pool_arrival_target` (set by dispatch's Pass 2);
+    # kernel Y / kernel_a_bwd run on the same compute stream as kernel A /
+    # kernel_y_bwd respectively, so same-stream FIFO covers their handoffs.
+    # Int64 `y_done_per_token` (Y→combine) and `bwd_a_done_per_token`
+    # (A_bwd→combine_grads) drive per-recv-token streaming on the combine
+    # sender warps.
     k_local_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
     y_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
     o: torch.Tensor                            # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
@@ -432,7 +433,6 @@ class Buffer:
             tile_id_to_expert=out.tile_id_to_expert,
             pool_arrival_target=out.pool_arrival_target,
             pool_arrival_count=out.pool_arrival_count,
-            a_ready_count=out.a_ready_count,
             k_local_remaining=out.k_local_remaining,
             y_done_per_token=out.y_done_per_token,
             o=out.o,
@@ -450,10 +450,18 @@ class Buffer:
     def dispatch_grads(self, handle: 'StreamingHandle', dL_dy: torch.Tensor,
                        *,
                        dispatch_seq: Optional[int] = None,
-                       config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                       config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor, EventHandle]:
         """Backward dispatch: ship ``dL/dy[t]`` origin → expert ranks along the
         same routing as forward dispatch, write K times into a pool-shaped
         ``dL_do_pool`` using the slot lookup persisted in ``handle.recv_token_to_slots``.
+
+        Returns ``(dL_do_pool, bwd_dispatch_arrival_count, grads_started_event)``.
+        ``grads_started_event`` is recorded between the channel-control barrier
+        and the dispatch_grads main kernel launch — analogous to fwd dispatch's
+        ``metadata_done_event``. Consumer streams ``wait_event`` on this so
+        kernel_y_bwd can launch CONCURRENT with dispatch_grads_main; its
+        scheduler then spins on ``bwd_dispatch_arrival_count`` per-tile for
+        the dispatch_grads ↔ Y_bwd streaming overlap.
 
         No metadata kernel, no host poll — reuses the routing already captured
         in ``handle``. Only the small channel-control memset + cross-rank
@@ -469,7 +477,7 @@ class Buffer:
         num_experts = num_local_experts * self.group_size
 
         if self._is_internode():
-            dL_do_pool, bwd_dispatch_arrival_count = self.runtime.internode_dispatch_grads(
+            dL_do_pool, bwd_dispatch_arrival_count, grads_started_event = self.runtime.internode_dispatch_grads(
                 dL_dy,
                 handle.is_token_in_rank,
                 handle._dispatch_out,
@@ -478,7 +486,7 @@ class Buffer:
                 config,
             )
         else:
-            dL_do_pool, bwd_dispatch_arrival_count = self.runtime.intranode_dispatch_grads(
+            dL_do_pool, bwd_dispatch_arrival_count, grads_started_event = self.runtime.intranode_dispatch_grads(
                 dL_dy,
                 handle.is_token_in_rank,
                 handle.recv_token_to_slots,
@@ -493,7 +501,7 @@ class Buffer:
                 seq,
                 config,
             )
-        return dL_do_pool, bwd_dispatch_arrival_count
+        return dL_do_pool, bwd_dispatch_arrival_count, grads_started_event
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',

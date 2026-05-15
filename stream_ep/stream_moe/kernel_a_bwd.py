@@ -4,17 +4,18 @@ Backward of fwd kernel A. Per the chain rule on `preact = pool @ W1[e].T`:
   dL/dpool[slot, :H] = dL/dswiglu_in[slot, :2I] @ W1[expert_for_slot]
 
 `dL/dswiglu_in` is produced directly by `kernel_y_bwd`'s mD TMA-store
-(SwiGLU bwd folded into kernel_y_bwd's epilogue — see
-`kernel_y_bwd.py`). Per-tile gating via count-vs-target on
-`bwd_a_ready_count[tile] == bwd_a_ready_target[tile]` (kernel_y_bwd fires
-one `red.release.gpu.global.add.s32` per stripe-CTA into
-`bwd_a_ready_count`; target tensor is filled with kernel_y_bwd's
-`num_pid_n` everywhere) ensures the kernel only consumes a tile's row range
-once all kernel_y_bwd stripes for that tile have drained their TMA stores.
+(SwiGLU bwd folded into kernel_y_bwd's epilogue — see `kernel_y_bwd.py`).
+
+Kernel A_bwd runs on the SAME compute stream as kernel_y_bwd; same-stream
+FIFO guarantees all of Y_bwd's mD/mPostAct TMA stores have drained and
+dL_dweight atomic-adds are visible before A_bwd issues its first
+instruction. No per-tile Y_bwd→A_bwd device-side signal is needed.
 
 Per tile:
-  * Streaming scheduler count-vs-target spins on
-    `bwd_a_ready_count[tile] == bwd_a_ready_target[tile]`.
+  * Streaming scheduler reuses dispatch_grads's per-tile pair
+    (``bwd_dispatch_arrival_count`` / ``pool_arrival_target``) — at-target
+    by the time A_bwd runs because Y_bwd already waited on it via the same
+    scheduler protocol.
   * Standard varlen_m strided TMA load of
     `dL_dswiglu_in[tile_id * tile_M : ..., :]` (the row offset
     `cu_seqlens_m[expert_id] + pid_m * tile_m` lands on the right pool-major
@@ -42,12 +43,8 @@ release) are inherited verbatim from `kernel_y.py`.
 
 Shares streaming machinery with fwd kernels:
   * `StreamingTileScheduler` for linear-claim + per-tile count-vs-target
-    spin. Kernel A_bwd plumbs (`bwd_a_ready_count`, `bwd_a_ready_target`)
-    in place of fwd kernel Y's (`a_ready_count`, `a_ready_target`); same
-    protocol, different tensors. kernel_y_bwd fires
-    `red.release.gpu.global.add.s32` per stripe-CTA into
-    `bwd_a_ready_count`; orchestrator fills `bwd_a_ready_target` with
-    kernel_y_bwd's `num_pid_n` everywhere.
+    spin. Kernel A_bwd plumbs (``bwd_dispatch_arrival_count``,
+    ``pool_arrival_target``) — same dispatch_grads handoff Y_bwd waited on.
   * Pool-layout `StreamingHandle` carries `pool_recv_token`,
     `bwd_k_local_remaining` (initialized from saved `k_local_total`),
     `bwd_a_done_per_token`, `dL_dx_per_r`,
@@ -74,11 +71,11 @@ from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
+from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.kernel_y import (
     AtomicScatterStore,
     ScatterParams,
     StreamingMoeY,
-    StreamingMoeYSchedulerOptions,
 )
 from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
@@ -107,11 +104,11 @@ class StreamingMoeABwd(StreamingMoeY):
       - `EpilogueArguments`: drop `mColVecBroadcast`.
       - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
         analogue here.
-      - `__call__` + `get_scheduler_arguments`: reuse fwd kernel_y's
-        `StreamingMoeYSchedulerOptions` for the epilogue handoff shape;
-        caller plumbs `bwd_a_ready_count` / `bwd_a_ready_target` (target
-        tensor filled with kernel_y_bwd's `num_pid_n` everywhere) so the
-        scheduler's count-vs-target spin matches.
+      - `__call__` + `get_scheduler_arguments`: reuse the shared
+        ``StreamingTileSchedulerOptions``; caller plumbs
+        ``bwd_dispatch_arrival_count`` / ``pool_arrival_target`` (the same
+        pair Y_bwd waited on; at-target by the time A_bwd runs because
+        Y_bwd and A_bwd share a compute stream).
     """
 
     _epi_ops = (AtomicScatterStore("scatter"),)
@@ -147,7 +144,7 @@ class StreamingMoeABwd(StreamingMoeY):
         mA: cute.Tensor,  # dL_dswiglu_in: (TK_padded, 2I), k-major
         mB: cute.Tensor,  # W1 permuted: (H, 2I, E_local), n-major
         mD: Optional[cute.Tensor],  # None — output via atomic-scatter
-        scheduler_args: StreamingMoeYSchedulerOptions,
+        scheduler_args: StreamingTileSchedulerOptions,
         varlen_args: VarlenArguments,
         epilogue_args,
     ):
@@ -157,8 +154,8 @@ class StreamingMoeABwd(StreamingMoeY):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.a_ready_count,
-            arrival_target=scheduler_args.a_ready_target,
+            arrival_count=scheduler_args.pool_arrival_count,
+            arrival_target=scheduler_args.pool_arrival_target,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
@@ -174,12 +171,12 @@ class StreamingMoeABwd(StreamingMoeY):
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
         epilogue_args,
-        scheduler_args: StreamingMoeYSchedulerOptions,
+        scheduler_args: StreamingTileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
         trace_ptr: Optional[Int64] = None,
     ):
-        """Type-shim override so CuTeDSL accepts StreamingMoeYSchedulerOptions
+        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
         as the scheduler_args type. Body delegates to GemmSm90.__call__.
         """
         GemmSm90.__call__(
@@ -252,14 +249,6 @@ def _compile_streaming_moe_a_bwd(
     expert_pool_block_offset_scatter = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
     )
-    # `kernel_y_started_sentinel` + `dispatch_seq` are required by ScatterParams
-    # for Stage 7 in kernel_y. kernel_a_bwd shares ScatterParams shape but is
-    # NOT a producer of that signal — supply a scratch fake tensor and 0 seq;
-    # kernel_a_bwd doesn't reach the emit site (epi_setup_postact override is
-    # on StreamingMoeY only).
-    kernel_y_started_sentinel_scratch = fake_tensor(
-        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
-    )
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
@@ -270,8 +259,6 @@ def _compile_streaming_moe_a_bwd(
         T_recv=Int32(0),
         combine_seq=Int64(0),
         num_pid_n=Int32(0),
-        kernel_y_started_sentinel=kernel_y_started_sentinel_scratch,
-        dispatch_seq=Int64(0),
     )
 
     # cu_seqlens_m drives the standard varlen_m m-offset for mA's pool read.
@@ -281,17 +268,19 @@ def _compile_streaming_moe_a_bwd(
     )
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    bwd_a_ready_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    bwd_a_ready_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    bwd_dispatch_arrival_count = fake_tensor(
+        cutlass.Int32, (total_tiles_sym,), divisibility=1
+    )
+    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
 
-    scheduler_args = StreamingMoeYSchedulerOptions(
+    scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
-        a_ready_count=bwd_a_ready_count,
-        a_ready_target=bwd_a_ready_target,
+        pool_arrival_count=bwd_dispatch_arrival_count,
+        pool_arrival_target=pool_arrival_target,
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(0),
     )
@@ -331,8 +320,8 @@ def streaming_moe_a_bwd(
     bwd_k_local_remaining: torch.Tensor,  # (T_recv,) int32 — initialised from K_local_count
     bwd_a_done_per_token: torch.Tensor,  # (T_recv,) int64 — zero-init
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
-    bwd_a_ready_count: torch.Tensor,  # (total_tiles,) int32 — kernel_y_bwd's release-add destination (live)
-    bwd_a_ready_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (= kernel_y_bwd's num_pid_n everywhere)
+    bwd_dispatch_arrival_count: torch.Tensor,  # (total_tiles,) int32 — dispatch_grads's per-tile counter (at-target by the time A_bwd runs)
+    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (shared with fwd)
     dispatch_seq: int,
     *,
     tile_m: int = 128,
@@ -351,16 +340,14 @@ def streaming_moe_a_bwd(
     combine_grads sender's per-token gate fires once kernel_a_bwd's last
     contributor for each recv-token has scattered.
 
-    Streamed via per-tile count-vs-target spin on
-    (``bwd_a_ready_count``, ``bwd_a_ready_target``) — kernel_y_bwd fires
-    ``red.release.gpu.global.add.s32`` per stripe-CTA into
-    ``bwd_a_ready_count[tile_id]`` after its TMA-store drain. Per-token
-    release-store on ``bwd_a_done_per_token`` (consumed by combine_grads on
-    a different stream).
+    Kernel A_bwd runs on the same compute stream as kernel_y_bwd; same-stream
+    FIFO covers cross-stage visibility, so the scheduler reuses
+    dispatch_grads's per-tile pair (``bwd_dispatch_arrival_count`` /
+    ``pool_arrival_target``). Both are at-target when A_bwd starts because
+    Y_bwd already spun on them.
 
     ``num_sms`` caps the persistent-grid CTA count. ``None`` (default) fills
-    the GPU; smaller caps leave SMs available for the other backward
-    kernels to overlap.
+    the GPU.
 
     Caller is responsible for:
       - allocating ``dL_dx_per_r`` zero-init ON THE SAME STREAM this
@@ -370,11 +357,6 @@ def streaming_moe_a_bwd(
         ``K_local_count[r]`` for each recv-token (the bwd orchestrator
         ``cudaMemcpyAsync``'s this from the saved handle).
       - allocating ``bwd_a_done_per_token`` zero-init.
-      - allocating ``bwd_a_ready_count`` zero-init and ``bwd_a_ready_target``
-        filled with kernel_y_bwd's ``num_pid_n`` everywhere
-        (``torch.full(..., num_pid_n_y_bwd, ...)``). The kernel's per-tile
-        count-vs-target spin handles cross-stream visibility once
-        kernel_y_bwd's release-adds land.
 
     The internal ``consumer_head`` and ``tile_n_stripes_done`` counters are
     allocated on the calling stream so their zero-init is naturally ordered
@@ -403,12 +385,12 @@ def streaming_moe_a_bwd(
     assert bwd_a_done_per_token.dtype == torch.int64
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert (
-        bwd_a_ready_count.shape == (total_tiles,)
-        and bwd_a_ready_count.dtype == torch.int32
+        bwd_dispatch_arrival_count.shape == (total_tiles,)
+        and bwd_dispatch_arrival_count.dtype == torch.int32
     )
     assert (
-        bwd_a_ready_target.shape == (total_tiles,)
-        and bwd_a_ready_target.dtype == torch.int32
+        pool_arrival_target.shape == (total_tiles,)
+        and pool_arrival_target.dtype == torch.int32
     )
 
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
@@ -473,10 +455,6 @@ def streaming_moe_a_bwd(
         total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device
     )
 
-    # Scratch sentinel for kernel_a_bwd (not the producer — see ScatterParams).
-    kernel_y_started_sentinel_scratch = torch.zeros(
-        1, dtype=torch.int64, device=dL_dx_per_r.device
-    )
     scatter = ScatterParams(
         mO=dL_dx_per_r,
         pool_recv_token=pool_recv_token,
@@ -487,15 +465,13 @@ def streaming_moe_a_bwd(
         T_recv=Int32(T_recv),
         combine_seq=Int64(dispatch_seq),
         num_pid_n=Int32(num_pid_n),
-        kernel_y_started_sentinel=kernel_y_started_sentinel_scratch,
-        dispatch_seq=Int64(0),
     )
     epi_args = StreamingMoeABwd.EpilogueArguments(scatter=scatter)
-    scheduler_args = StreamingMoeYSchedulerOptions(
+    scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        a_ready_count=bwd_a_ready_count,
-        a_ready_target=bwd_a_ready_target,
+        pool_arrival_count=bwd_dispatch_arrival_count,
+        pool_arrival_target=pool_arrival_target,
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
     )

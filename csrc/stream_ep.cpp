@@ -215,12 +215,6 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, at::cuda::getCurrentCUDAStream()));
 
-    // Stage 7 kernel_y_started sentinel — single int64 slot, monotonic-seq
-    // protocol (no per-iter zero-init). Allocated for both intranode and
-    // internode paths since fwd kernel_y runs in both.
-    CUDA_CHECK(cudaMalloc(&kernel_y_started_sentinel, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(kernel_y_started_sentinel, 0, sizeof(int64_t)));
-
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_counter_mapped, const_cast<int*>(moe_recv_counter), 0));
@@ -344,7 +338,6 @@ void Buffer::destroy() {
 
     // Free workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
-    if (kernel_y_started_sentinel) CUDA_CHECK(cudaFree(kernel_y_started_sentinel));
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
 
     // Free chunked mode staffs
@@ -619,16 +612,15 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
 //   Z_pre (zeroed BEFORE event — kernel A / Y read these via the per-tile
 //          count-vs-target acquire-spin):
 //     pool_topk_weight, recv_channel_prefix_matrix, send_head,
-//     pool_arrival_count, a_ready_count
+//     pool_arrival_count
 //
 //   N (0xFF = -1, BEFORE event — kernel Y reads via predicate):
 //     pool_recv_token, pool_k_slot
 //
 //   Z_post (zeroed AFTER event — kernel Y atomic-scatter destinations + combine
-//          sender state + backward-only scaffolding. Kernel Y waits on a_ready_count
-//          (kernel A's release), which serializes after this memset on
-//          dispatch_stream → no race; backward consumers serialize via
-//          caller_stream's wait on dispatch_stream at fwd's exit):
+//          sender state + backward-only scaffolding. With the 3-stream graph
+//          all consumers serialize after dispatch via the layer-end exit
+//          chain on caller_stream — no race possible):
 //     k_local_remaining, y_done_per_token, o,
 //     recv_token_to_slots, k_local_total
 struct PostPollBundle {
@@ -637,7 +629,6 @@ struct PostPollBundle {
     torch::Tensor recv_channel_prefix_matrix;
     torch::Tensor send_head;
     torch::Tensor pool_arrival_count;
-    torch::Tensor a_ready_count;
     torch::Tensor pool_recv_token;
     torch::Tensor pool_k_slot;
 
@@ -681,7 +672,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     int64_t off_recv_channel_prefix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
     int64_t off_send_head           = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_ranks);
     int64_t off_pool_arrival_count  = b.reserve<int>(total_tiles);
-    int64_t off_a_ready_count       = b.reserve<int>(total_tiles);
     int64_t z_pre_bytes             = b.total_bytes();
 
     // N region (-1 fill, before metadata_done).
@@ -709,7 +699,6 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     out.recv_channel_prefix_matrix = at::from_blob(base + off_recv_channel_prefix, {num_ranks, num_channels},            keep, i32_opts);
     out.send_head                  = at::from_blob(base + off_send_head,           {num_tokens, num_ranks},              keep, i32_opts);
     out.pool_arrival_count         = at::from_blob(base + off_pool_arrival_count,  {total_tiles},                        keep, i32_opts);
-    out.a_ready_count              = at::from_blob(base + off_a_ready_count,       {total_tiles},                        keep, i32_opts);
     out.pool_recv_token            = at::from_blob(base + off_pool_recv_token,     {TK_padded},                          keep, i32_opts);
     out.pool_k_slot                = at::from_blob(base + off_pool_k_slot,         {TK_padded},                          keep, i32_opts);
 
@@ -810,7 +799,6 @@ struct PostPollBundleInternode {
     // Z_pre region (zero-init, before metadata_done_event).
     torch::Tensor pool_topk_weight;
     torch::Tensor pool_arrival_count;
-    torch::Tensor a_ready_count;
     torch::Tensor recv_rdma_channel_prefix_matrix;
     torch::Tensor recv_gbl_channel_prefix_matrix;
     torch::Tensor send_rdma_head;
@@ -856,7 +844,6 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // Z_pre region (zeroed before metadata_done event).
     int64_t off_pool_topk_weight       = b.reserve<float>(TK_padded);
     int64_t off_pool_arrival_count     = b.reserve<int>(total_tiles);
-    int64_t off_a_ready_count          = b.reserve<int>(total_tiles);
     int64_t off_recv_rdma_chprefix     = b.reserve<int>(static_cast<int64_t>(num_rdma_ranks) * num_channels);
     int64_t off_recv_gbl_chprefix      = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
     int64_t off_send_rdma_head         = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_rdma_ranks);
@@ -888,7 +875,6 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     PostPollBundleInternode out;
     out.pool_topk_weight                = at::from_blob(base + off_pool_topk_weight,       {TK_padded},                                  keep, f32_opts);
     out.pool_arrival_count              = at::from_blob(base + off_pool_arrival_count,     {total_tiles},                                keep, i32_opts);
-    out.a_ready_count                   = at::from_blob(base + off_a_ready_count,          {total_tiles},                                keep, i32_opts);
     out.recv_rdma_channel_prefix_matrix = at::from_blob(base + off_recv_rdma_chprefix,     {num_rdma_ranks, num_channels},               keep, i32_opts);
     out.recv_gbl_channel_prefix_matrix  = at::from_blob(base + off_recv_gbl_chprefix,      {num_ranks, num_channels},                    keep, i32_opts);
     out.send_rdma_head                  = at::from_blob(base + off_send_rdma_head,         {num_tokens, num_rdma_ranks},                 keep, i32_opts);
@@ -1095,7 +1081,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .tile_id_to_expert          = tile_id_to_expert,
         .pool_arrival_target        = pool_arrival_target,
         .pool_arrival_count         = post.pool_arrival_count,
-        .a_ready_count              = post.a_ready_count,
         .k_local_remaining        = post.k_local_remaining,
         .y_done_per_token     = post.y_done_per_token,
         .o                          = post.o,
@@ -1106,7 +1091,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
+std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch_grads(
     const torch::Tensor& dL_dy,
     const torch::Tensor& is_token_in_rank,
     const torch::Tensor& recv_token_to_slots,
@@ -1207,10 +1192,18 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::intranode_dispatch_grads(
         .num_max_send_tokens    = config.num_max_nvl_chunked_send_tokens,
         .num_recv_buffer_tokens = config.num_max_nvl_chunked_recv_tokens,
     };
+    // Record an event between the channel-control barrier and the main
+    // kernel launch — analogous to fwd dispatch's `metadata_done_event`. The
+    // bwd orchestrator's compute stream waits on this so kernel_y_bwd can
+    // launch CONCURRENT with dispatch_grads_main_kernel; kernel_y_bwd's
+    // scheduler then spins on `bwd_dispatch_arrival_count` per-tile for the
+    // dispatch_grads ↔ Y_bwd streaming overlap.
+    EventHandle grads_started_event(stream);
+
     intranode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env,
                                           num_ranks, stream, config.num_sms);
 
-    return std::make_tuple(dL_do_pool, bwd_dispatch_arrival_count);
+    return std::make_tuple(dL_do_pool, bwd_dispatch_arrival_count, grads_started_event);
 }
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combine(
@@ -1519,7 +1512,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .tile_id_to_expert               = tile_id_to_expert_n,
         .pool_arrival_target             = pool_arrival_target_n,
         .pool_arrival_count              = post.pool_arrival_count,
-        .a_ready_count                   = post.a_ready_count,
         .k_local_remaining             = post.k_local_remaining,
         .y_done_per_token          = post.y_done_per_token,
         .o                               = post.o,
@@ -1548,7 +1540,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
 // metadata kernel, no host poll — routing tensors come from the fwd
 // dispatch's StreamingDispatchOutputs (persisted on the StreamingHandle).
 // ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
+std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch_grads(
     const torch::Tensor& dL_dy,
     const torch::Tensor& is_token_in_rank,
     const StreamingDispatchOutputs& dispatch_out,
@@ -1631,9 +1623,16 @@ std::tuple<torch::Tensor, torch::Tensor> Buffer::internode_dispatch_grads(
         .dispatch_meta_sentinel_prev         = dispatch_meta_sentinel_prev,
     };
 
+    // Recorded before the main kernel launch — bwd orchestrator's compute
+    // stream waits on this so kernel_y_bwd can run CONCURRENT with
+    // dispatch_grads_main_kernel (per-tile bwd_dispatch_arrival_count
+    // release-adds drive the actual streaming overlap). Mirror of fwd's
+    // metadata_done_event.
+    EventHandle grads_started_event(stream);
+
     internode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env, num_rdma_ranks, num_channels, stream);
 
-    return {dL_do_pool, bwd_dispatch_arrival_count};
+    return std::make_tuple(dL_do_pool, bwd_dispatch_arrival_count, grads_started_event);
 #else
     EP_HOST_ASSERT(false and "internode_dispatch_grads requires NVSHMEM");
     return {};
@@ -1754,29 +1753,6 @@ bool is_sm90_compiled() {
 #endif
 }
 
-torch::Tensor Buffer::get_kernel_y_started_sentinel_tensor() const {
-    // Non-owning view over the 1-element int64 slot on the Buffer.
-    EP_HOST_ASSERT(kernel_y_started_sentinel != nullptr);
-    return torch::from_blob(
-        kernel_y_started_sentinel, {1},
-        torch::TensorOptions().dtype(torch::kInt64).device(at::kCUDA, device_id));
-}
-
-void Buffer::wait_kernel_y_started_geq(int64_t stream_handle, int64_t expected_seq) const {
-    EP_HOST_ASSERT(kernel_y_started_sentinel != nullptr);
-    CUstream stream = reinterpret_cast<CUstream>(stream_handle);
-    CUstreamBatchMemOpParams op{};
-    op.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
-    op.waitValue.address = reinterpret_cast<CUdeviceptr>(kernel_y_started_sentinel);
-    op.waitValue.value64 = expected_seq;
-    // WAIT_VALUE_GEQ: succeed once the slot's int64 value compares
-    // greater-or-equal to `expected_seq` under signed-difference
-    // semantics (so the monotonic-dispatch_seq protocol works across the
-    // 2^63 wrap horizon — never reached in practice).
-    op.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
-    CU_CHECK(cuStreamBatchMemOp(stream, 1, &op, 0));
-}
-
 }  // namespace stream_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1813,7 +1789,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("tile_id_to_expert",          &stream_ep::StreamingDispatchOutputs::tile_id_to_expert)
         .def_readonly("pool_arrival_target",        &stream_ep::StreamingDispatchOutputs::pool_arrival_target)
         .def_readonly("pool_arrival_count",         &stream_ep::StreamingDispatchOutputs::pool_arrival_count)
-        .def_readonly("a_ready_count",              &stream_ep::StreamingDispatchOutputs::a_ready_count)
         .def_readonly("k_local_remaining",        &stream_ep::StreamingDispatchOutputs::k_local_remaining)
         .def_readonly("y_done_per_token",     &stream_ep::StreamingDispatchOutputs::y_done_per_token)
         .def_readonly("o",                          &stream_ep::StreamingDispatchOutputs::o)
@@ -1849,11 +1824,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &stream_ep::Buffer::internode_dispatch)
         .def("internode_dispatch_grads", &stream_ep::Buffer::internode_dispatch_grads)
-        .def("internode_combine", &stream_ep::Buffer::internode_combine)
-        .def("get_kernel_y_started_sentinel_tensor",
-             &stream_ep::Buffer::get_kernel_y_started_sentinel_tensor)
-        .def("wait_kernel_y_started_geq",
-             &stream_ep::Buffer::wait_kernel_y_started_geq);
+        .def("internode_combine", &stream_ep::Buffer::internode_combine);
 
     m.def("is_sm90_compiled", stream_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =

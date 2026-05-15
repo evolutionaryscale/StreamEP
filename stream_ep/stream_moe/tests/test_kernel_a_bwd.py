@@ -5,7 +5,7 @@ kernel_y's epilogue (no per-slot weight multiply), so the test cases
 parallel `test_kernel_y.py` 1:1.
 
   * test_compile: kernel compiles for a representative shape (compile-only).
-  * test_single_tile: total_tiles=1, bwd_a_ready pre-set, no padding rows.
+  * test_single_tile: total_tiles=1, dispatch handoff pre-fired, no padding.
     Validates GEMM `dL_dswiglu_in @ W1[e]` + atomic-scatter against a torch
     reference.
   * test_multi_tile_static: total_tiles=N spread across multiple experts,
@@ -17,8 +17,8 @@ parallel `test_kernel_y.py` 1:1.
     Validates PTX-predicated atomic-add: padding lanes skip the atomic at
     issue time so no contributions land in valid rows from padding slots.
   * test_producer_consumer: kernel A bwd on compute_a_stream spins on
-    bwd_a_ready while a producer kernel on a separate stream fires
-    slot-by-slot.
+    the dispatch-arrival counter while a producer kernel on a separate
+    stream fires slot-by-slot.
 
 All cases assert:
   - dL_dx_per_r[r, :] equals sum over slots s mapping to r of
@@ -55,20 +55,23 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
     return tile_id_to_expert, expert_pool_block_offset
 
 
-def _make_bwd_a_ready_pair(total_tiles, device, *, target=1, fired=True):
-    """Build (bwd_a_ready_count, bwd_a_ready_target) for the unified
-    count-vs-target protocol. Mirrors kernel_y's test helper.
+def _make_bwd_dispatch_arrival_pair(total_tiles, device, *, target=1, fired=True):
+    """Build (bwd_dispatch_arrival_count, pool_arrival_target) for the
+    count-vs-target spin that drives kernel_a_bwd's scheduler. In production
+    A_bwd FIFOs after Y_bwd on the same compute stream, so the spin
+    terminates immediately; the test artificially feeds delayed signals to
+    exercise the scheduler path.
     """
-    bwd_a_ready_target = torch.full(
+    pool_arrival_target = torch.full(
         (total_tiles,), target, dtype=torch.int32, device=device
     )
     if fired:
-        bwd_a_ready_count = bwd_a_ready_target.clone()
+        bwd_dispatch_arrival_count = pool_arrival_target.clone()
     else:
-        bwd_a_ready_count = torch.zeros(
+        bwd_dispatch_arrival_count = torch.zeros(
             total_tiles, dtype=torch.int32, device=device
         )
-    return bwd_a_ready_count, bwd_a_ready_target
+    return bwd_dispatch_arrival_count, pool_arrival_target
 
 
 def _eager_a_bwd_reference(
@@ -133,7 +136,7 @@ def test_streaming_moe_a_bwd_compiles(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
     )
-    bwd_a_ready_count, bwd_a_ready_target = _make_bwd_a_ready_pair(
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
         total_tiles, device=device
     )
 
@@ -150,8 +153,8 @@ def test_streaming_moe_a_bwd_compiles(device):
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             expert_pool_block_offset,
-            bwd_a_ready_count,
-            bwd_a_ready_target,
+            bwd_dispatch_arrival_count,
+            pool_arrival_target,
             dispatch_seq=1,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -192,7 +195,7 @@ def test_streaming_moe_a_bwd_single_tile(device):
         [chosen_expert], E_local, device
     )
     dispatch_seq = 42
-    bwd_a_ready_count, bwd_a_ready_target = _make_bwd_a_ready_pair(
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
         total_tiles, device=device
     )
 
@@ -204,8 +207,8 @@ def test_streaming_moe_a_bwd_single_tile(device):
         bwd_k_local_remaining,
         bwd_a_done_per_token,
         expert_pool_block_offset,
-        bwd_a_ready_count,
-        bwd_a_ready_target,
+        bwd_dispatch_arrival_count,
+        pool_arrival_target,
         dispatch_seq=dispatch_seq,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -278,7 +281,7 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
         tile_to_expert_list, E_local, device
     )
     dispatch_seq = 99
-    bwd_a_ready_count, bwd_a_ready_target = _make_bwd_a_ready_pair(
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
         total_tiles, device=device
     )
 
@@ -290,8 +293,8 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
         bwd_k_local_remaining,
         bwd_a_done_per_token,
         expert_pool_block_offset,
-        bwd_a_ready_count,
-        bwd_a_ready_target,
+        bwd_dispatch_arrival_count,
+        pool_arrival_target,
         dispatch_seq=dispatch_seq,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -375,7 +378,7 @@ def test_streaming_moe_a_bwd_padding_rows(device):
         [0, 1], E_local, device
     )
     dispatch_seq = 7
-    bwd_a_ready_count, bwd_a_ready_target = _make_bwd_a_ready_pair(
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
         total_tiles, device=device
     )
 
@@ -387,8 +390,8 @@ def test_streaming_moe_a_bwd_padding_rows(device):
         bwd_k_local_remaining,
         bwd_a_done_per_token,
         expert_pool_block_offset,
-        bwd_a_ready_count,
-        bwd_a_ready_target,
+        bwd_dispatch_arrival_count,
+        pool_arrival_target,
         dispatch_seq=dispatch_seq,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -416,11 +419,12 @@ def test_streaming_moe_a_bwd_padding_rows(device):
 
 
 def test_streaming_moe_a_bwd_producer_consumer(device):
-    """Kernel A bwd on compute_a_stream count-vs-target spins on
-    `bwd_a_ready_count[tile] == bwd_a_ready_target[tile]` while a producer
-    fires release-adds tile-by-tile from a separate stream. Reuses the
-    kernel-A `fire_tiles_with_delay` helper since the protocol is identical
-    across every per-tile handoff (post-#3 + protocol unification).
+    """Kernel A bwd on its own stream count-vs-target spins on
+    `bwd_dispatch_arrival_count[tile] == pool_arrival_target[tile]` while a
+    producer fires release-adds tile-by-tile from a separate stream.
+    In production A_bwd FIFOs after Y_bwd on the same compute stream, so
+    the spin terminates immediately; the test exercises the scheduler path
+    artificially.
     """
     from stream_ep.stream_moe.kernel_a import fire_tiles_with_delay
     from stream_ep.stream_moe.kernel_a_bwd import (
@@ -450,14 +454,14 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    bwd_a_ready_count, bwd_a_ready_target = _make_bwd_a_ready_pair(
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
         total_tiles, device=device, fired=False
     )
 
     # Pre-warm the producer JIT.
-    fire_tiles_with_delay(bwd_a_ready_count, bwd_a_ready_target, delay_us=0)
+    fire_tiles_with_delay(bwd_dispatch_arrival_count, pool_arrival_target, delay_us=0)
     torch.cuda.synchronize()
-    bwd_a_ready_count.zero_()
+    bwd_dispatch_arrival_count.zero_()
     torch.cuda.synchronize()
 
     compute_a_stream = torch.cuda.Stream()
@@ -472,15 +476,15 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             expert_pool_block_offset,
-            bwd_a_ready_count,
-            bwd_a_ready_target,
+            bwd_dispatch_arrival_count,
+            pool_arrival_target,
             dispatch_seq=5,
             tile_m=tile_m,
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
         fire_tiles_with_delay(
-            bwd_a_ready_count, bwd_a_ready_target, delay_us=50
+            bwd_dispatch_arrival_count, pool_arrival_target, delay_us=50
         )
 
     torch.cuda.synchronize()

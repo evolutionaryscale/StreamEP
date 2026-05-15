@@ -51,22 +51,19 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
     return tile_id_to_expert, expert_pool_block_offset
 
 
-def _make_a_ready_pair(total_tiles, device, *, target=1, fired=True):
-    """Build (a_ready_count, a_ready_target) for the unified count-vs-target
-    protocol. ``target`` is the per-tile firing target (one for the simple
-    test pattern: one fire per tile == one stripe-CTA's contribution).
-    When ``fired=True``, count == target so the consumer's spin passes
-    immediately. When ``fired=False``, count starts at zero and the test's
-    producer kernel (`fire_tiles_with_delay`) walks it to target.
+def _make_pool_arrival_pair(total_tiles, device, *, target=1, fired=True):
+    """Build (pool_arrival_count, pool_arrival_target) for the dispatch→A
+    count-vs-target spin that the scheduler reuses for kernel Y now that
+    A → Y is implicit same-stream FIFO.
     """
-    a_ready_target = torch.full(
+    pool_arrival_target = torch.full(
         (total_tiles,), target, dtype=torch.int32, device=device
     )
     if fired:
-        a_ready_count = a_ready_target.clone()
+        pool_arrival_count = pool_arrival_target.clone()
     else:
-        a_ready_count = torch.zeros(total_tiles, dtype=torch.int32, device=device)
-    return a_ready_count, a_ready_target
+        pool_arrival_count = torch.zeros(total_tiles, dtype=torch.int32, device=device)
+    return pool_arrival_count, pool_arrival_target
 
 
 def _eager_y_reference(
@@ -133,7 +130,7 @@ def test_streaming_moe_y_compiles(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 0, 0, 0], E_local, device
     )
-    a_ready_count, a_ready_target = _make_a_ready_pair(total_tiles, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     import quack.cache_utils as cu
 
@@ -149,9 +146,8 @@ def test_streaming_moe_y_compiles(device):
             k_local_remaining,
             y_done_per_token,
             expert_pool_block_offset,
-            a_ready_count,
-            a_ready_target,
-            torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
+            pool_arrival_count,
+            pool_arrival_target,
             combine_seq=1,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -192,7 +188,7 @@ def test_streaming_moe_y_single_tile(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [chosen_expert], E_local, device
     )
-    a_ready_count, a_ready_target = _make_a_ready_pair(total_tiles, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     streaming_moe_y(
         postact_a,
@@ -203,9 +199,8 @@ def test_streaming_moe_y_single_tile(device):
         k_local_remaining,
         y_done_per_token,
         expert_pool_block_offset,
-        a_ready_count,
-        a_ready_target,
-        torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
+        pool_arrival_count,
+        pool_arrival_target,
         combine_seq=42,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -283,7 +278,7 @@ def test_streaming_moe_y_multi_tile_static(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    a_ready_count, a_ready_target = _make_a_ready_pair(total_tiles, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     streaming_moe_y(
         postact_a,
@@ -294,9 +289,8 @@ def test_streaming_moe_y_multi_tile_static(device):
         k_local_remaining,
         y_done_per_token,
         expert_pool_block_offset,
-        a_ready_count,
-        a_ready_target,
-        torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
+        pool_arrival_count,
+        pool_arrival_target,
         combine_seq=99,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -386,7 +380,7 @@ def test_streaming_moe_y_padding_rows(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         [0, 1], E_local, device
     )
-    a_ready_count, a_ready_target = _make_a_ready_pair(total_tiles, device=device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     streaming_moe_y(
         postact_a,
@@ -397,9 +391,8 @@ def test_streaming_moe_y_padding_rows(device):
         k_local_remaining,
         y_done_per_token,
         expert_pool_block_offset,
-        a_ready_count,
-        a_ready_target,
-        torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
+        pool_arrival_count,
+        pool_arrival_target,
         combine_seq=7,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -429,9 +422,12 @@ def test_streaming_moe_y_padding_rows(device):
 
 
 def test_streaming_moe_y_producer_consumer(device):
-    """Kernel Y on compute_y_stream count-vs-target spins on
-    `a_ready_count[tile] == a_ready_target[tile]` while a producer fires
-    release-adds tile-by-tile from a separate stream.
+    """Kernel Y on its own stream count-vs-target spins on
+    `pool_arrival_count[tile] == pool_arrival_target[tile]` while a producer
+    fires release-adds tile-by-tile from a separate stream. In production
+    Y always FIFOs after A on the same compute stream (so this spin
+    terminates immediately); the test exercises the scheduler path
+    artificially to confirm correctness when fed delayed signals.
     """
     from stream_ep.stream_moe.kernel_a import fire_tiles_with_delay
     from stream_ep.stream_moe.kernel_y import streaming_moe_y
@@ -459,14 +455,14 @@ def test_streaming_moe_y_producer_consumer(device):
     tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
         tile_to_expert_list, E_local, device
     )
-    a_ready_count, a_ready_target = _make_a_ready_pair(
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(
         total_tiles, device=device, fired=False
     )
 
     # Pre-warm the producer JIT.
-    fire_tiles_with_delay(a_ready_count, a_ready_target, delay_us=0)
+    fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=0)
     torch.cuda.synchronize()
-    a_ready_count.zero_()
+    pool_arrival_count.zero_()
     torch.cuda.synchronize()
 
     compute_y_stream = torch.cuda.Stream()
@@ -482,15 +478,14 @@ def test_streaming_moe_y_producer_consumer(device):
             k_local_remaining,
             y_done_per_token,
             expert_pool_block_offset,
-            a_ready_count,
-            a_ready_target,
-            torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
+            pool_arrival_count,
+            pool_arrival_target,
             combine_seq=5,
             tile_m=tile_m,
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(a_ready_count, a_ready_target, delay_us=50)
+        fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=50)
 
     torch.cuda.synchronize()
 

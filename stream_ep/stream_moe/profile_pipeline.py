@@ -12,19 +12,15 @@ ablation rows we still keep there.
 
 What you should see in the resulting chrome trace
 -------------------------------------------------
-- `dispatch_stream`: streaming_dispatch_metadata → host poll → tile_arrays_init
-  → dispatch main kernel. The dispatch kernel's receiver does Pass 1
-  (per-batch slot allocation + data copy into pool) and Pass 2
-  (substream-end expert-major release-add into pool_arrival_count) inline.
-- `compute_a_stream`: streaming_moe_a launches early, overlapped with the
-  tail of dispatch. Its CTAs spin on pool_arrival_count[tile] ==
-  pool_arrival_target[tile] then process. Per-tile a_ready_count release-adds
-  happen at the end of each stripe-CTA's epilogue.
-- `compute_y_stream`: streaming_moe_y launches early, overlapped with the
-  tail of kernel A. Its CTAs spin on
-  `a_ready_count[tile] == a_ready_target[tile]` then GEMM + per-warp
-  coalesced atomic-scatter into o[T_recv, H], finishing with per-token
-  bookkeeping (k_local_remaining decrement + compute_done release).
+- `communicate stream`: dispatch_metadata → host poll → tile_arrays_init
+  → dispatch main → combine. Combine FIFOs after dispatch, but waits on
+  a torch.cuda.Event recorded on the compute stream so kernel Y wins the
+  SM race.
+- `compute stream`: streaming_moe_a → streaming_moe_y. Same-stream FIFO
+  covers the A → Y handoff (no per-tile a_ready_count signal). Kernel A's
+  CTAs spin on pool_arrival_count[tile] == pool_arrival_target[tile] for
+  the dispatch ↔ A overlap window. Combine's per-warp sender then picks
+  up Y tiles as they retire via the per-token y_done_per_token gate.
 
 Launch
 ------
@@ -163,7 +159,7 @@ def main():
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)
     p.add_argument("--num_sms_y_bwd", type=int, default=None)
-    p.add_argument("--prioritize_dispatch_combine", action="store_true")
+    p.add_argument("--prioritize_communicate", action="store_true")
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
@@ -254,7 +250,7 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    streams = make_streams(prioritize_dispatch_combine=args.prioritize_dispatch_combine)
+    streams = make_streams(prioritize_communicate=args.prioritize_communicate)
 
     os.makedirs(args.profile_dir, exist_ok=True)
     if rank == 0:

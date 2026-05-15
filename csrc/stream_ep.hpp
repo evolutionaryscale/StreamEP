@@ -64,9 +64,7 @@ namespace stream_ep {
 //   expert_*, base_pool      pool-shape metadata (kernel A scheduler).
 //   tile_id_to_expert,
 //   pool_arrival_target,
-//   pool_arrival_count,
-//   a_ready_count            per-tile arrays (scheduler + cross-stream signals).
-//                            Scheduler spins on
+//   pool_arrival_count       per-tile arrays. Scheduler spins on
 //                            `pool_arrival_count[tile] == pool_arrival_target[tile]`
 //                            (set by dispatch's Pass 2 `red.release.gpu.add`).
 //   k_local_remaining,
@@ -105,7 +103,6 @@ struct StreamingDispatchOutputs {
     torch::Tensor pool_arrival_target;
     torch::Tensor pool_arrival_count;
 
-    torch::Tensor a_ready_count;
     torch::Tensor k_local_remaining;
     torch::Tensor y_done_per_token;
     torch::Tensor o;
@@ -191,19 +188,6 @@ private:
     // reader_prev_*; freed in destructor; shared by fwd dispatch + bwd
     // dispatch_grads (same dispatch stream).
     int* dispatch_meta_sentinel_prev = nullptr;
-
-    // Stage 7 "kernel_y_started" sentinel. Single int64 slot, persistent
-    // across iters via monotonic dispatch_seq protocol. CTA 0 thread 0 of
-    // kernel_y release-stores `dispatch_seq` here as its first runtime
-    // instruction (see StreamingMoeY.__call__ in kernel_y.py). Host code
-    // on streams.combine waits via cuStreamBatchMemOp WAIT_VALUE_64 `>=
-    // dispatch_seq` before launching combine_main, so combine's persistent
-    // CTAs can't grab SMs before kernel_y has at least one CTA running.
-    // Closes the SM-starvation cascade where combine_main spins on per-
-    // token y_done_per_token gates while holding 80 SMs hostage, starving
-    // kernel_y of SMs (empirically: kernel_y 547 → 1406 µs without this
-    // gate at 2-node CDMC=8). See markdowns/cdmc-partial-fix.md §"Stage 7".
-    int64_t* kernel_y_started_sentinel = nullptr;
 
     // Shrink mode buffer
     bool enable_shrink = false;
@@ -324,7 +308,7 @@ public:
     // memset and the kernel launch. Returns (dL_do_pool,
     // bwd_dispatch_arrival_count); caller (orchestrator) holds the count for
     // kernel_y_bwd to spin on (count == pool_arrival_target).
-    std::tuple<torch::Tensor, torch::Tensor> intranode_dispatch_grads(
+    std::tuple<torch::Tensor, torch::Tensor, EventHandle> intranode_dispatch_grads(
         const torch::Tensor& dL_dy,
         const torch::Tensor& is_token_in_rank,
         const torch::Tensor& recv_token_to_slots,
@@ -397,7 +381,7 @@ public:
     // `StreamingDispatchOutputs` from the fwd dispatch and are reused here.
     //
     // Streams: kernel runs on `at::cuda::getCurrentCUDAStream()`.
-    std::tuple<torch::Tensor, torch::Tensor> internode_dispatch_grads(
+    std::tuple<torch::Tensor, torch::Tensor, EventHandle> internode_dispatch_grads(
         const torch::Tensor& dL_dy,
         const torch::Tensor& is_token_in_rank,
         const StreamingDispatchOutputs& dispatch_out,
@@ -435,19 +419,6 @@ public:
         int64_t combine_phase,
         bool is_fwd,
         const Config& config);
-
-    // Stage 7 — see header note on `kernel_y_started_sentinel`. Exposes
-    // the 1-element int64 slot as a torch.Tensor view so kernel_y's host
-    // wrapper can pass it as a normal tensor arg. The Buffer owns the
-    // underlying storage; the returned tensor is a non-owning view.
-    torch::Tensor get_kernel_y_started_sentinel_tensor() const;
-
-    // Host-side gate: insert a cuStreamBatchMemOp WAIT_VALUE_64 on the
-    // given stream that blocks until `kernel_y_started_sentinel[0] >=
-    // expected_seq`. Called right before combine_main launches so combine's
-    // CTAs can't grab SMs ahead of kernel_y's first CTA. `stream_handle`
-    // is the integer from `torch.cuda.Stream.cuda_stream`.
-    void wait_kernel_y_started_geq(int64_t stream_handle, int64_t expected_seq) const;
 
 };
 

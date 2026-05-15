@@ -92,13 +92,6 @@ def device():
     return torch.device("cuda")
 
 
-def _make_a_ready_count(total_tiles: int, device) -> torch.Tensor:
-    """Zero-init a_ready_count[total_tiles] int32 — kernel A's output
-    release-add destination (consumed by kernel Y's count-vs-target spin).
-    """
-    return torch.zeros(total_tiles, dtype=torch.int32, device=device)
-
-
 def test_streaming_moe_a_compiles(device):
     """JIT-compile only (no launch) for a representative production-shape config."""
     from stream_ep.stream_moe.kernel_a import (
@@ -122,8 +115,6 @@ def test_streaming_moe_a_compiles(device):
     pool_arrival_count, pool_arrival_target = _make_pool_arrival(
         total_tiles, device=device
     )
-    a_ready_count = _make_a_ready_count(total_tiles, device)
-
     import quack.cache_utils as cu
 
     orig = cu.COMPILE_ONLY
@@ -136,7 +127,6 @@ def test_streaming_moe_a_compiles(device):
             expert_pool_block_offset,
             pool_arrival_count,
             pool_arrival_target,
-            a_ready_count,
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -171,7 +161,6 @@ def test_streaming_moe_a_single_tile(device):
     pool_arrival_count, pool_arrival_target = _make_pool_arrival(
         total_tiles, device=device
     )
-    a_ready_count = _make_a_ready_count(total_tiles, device)
 
     streaming_moe_a(
         pool,
@@ -180,7 +169,6 @@ def test_streaming_moe_a_single_tile(device):
         expert_pool_block_offset,
         pool_arrival_count,
         pool_arrival_target,
-        a_ready_count,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -196,15 +184,6 @@ def test_streaming_moe_a_single_tile(device):
     assert (
         rel.max().item() < 5e-2
     ), f"max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
-
-    # Every stripe-CTA fires `red.release.gpu.global.add.s32(a_ready_count, 1)`
-    # once per tile; total per-tile count should reach num_pid_n.
-    num_pid_n_a = (2 * I + tile_n - 1) // tile_n
-    assert (a_ready_count == num_pid_n_a).all(), (
-        f"a_ready_count not all == num_pid_n_a={num_pid_n_a} (kernel A's "
-        f"per-stripe release-add didn't fire for all stripes); got unique "
-        f"values {a_ready_count.unique().tolist()}"
-    )
 
 
 def test_streaming_moe_a_multi_tile_static(device):
@@ -237,7 +216,6 @@ def test_streaming_moe_a_multi_tile_static(device):
     pool_arrival_count, pool_arrival_target = _make_pool_arrival(
         total_tiles, device=device
     )
-    a_ready_count = _make_a_ready_count(total_tiles, device)
 
     streaming_moe_a(
         pool,
@@ -246,7 +224,6 @@ def test_streaming_moe_a_multi_tile_static(device):
         expert_pool_block_offset,
         pool_arrival_count,
         pool_arrival_target,
-        a_ready_count,
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -263,11 +240,6 @@ def test_streaming_moe_a_multi_tile_static(device):
             f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, "
             f"max abs diff {diff.max().item():.4f}"
         )
-    num_pid_n_a = (2 * I + tile_n - 1) // tile_n
-    assert (a_ready_count == num_pid_n_a).all(), (
-        f"a_ready_count not all == num_pid_n_a={num_pid_n_a}; bad indices "
-        f"{(a_ready_count != num_pid_n_a).nonzero().squeeze().tolist()}"
-    )
 
 
 def test_streaming_moe_a_with_preact(device):
@@ -304,7 +276,6 @@ def test_streaming_moe_a_with_preact(device):
     pool_arrival_count, pool_arrival_target = _make_pool_arrival(
         total_tiles, device=device
     )
-    a_ready_count = _make_a_ready_count(total_tiles, device)
 
     streaming_moe_a(
         pool,
@@ -313,7 +284,6 @@ def test_streaming_moe_a_with_preact(device):
         expert_pool_block_offset,
         pool_arrival_count,
         pool_arrival_target,
-        a_ready_count,
         preact_a=preact_a,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -347,12 +317,6 @@ def test_streaming_moe_a_with_preact(device):
             f"max abs diff {diff_h.max().item():.4f}"
         )
 
-    num_pid_n_a = (2 * I + tile_n - 1) // tile_n
-    assert (a_ready_count == num_pid_n_a).all(), (
-        f"a_ready_count not all == num_pid_n_a={num_pid_n_a} with preact "
-        f"path; bad indices "
-        f"{(a_ready_count != num_pid_n_a).nonzero().squeeze().tolist()}"
-    )
 
 
 def test_streaming_moe_a_producer_consumer(device):
@@ -383,7 +347,6 @@ def test_streaming_moe_a_producer_consumer(device):
     pool_arrival_count, pool_arrival_target = _make_pool_arrival(
         total_tiles, device=device, fired=False
     )
-    a_ready_count = _make_a_ready_count(total_tiles, device)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
     # concurrent launch (one-shot pre-fire then reset).
@@ -403,7 +366,6 @@ def test_streaming_moe_a_producer_consumer(device):
             expert_pool_block_offset,
             pool_arrival_count,
             pool_arrival_target,
-            a_ready_count,
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -423,12 +385,6 @@ def test_streaming_moe_a_producer_consumer(device):
             f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, "
             f"max abs diff {diff.max().item():.4f}"
         )
-    num_pid_n_a = (2 * I + tile_n - 1) // tile_n
-    assert (a_ready_count == num_pid_n_a).all(), (
-        f"a_ready_count not all == num_pid_n_a={num_pid_n_a} under "
-        f"producer-consumer; bad indices "
-        f"{(a_ready_count != num_pid_n_a).nonzero().squeeze().tolist()}"
-    )
 
 
 if __name__ == "__main__":

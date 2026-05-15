@@ -1,11 +1,13 @@
 """Streaming-MoE kernel Y (CuTeDSL, SM90, pool layout — fused scatter).
 
 Forward kernel Y of the streaming pipeline:
-  * Persistent CTAs pull tiles via a count-vs-target spin on
-    (`a_ready_count`, `a_ready_target`); kernel A fires
-    `red.release.gpu.global.add.s32` per stripe-CTA into `a_ready_count`,
-    and the host wrapper fills `a_ready_target` with kernel A's `num_pid_n`
-    everywhere.
+  * Persistent CTAs pull tiles via the streaming scheduler's linear-claim
+    + warp-cooperative expert lookup. Kernel A retires before kernel Y
+    starts (same compute stream, FIFO-ordered), so the per-tile ready spin
+    is driven by ``pool_arrival_count`` / ``pool_arrival_target`` — the same
+    tensors kernel A already waited on. By the time Y runs every tile's
+    count == target, so the spin terminates immediately. No A→Y per-tile
+    signal is needed.
   * For each claimed tile_id, the streaming scheduler derives `expert_id`
     from a warp-cooperative ballot over `expert_pool_block_offset` and
     computes `pid_m = tile_id - expert_pool_block_offset[expert_id]`.
@@ -35,12 +37,11 @@ plumbing untouched.
 
 Streaming machinery is shared with kernel A:
   * `StreamingTileScheduler` for linear-claim + per-tile count-vs-target spin.
-    One protocol for every per-tile handoff: kernel A's release-add into
-    `a_ready_count` (with `a_ready_target` filled with kernel A's
-    `num_pid_n` everywhere) mirrors dispatch's release-add into
-    `pool_arrival_count` against the per-tile-variable `pool_arrival_target`.
+    Kernel Y plumbs the same ``pool_arrival_count`` / ``pool_arrival_target``
+    pair kernel A used; the spin terminates immediately because A has already
+    waited on it and the dispatch producers have hit target.
   * Pool-layout `StreamingHandle` carries: `pool_recv_token`, `pool_topk_weight`,
-    `k_local_remaining`, `y_done_per_token`, `o`, `a_ready_count`,
+    `k_local_remaining`, `y_done_per_token`, `o`,
     `expert_pool_block_offset` from `Buffer.dispatch`.
 
 Padding rows (pool_recv_token[s] == -1) and other masked lanes: PTX-level
@@ -77,11 +78,10 @@ from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
+from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.ptx_helpers import (
-    ld_acquire_gpu_global_i32,
     pack_bf16x2,
     red_add_bf16x2_v4_pred,
-    st_release_gpu_global,
     st_release_sys_global,
     threadfence_system,
 )
@@ -112,16 +112,6 @@ class ScatterParams(NamedTuple):
     T_recv: Int32  # row count == mO.shape[0]
     combine_seq: Int64  # value to release-store on hit-zero
     num_pid_n: Int32  # N-stripe count per tile (= ceil(H / tile_N))
-    # Stage 7 kernel_y_started signal. CTA 0 thread 0 release-stores
-    # `dispatch_seq` into `kernel_y_started_sentinel[0]` from inside
-    # `StreamingMoeY.epi_setup_postact` (device context). Combine on its
-    # own stream acquires via cuStreamBatchMemOp WAIT_VALUE_64 `>= dispatch_seq`
-    # before launching combine_main, so combine's CTAs can't grab SMs before
-    # kernel_y has any CTA running. Idempotent across re-emits (monotonic seq);
-    # we don't bother tracking "first call" — same value is restored each tile.
-    # See markdowns/cdmc-partial-fix.md §"Stage 7 — kernel_y_started".
-    kernel_y_started_sentinel: cute.Tensor  # [1] int64
-    dispatch_seq: Int64
 
 
 # ---------------------------------------------------------------------------
@@ -331,25 +321,10 @@ class AtomicScatterStore(EpiOp):
                     st_release_sys_global(done_ptr, combine_seq)
 
 
-# ---------------------------------------------------------------------------
-# Host-facing scheduler-options NamedTuple. Mirrors kernel A's
-# StreamingTileSchedulerOptions but plumbs the (a_ready_count, a_ready_target)
-# pair for the A → Y handoff in place of (pool_arrival_count,
-# pool_arrival_target). Same count-vs-target protocol.
-# ---------------------------------------------------------------------------
-@mlir_namedtuple
-class StreamingMoeYSchedulerOptions(NamedTuple):
-    max_active_clusters: Int32
-    consumer_head: cute.Tensor
-    # Per-tile ready spin source for the A → Y handoff.  Kernel A fires
-    # `red.release.gpu.global.add.s32(a_ready_count[tile_id], 1)` once per
-    # stripe-CTA; kernel Y's scheduler spins on
-    # `a_ready_count[tile_id] == a_ready_target[tile_id]`. Host wrapper fills
-    # `a_ready_target` with kernel A's `num_pid_n` everywhere.
-    a_ready_count: cute.Tensor   # [total_tiles] int32 — release-add destination
-    a_ready_target: cute.Tensor  # [total_tiles] int32 — per-tile firing target (= num_pid_n_a)
-    expert_pool_block_offset: cute.Tensor
-    total_tiles: Int32
+# Kernel Y reuses kernel A's StreamingTileSchedulerOptions verbatim — both
+# kernels are driven by the same dispatch handoff signals
+# (``pool_arrival_count`` / ``pool_arrival_target``). Y just inherits the
+# at-target state A left behind via same-stream FIFO.
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +348,6 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         bias path of GemmDefaultEpiMixin).
       - epi_subtile_store: R2S into AtomicScatterStore's staging; per-warp
         coalesced atomic-scatter from staging into mO[r, n_origin:].
-      - epi_setup_postact: returns None (no postact).
     """
 
     _epi_ops = (ColVecLoad("mColVecBroadcast"), AtomicScatterStore("scatter"))
@@ -400,21 +374,10 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         varlen_manager,
         tidx,
     ):
-        # Stage 7 — kernel_y_started sentinel release. Runs in device
-        # context inside GemmSm90.kernel()'s per-tile loop; gated to
-        # bidx == 0 and tidx == 0 so only one thread emits per tile.
-        # Combine on its own stream acquires via cuStreamBatchMemOp
-        # WAIT_VALUE_64 `>= dispatch_seq` before launching combine_main,
-        # so combine's persistent CTAs can't grab SMs ahead of kernel_y's
-        # CTAs. Monotonic-seq protocol makes redundant per-tile re-emits
-        # idempotent. See markdowns/cdmc-partial-fix.md §"Stage 7".
-        bidx, _, _ = cute.arch.block_idx()
-        if bidx == 0:
-            if tidx == 0:
-                sentinel_ptr = utils.elem_pointer(
-                    params.scatter.kernel_y_started_sentinel, (0,)
-                )
-                st_release_gpu_global(sentinel_ptr, params.scatter.dispatch_seq)
+        # Kernel Y has no postact output (atomic-scatter goes directly into
+        # `mO` via AtomicScatterStore). Return None so GemmSm90's epilogue
+        # dispatcher knows there's nothing to set up. kernel_a_bwd inherits
+        # this no-op via StreamingMoeABwd(StreamingMoeY).
         return None
 
     @cute.jit
@@ -601,7 +564,7 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         mA,
         mB,
         mD,
-        scheduler_args: StreamingMoeYSchedulerOptions,
+        scheduler_args: StreamingTileSchedulerOptions,
         varlen_args: VarlenArguments,
         epilogue_args,
     ):
@@ -611,8 +574,8 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         return StreamingTileSchedulerArguments(
             problem_shape_ntile_mnl=(None, num_pid_n, E_local),
             consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.a_ready_count,
-            arrival_target=scheduler_args.a_ready_target,
+            arrival_count=scheduler_args.pool_arrival_count,
+            arrival_target=scheduler_args.pool_arrival_target,
             expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
@@ -628,12 +591,12 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         mD,
         mC,
         epilogue_args,
-        scheduler_args: StreamingMoeYSchedulerOptions,
+        scheduler_args: StreamingTileSchedulerOptions,
         varlen_args,
         stream,
         trace_ptr=None,
     ):
-        """Type-shim override so CuTeDSL accepts StreamingMoeYSchedulerOptions
+        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
         as the scheduler_args type. Body delegates to GemmSm90.__call__.
         """
         GemmSm90.__call__(
@@ -701,9 +664,6 @@ def _compile_streaming_moe_y(
     expert_pool_block_offset_scatter = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
     )
-    kernel_y_started_sentinel = fake_tensor(
-        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
-    )
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
@@ -714,8 +674,6 @@ def _compile_streaming_moe_y(
         T_recv=Int32(0),
         combine_seq=Int64(0),
         num_pid_n=Int32(0),
-        kernel_y_started_sentinel=kernel_y_started_sentinel,
-        dispatch_seq=Int64(0),
     )
 
     # ColVecLoad's per-row weight broadcast (varlen_m). Shape (TK_padded,) fp32.
@@ -730,17 +688,17 @@ def _compile_streaming_moe_y(
     )
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    a_ready_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    a_ready_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
+    pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     expert_pool_block_offset = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
 
-    scheduler_args = StreamingMoeYSchedulerOptions(
+    scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
-        a_ready_count=a_ready_count,
-        a_ready_target=a_ready_target,
+        pool_arrival_count=pool_arrival_count,
+        pool_arrival_target=pool_arrival_target,
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(0),
     )
@@ -783,9 +741,8 @@ def streaming_moe_y(
     k_local_remaining: torch.Tensor,  # (T_recv,) int32
     y_done_per_token: torch.Tensor,  # (T_recv,) int64
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
-    a_ready_count: torch.Tensor,  # (total_tiles,) int32 — kernel A's release-add destination (live)
-    a_ready_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (= kernel A's num_pid_n everywhere)
-    kernel_y_started_sentinel: torch.Tensor,  # (1,) int64 — Stage 7 sentinel; CTA 0 thread 0 release-stores `dispatch_seq` here as the kernel's first runtime instruction
+    pool_arrival_count: torch.Tensor,  # (total_tiles,) int32 — dispatch's per-tile release-add destination (already at-target by the time Y runs)
+    pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (set by dispatch metadata)
     combine_seq: int,
     *,
     tile_m: int = 128,
@@ -798,8 +755,13 @@ def streaming_moe_y(
     current CUDA stream.
 
     ``num_sms`` caps the persistent-grid CTA count to the given value. When
-    ``None`` (default) the kernel fills the GPU. Smaller caps leave SMs
-    available for kernel A to run concurrently — see design.md §"SM budget".
+    ``None`` (default) the kernel fills the GPU.
+
+    Kernel Y must run on the same compute stream as kernel A (it depends on
+    A's `postact_a` writes via same-stream FIFO). The orchestrator records a
+    ``torch.cuda.Event`` between the A and Y launches so the combine stream
+    can wait on Y having started before its own launch — that gate replaces
+    the older device-side ``kernel_y_started`` sentinel.
 
     Caller is responsible for:
       - allocating ``o`` with shape ``(T_recv, H)``, zero-initialized, on
@@ -809,11 +771,12 @@ def streaming_moe_y(
       - allocating ``k_local_remaining`` with the K_local count for each
         recv-token (DeepEP's dispatch sets this in Pass B's per-pool-slot block).
       - allocating ``y_done_per_token`` zero-initialized.
-      - ensuring ``a_ready_count`` / ``a_ready_target`` are populated by
-        kernel A (or a test stub) on a stream that release-adds into
-        ``a_ready_count[tile_id]`` until it equals ``a_ready_target[tile_id]``
-        (= kernel A's ``num_pid_n`` everywhere; caller fills it via
-        ``torch.full(..., num_pid_n_a, ...)`` once per dispatch).
+      - passing the same ``pool_arrival_count`` / ``pool_arrival_target`` that
+        kernel A's scheduler waited on. By the time kernel Y issues its first
+        instruction on the compute stream, A has fully retired and every
+        tile's count == target, so the scheduler's per-tile ready spin
+        terminates immediately. The scheduler still reads the pair to keep
+        a single canonical handoff protocol across A and Y.
     """
     assert postact_a.is_cuda and W2.is_cuda and o.is_cuda
     assert postact_a.dim() == 3
@@ -836,12 +799,10 @@ def streaming_moe_y(
     assert y_done_per_token.shape == (T_recv,)
     assert y_done_per_token.dtype == torch.int64
     assert expert_pool_block_offset.shape == (E_local + 1,)
-    assert a_ready_count.shape == (total_tiles,)
-    assert a_ready_count.dtype == torch.int32
-    assert a_ready_target.shape == (total_tiles,)
-    assert a_ready_target.dtype == torch.int32
-    assert kernel_y_started_sentinel.shape == (1,)
-    assert kernel_y_started_sentinel.dtype == torch.int64
+    assert pool_arrival_count.shape == (total_tiles,)
+    assert pool_arrival_count.dtype == torch.int32
+    assert pool_arrival_target.shape == (total_tiles,)
+    assert pool_arrival_target.dtype == torch.int32
 
     # Caller passes W2 as (E_local, H, I) k-major contiguous. We need the
     # kernel to see shape (H, I, E_local) with leading_dim=1 (I contiguous
@@ -907,17 +868,15 @@ def streaming_moe_y(
         T_recv=Int32(T_recv),
         combine_seq=Int64(combine_seq),
         num_pid_n=Int32(num_pid_n),
-        kernel_y_started_sentinel=kernel_y_started_sentinel,
-        dispatch_seq=Int64(combine_seq),
     )
     epi_args = StreamingMoeY.EpilogueArguments(
         scatter=scatter, mColVecBroadcast=pool_topk_weight
     )
-    scheduler_args = StreamingMoeYSchedulerOptions(
+    scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
-        a_ready_count=a_ready_count,
-        a_ready_target=a_ready_target,
+        pool_arrival_count=pool_arrival_count,
+        pool_arrival_target=pool_arrival_target,
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
     )
@@ -930,8 +889,7 @@ def streaming_moe_y(
     )
 
 
-# Tests for kernel Y's per-tile spin use ``kernel_a.fire_tiles_with_delay``
-# directly (caller pre-fills ``a_ready_target`` with the producer's
-# ``num_pid_n`` everywhere; a single release-add per tile brings count to
-# target). The old int64-stamp test stub was retired with the protocol
-# unification — same primitive for every per-tile handoff.
+# Tests for kernel Y reuse ``kernel_a.fire_tiles_with_delay`` against the
+# shared ``pool_arrival_count`` / ``pool_arrival_target`` tensors. In
+# production both kernels run on a single compute stream; the FIFO ordering
+# guarantees Y sees A's results without any per-tile A→Y signal.

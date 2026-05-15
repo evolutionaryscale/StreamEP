@@ -14,10 +14,9 @@ graph (NOT finite differences — bf16 noise floor makes FD useless).
 This catches both (a) the cross-layer-race class the historical kernel-A had
 (iter 0 correct, iter K silently wrong because some CTAs of iter N+1 saw stale
 "all done" state from iter N), now also for the bwd's
-`bwd_dispatch_arrival_count` / `bwd_a_ready_count` / `bwd_a_done_per_token`
-cross-iter signals, and (b) any
-regression in the fwd / bwd pipeline as a whole — including the per-token
-gate's interaction with the release-store path on either direction.
+`bwd_dispatch_arrival_count` / `bwd_a_done_per_token` cross-iter signals, and
+(b) any regression in the fwd / bwd pipeline as a whole — including the
+per-token gate's interaction with the release-store path on either direction.
 
 Symptom signature for the cross-layer race: iter 0 PASS, iter K (K >= 1) FAIL,
 on the side (fwd or bwd) that holds stale state. The bench_pipeline.py timing

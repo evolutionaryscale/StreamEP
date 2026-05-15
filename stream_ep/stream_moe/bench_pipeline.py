@@ -173,16 +173,13 @@ def main():
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
-    # Four caller-managed streams. The metadata-done event records between the
-    # metadata kernel and the dispatch main kernel — consumer streams
-    # `wait_event` on it to safely read metadata tensors without serializing
-    # against dispatch main.
+    # Three caller-managed streams (communicate / compute / dw).
     streams = make_streams(device)
 
     # Run dispatch once to get a StreamingHandle. Reuse this for all isolated
     # kernel timing runs (kernel A / kernel Y individually).
-    with torch.cuda.stream(streams.dispatch):
-        pool, handle, metadata_done = buffer.dispatch(
+    with torch.cuda.stream(streams.communicate):
+        pool, handle, _metadata_done = buffer.dispatch(
             x,
             topk_idx,
             topk_weights,
@@ -192,9 +189,9 @@ def main():
             dispatch_seq=1,
         )
     # For isolated kernel timing below we need dispatch fully done; sync the
-    # default stream against streams.dispatch so subsequent default-stream work
-    # (the isolated runs) sees dispatch's writes.
-    torch.cuda.current_stream().wait_stream(streams.dispatch)
+    # default stream against streams.communicate so subsequent default-stream
+    # work (the isolated runs) sees dispatch's writes.
+    torch.cuda.current_stream().wait_stream(streams.communicate)
     torch.cuda.synchronize()
     total_tiles = handle.total_tiles
     TK_padded = pool.shape[0]
@@ -205,22 +202,10 @@ def main():
     expert_frequency = handle.expert_frequency
     TK = int(expert_frequency.sum().item())  # actual (token, k) count, no padding
 
-    # Pre-fired ready signals so kernel A / kernel Y can be timed in isolation.
-    # Every per-tile handoff is the same count-vs-target protocol: set
-    # count := target so the spin passes immediately on the first
-    # acquire-load.
+    # Pre-fired dispatch ready signals so kernel A can be timed in isolation:
+    # set count := target so the scheduler's spin passes immediately on the
+    # first acquire-load.
     pool_arrival_count_fired = handle.pool_arrival_target.clone()
-    # Kernel A's num_pid_n target for the A → Y handoff (= ceil(2I/tile_n_a)).
-    num_pid_n_a = (2 * I + args.tile_n_a - 1) // args.tile_n_a
-    a_ready_target = torch.full(
-        (total_tiles,), num_pid_n_a, dtype=torch.int32, device=device
-    )
-    # Pre-fired a_ready_count: count := target so isolated kernel Y's spin
-    # passes immediately.
-    a_ready_count_fired = a_ready_target.clone()
-    # Fresh a_ready_count for kernel A's own release-add (one isolated kernel
-    # A run writes here; we don't read it). zero-init per dispatch.
-    a_ready_count_for_a = torch.zeros_like(handle.a_ready_count)
 
     # Postact_a (kernel A → kernel Y intermediate). Sized for per-tile slabs.
     postact_a = torch.empty(total_tiles, args.tile_m, I, dtype=DTYPE, device=device)
@@ -259,18 +244,6 @@ def main():
     # All count-vs-target post-C — set count := target so the spin passes
     # immediately.
     bwd_dispatch_arrival_count_fired = handle.pool_arrival_target.clone()
-    # kernel_y_bwd's num_pid_n target for the Y_bwd → A_bwd handoff
-    # (= ceil(I / tile_n_y_bwd)).
-    num_pid_n_y_bwd = (I + args.tile_n_y_bwd - 1) // args.tile_n_y_bwd
-    bwd_a_ready_target = torch.full(
-        (total_tiles,), num_pid_n_y_bwd, dtype=torch.int32, device=device
-    )
-    bwd_a_ready_count_fired = bwd_a_ready_target.clone()
-    # bwd_a_ready_count_for_y: kernel_y_bwd writes its release-adds here.
-    # Must zero-init before each call. Reset inside run_streaming_y_bwd.
-    bwd_a_ready_count_for_y = torch.zeros(
-        total_tiles, dtype=torch.int32, device=device
-    )
     bwd_k_local_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
     bwd_k_local_remaining_init = handle.k_local_total.to(torch.int32).clone()
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
@@ -302,8 +275,6 @@ def main():
     # ────────────────────────────────────────────────────────────────────
 
     def run_streaming_a():
-        # Fresh per dispatch (CLAUDE.md anti-pattern §2).
-        a_ready_count_for_a.zero_()
         streaming_moe_a(
             pool,
             w1_local,
@@ -311,7 +282,6 @@ def main():
             handle.expert_pool_block_offset,
             pool_arrival_count_fired,
             handle.pool_arrival_target,
-            a_ready_count_for_a,
             tile_m=args.tile_m,
             tile_n=args.tile_n_a,
             cluster_n=2,
@@ -342,10 +312,6 @@ def main():
         handle.k_local_remaining.copy_(_k_local_remaining_init)
         handle.y_done_per_token.zero_()
         o_buf.zero_()
-        # Stage 7 sentinel — kernel_y release-stores into this slot, but
-        # bench_pipeline runs the kernel in isolation (no concurrent combine
-        # gating on it), so we just allocate a 1-elem scratch tensor.
-        kernel_y_started_scratch = torch.zeros(1, dtype=torch.int64, device=o_buf.device)
         streaming_moe_y(
             postact_a,
             w2_local,
@@ -355,9 +321,8 @@ def main():
             handle.k_local_remaining,
             handle.y_done_per_token,
             handle.expert_pool_block_offset,
-            a_ready_count_fired,
-            a_ready_target,
-            kernel_y_started_scratch,
+            pool_arrival_count_fired,
+            handle.pool_arrival_target,
             combine_seq=1,
             tile_m=args.tile_m,
             tile_n=args.tile_n_y,
@@ -398,21 +363,18 @@ def main():
 
     def materialize_dispatch_grads():
         nonlocal _dL_do_pool_captured, _bwd_dispatch_arrival_count_captured
-        with torch.cuda.stream(streams.dispatch):
+        with torch.cuda.stream(streams.communicate):
             (
                 _dL_do_pool_captured,
                 _bwd_dispatch_arrival_count_captured,
             ) = buffer.dispatch_grads(
                 handle, dL_dy_in, dispatch_seq=handle.dispatch_seq
             )
-        torch.cuda.current_stream().wait_stream(streams.dispatch)
+        torch.cuda.current_stream().wait_stream(streams.communicate)
 
     def run_streaming_y_bwd():
-        # Reset bwd_a_ready_count (kernel_y_bwd's release-add destination)
-        # so the next iter starts at zero — fresh per dispatch
-        # (CLAUDE.md anti-pattern §2). Zero dL_dweight too — kernel
-        # atomic-adds into it; non-zero would double-count across iterations.
-        bwd_a_ready_count_for_y.zero_()
+        # Zero dL_dweight — kernel atomic-adds into it; non-zero would
+        # double-count across iterations.
         dL_dweight.zero_()
         streaming_moe_y_bwd(
             _dL_do_pool_captured,
@@ -426,7 +388,6 @@ def main():
             handle.expert_pool_block_offset,
             bwd_dispatch_arrival_count_fired,
             handle.pool_arrival_target,
-            bwd_a_ready_count_for_y,
             tile_m=args.tile_m,
             tile_n=args.tile_n_y_bwd,
             num_sms=args.num_sms_a,
@@ -474,8 +435,8 @@ def main():
             bwd_k_local_remaining,
             bwd_a_done_per_token,
             handle.expert_pool_block_offset,
-            bwd_a_ready_count_fired,
-            bwd_a_ready_target,
+            bwd_dispatch_arrival_count_fired,
+            handle.pool_arrival_target,
             dispatch_seq=handle.dispatch_seq,
             tile_m=args.tile_m,
             tile_n=args.tile_n_a_bwd,
@@ -655,19 +616,20 @@ def main():
     rank_zero_print()
 
     # ────────────────────────────────────────────────────────────────────
-    # End-to-end pipeline timing: dispatch + A + Y + combine on four streams.
+    # End-to-end pipeline timing: dispatch + A + Y + combine on 3 streams.
     # ────────────────────────────────────────────────────────────────────
-    # Each iteration runs a fresh dispatch (so DeepEP allocates fresh per-token
-    # state) followed by kernel A on compute_a_stream, kernel Y on
-    # compute_y_stream, and combine sender on combine_stream.
-    # Cross-stream visibility:
-    # (a) `metadata_done` event recorded by dispatch between the metadata
-    #     kernel and the dispatch main kernel — consumer streams wait_event on
-    #     this to safely read metadata tensors without serializing against
-    #     dispatch main, preserving per-tile streaming overlap.
-    # (b) per-tile `pool_arrival_count` (dispatch→A) / `a_ready_count` (A→Y)
-    #     count-vs-target spins and per-token `y_done_per_token` (Y→combine
-    #     sender) gate.
+    # Each iteration runs a fresh dispatch (so DeepEP allocates fresh
+    # per-token state) followed by kernel A + kernel Y on the compute stream
+    # (same-stream FIFO) and combine on the communicate stream (FIFO after
+    # dispatch). Cross-stream visibility:
+    # (a) Communicate → compute: a single wait_stream after dispatch lets
+    #     kernel A read dispatch's outputs via per-tile pool_arrival_count
+    #     count-vs-target.
+    # (b) Compute → communicate: a torch.cuda.Event recorded between
+    #     kernel A and kernel Y on compute gates combine's launch so
+    #     kernel_y wins the SM race against combine's persistent sender CTAs.
+    # (c) Per-token `y_done_per_token` drives combine sender streaming for
+    #     real Y ↔ combine tail overlap.
 
     def run_pipeline_step(seq):
         stream_moe_func(
@@ -743,10 +705,10 @@ def main():
     )
 
     if rank == 0:
-        print("=== end-to-end pipeline (dispatch + A + Y + combine, 4 streams) ===")
-        print(f"  streaming_moe_a (alone, compute_a):      {streaming_a_us:7.1f} μs")
-        print(f"  streaming_moe_y (alone, compute_y):      {streaming_y_us:7.1f} μs")
-        print(f"  fwd-only e2e (4 streams, real overlap):  {pipeline_us:7.1f} μs")
+        print("=== end-to-end pipeline (dispatch + A + Y + combine, 3 streams) ===")
+        print(f"  streaming_moe_a (alone, compute):        {streaming_a_us:7.1f} μs")
+        print(f"  streaming_moe_y (alone, compute):        {streaming_y_us:7.1f} μs")
+        print(f"  fwd-only e2e (3 streams, real overlap):  {pipeline_us:7.1f} μs")
         print(
             f"  streaming_moe_y_bwd (alone):             {streaming_y_bwd_us:7.1f} μs"
         )
