@@ -164,6 +164,18 @@ def threadfence_system(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def threadfence_gpu(*, loc=None, ip=None) -> None:
+    """Device-scope memory fence (membar.gl). Use for intra-GPU
+    producer→consumer ordering across different CUDA streams on the same
+    device — flushes L1 + serializes against L2 without the cost of
+    ``membar.sys``'s PCIe / NVLink fence.
+    """
+    llvm.inline_asm(
+        None, [], "membar.gl;", "", has_side_effects=True, is_align_stack=False
+    )
+
+
+@dsl_user_op
 def red_add_bf16x2_v4_pred(
     gmem_ptr: cute.Pointer,
     p0: cutlass.Int32,

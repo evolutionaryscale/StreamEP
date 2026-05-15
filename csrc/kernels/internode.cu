@@ -2410,15 +2410,6 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             : 0;
         if (lane_id < kNumRDMARanks) {
             while (true) {
-                // HCA-written slot — force a system-scope memory fence before
-                // each spin read. .sys-acquire alone establishes happens-before
-                // ordering but doesn't guarantee L2 invalidation against PCIe
-                // writes from the HCA on every spin iteration; without the
-                // explicit fence the GPU keeps the cache line hot in L2 and
-                // misses the HCA's atomic write entirely (iter 2+ symptom on
-                // 4-node, peer-3-specific stall on GPU 7).
-                // TODO(jaimec00): revisit if this is necessary / we can do something cheaper
-                __threadfence_system();
                 auto cur_sentinel = ld_acquire_sys_global(
                     rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
                 if (cur_sentinel > prev_meta_sentinel_at_entry) {
@@ -3064,24 +3055,14 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     int64_t first_token_idx = token_idx;
                     if (elect_one_sync()) {
                         auto gate_start = clock64();
-                        while (ld_acquire_sys_global(&y_done_per_token[first_token_idx]) < combine_seq) {
+                        // ``.gpu`` scope is sufficient: kernel_y (fwd) /
+                        // kernel_a_bwd (bwd) and combine_main_kernel run
+                        // on the SAME GPU on different CUDA streams. L2
+                        // is coherent within a single device.
+                        while (ld_acquire_gpu_global(&y_done_per_token[first_token_idx]) < combine_seq) {
                             if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
-                                // Diagnostic: print device-observed value at
-                                // trap so we can compare with host's view of
-                                // the same memory (the doc's original
-                                // host-vs-device check). Three possible
-                                // shapes:
-                                //   observed == 0           → matches doc's
-                                //     Z_post race (memset clobbered kernel_y).
-                                //   observed in (0, seq)    → kernel_y started
-                                //     writing this row but didn't finish.
-                                //   observed == reread      → stable, the value
-                                //     truly hasn't advanced (most likely).
-                                //   observed != reread      → race; value
-                                //     arrived between two reads (unlikely with
-                                //     .sys-acquire but worth printing).
-                                auto observed = ld_acquire_sys_global(&y_done_per_token[first_token_idx]);
-                                auto reread = ld_acquire_sys_global(&y_done_per_token[first_token_idx]);
+                                auto observed = ld_acquire_gpu_global(&y_done_per_token[first_token_idx]);
+                                auto reread = ld_acquire_gpu_global(&y_done_per_token[first_token_idx]);
                                 printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                        "token: %ld, seq: %ld, observed: %ld, reread: %ld, addr: %p\n",
                                        channel_id, rdma_rank, nvl_rank, dst_nvl_rank,
@@ -3145,7 +3126,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         int64_t next_token_idx = token_idx + 1;
                         if (elect_one_sync()) {
                             auto gate_start = clock64();
-                            while (ld_acquire_sys_global(&y_done_per_token[next_token_idx]) < combine_seq) {
+                            while (ld_acquire_gpu_global(&y_done_per_token[next_token_idx]) < combine_seq) {
                                 if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                     printf("DeepEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                            "token: %ld, seq: %ld\n",

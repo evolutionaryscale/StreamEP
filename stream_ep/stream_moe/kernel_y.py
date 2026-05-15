@@ -82,8 +82,8 @@ from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.ptx_helpers import (
     pack_bf16x2,
     red_add_bf16x2_v4_pred,
-    st_release_sys_global,
-    threadfence_system,
+    st_release_gpu_global,
+    threadfence_gpu,
 )
 from stream_ep.stream_moe.tile_scheduler import (
     StreamingTileScheduler,
@@ -295,12 +295,15 @@ class AtomicScatterStore(EpiOp):
             prev_stripes = utils.atomic_add_i32(Int32(1), stripes_ptr)
             is_last_stripe = prev_stripes == (param.num_pid_n - Int32(1))
             if is_last_stripe:
-                # Make all atomic-scatters from all N-stripes globally visible
-                # before the per-token release-stores below. The threadfence
-                # is followed by the SMEM-stamp + named barrier, so all 128
-                # epilogue threads observe its effect before issuing their
-                # release-stores.
-                threadfence_system()
+                # Make all atomic-scatters from all N-stripes visible at GPU
+                # scope before the per-token release-stores below. The
+                # threadfence is followed by the SMEM-stamp + named barrier,
+                # so all 128 epilogue threads observe its effect before
+                # issuing their release-stores. ``.gpu`` scope is sufficient
+                # because the consumer (combine_main_kernel) runs on the
+                # SAME GPU on a different CUDA stream — no PCIe / NVLink
+                # writer is involved in this gate.
+                threadfence_gpu()
             is_last_t[0] = Int32(1) if is_last_stripe else Int32(0)
 
         # Epilogue-scoped named barrier (id=8 — outside NamedBarrierGemm's
@@ -316,9 +319,14 @@ class AtomicScatterStore(EpiOp):
                 prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
                 if prev == Int32(1):
                     done_ptr = utils.elem_pointer(param.y_done_per_token, (r,))
-                    # DIAGNOSTIC: use .sys scope instead of .gpu for cross-HW-queue
-                    # visibility under CDMC>1
-                    st_release_sys_global(done_ptr, combine_seq)
+                    # ``.gpu`` scope is sufficient: kernel_y (compute stream)
+                    # and combine_main_kernel (communicate stream) run on the
+                    # same GPU, so L2 coherence handles cross-stream
+                    # visibility. The previous ``.sys`` scope was a
+                    # diagnostic carry-over from before the 2-stream graph
+                    # cleanup; ``membar.gl`` is meaningfully cheaper than
+                    # ``membar.sys`` on a per-token gate.
+                    st_release_gpu_global(done_ptr, combine_seq)
 
 
 # Kernel Y reuses kernel A's StreamingTileSchedulerOptions verbatim — both
