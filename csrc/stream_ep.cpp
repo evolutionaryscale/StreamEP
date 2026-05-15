@@ -215,44 +215,11 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, at::cuda::getCurrentCUDAStream()));
 
-    // Per-(channel, peer) "prefix-matrix ready" sentinel — see header for
-    // role. Sized for the larger of the two index spaces this Buffer might
-    // use (intranode: num_nvl_ranks; internode: num_rdma_ranks). One Buffer
-    // serves one path so only one slice is ever indexed. int64 lets the
-    // signal carry monotonic dispatch_seq directly (no parity encoding).
-    const int max_num_channels_routing = num_device_sms / 2;
-    const int max_routing_peers = std::max(num_nvl_ranks, num_rdma_ranks);
-    const int64_t combine_routing_ready_bytes =
-        static_cast<int64_t>(max_num_channels_routing) * max_routing_peers * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&combine_routing_ready, combine_routing_ready_bytes));
-    CUDA_CHECK(cudaMemset(combine_routing_ready, 0, combine_routing_ready_bytes));
-
-    // Internode-only: per-(src_rdma, src_nvl, channel) sentinel covering
-    // `recv_gbl_channel_prefix_matrix`. See header for role.
-    if (num_rdma_ranks > 1) {
-        const int64_t combine_routing_ready_gbl_bytes =
-            static_cast<int64_t>(max_num_channels_routing) *
-            num_rdma_ranks * NUM_MAX_NVL_PEERS * sizeof(int64_t);
-        CUDA_CHECK(cudaMalloc(&combine_routing_ready_gbl, combine_routing_ready_gbl_bytes));
-        CUDA_CHECK(cudaMemset(combine_routing_ready_gbl, 0, combine_routing_ready_gbl_bytes));
-
-        // kNumDispatchRDMASenderWarps is defined inside `launch_dispatch_main`
-        // (internode.cu:1693) and not exposed here. Keep this in sync with
-        // that constant — bumping there without updating this allocation
-        // size would over- or under-allocate the sender-ready array.
-        const int kNumDispatchRDMASenderWarps = 7;
-        const int64_t combine_send_rdma_ready_bytes =
-            static_cast<int64_t>(max_num_channels_routing) *
-            kNumDispatchRDMASenderWarps * sizeof(int64_t);
-        CUDA_CHECK(cudaMalloc(&combine_send_rdma_ready, combine_send_rdma_ready_bytes));
-        CUDA_CHECK(cudaMemset(combine_send_rdma_ready, 0, combine_send_rdma_ready_bytes));
-
-        const int64_t combine_send_nvl_ready_bytes =
-            static_cast<int64_t>(max_num_channels_routing) *
-            NUM_MAX_NVL_PEERS * sizeof(int64_t);
-        CUDA_CHECK(cudaMalloc(&combine_send_nvl_ready, combine_send_nvl_ready_bytes));
-        CUDA_CHECK(cudaMemset(combine_send_nvl_ready, 0, combine_send_nvl_ready_bytes));
-    }
+    // Stage 7 kernel_y_started sentinel — single int64 slot, monotonic-seq
+    // protocol (no per-iter zero-init). Allocated for both intranode and
+    // internode paths since fwd kernel_y runs in both.
+    CUDA_CHECK(cudaMalloc(&kernel_y_started_sentinel, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(kernel_y_started_sentinel, 0, sizeof(int64_t)));
 
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
@@ -377,10 +344,7 @@ void Buffer::destroy() {
 
     // Free workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
-    if (combine_routing_ready) CUDA_CHECK(cudaFree(combine_routing_ready));
-    if (combine_routing_ready_gbl) CUDA_CHECK(cudaFree(combine_routing_ready_gbl));
-    if (combine_send_rdma_ready) CUDA_CHECK(cudaFree(combine_send_rdma_ready));
-    if (combine_send_nvl_ready) CUDA_CHECK(cudaFree(combine_send_nvl_ready));
+    if (kernel_y_started_sentinel) CUDA_CHECK(cudaFree(kernel_y_started_sentinel));
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
 
     // Free chunked mode staffs
@@ -1095,7 +1059,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .base_pool             = pre.base_pool.data_ptr<int>(),
         .pool_arrival_count    = post.pool_arrival_count.data_ptr<int>(),
         .pool_arrival_target   = pool_arrival_target.data_ptr<int>(),
-        .combine_routing_ready = combine_routing_ready,
         .dispatch_seq          = dispatch_seq,
     };
     intranode::DispatchShape dispatch_shape{
@@ -1340,7 +1303,6 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
                        channel_prefix_matrix.data_ptr<int>(),
                        send_head.data_ptr<int>(),
                        y_done_per_token.data_ptr<int64_t>(),
-                       combine_routing_ready,
                        combine_seq,
                        is_fwd,
                        num_tokens,
@@ -1516,10 +1478,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .seen_per_substream        = pre.seen_per_substream.data_ptr<int>(),
         .pool_arrival_count        = post.pool_arrival_count.data_ptr<int>(),
         .pool_arrival_target       = pool_arrival_target_n.data_ptr<int>(),
-        .combine_routing_ready     = combine_routing_ready,
-        .combine_routing_ready_gbl = combine_routing_ready_gbl,
-        .combine_send_rdma_ready   = combine_send_rdma_ready,
-        .combine_send_nvl_ready    = combine_send_nvl_ready,
         .dispatch_seq              = dispatch_seq,
     };
     internode::DispatchShape shape{
@@ -1740,10 +1698,6 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.send_nvl_head.data_ptr<int>(),
-        combine_routing_ready,
-        combine_send_rdma_ready,
-        combine_send_nvl_ready,
-        combine_seq,
         stream);
 
     // Combine output tensors. Fwd: no per-K weight output (kernel Y already
@@ -1772,7 +1726,6 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
         y_done_per_token.data_ptr<int64_t>(),
-        combine_routing_ready_gbl,
         combine_seq,
         static_cast<int>(combine_phase),
         is_fwd,
@@ -1799,6 +1752,29 @@ bool is_sm90_compiled() {
 #else
     return false;
 #endif
+}
+
+torch::Tensor Buffer::get_kernel_y_started_sentinel_tensor() const {
+    // Non-owning view over the 1-element int64 slot on the Buffer.
+    EP_HOST_ASSERT(kernel_y_started_sentinel != nullptr);
+    return torch::from_blob(
+        kernel_y_started_sentinel, {1},
+        torch::TensorOptions().dtype(torch::kInt64).device(at::kCUDA, device_id));
+}
+
+void Buffer::wait_kernel_y_started_geq(int64_t stream_handle, int64_t expected_seq) const {
+    EP_HOST_ASSERT(kernel_y_started_sentinel != nullptr);
+    CUstream stream = reinterpret_cast<CUstream>(stream_handle);
+    CUstreamBatchMemOpParams op{};
+    op.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
+    op.waitValue.address = reinterpret_cast<CUdeviceptr>(kernel_y_started_sentinel);
+    op.waitValue.value64 = expected_seq;
+    // WAIT_VALUE_GEQ: succeed once the slot's int64 value compares
+    // greater-or-equal to `expected_seq` under signed-difference
+    // semantics (so the monotonic-dispatch_seq protocol works across the
+    // 2^63 wrap horizon — never reached in practice).
+    op.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+    CU_CHECK(cuStreamBatchMemOp(stream, 1, &op, 0));
 }
 
 }  // namespace stream_ep
@@ -1873,7 +1849,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &stream_ep::Buffer::internode_dispatch)
         .def("internode_dispatch_grads", &stream_ep::Buffer::internode_dispatch_grads)
-        .def("internode_combine", &stream_ep::Buffer::internode_combine);
+        .def("internode_combine", &stream_ep::Buffer::internode_combine)
+        .def("get_kernel_y_started_sentinel_tensor",
+             &stream_ep::Buffer::get_kernel_y_started_sentinel_tensor)
+        .def("wait_kernel_y_started_geq",
+             &stream_ep::Buffer::wait_kernel_y_started_geq);
 
     m.def("is_sm90_compiled", stream_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =

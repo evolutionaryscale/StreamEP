@@ -295,6 +295,13 @@ class StreamMoEFunc(torch.autograd.Function):
         handle.k_local_remaining.record_stream(streams.compute_y)
         handle.y_done_per_token.record_stream(streams.compute_y)
         handle.o.record_stream(streams.compute_y)
+        # Stage 7 — kernel_y_started sentinel tensor. CTA 0 thread 0 of
+        # kernel_y release-stores `dispatch_seq` here as its first runtime
+        # instruction; combine on streams.combine acquires via
+        # cuStreamBatchMemOp WAIT_VALUE_64 before its kernel launch (below).
+        # See markdowns/cdmc-partial-fix.md §"Stage 7".
+        kernel_y_started_sentinel = buffer.runtime.get_kernel_y_started_sentinel_tensor()
+        kernel_y_started_sentinel.record_stream(streams.compute_y)
         with torch.cuda.stream(streams.compute_y):
             streaming_moe_y(
                 postact_a,
@@ -307,6 +314,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.expert_pool_block_offset,
                 handle.a_ready_count,
                 a_ready_target,
+                kernel_y_started_sentinel,
                 combine_seq=dispatch_seq,
                 tile_m=tile_m,
                 tile_n=tile_n_y,
@@ -327,19 +335,32 @@ class StreamMoEFunc(torch.autograd.Function):
         # themselves issue; ``streams.combine``'s only cross-stream sync is the
         # ``metadata_done`` event (one-shot, before dispatch main).
         streams.combine.wait_event(metadata_done)
-        # CDMC>1 dispatch_main ↔ combine data races are closed device-side
-        # by four per-(channel, peer) sentinels released by dispatch_main
-        # warps after their respective writes, gated either inside combine
-        # (kNVLSender on recv_gbl_channel_prefix_matrix) or inside
-        # encode_combine_heads (recv_rdma_channel_prefix_matrix +
-        # send_rdma_head + send_nvl_head; downstream combine_main reads
-        # are FIFO-covered on the same combine stream). Buffer fields:
-        # `combine_routing_ready`, `combine_routing_ready_gbl`,
-        # `combine_send_rdma_ready`, `combine_send_nvl_ready`. See
-        # markdowns/cdmc-partial-fix.md §"Stage 1 — Prefix-matrix sentinel".
-        # No stream-level serialization against dispatch needed —
-        # `combine.wait_event(metadata_done)` above suffices for metadata
-        # tensor visibility, and the per-slot device gates handle the rest.
+        # Defensive serialization of combine behind dispatch — backstops
+        # the dispatch_main ↔ combine prefix-matrix / send-head data race
+        # surface (cdmc-bugnew.md §"Fwd combine ↔ dispatch_main prefix-
+        # matrix race"). In practice this is a no-op on the critical path:
+        # Stage 7's wait_kernel_y_started_geq below already gates combine
+        # on kernel_y having CTAs on SMs, and kernel_y can't start until
+        # kernel_a finishes, which can't finish until dispatch retires.
+        # So combine always launches after dispatch is done. An earlier
+        # design used four device-side per-(channel, peer) sentinels
+        # (combine_routing_ready et al.) to "preserve dispatch ↔ combine
+        # overlap"; measurement showed the overlap is structurally
+        # impossible (the per-token y_done_per_token gate forces combine
+        # to wait on kernel_y anyway). The sentinels paid complexity for
+        # nothing and were removed.
+        streams.combine.wait_stream(streams.dispatch)
+        # Stage 7 — device-side gate: block combine's launch until
+        # kernel_y's CTA 0 has landed on an SM and released `dispatch_seq`
+        # into `kernel_y_started_sentinel`. Prevents combine's 80
+        # persistent CTAs from grabbing SMs ahead of kernel_y's 132 CTAs
+        # and holding them while spinning on per-token y_done_per_token
+        # gates. Pairs with kernel_y's CTA-0 release inside
+        # `StreamingMoeY.epi_setup_postact`. See
+        # markdowns/cdmc-partial-fix.md §"Stage 7 — kernel_y_started".
+        buffer.runtime.wait_kernel_y_started_geq(
+            streams.combine.cuda_stream, dispatch_seq
+        )
         handle.y_done_per_token.record_stream(streams.combine)
         handle.o.record_stream(streams.combine)
         handle.rank_prefix_matrix.record_stream(streams.combine)

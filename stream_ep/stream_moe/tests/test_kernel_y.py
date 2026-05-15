@@ -151,6 +151,7 @@ def test_streaming_moe_y_compiles(device):
             expert_pool_block_offset,
             a_ready_count,
             a_ready_target,
+            torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
             combine_seq=1,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -204,6 +205,7 @@ def test_streaming_moe_y_single_tile(device):
         expert_pool_block_offset,
         a_ready_count,
         a_ready_target,
+        torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
         combine_seq=42,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -294,6 +296,7 @@ def test_streaming_moe_y_multi_tile_static(device):
         expert_pool_block_offset,
         a_ready_count,
         a_ready_target,
+        torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
         combine_seq=99,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -396,6 +399,7 @@ def test_streaming_moe_y_padding_rows(device):
         expert_pool_block_offset,
         a_ready_count,
         a_ready_target,
+        torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
         combine_seq=7,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -480,6 +484,7 @@ def test_streaming_moe_y_producer_consumer(device):
             expert_pool_block_offset,
             a_ready_count,
             a_ready_target,
+            torch.zeros(1, dtype=torch.int64, device=device),  # kernel_y_started scratch
             combine_seq=5,
             tile_m=tile_m,
             tile_n=tile_n,

@@ -342,6 +342,10 @@ def main():
         handle.k_local_remaining.copy_(_k_local_remaining_init)
         handle.y_done_per_token.zero_()
         o_buf.zero_()
+        # Stage 7 sentinel — kernel_y release-stores into this slot, but
+        # bench_pipeline runs the kernel in isolation (no concurrent combine
+        # gating on it), so we just allocate a 1-elem scratch tensor.
+        kernel_y_started_scratch = torch.zeros(1, dtype=torch.int64, device=o_buf.device)
         streaming_moe_y(
             postact_a,
             w2_local,
@@ -353,6 +357,7 @@ def main():
             handle.expert_pool_block_offset,
             a_ready_count_fired,
             a_ready_target,
+            kernel_y_started_scratch,
             combine_seq=1,
             tile_m=args.tile_m,
             tile_n=args.tile_n_y,

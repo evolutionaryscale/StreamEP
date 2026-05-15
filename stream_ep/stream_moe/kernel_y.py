@@ -112,6 +112,16 @@ class ScatterParams(NamedTuple):
     T_recv: Int32  # row count == mO.shape[0]
     combine_seq: Int64  # value to release-store on hit-zero
     num_pid_n: Int32  # N-stripe count per tile (= ceil(H / tile_N))
+    # Stage 7 kernel_y_started signal. CTA 0 thread 0 release-stores
+    # `dispatch_seq` into `kernel_y_started_sentinel[0]` from inside
+    # `StreamingMoeY.epi_setup_postact` (device context). Combine on its
+    # own stream acquires via cuStreamBatchMemOp WAIT_VALUE_64 `>= dispatch_seq`
+    # before launching combine_main, so combine's CTAs can't grab SMs before
+    # kernel_y has any CTA running. Idempotent across re-emits (monotonic seq);
+    # we don't bother tracking "first call" — same value is restored each tile.
+    # See markdowns/cdmc-partial-fix.md §"Stage 7 — kernel_y_started".
+    kernel_y_started_sentinel: cute.Tensor  # [1] int64
+    dispatch_seq: Int64
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +389,7 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         return self.EpilogueParams(**self._epi_ops_to_params_dict(args))
 
+    @cute.jit
     def epi_setup_postact(
         self,
         params,
@@ -389,6 +400,21 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         varlen_manager,
         tidx,
     ):
+        # Stage 7 — kernel_y_started sentinel release. Runs in device
+        # context inside GemmSm90.kernel()'s per-tile loop; gated to
+        # bidx == 0 and tidx == 0 so only one thread emits per tile.
+        # Combine on its own stream acquires via cuStreamBatchMemOp
+        # WAIT_VALUE_64 `>= dispatch_seq` before launching combine_main,
+        # so combine's persistent CTAs can't grab SMs ahead of kernel_y's
+        # CTAs. Monotonic-seq protocol makes redundant per-tile re-emits
+        # idempotent. See markdowns/cdmc-partial-fix.md §"Stage 7".
+        bidx, _, _ = cute.arch.block_idx()
+        if bidx == 0:
+            if tidx == 0:
+                sentinel_ptr = utils.elem_pointer(
+                    params.scatter.kernel_y_started_sentinel, (0,)
+                )
+                st_release_gpu_global(sentinel_ptr, params.scatter.dispatch_seq)
         return None
 
     @cute.jit
@@ -675,6 +701,9 @@ def _compile_streaming_moe_y(
     expert_pool_block_offset_scatter = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
     )
+    kernel_y_started_sentinel = fake_tensor(
+        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
+    )
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
@@ -685,6 +714,8 @@ def _compile_streaming_moe_y(
         T_recv=Int32(0),
         combine_seq=Int64(0),
         num_pid_n=Int32(0),
+        kernel_y_started_sentinel=kernel_y_started_sentinel,
+        dispatch_seq=Int64(0),
     )
 
     # ColVecLoad's per-row weight broadcast (varlen_m). Shape (TK_padded,) fp32.
@@ -754,6 +785,7 @@ def streaming_moe_y(
     expert_pool_block_offset: torch.Tensor,  # (E_local + 1,) int32
     a_ready_count: torch.Tensor,  # (total_tiles,) int32 — kernel A's release-add destination (live)
     a_ready_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (= kernel A's num_pid_n everywhere)
+    kernel_y_started_sentinel: torch.Tensor,  # (1,) int64 — Stage 7 sentinel; CTA 0 thread 0 release-stores `dispatch_seq` here as the kernel's first runtime instruction
     combine_seq: int,
     *,
     tile_m: int = 128,
@@ -808,6 +840,8 @@ def streaming_moe_y(
     assert a_ready_count.dtype == torch.int32
     assert a_ready_target.shape == (total_tiles,)
     assert a_ready_target.dtype == torch.int32
+    assert kernel_y_started_sentinel.shape == (1,)
+    assert kernel_y_started_sentinel.dtype == torch.int64
 
     # Caller passes W2 as (E_local, H, I) k-major contiguous. We need the
     # kernel to see shape (H, I, E_local) with leading_dim=1 (I contiguous
@@ -873,6 +907,8 @@ def streaming_moe_y(
         T_recv=Int32(T_recv),
         combine_seq=Int64(combine_seq),
         num_pid_n=Int32(num_pid_n),
+        kernel_y_started_sentinel=kernel_y_started_sentinel,
+        dispatch_seq=Int64(combine_seq),
     )
     epi_args = StreamingMoeY.EpilogueArguments(
         scatter=scatter, mColVecBroadcast=pool_topk_weight

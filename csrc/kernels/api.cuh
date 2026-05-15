@@ -102,19 +102,10 @@ struct DispatchTileSignal {
     int* pool_arrival_count;       // [total_tiles]   release-add target during Pass 2
                                    //                 (consumer spins on count == arrival_target)
     const int* pool_arrival_target;  // [total_tiles] firing target (per-tile expected count)
-    // Per-(dst_rank, channel) ready sentinel; the sender warp releases
-    // `dispatch_seq` into `combine_routing_ready[responsible_rank * num_channels +
-    // responsible_channel]` immediately after writing the corresponding
-    // `channel_prefix_matrix` entry, so combine CTAs can acquire-spin at
-    // kernel entry per slot instead of waiting for the whole dispatch
-    // stream. See `Buffer::combine_routing_ready` in stream_ep.hpp.
-    int64_t* combine_routing_ready;
-    int64_t dispatch_seq;          // also released into combine_routing_ready[...] by
-                                   //   the sender warp after each per-(rank, channel)
-                                   //   prefix-matrix write. Reused as the NVL gen-stamp
-                                   //   (`nvl_seq = dispatch_seq << 1`). NOT used for the
-                                   //   per-tile ready signal — that pair was retired in
-                                   //   favor of `pool_arrival_count == pool_arrival_target`.
+    int64_t dispatch_seq;          // NVL gen-stamp (`nvl_seq = dispatch_seq << 1`).
+                                   //   NOT used for the per-tile ready signal — that pair
+                                   //   was retired in favor of
+                                   //   `pool_arrival_count == pool_arrival_target`.
 };
 
 struct DispatchShape {
@@ -210,13 +201,6 @@ void launch_combine_main(cudaDataType_t type,
              const int* channel_prefix_matrix,
              int* send_head,
              const int64_t* y_done_per_token,
-             // Per-(send_rank, channel) ready sentinel released by
-             // dispatch_main; combine sender warps acquire-spin on
-             // `combine_routing_ready[send_rank * num_channels + channel]
-             // >= combine_seq` at warp entry before reading
-             // `channel_prefix_matrix`. Closes the dispatch_main ↔ combine
-             // prefix-matrix race under CDMC>1.
-             const int64_t* combine_routing_ready,
              int64_t combine_seq,
              // true → fwd combine: drop per-K topk-weight wire payload +
              // skip the receiver-side reduce + skip writing
@@ -402,36 +386,7 @@ struct DispatchTileSignal {
                                      //   blocks (consumer spins on count == target).
     int* pool_arrival_count;         // [total_tiles]
     const int* pool_arrival_target;  // [total_tiles]
-    // Per-(src_rdma_rank, channel) ready sentinel. The kRDMAAndNVLForwarder
-    // warp releases `dispatch_seq` into `combine_routing_ready[lane_id *
-    // num_channels + channel_id]` after writing the corresponding
-    // `recv_rdma_channel_prefix_matrix` entry (each lane fires for its own
-    // src_rdma_rank). Combine's kNVLAndRDMAForwarder warp acquire-spins on
-    // its slot at kernel entry. See `Buffer::combine_routing_ready` in
-    // stream_ep.hpp.
-    int64_t* combine_routing_ready;
-    // Per-(src_rdma, src_nvl, channel) ready sentinel for the second
-    // prefix matrix (`recv_gbl_channel_prefix_matrix`). The kNVLReceivers
-    // warp releases `dispatch_seq` into `combine_routing_ready_gbl[
-    // (lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels +
-    // channel_id]` after writing the matrix entry. Combine's kNVLSender
-    // warp acquire-spins on its slot at kernel entry. See
-    // `Buffer::combine_routing_ready_gbl` in stream_ep.hpp.
-    int64_t* combine_routing_ready_gbl;
-    // Per-(channel, sender_warp_id) sentinel released by each
-    // kRDMASender warp at end of its per-token loop; encode_combine_heads's
-    // rdma_head branch acquires all kNumDispatchRDMASenderWarps slots for
-    // its channel before reading `combined_rdma_head`. See
-    // `Buffer::combine_send_rdma_ready` in stream_ep.hpp.
-    int64_t* combine_send_rdma_ready;
-    // Per-(channel, dst_nvl_rank) sentinel released by each
-    // kRDMAAndNVLForwarder warp at end of its main loop;
-    // encode_combine_heads's nvl_head branch acquires all NUM_MAX_NVL_PEERS
-    // slots for its channel before TMA-loading `combined_nvl_head`. See
-    // `Buffer::combine_send_nvl_ready` in stream_ep.hpp.
-    int64_t* combine_send_nvl_ready;
-    int64_t dispatch_seq;            // also released into all combine_*_ready arrays.
-                                     //   Reused as NVL gen-stamp; not used for tile-ready.
+    int64_t dispatch_seq;            // NVL gen-stamp; not used for tile-ready.
 };
 
 struct DispatchShape {
@@ -555,28 +510,6 @@ void encode_combine_heads(int hidden_int4,
                            const int* rdma_channel_prefix_matrix,
                            const int* rdma_rank_prefix_sum,
                            int* combined_nvl_head,
-                           // Per-(dst_rdma_rank, channel) ready sentinel —
-                           // gates the nvl_head branch's read of
-                           // `rdma_channel_prefix_matrix` so combine_main's
-                           // FIFO-downstream read of the same matrix is
-                           // safe without a separate gate. See Buffer's
-                           // `combine_routing_ready` in stream_ep.hpp.
-                           const int64_t* combine_routing_ready,
-                           // Per-(channel, sender_warp_id) sentinel —
-                           // gates the rdma_head branch's reads of
-                           // `combined_rdma_head` (= send_rdma_head) which
-                           // is written per-token by dispatch_main's
-                           // kRDMASender warps. Sized
-                           // [num_channels × kNumDispatchRDMASenderWarps].
-                           const int64_t* combine_send_rdma_ready,
-                           // Per-(channel, dst_nvl_rank) sentinel — gates
-                           // the nvl_head branch's TMA loads of
-                           // `combined_nvl_head` (= send_nvl_head) which is
-                           // written per-(token, dst_nvl_rank) by
-                           // kRDMAAndNVLForwarder warps. Sized
-                           // [num_channels × NUM_MAX_NVL_PEERS].
-                           const int64_t* combine_send_nvl_ready,
-                           int64_t combine_seq,
                            cudaStream_t stream);
 
 // combine_main_kernel — used by both forward combine and backward
@@ -599,16 +532,6 @@ void launch_combine_main(cudaDataType_t type,
                          const int* recv_rdma_rank_prefix_sum,
                          const int* gbl_channel_prefix_matrix,
                          const int64_t* y_done_per_token,
-                         // Per-(src_rdma, src_nvl, channel) ready sentinel
-                         // released by dispatch_main's NVL receiver warp;
-                         // combine's kNVLSender acquire-spins on its slot
-                         // at kernel entry before reading
-                         // `recv_gbl_channel_prefix_matrix`. The recv-rdma
-                         // matrix is gated inside `encode_combine_heads`
-                         // (same combine stream, FIFO-ordered before
-                         // combine_main), so no separate gate is needed
-                         // for it here.
-                         const int64_t* combine_routing_ready_gbl,
                          int64_t combine_seq,
                          // 0 = fwd combine, 1 = bwd combine_grads. Phase-
                          // distinguishes the NVL gen-stamp tag so fwd's slot

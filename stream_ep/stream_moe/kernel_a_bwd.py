@@ -252,6 +252,14 @@ def _compile_streaming_moe_a_bwd(
     expert_pool_block_offset_scatter = fake_tensor(
         cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
     )
+    # `kernel_y_started_sentinel` + `dispatch_seq` are required by ScatterParams
+    # for Stage 7 in kernel_y. kernel_a_bwd shares ScatterParams shape but is
+    # NOT a producer of that signal — supply a scratch fake tensor and 0 seq;
+    # kernel_a_bwd doesn't reach the emit site (epi_setup_postact override is
+    # on StreamingMoeY only).
+    kernel_y_started_sentinel_scratch = fake_tensor(
+        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
+    )
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
@@ -262,6 +270,8 @@ def _compile_streaming_moe_a_bwd(
         T_recv=Int32(0),
         combine_seq=Int64(0),
         num_pid_n=Int32(0),
+        kernel_y_started_sentinel=kernel_y_started_sentinel_scratch,
+        dispatch_seq=Int64(0),
     )
 
     # cu_seqlens_m drives the standard varlen_m m-offset for mA's pool read.
@@ -463,6 +473,10 @@ def streaming_moe_a_bwd(
         total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device
     )
 
+    # Scratch sentinel for kernel_a_bwd (not the producer — see ScatterParams).
+    kernel_y_started_sentinel_scratch = torch.zeros(
+        1, dtype=torch.int64, device=dL_dx_per_r.device
+    )
     scatter = ScatterParams(
         mO=dL_dx_per_r,
         pool_recv_token=pool_recv_token,
@@ -473,6 +487,8 @@ def streaming_moe_a_bwd(
         T_recv=Int32(T_recv),
         combine_seq=Int64(dispatch_seq),
         num_pid_n=Int32(num_pid_n),
+        kernel_y_started_sentinel=kernel_y_started_sentinel_scratch,
+        dispatch_seq=Int64(0),
     )
     epi_args = StreamingMoeABwd.EpilogueArguments(scatter=scatter)
     scheduler_args = StreamingMoeYSchedulerOptions(
