@@ -106,8 +106,20 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 // `expert_pool_block_offset[e] * BLOCK_M` (BLOCK_M = tile_m) and is padded up to
 // a BLOCK_M multiple. base_pool[c, src, e] is the substream's first slot for
 // expert e (deterministic given cached routing).
+// Phase A (cross-rank IPC exchange): single block, 60 KB SMEM, NOT cooperative.
+// Builds local SMEM histogram by scanning topk_idx, bracketed by two
+// barrier_block calls so peer writes are observable on the post-barrier read.
+// This kernel does ONLY Phase 1-5 from the v1 single-kernel design; Phase 6-9
+// lives in `_phase_b_kernel` below, launched FIFO-after on the same stream.
+// Splitting lets phase B run with much smaller per-block SMEM (~1.5 KB vs
+// 60 KB), which:
+//   (a) avoids the cooperative-launch occupancy ceiling (1 block/SM at 60 KB
+//       SMEM → 32 cooperative blocks fit cleanly across 132 SMs);
+//   (b) lets the cooperative scheduler pack more concurrent blocks per SM in
+//       Phase B (4-6 at ~5 KB), so SM-availability variance from the prior
+//       iter's combine tail no longer pins this kernel to 1-block-per-SM.
 template <int kNumRanks>
-__global__ void streaming_dispatch_metadata_kernel(
+__global__ void streaming_dispatch_metadata_phase_a_kernel(
         const topk_idx_t* topk_idx,
         int* expert_frequency,
         int* expert_pool_block_offset,
@@ -211,9 +223,51 @@ __global__ void streaming_dispatch_metadata_kernel(
         // post-barrier read.
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     }
+}  // end streaming_dispatch_metadata_phase_a_kernel
 
-    // Grid-wide barrier #1: all blocks see post-phase-5 inbox state.
-    grid.sync();
+// Phase B (post-exchange compute): cooperative grid, ~1.5 KB SMEM/block.
+// Reads from this rank's IPC inbox (peer-populated by Phase A) and computes
+// the metadata outputs the dispatch hot path consumes. Launched FIFO-after
+// the Phase A kernel on the same stream.
+template <int kNumRanks>
+__global__ void streaming_dispatch_metadata_phase_b_kernel(
+        int* expert_frequency,
+        int* expert_pool_block_offset,
+        int* base_pool,
+        int* seen_per_substream,
+        int* rank_prefix_matrix,
+        int* tile_id_to_expert,
+        int* pool_arrival_target,
+        int* total_tiles_out,
+        int* num_recv_mapped,
+        int* num_recv_per_expert_mapped,
+        int* total_tiles_mapped,
+        int num_experts_per_rank,
+        int num_channels,
+        int64_t streaming_section_offset,
+        void** buffer_ptrs,
+        int rank,
+        int tile_m,
+        int expert_alignment) {
+    namespace cg = cooperative_groups;
+    auto grid = cg::this_grid();
+
+    constexpr int kNumWarpsV2 = 256 / 32;
+
+    const int block_id = static_cast<int>(blockIdx.x);
+    const int num_blocks = static_cast<int>(gridDim.x);
+    const int thread_id = static_cast<int>(threadIdx.x);
+    const int num_threads = static_cast<int>(blockDim.x);
+    const int warp_id = thread_id / 32;
+    const int lane_id = thread_id % 32;
+    const int num_warps = num_threads / 32;
+    const int grid_tid = block_id * num_threads + thread_id;
+    const int grid_threads = num_blocks * num_threads;
+
+    const int E = num_experts_per_rank;
+    const int e_inbox_size = num_channels * kNumRanks * E;
+
+    extern __shared__ int smem[];
 
     // ──────────────────────────────────────────────────────────────────────
     // PHASE 6: seen_per_substream copy + expert_frequency warp-reduce.
@@ -433,73 +487,85 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int tile_m,
                                  int expert_alignment,
                                  cudaStream_t stream) {
-#define STREAMING_DISPATCH_METADATA_LAUNCH_CASE(ranks)                                       \
+    // Two-kernel split — Phase A (cross-rank IPC, single-block, 60 KB SMEM,
+    // non-cooperative) followed by Phase B (cooperative grid, ~1.5 KB SMEM
+    // per block). The Phase A→Phase B boundary uses stream FIFO (no event
+    // needed); the cheap kernel-launch dep replaces what was a grid.sync()
+    // in the single-kernel v2 design.
+
+    // ── Phase A kernel: 1 block, 256 threads, 60 KB SMEM, NOT cooperative ──
+    constexpr int kNumThreadsV2 = 256;
+    int smem_bytes_a = num_ranks * num_channels * (num_experts_per_rank + 1) * sizeof(int);
+
+#define STREAMING_DISPATCH_METADATA_PHASE_A_LAUNCH(ranks)                                    \
     EP_HOST_ASSERT(cudaFuncSetAttribute(                                                     \
-                       streaming_dispatch_metadata_kernel<ranks>,                            \
+                       streaming_dispatch_metadata_phase_a_kernel<ranks>,                    \
                        cudaFuncAttributeMaxDynamicSharedMemorySize,                          \
-                       smem_bytes) == cudaSuccess);                                          \
-    LAUNCH_KERNEL(&cfg,                                                                      \
-                  streaming_dispatch_metadata_kernel<ranks>,                                 \
-                  topk_idx,                                                                  \
-                  expert_frequency,                                                          \
-                  expert_pool_block_offset,                                                  \
-                  base_pool,                                                                 \
-                  seen_per_substream,                                                        \
-                  rank_prefix_matrix,                                                        \
-                  tile_id_to_expert,                                                         \
-                  pool_arrival_target,                                                       \
-                  total_tiles_out,                                                           \
-                  num_recv_mapped,                                                           \
-                  num_recv_per_expert_mapped,                                                \
-                  total_tiles_mapped,                                                        \
-                  num_tokens,                                                                \
-                  num_topk,                                                                  \
-                  num_experts_per_rank,                                                      \
-                  num_channels,                                                              \
-                  streaming_section_offset,                                                  \
-                  buffer_ptrs,                                                               \
-                  barrier_signal_ptrs,                                                       \
-                  rank,                                                                      \
-                  tile_m,                                                                    \
-                  expert_alignment);                                                         \
+                       smem_bytes_a) == cudaSuccess);                                        \
+    {                                                                                        \
+        cudaLaunchConfig_t cfg_a = {1, kNumThreadsV2, 0, stream, nullptr, 0};                \
+        cfg_a.dynamicSmemBytes = smem_bytes_a;                                               \
+        LAUNCH_KERNEL(&cfg_a,                                                                \
+                      streaming_dispatch_metadata_phase_a_kernel<ranks>,                     \
+                      topk_idx,                                                              \
+                      expert_frequency, expert_pool_block_offset, base_pool,                 \
+                      seen_per_substream, rank_prefix_matrix,                                \
+                      tile_id_to_expert, pool_arrival_target,                                \
+                      total_tiles_out, num_recv_mapped,                                      \
+                      num_recv_per_expert_mapped, total_tiles_mapped,                        \
+                      num_tokens, num_topk, num_experts_per_rank, num_channels,              \
+                      streaming_section_offset, buffer_ptrs, barrier_signal_ptrs,            \
+                      rank, tile_m, expert_alignment);                                       \
+    }                                                                                        \
     break
 
-    // Cooperative-grid launch: ~32 blocks × 256 threads. Block 0 owns the
-    // cross-rank IPC exchange (Phases 1-5, single-block by protocol);
-    // all blocks participate in the wide-parallel post-exchange phases (6-9).
-    // Grid.sync() between phases requires cooperative launch — already set
-    // in SETUP_LAUNCH_CONFIG via cudaLaunchAttributeCooperative=1.
-    //
-    // SMEM: block 0 uses kNumRanks × num_channels × (E + 1) ints for its
-    // phase-1-5 local histogram (~62KB at production E=384, R=8, num_sms=80).
-    // Other blocks share the same allocation but use only a smaller slice
-    // (Phase 8's per-expert scan SMEM = cs_total ints, ~1.3KB at intranode
-    // production). The unused SMEM in non-block-0 SMs doesn't affect
-    // occupancy on the rest of the pipeline (those SMs are idle in this
-    // kernel's lifetime).
-    //
-    // num_blocks_v2 = min(32, ceil(E / 1)) — one block per expert is enough
-    // for Phase 8 to run in a single wave at production E_local=8-48.
-    constexpr int kNumThreadsV2 = 256;
+    SWITCH_RANKS(STREAMING_DISPATCH_METADATA_PHASE_A_LAUNCH);
+
+#undef STREAMING_DISPATCH_METADATA_PHASE_A_LAUNCH
+
+    // ── Phase B kernel: 32 cooperative blocks × 256 threads, small SMEM ──
+    // SMEM: cs_total (= num_channels × kNumRanks) ints for parallel-scan
+    // workspace + kNumWarpsV2 ints for warp-sum scratch. At intranode
+    // production (num_channels=40, kNumRanks=8), cs_total=320 ints =
+    // 1.28 KB + 32 bytes ≈ 1.3 KB per block — well within H100's 228 KB
+    // per-SM SMEM, so 32 cooperative blocks pack ~4-6 blocks per SM if the
+    // scheduler chooses (vs 1 block/SM at 60 KB).
     constexpr int kNumBlocksV2 = 32;
-    int smem_bytes = num_ranks * num_channels * (num_experts_per_rank + 1) * sizeof(int);
-    // SETUP_LAUNCH_CONFIG sets cluster_dim from num_sms%2 — for 32 blocks
-    // that picks cluster_dim=2. Cooperative + cluster has stricter occupancy
-    // requirements (clusters must co-reside on adjacent SMs); use cluster=1
-    // explicitly to avoid resident-block-count surprises with cooperative.
-    cudaLaunchConfig_t cfg = {kNumBlocksV2, kNumThreadsV2, 0, stream, nullptr, 0};
-    cudaLaunchAttribute attr[2];
-    attr[0].id = cudaLaunchAttributeCooperative;
-    attr[0].val.cooperative = 1;
-    attr[1].id = cudaLaunchAttributeClusterDimension;
-    attr[1].val.clusterDim.x = 1;
-    attr[1].val.clusterDim.y = 1;
-    attr[1].val.clusterDim.z = 1;
-    cfg.attrs = attr;
-    cfg.numAttrs = 2;
-    cfg.dynamicSmemBytes = smem_bytes;
-    SWITCH_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
-#undef STREAMING_DISPATCH_METADATA_LAUNCH_CASE
+    int smem_bytes_b = (num_channels * num_ranks + (kNumThreadsV2 / 32)) * sizeof(int);
+
+#define STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH(ranks)                                    \
+    EP_HOST_ASSERT(cudaFuncSetAttribute(                                                     \
+                       streaming_dispatch_metadata_phase_b_kernel<ranks>,                    \
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,                          \
+                       smem_bytes_b) == cudaSuccess);                                        \
+    {                                                                                        \
+        cudaLaunchConfig_t cfg_b = {kNumBlocksV2, kNumThreadsV2, 0, stream, nullptr, 0};     \
+        cudaLaunchAttribute attr_b[2];                                                       \
+        attr_b[0].id = cudaLaunchAttributeCooperative;                                       \
+        attr_b[0].val.cooperative = 1;                                                       \
+        attr_b[1].id = cudaLaunchAttributeClusterDimension;                                  \
+        attr_b[1].val.clusterDim.x = 1;                                                      \
+        attr_b[1].val.clusterDim.y = 1;                                                      \
+        attr_b[1].val.clusterDim.z = 1;                                                      \
+        cfg_b.attrs = attr_b;                                                                \
+        cfg_b.numAttrs = 2;                                                                  \
+        cfg_b.dynamicSmemBytes = smem_bytes_b;                                               \
+        LAUNCH_KERNEL(&cfg_b,                                                                \
+                      streaming_dispatch_metadata_phase_b_kernel<ranks>,                     \
+                      expert_frequency, expert_pool_block_offset, base_pool,                 \
+                      seen_per_substream, rank_prefix_matrix,                                \
+                      tile_id_to_expert, pool_arrival_target,                                \
+                      total_tiles_out, num_recv_mapped,                                      \
+                      num_recv_per_expert_mapped, total_tiles_mapped,                        \
+                      num_experts_per_rank, num_channels,                                    \
+                      streaming_section_offset, buffer_ptrs,                                 \
+                      rank, tile_m, expert_alignment);                                       \
+    }                                                                                        \
+    break
+
+    SWITCH_RANKS(STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH);
+
+#undef STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>

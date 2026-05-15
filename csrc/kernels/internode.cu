@@ -155,8 +155,14 @@ __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_tea
 //   RDMA-received slabs and propagates to its 7 NVL peers via direct
 //   buffer_ptrs writes — same RDMA-then-NVL two-hop count-aggregation
 //   pattern used for the per-rank/per-expert recv counters).
+// Phase A (cross-rank IPC + RDMA + NVL exchange): max(1, 1 + kNumRDMARanks)
+// blocks × 512 threads × ~60 KB SMEM (block 0). NOT cooperative — blocks
+// 1..kNumRDMARanks do independent per-dst_rdma channel-prefix-matrix work,
+// no inter-block grid.sync needed. The Phase B kernel runs FIFO-after on
+// the same stream (kernel-launch dep replaces the v2-single-kernel
+// grid.sync between phase A's barrier_block and Phase B1's read).
 template <bool kLowLatencyMode, int kNumRDMARanks>
-__global__ void streaming_dispatch_metadata_kernel(
+__global__ void streaming_dispatch_metadata_phase_a_kernel(
         const topk_idx_t* topk_idx,
         // Counters (host-mapped, written)
         int* moe_recv_counter_mapped,
@@ -561,20 +567,61 @@ __global__ void streaming_dispatch_metadata_kernel(
     barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
 
     }  // end if (sm_id == 0) — Phase A1-A5 + Phase B0 completed by block 0.
+}  // end streaming_dispatch_metadata_phase_a_kernel
 
-    // ──────────────────────────────────────────────────────────────────────
-    // Grid-wide barrier #1: block 0's NVL exchange + barrier_block ensures
-    // seen-side peer slots are observable. All other blocks (1..N) can now
-    // read peer-write outputs for the rest of Phase B.
-    // ──────────────────────────────────────────────────────────────────────
-    grid.sync();
+// Phase B (post-exchange compute): cooperative grid, ~5 KB SMEM/block.
+// Reads from this rank's IPC inbox (peer-populated by Phase A) and computes
+// the metadata outputs the dispatch hot path consumes. Launched FIFO-after
+// the Phase A kernel on the same stream.
+template <bool kLowLatencyMode, int kNumRDMARanks>
+__global__ void streaming_dispatch_metadata_phase_b_kernel(
+        // Counters (host-mapped, written)
+        int* moe_recv_counter_mapped,
+        int* streaming_total_tiles_mapped,
+        // Channel prefix matrices (read in Phase B3 by block 0 thread 0)
+        int* recv_gbl_rank_prefix_sum,
+        // Streaming-superset outputs
+        int* expert_frequency,
+        int* expert_pool_block_offset,
+        int* base_pool,
+        int* seen_per_substream,
+        int* rank_prefix_matrix,
+        int* tile_id_to_expert,
+        int* pool_arrival_target,
+        int* total_tiles_device,
+        // Shape
+        int num_experts,
+        int num_channels,
+        int expert_alignment,
+        int tile_m,
+        // Env
+        void** buffer_ptrs,
+        int rank) {
+    namespace cg = cooperative_groups;
+    auto grid = cg::this_grid();
+
+    auto sm_id = static_cast<int>(blockIdx.x);
+    const int num_blocks = static_cast<int>(gridDim.x);
+    auto thread_id = static_cast<int>(threadIdx.x);
+    auto warp_id = thread_id / 32;
+    auto lane_id = get_lane_id();
+    auto num_threads = static_cast<int>(blockDim.x);
+    auto num_warps = num_threads / 32;
+    const int grid_tid = sm_id * num_threads + thread_id;
+    const int grid_threads = num_blocks * num_threads;
+
+    auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
+    auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    const int num_ranks = kNumRDMARanks * NUM_MAX_NVL_PEERS;
+    const int E_local = num_experts / num_ranks;
+    const int num_rdma_experts = num_experts / kNumRDMARanks;
 
     // Recompute the NVL recv-buffer offset of `nvl_streaming_recv` in EVERY
     // block (it's cheap — pure pointer arithmetic on `buffer_ptrs[nvl_rank]`).
-    // The cross-rank writes already happened in block 0; downstream phases
-    // only READ from these slabs. Layout mirrors the v1 block-0 derivation
+    // The cross-rank writes already happened in Phase A; this kernel only
+    // READS from these slabs. Layout mirrors the v1 block-0 derivation
     // — same advance sequence (Buffer<int> + 4 × AsymBuffer<int>) so the
-    // streaming_recv slot lands at exactly the same offset block 0 wrote to.
+    // streaming_recv slot lands at exactly the same offset Phase A wrote to.
     auto* nvl_recv_buffer_all = buffer_ptrs[nvl_rank];
     const int kNvlSlotInts_all = kNumRDMARanks * num_channels * E_local;
     // Skip past Phase A5 slabs:
@@ -829,58 +876,85 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
     int smem_bytes =
         (num_rdma_ranks * kStreamSlabInts + num_ranks + num_rdma_ranks + num_experts) * sizeof(int);
 
-#define STREAMING_DISPATCH_METADATA_LAUNCH_CASE(num_rdma_ranks)                                       \
-    {                                                                                                  \
-        auto k = streaming_dispatch_metadata_kernel<false, num_rdma_ranks>;                            \
-        EP_HOST_ASSERT(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
-                                            smem_bytes) == cudaSuccess);                              \
-        cfg.dynamicSmemBytes = smem_bytes;                                                             \
-        LAUNCH_KERNEL(&cfg, k,                                                                         \
-                      topk_idx,                                                                        \
-                      moe_recv_counter_mapped,                                                         \
-                      moe_recv_rdma_counter_mapped,                                                    \
-                      moe_recv_expert_counter_mapped,                                                  \
-                      streaming_total_tiles_mapped,                                                    \
-                      rdma_channel_prefix_matrix,                                                      \
-                      recv_rdma_rank_prefix_sum,                                                       \
-                      gbl_channel_prefix_matrix,                                                       \
-                      recv_gbl_rank_prefix_sum,                                                        \
-                      expert_frequency,                                                                \
-                      expert_pool_block_offset,                                                        \
-                      base_pool,                                                                       \
-                      seen_per_substream,                                                              \
-                      rank_prefix_matrix,                                                              \
-                      tile_id_to_expert,                                                               \
-                      pool_arrival_target,                                                             \
-                      total_tiles_device,                                                              \
-                      num_tokens, num_topk, num_experts, num_channels,                                 \
-                      expert_alignment, tile_m,                                                        \
-                      streaming_rdma_offset,                                                           \
-                      rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,                         \
-                      cpu_rdma_team);                                                                  \
-    }                                                                                                  \
+    // Two-kernel split — Phase A (cross-rank IPC + RDMA + NVL exchange, NOT
+    // cooperative; block 0 + blocks 1..kNumRDMARanks do their independent
+    // work) followed by Phase B (cooperative grid, ~5 KB SMEM per block,
+    // wide-parallel Phase B1-B5). The Phase A→Phase B boundary uses stream
+    // FIFO (kernel-launch dep), replacing what was a grid.sync() in the
+    // v2-single-kernel design.
+
+    // ── Phase A kernel: max(1, 1+kNumRDMARanks) blocks × 512 threads × 60 KB SMEM
+    const int kMinBlocksA = 1 + num_rdma_ranks;
+    int smem_bytes_a = smem_bytes;
+
+#define STREAMING_DISPATCH_METADATA_PHASE_A_LAUNCH(num_rdma_ranks)                                   \
+    {                                                                                                \
+        auto k = streaming_dispatch_metadata_phase_a_kernel<false, num_rdma_ranks>;                  \
+        EP_HOST_ASSERT(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,          \
+                                            smem_bytes_a) == cudaSuccess);                          \
+        cudaLaunchConfig_t cfg_a = {(unsigned)kMinBlocksA, (unsigned)kNumThreads, 0, stream,         \
+                                    nullptr, 0};                                                     \
+        cfg_a.dynamicSmemBytes = smem_bytes_a;                                                       \
+        LAUNCH_KERNEL(&cfg_a, k,                                                                     \
+                      topk_idx,                                                                      \
+                      moe_recv_counter_mapped, moe_recv_rdma_counter_mapped,                         \
+                      moe_recv_expert_counter_mapped, streaming_total_tiles_mapped,                  \
+                      rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,                         \
+                      gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,                           \
+                      expert_frequency, expert_pool_block_offset, base_pool,                        \
+                      seen_per_substream, rank_prefix_matrix,                                        \
+                      tile_id_to_expert, pool_arrival_target, total_tiles_device,                    \
+                      num_tokens, num_topk, num_experts, num_channels,                               \
+                      expert_alignment, tile_m, streaming_rdma_offset,                               \
+                      rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,                       \
+                      cpu_rdma_team);                                                                \
+    }                                                                                                \
     break
 
-    // Cooperative-grid launch: block 0 owns Phase A1-A5 + Phase B0 (cross-rank
-    // IPC + RDMA puts), blocks 1..kNumRDMARanks own per-dst_rdma channel
-    // prefix matrix, remaining blocks idle until the post-Phase-B0 grid.sync
-    // then all blocks join the wide-parallel Phase B1-B5 work. ~32 blocks at
-    // production gives enough Phase B parallelism while staying well within
-    // the cooperative-launch occupancy ceiling.
-    const int kMinBlocks = 1 + num_rdma_ranks;
-    const int num_blocks = std::max(kMinBlocks, 32);
-    cudaLaunchConfig_t cfg = {(unsigned)num_blocks, (unsigned)kNumThreads, 0, stream, nullptr, 0};
-    cudaLaunchAttribute attr[2];
-    attr[0].id = cudaLaunchAttributeCooperative;
-    attr[0].val.cooperative = 1;
-    attr[1].id = cudaLaunchAttributeClusterDimension;
-    attr[1].val.clusterDim.x = 1;
-    attr[1].val.clusterDim.y = 1;
-    attr[1].val.clusterDim.z = 1;
-    cfg.attrs = attr;
-    cfg.numAttrs = 2;
-    SWITCH_RDMA_RANKS(STREAMING_DISPATCH_METADATA_LAUNCH_CASE);
-#undef STREAMING_DISPATCH_METADATA_LAUNCH_CASE
+    SWITCH_RDMA_RANKS(STREAMING_DISPATCH_METADATA_PHASE_A_LAUNCH);
+
+#undef STREAMING_DISPATCH_METADATA_PHASE_A_LAUNCH
+
+    // ── Phase B kernel: 32 cooperative blocks × 512 threads, small SMEM ──
+    // SMEM: cs_total ints (scan workspace) + kNumWarpsV2 ints (warp-sum scratch).
+    // At internode production (num_channels=40, num_ranks=32), cs_total=1280
+    // ints = 5.1 KB + 64 bytes ≈ 5.2 KB per block. Lets the cooperative
+    // scheduler pack 4-8 blocks per SM, vs 1 block/SM at 60 KB.
+    const int num_blocks = std::max(kMinBlocksA, 32);
+    int smem_bytes_b =
+        (num_channels * num_ranks + (kNumThreads / 32)) * sizeof(int);
+
+#define STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH(num_rdma_ranks)                                   \
+    {                                                                                                \
+        auto k = streaming_dispatch_metadata_phase_b_kernel<false, num_rdma_ranks>;                  \
+        EP_HOST_ASSERT(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,          \
+                                            smem_bytes_b) == cudaSuccess);                          \
+        cudaLaunchConfig_t cfg_b = {(unsigned)num_blocks, (unsigned)kNumThreads, 0, stream,          \
+                                    nullptr, 0};                                                     \
+        cudaLaunchAttribute attr_b[2];                                                               \
+        attr_b[0].id = cudaLaunchAttributeCooperative;                                               \
+        attr_b[0].val.cooperative = 1;                                                               \
+        attr_b[1].id = cudaLaunchAttributeClusterDimension;                                          \
+        attr_b[1].val.clusterDim.x = 1;                                                              \
+        attr_b[1].val.clusterDim.y = 1;                                                              \
+        attr_b[1].val.clusterDim.z = 1;                                                              \
+        cfg_b.attrs = attr_b;                                                                        \
+        cfg_b.numAttrs = 2;                                                                          \
+        cfg_b.dynamicSmemBytes = smem_bytes_b;                                                       \
+        LAUNCH_KERNEL(&cfg_b, k,                                                                     \
+                      moe_recv_counter_mapped, streaming_total_tiles_mapped,                        \
+                      recv_gbl_rank_prefix_sum,                                                      \
+                      expert_frequency, expert_pool_block_offset, base_pool,                        \
+                      seen_per_substream, rank_prefix_matrix,                                        \
+                      tile_id_to_expert, pool_arrival_target, total_tiles_device,                    \
+                      num_experts, num_channels, expert_alignment, tile_m,                           \
+                      buffer_ptrs, rank);                                                            \
+    }                                                                                                \
+    break
+
+    SWITCH_RDMA_RANKS(STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH);
+
+#undef STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH
 }
 
 // At most 8 RDMA ranks to be sent
