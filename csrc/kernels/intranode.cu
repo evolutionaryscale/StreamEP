@@ -1208,6 +1208,14 @@ __global__ void encode_combine_heads_kernel(
                 send_head[token_idx * kNumRanks + rank_id] = expected_head;
         }
     }
+
+    // PDL trigger — combine_main_kernel (the next kernel on this stream)
+    // is marked as a programmatic consumer. Releasing here, after each
+    // block's writes drain (block 0's IPC slab cleanup is bracketed by
+    // its two barrier_block calls; blocks 1..N's send_head reverse-scan
+    // writes are register-resident before this point), lets combine's
+    // CTAs start dispatching while encode's last blocks drain.
+    griddepcontrol_launch_dependents();
 }
 
 void encode_combine_heads(void** buffer_ptrs,
@@ -1279,6 +1287,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                                           int rank,
                                                           int num_max_send_tokens,
                                                           int num_recv_buffer_tokens) {
+    // PDL barrier — encode_combine_heads (immediately preceding kernel on
+    // this stream) called `griddepcontrol.launch_dependents` at its tail.
+    // Wait here so the slab cleanup + reverse-scanned send_head are visible.
+    griddepcontrol_wait();
+
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
@@ -1679,7 +1692,8 @@ void launch_combine_main(cudaDataType_t type,
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
     EP_HOST_ASSERT(num_sms % 2 == 0);
     EP_HOST_ASSERT(kNumThreads >= num_ranks * 32);
-    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    // PDL consumer of `encode_combine_heads` (same stream, FIFO predecessor).
+    SETUP_LAUNCH_CONFIG_PDL_CONSUMER(num_sms, kNumThreads, stream);
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE
