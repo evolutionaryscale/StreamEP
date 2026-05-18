@@ -744,15 +744,19 @@ def _register(reg, obj):
     return h
 
 
-# DEBUG: removed `@torch.compiler.disable` so dynamo traces the call to
-# `torch.ops.stream_ep.moe` and inductor can insert cross-stream syncs
-# around the registered custom op. See logbook 2026-05-18 "Register
-# stream_moe_func as a torch.library.custom_op" — making the layer
-# opaque-to-dynamo (via custom_op) is what closes the CDMC>1 race where
-# `streams.communicate.wait_stream(caller_stream)` misses inductor's
-# other internal streams. The `@torch.compiler.disable` added in
-# 44fc996 defeats this mechanism: it makes dynamo graph-break on the
-# call rather than tracing through to the custom op.
+# `@torch._dynamo.allow_in_graph` tells dynamo: treat this function as a
+# leaf in the FX graph. Don't trace into the body — call it eagerly at
+# runtime. Without this, dynamo follows the wrapper into the
+# `_register(_BUFFER_REG, ...)` / `_register(_STREAMS_REG, ...)` calls,
+# trips on `weakref.WeakValueDictionary.__setitem__` (untraceable C-side
+# weakref machinery), and graph-breaks ONCE PER LAYER PER ITER. That break
+# fragments the compiled outer graph at the MoE boundary, adding a Python
+# re-entry round trip per layer. `allow_in_graph` collapses the entire
+# wrapper to a single call_function FX node; dynamo continues tracing
+# uninterrupted after it. The custom op `torch.ops.stream_ep.moe` is
+# already opaque to dynamo (registered via torch.library.custom_op) — this
+# decorator just plugs the residual hole around the registry plumbing.
+@torch._dynamo.allow_in_graph
 def stream_moe_func(
     buffer: StreamEPBuffer,
     x: torch.Tensor,
