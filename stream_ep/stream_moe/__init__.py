@@ -2,14 +2,13 @@
 
 Public surface:
   - ``stream_moe.stream_moe_func`` — one MoE forward layer (dispatch →
-    kernel A → kernel Y → combine, on four caller-owned streams). Wraps
-    ``StreamMoEFunc.apply`` with the keyword-arg public API.
-  - ``stream_moe.StreamMoEFunc`` — ``torch.autograd.Function`` running the
-    layer forward and backward (dispatch_grads → kernel_y_bwd → kernel_a_bwd
-    → combine_grads on the same four streams as forward, plus dW1 / dW2
-    grouped GEMMs on a dedicated ``grads`` stream).
+    kernel A → kernel Y → combine on the communicate stream, kernel_a +
+    kernel_y on the compute stream). Dispatches through the registered
+    ``torch.ops.stream_ep.moe`` custom op so dynamo treats the layer as
+    opaque; under torch.compile this lets inductor place the right stream
+    syncs on the boundary.
   - ``stream_moe.StreamHolder`` / ``stream_moe.make_streams`` —
-    dataclass holding the four caller-owned streams + helper to allocate them.
+    dataclass holding the two caller-owned streams + helper to allocate them.
   - ``kernel_a.streaming_moe_a`` /
     ``kernel_y.streaming_moe_y`` — host wrappers for kernels A and Y.
   - ``tile_scheduler.StreamingTileScheduler`` /
