@@ -394,6 +394,8 @@ struct DispatchTileSignal {
     int* pool_arrival_count;         // [total_tiles]
     const int* pool_arrival_target;  // [total_tiles]
     int64_t dispatch_seq;            // NVL gen-stamp; not used for tile-ready.
+    // Monotonic "kernel entered" flag — see intranode::DispatchTileSignal.
+    int* started_flag;
 };
 
 struct DispatchShape {
@@ -477,6 +479,8 @@ struct DispatchGradsTileSignal {
                                       //   (consumer spins on count == arrival_target)
     const int* pool_arrival_target;   // [total_tiles] int32  firing target (same as fwd's)
     int64_t dispatch_seq;             // NVL gen-stamp only (`nvl_seq = (seq << 1) | 1`).
+    // Monotonic "kernel entered" flag — see intranode::DispatchGradsTileSignal.
+    int* started_flag;
 };
 
 struct DispatchGradsShape {

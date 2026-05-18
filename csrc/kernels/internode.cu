@@ -1007,6 +1007,10 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                      DispatchTileSignal tile_signal,
                      DispatchShape shape,
                      DispatchEnv env) {
+    // Bump the "kernel started" flag for the host-queued cuStreamWaitValue
+    // gate — see intranode kernel for the rationale. Block 0 thread 0 only.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && tile_signal.started_flag != nullptr)
+        atomicAdd(tile_signal.started_flag, 1);
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -2279,6 +2283,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                            DispatchGradsTileSignal tile_signal,
                            DispatchGradsShape shape,
                            DispatchEnv env) {
+    // Mirror of the fwd internode dispatch_main_kernel entry gate — see comment there.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && tile_signal.started_flag != nullptr)
+        atomicAdd(tile_signal.started_flag, 1);
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);

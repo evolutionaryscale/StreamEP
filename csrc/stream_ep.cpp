@@ -1561,12 +1561,15 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .gbl_channel_prefix_matrix  = pre.gbl_channel_prefix_matrix.data_ptr<int>(),
         .recv_gbl_rank_prefix_sum   = pre.recv_gbl_rank_prefix_sum.data_ptr<int>(),
     };
+    // Bump issued-count before launch (shared Buffer flags across intra/internode).
+    ++dispatch_main_issued_count;
     internode::DispatchTileSignal tile_signal{
         .base_pool                 = pre.base_pool.data_ptr<int>(),
         .seen_per_substream        = pre.seen_per_substream.data_ptr<int>(),
         .pool_arrival_count        = post.pool_arrival_count.data_ptr<int>(),
         .pool_arrival_target       = pool_arrival_target_n.data_ptr<int>(),
         .dispatch_seq              = dispatch_seq,
+        .started_flag              = dispatch_main_started_flag,
     };
     internode::DispatchShape shape{
         .num_tokens  = num_tokens,
@@ -1693,10 +1696,13 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
         .recv_rdma_rank_prefix_sum          = dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
         .recv_gbl_channel_prefix_matrix     = dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
     };
+    // Bump issued-count before launch (shared Buffer flags across intra/internode).
+    ++dispatch_grads_issued_count;
     internode::DispatchGradsTileSignal tile_signal{
         .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),
         .pool_arrival_target        = dispatch_out.pool_arrival_target.data_ptr<int>(),
         .dispatch_seq               = dispatch_seq,
+        .started_flag               = dispatch_grads_started_flag,
     };
     internode::DispatchGradsShape shape{
         .num_tokens   = num_tokens,
