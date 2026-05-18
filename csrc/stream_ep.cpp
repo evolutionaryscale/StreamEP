@@ -215,6 +215,15 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, at::cuda::getCurrentCUDAStream()));
 
+    // "Kernel started" flags — single int32 each, zero-init. See stream_ep.hpp
+    // for the cross-stream launch-gate rationale.
+    CUDA_CHECK(cudaMalloc(&dispatch_main_started_flag, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dispatch_grads_started_flag, sizeof(int)));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_main_started_flag, 0, sizeof(int),
+                               at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_grads_started_flag, 0, sizeof(int),
+                               at::cuda::getCurrentCUDAStream()));
+
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_counter_mapped, const_cast<int*>(moe_recv_counter), 0));
@@ -346,8 +355,45 @@ void Buffer::destroy() {
     // Free streaming sync slot
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(streaming_total_tiles)));
 
+    // Free cross-stream launch-gate flags
+    CUDA_CHECK(cudaFree(dispatch_main_started_flag));
+    CUDA_CHECK(cudaFree(dispatch_grads_started_flag));
+
     destroyed = true;
     available = false;
+}
+
+// cuStreamBatchMemOp-based wait: queues a GPU-front-end wait on `stream` until
+// `*flag >= target`. The wait sits at the front-end — does NOT consume an SM.
+// Used to gate kernel_a / kernel_y_bwd launches behind their respective
+// dispatch_main / dispatch_grads_main kernels actually entering execution, so
+// dispatch grabs SMs first under CDMC>1 + torch.compile.
+static void wait_value_geq_on_stream(CUstream stream, int* flag, int target) {
+    CUstreamBatchMemOpParams op{};
+    op.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    op.waitValue.address = reinterpret_cast<CUdeviceptr>(flag);
+    op.waitValue.value = static_cast<cuuint32_t>(target);
+    op.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+    CUresult err = cuStreamBatchMemOp(stream, 1, &op, 0);
+    if (err != CUDA_SUCCESS) {
+        const char* msg = nullptr;
+        cuGetErrorString(err, &msg);
+        EP_HOST_ASSERT(false and msg);
+    }
+}
+
+void Buffer::wait_dispatch_main_started(int64_t stream_handle) {
+    if (dispatch_main_issued_count == 0) return;  // nothing launched yet
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
+                             dispatch_main_started_flag,
+                             dispatch_main_issued_count);
+}
+
+void Buffer::wait_dispatch_grads_started(int64_t stream_handle) {
+    if (dispatch_grads_issued_count == 0) return;
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
+                             dispatch_grads_started_flag,
+                             dispatch_grads_issued_count);
 }
 
 void Buffer::sync(const std::vector<int>& device_ids,
@@ -1082,12 +1128,16 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
         .topk_weights     = topk_weights.data_ptr<float>(),
         .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
     };
+    // Increment the host-side issued-count BEFORE launching so subsequent
+    // `wait_dispatch_main_started` calls compare against the right target.
+    ++dispatch_main_issued_count;
     intranode::DispatchTileSignal dispatch_tile_signal{
         .channel_prefix_matrix = pre.channel_prefix_matrix.data_ptr<int>(),
         .base_pool             = pre.base_pool.data_ptr<int>(),
         .pool_arrival_count    = post.pool_arrival_count.data_ptr<int>(),
         .pool_arrival_target   = pool_arrival_target.data_ptr<int>(),
         .dispatch_seq          = dispatch_seq,
+        .started_flag          = dispatch_main_started_flag,
     };
     intranode::DispatchShape dispatch_shape{
         .num_tokens          = num_tokens,
@@ -1216,10 +1266,13 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
         .seen_per_substream  = seen_per_substream.data_ptr<int>(),
         .rank_prefix_matrix  = rank_prefix_matrix.data_ptr<int>(),
     };
+    // Bump issued-count before launch (see fwd path for rationale).
+    ++dispatch_grads_issued_count;
     intranode::DispatchGradsTileSignal tile_signal{
         .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),
         .pool_arrival_target        = pool_arrival_target.data_ptr<int>(),
         .dispatch_seq               = dispatch_seq,
+        .started_flag               = dispatch_grads_started_flag,
     };
     intranode::DispatchGradsShape shape{
         .num_tokens  = num_tokens,
@@ -1861,6 +1914,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_buffer_tensor", &stream_ep::Buffer::get_local_buffer_tensor)
         .def("sync", &stream_ep::Buffer::sync)
         .def("destroy", &stream_ep::Buffer::destroy)
+        .def("wait_dispatch_main_started", &stream_ep::Buffer::wait_dispatch_main_started)
+        .def("wait_dispatch_grads_started", &stream_ep::Buffer::wait_dispatch_grads_started)
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)

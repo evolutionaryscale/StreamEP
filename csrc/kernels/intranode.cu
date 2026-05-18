@@ -576,6 +576,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         DispatchTileSignal tile_signal,
         DispatchShape shape,
         DispatchEnv env) {
+    // Bump the "kernel started" flag for the host-queued cuStreamWaitValue
+    // gate. Block 0 thread 0 only — the flag is single-writer-per-kernel-call
+    // monotonic. Host queues `wait flag >= issued_count` on the compute stream
+    // before launching kernel_a so kernel_a doesn't grab SMs first under CDMC>1
+    // + torch.compile, where SM contention would otherwise leave dispatch_main
+    // queued behind kernel_a.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && tile_signal.started_flag != nullptr)
+        atomicAdd(tile_signal.started_flag, 1);
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -1074,6 +1082,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         DispatchGradsTileSignal tile_signal,
         DispatchGradsShape shape,
         DispatchEnv env) {
+    // Mirror of the fwd dispatch_main_kernel entry gate — see comment there.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && tile_signal.started_flag != nullptr)
+        atomicAdd(tile_signal.started_flag, 1);
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;

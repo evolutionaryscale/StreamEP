@@ -109,7 +109,6 @@ class Buffer:
 
     num_sms: int = 20
 
-    @torch.compiler.disable
     def __init__(self,
                  group: Optional[dist.ProcessGroup],
                  num_nvl_bytes: int = 0,
@@ -213,6 +212,14 @@ class Buffer:
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
 
+        # Monotonic per-Buffer dispatch counter. Per design.md §"Cross-dispatch
+        # reuse": the seq keys the Y → combine `y_done_per_token` release-stamp
+        # and the NVL gen-stamp protocol. It must be globally monotonic per
+        # Buffer (a per-instance counter would collide across layers sharing
+        # this Buffer). Allocated on dispatch when caller passes
+        # ``dispatch_seq=None``; explicit override still supported for tests.
+        self._next_seq = 0
+
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
@@ -223,6 +230,25 @@ class Buffer:
 
         self.runtime.destroy()
         self.runtime = None
+
+    def wait_dispatch_main_started(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Queue a GPU-front-end wait on ``stream`` until the most-recently-launched
+        ``dispatch_main_kernel`` has actually entered execution. Use this BEFORE
+        launching kernel_a on the compute stream so kernel_a doesn't grab SMs
+        ahead of dispatch_main. Implemented as ``cuStreamBatchMemOp``
+        wait_value_geq — the wait sits at the GPU front-end and does NOT
+        consume an SM. Defaults to the current torch CUDA stream.
+        """
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.runtime.wait_dispatch_main_started(stream.cuda_stream)
+
+    def wait_dispatch_grads_started(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Same as :meth:`wait_dispatch_main_started` but gates
+        kernel_y_bwd's launch behind ``dispatch_grads_main_kernel``'s entry."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.runtime.wait_dispatch_grads_started(stream.cuda_stream)
 
     @staticmethod
     def is_sm90_compiled():
@@ -339,7 +365,6 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
-    @torch.compiler.disable
     def dispatch(self, x: torch.Tensor,
                  topk_idx: torch.Tensor,
                  topk_weights: torch.Tensor,
@@ -348,7 +373,7 @@ class Buffer:
                  *,
                  expert_alignment: int = 1,
                  tile_m: int = 128,
-                 dispatch_seq: int = 1,
+                 dispatch_seq: Optional[int] = None,
                  config: Optional[Config] = None) -> \
             Tuple[torch.Tensor, 'StreamingHandle', EventHandle]:
         """Streaming-MoE pool-layout dispatch.
@@ -390,6 +415,10 @@ class Buffer:
                 kernel Y's `combine_seq` and the NVL gen-stamp protocol).
                 NOT used for the per-tile dispatch→A or A→Y signals — both
                 are count-vs-target spins on int32 release-add counters.
+                Defaults to ``None`` — Buffer allocates from its internal
+                monotonic counter (``self._next_seq``). Explicit override
+                supported for tests / harnesses that need deterministic
+                seq sequencing.
 
         Returns:
             recv: ``handle.pool`` (Tensor).
@@ -405,16 +434,22 @@ class Buffer:
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
+        if dispatch_seq is None:
+            self._next_seq += 1
+            seq = self._next_seq
+        else:
+            seq = dispatch_seq
+
         if self._is_internode():
             out = self.runtime.internode_dispatch(
                 x, topk_idx, topk_weights, is_token_in_rank,
-                num_experts, expert_alignment, tile_m, dispatch_seq,
+                num_experts, expert_alignment, tile_m, seq,
                 config,
             )
         else:
             out = self.runtime.intranode_dispatch(
                 x, topk_idx, topk_weights, is_token_in_rank,
-                num_experts, expert_alignment, tile_m, dispatch_seq,
+                num_experts, expert_alignment, tile_m, seq,
                 config,
             )
 
@@ -442,14 +477,13 @@ class Buffer:
             k_local_total=out.k_local_total,
             total_tiles=out.total_tiles,
             tile_m=tile_m,
-            dispatch_seq=dispatch_seq,
+            dispatch_seq=seq,
             _dispatch_out=out,
         )
 
         return out.pool, handle, out.metadata_done_event
 
     # noinspection PyTypeChecker
-    @torch.compiler.disable
     def dispatch_grads(self, handle: 'StreamingHandle', dL_dy: torch.Tensor,
                        *,
                        dispatch_seq: Optional[int] = None,
@@ -507,10 +541,9 @@ class Buffer:
         return dL_do_pool, bwd_dispatch_arrival_count, grads_started_event
 
     # noinspection PyTypeChecker
-    @torch.compiler.disable
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
                 *,
-                combine_seq: int = 1,
+                combine_seq: Optional[int] = None,
                 config: Optional[Config] = None) -> \
             Tuple[torch.Tensor, None]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
@@ -539,11 +572,12 @@ class Buffer:
         shared, gated by ``is_fwd``.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
+        seq = handle.dispatch_seq if combine_seq is None else combine_seq
 
         if self._is_internode():
             recv_x, _ = self.runtime.internode_combine(
                 x, handle.pool_topk_weight, handle._dispatch_out,
-                handle.y_done_per_token, combine_seq,
+                handle.y_done_per_token, seq,
                 # `combine_phase=0` = fwd combine. Phase-distinguishes the NVL
                 # gen-stamp tag from bwd `combine_grads` (phase=1) so the two
                 # phases of one layer (which share `combine_seq`) can't alias
@@ -556,13 +590,12 @@ class Buffer:
                 x, handle.pool_topk_weight, handle.recv_token_to_slots,
                 handle.rank_prefix_matrix,
                 handle.recv_channel_prefix_matrix, handle.send_head,
-                handle.y_done_per_token, combine_seq,
+                handle.y_done_per_token, seq,
                 True,  # is_fwd
                 config)
         return recv_x, None
 
     # noinspection PyTypeChecker
-    @torch.compiler.disable
     def combine_grads(self, dL_dx_per_r: torch.Tensor, handle: 'StreamingHandle',
                       weight_grads: torch.Tensor,
                       bwd_a_done_per_token: torch.Tensor,

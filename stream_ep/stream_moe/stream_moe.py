@@ -153,6 +153,24 @@ _STREAMS_REG: weakref.WeakValueDictionary[int, StreamHolder] = weakref.WeakValue
 # kernel returned. id() differs; data_ptr() does not (storage is preserved).
 _HANDLE_STASH: dict[int, object] = {}
 
+# NVTX call counters — used to label fwd/bwd nsys ranges with a per-rank
+# monotonic id. Set STREAM_EP_NVTX=1 in the env to enable. Off by default
+# so we don't pay the nvtx push/pop overhead in production runs.
+_NVTX_FWD_COUNT = 0
+_NVTX_BWD_COUNT = 0
+import os as _os
+_NVTX_ENABLED = bool(_os.environ.get("STREAM_EP_NVTX"))
+
+
+def _nvtx_push(name: str) -> None:
+    if _NVTX_ENABLED:
+        torch.cuda.nvtx.range_push(name)
+
+
+def _nvtx_pop() -> None:
+    if _NVTX_ENABLED:
+        torch.cuda.nvtx.range_pop()
+
 
 def _moe_fwd_impl(
     x: torch.Tensor,
@@ -164,7 +182,6 @@ def _moe_fwd_impl(
     buf_handle: int,
     streams_handle: int,
     num_experts: int,
-    dispatch_seq: int,
     tile_m: int,
     tile_n_a: int,
     tile_n_y: int,
@@ -187,6 +204,11 @@ def _moe_fwd_impl(
     num_sms_a_bwd: int | None,
     num_sms_y_bwd: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    global _NVTX_FWD_COUNT
+    _NVTX_FWD_COUNT += 1
+    _nvtx_fid = _NVTX_FWD_COUNT
+    _nvtx_push(f"moe_fwd_{_nvtx_fid}")
+
     buffer = _BUFFER_REG[buf_handle]
     streams = _STREAMS_REG[streams_handle]
     caller_stream = torch.cuda.current_stream()
@@ -197,6 +219,7 @@ def _moe_fwd_impl(
     streams.communicate.wait_stream(caller_stream)
     streams.compute.wait_stream(caller_stream)
 
+    _nvtx_push(f"fwd_dispatch_{_nvtx_fid}")
     with torch.cuda.stream(streams.communicate):
         pool, handle, metadata_done = buffer.dispatch(
             x,
@@ -205,8 +228,13 @@ def _moe_fwd_impl(
             is_token_in_rank,
             num_experts,
             tile_m=tile_m,
-            dispatch_seq=dispatch_seq,
         )
+    _nvtx_pop()
+    # Buffer-owned monotonic counter — `handle.dispatch_seq` is the
+    # source of truth for the layer's seq. Threaded through kernel Y's
+    # `combine_seq` and `buffer.combine` (which itself defaults to
+    # ``handle.dispatch_seq`` when no explicit override is passed).
+    dispatch_seq = handle.dispatch_seq
 
     # Cross-stream visibility from communicate → compute. ``metadata_done``
     # is recorded by dispatch *between* the metadata kernel and
@@ -220,12 +248,21 @@ def _moe_fwd_impl(
     # the moment ``metadata_done`` fires.
     streams.compute.wait_event(metadata_done)
 
+    # GPU-front-end gate: queue a cuStreamWaitValue on streams.compute so
+    # kernel_a's launch cannot grab SMs before dispatch_main's block 0 has
+    # entered execution. Without this, under CDMC>1 + torch.compile, kernel_a
+    # can race ahead and claim SMs while dispatch_main is still queued —
+    # causing dispatch_main to never get its block 0 co-resident. The wait
+    # sits at the GPU front-end and does NOT consume an SM.
+    buffer.wait_dispatch_main_started(streams.compute)
+
     # ── Kernel A on `streams.compute` ─────────────────────────────────
     # dispatch_main has retired (wait_stream above), but its per-tile
     # release-add into `pool_arrival_count` runs *before* dispatch_main
     # finishes — kernel A's scheduler spin on
     # `pool_arrival_count[tile] == pool_arrival_target[tile]` re-claims
     # those, terminating immediately on every tile.
+    _nvtx_push(f"fwd_compute_{_nvtx_fid}")
     with torch.cuda.stream(streams.compute):
         postact_a = torch.empty(
             handle.total_tiles,
@@ -291,15 +328,19 @@ def _moe_fwd_impl(
             cluster_n=2,
             num_sms=num_sms_y,
         )
+    _nvtx_pop()  # fwd_compute_{fid}
 
     # ── Combine on `streams.communicate` (same stream as dispatch) ────
     # FIFO-ordered after dispatch_main. Waits on the Y-started event so
     # combine's launch doesn't dispatch ahead of kernel_y's on the GPU
     # front-end. Combine's per-warp sender then spins on
     # `y_done_per_token[r] >= dispatch_seq` for per-recv-token streaming.
+    _nvtx_push(f"fwd_combine_{_nvtx_fid}")
     streams.communicate.wait_event(y_started)
     with torch.cuda.stream(streams.communicate):
-        out, _ = buffer.combine(handle.o, handle, combine_seq=dispatch_seq)
+        # combine_seq defaults to ``handle.dispatch_seq`` per Buffer.combine.
+        out, _ = buffer.combine(handle.o, handle)
+    _nvtx_pop()  # fwd_combine_{fid}
 
     # Layer-end back-edges. caller_stream waits on both streams so the
     # layer-as-barrier invariant holds across layers.
@@ -310,6 +351,7 @@ def _moe_fwd_impl(
     # storage data_ptr — survives AOT autograd's tensor wrapping. See
     # _HANDLE_STASH comment.
     _HANDLE_STASH[preact_a.untyped_storage().data_ptr()] = handle
+    _nvtx_pop()  # moe_fwd_{fid}
     return out, preact_a, pool
 
 
@@ -328,7 +370,6 @@ def _moe_op(
     buf_handle: int,
     streams_handle: int,
     num_experts: int,
-    dispatch_seq: int,
     tile_m: int,
     tile_n_a: int,
     tile_n_y: int,
@@ -353,7 +394,7 @@ def _moe_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _moe_fwd_impl(
         x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local,
-        buf_handle, streams_handle, num_experts, dispatch_seq,
+        buf_handle, streams_handle, num_experts,
         tile_m, tile_n_a, tile_n_y, tile_n_y_bwd, tile_n_a_bwd,
         tile_m_dW1, tile_n_dW1, tile_m_dW2, tile_n_dW2,
         cluster_m_dW1, cluster_n_dW1, cluster_m_dW2, cluster_n_dW2,
@@ -365,7 +406,7 @@ def _moe_op(
 @_moe_op.register_fake
 def _moe_op_fake(
     x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local,
-    buf_handle, streams_handle, num_experts, dispatch_seq,
+    buf_handle, streams_handle, num_experts,
     tile_m, tile_n_a, tile_n_y, tile_n_y_bwd, tile_n_a_bwd,
     tile_m_dW1, tile_n_dW1, tile_m_dW2, tile_n_dW2,
     cluster_m_dW1, cluster_n_dW1, cluster_m_dW2, cluster_n_dW2,
@@ -391,7 +432,7 @@ def _moe_op_fake(
 def _moe_setup_ctx(ctx, inputs, output):
     (
         x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local,
-        buf_handle, streams_handle, num_experts, dispatch_seq,
+        buf_handle, streams_handle, num_experts,
         tile_m, tile_n_a, tile_n_y, tile_n_y_bwd, tile_n_a_bwd,
         tile_m_dW1, tile_n_dW1, tile_m_dW2, tile_n_dW2,
         cluster_m_dW1, cluster_n_dW1, cluster_m_dW2, cluster_n_dW2,
@@ -444,6 +485,11 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
     ignored here.
     """
     del dL_dpreact_a, dL_dpool
+    global _NVTX_BWD_COUNT
+    _NVTX_BWD_COUNT += 1
+    _nvtx_bid = _NVTX_BWD_COUNT
+    _nvtx_push(f"moe_bwd_{_nvtx_bid}")
+
     buffer: StreamEPBuffer = _BUFFER_REG[ctx.buf_handle]
     streams: StreamHolder = _STREAMS_REG[ctx.streams_handle]
     preact_a, pool, w1_local, w2_local = ctx.saved_tensors
@@ -538,6 +584,12 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
         )
 
     streams.compute.wait_event(grads_started)
+
+    # GPU-front-end gate: queue a cuStreamWaitValue so kernel_y_bwd's launch
+    # cannot grab SMs before dispatch_grads_main's block 0 has entered
+    # execution. Mirror of the fwd dispatch ↔ kernel_a gate above; same
+    # rationale.
+    buffer.wait_dispatch_grads_started(streams.compute)
 
     # ── Stage 2 — kernel_y_bwd on streams.compute ──────────────────────
     with torch.cuda.stream(streams.compute):
@@ -641,6 +693,8 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
     dW1_local.record_stream(caller_stream)
     dW2_local.record_stream(caller_stream)
 
+    _nvtx_pop()  # moe_bwd_{bid}
+
     # Gradients match the op's input arity. Non-tensor inputs return None;
     # is_token_in_rank / topk_idx are integer / boolean inputs with no grad.
     return (
@@ -653,7 +707,6 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
         None,                 # buf_handle
         None,                 # streams_handle
         None,                 # num_experts
-        None,                 # dispatch_seq
         None,                 # tile_m
         None,                 # tile_n_a
         None,                 # tile_n_y
@@ -691,7 +744,15 @@ def _register(reg, obj):
     return h
 
 
-@torch.compiler.disable
+# DEBUG: removed `@torch.compiler.disable` so dynamo traces the call to
+# `torch.ops.stream_ep.moe` and inductor can insert cross-stream syncs
+# around the registered custom op. See logbook 2026-05-18 "Register
+# stream_moe_func as a torch.library.custom_op" — making the layer
+# opaque-to-dynamo (via custom_op) is what closes the CDMC>1 race where
+# `streams.communicate.wait_stream(caller_stream)` misses inductor's
+# other internal streams. The `@torch.compiler.disable` added in
+# 44fc996 defeats this mechanism: it makes dynamo graph-break on the
+# call rather than tracing through to the custom op.
 def stream_moe_func(
     buffer: StreamEPBuffer,
     x: torch.Tensor,
@@ -703,7 +764,6 @@ def stream_moe_func(
     *,
     streams: StreamHolder,
     num_experts: int,
-    dispatch_seq: int,
     tile_m: int = 128,
     tile_n_a: int = 192,
     tile_n_y: int = 256,
@@ -757,7 +817,6 @@ def stream_moe_func(
         _register(_BUFFER_REG, buffer),
         _register(_STREAMS_REG, streams),
         num_experts,
-        dispatch_seq,
         tile_m,
         tile_n_a,
         tile_n_y,

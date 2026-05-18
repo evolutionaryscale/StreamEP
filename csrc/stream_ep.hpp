@@ -240,6 +240,18 @@ private:
     volatile int* streaming_total_tiles = nullptr;
     int* streaming_total_tiles_mapped = nullptr;
 
+    // "Kernel started" flags for the cross-stream launch gate. Each is a
+    // single int32 in device memory. dispatch_main_kernel / dispatch_grads_main_kernel
+    // atomicAdd these once at entry (block 0 thread 0). The host issues
+    // `cuStreamBatchMemOp` wait_value_geq on the compute stream before
+    // launching the consumer kernel (kernel_a / kernel_y_bwd), forcing the
+    // consumer to wait until the dispatch kernel's block 0 is actually
+    // co-resident — so dispatch grabs SMs first.
+    int* dispatch_main_started_flag = nullptr;
+    int* dispatch_grads_started_flag = nullptr;
+    int dispatch_main_issued_count = 0;
+    int dispatch_grads_issued_count = 0;
+
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
@@ -276,6 +288,17 @@ public:
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
     void destroy();
+
+    // Wait on the compute stream until the most-recently-launched
+    // dispatch_main_kernel / dispatch_grads_main_kernel has actually entered
+    // execution (block 0 thread 0 atomicAdd'd the started_flag). Implemented
+    // as a host-queued `cuStreamBatchMemOp` wait_value_geq. The wait fires at
+    // the GPU front-end so the compute stream's pending kernel sits without
+    // consuming an SM; once dispatch has its block 0 co-resident, the wait
+    // passes and the compute kernel can launch onto the remaining SMs.
+    // Streams: takes a torch CUDAStream — typically the caller's compute stream.
+    void wait_dispatch_main_started(int64_t stream_handle);
+    void wait_dispatch_grads_started(int64_t stream_handle);
 
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
     // + one host sync per call: a fused metadata kernel (cross-rank count

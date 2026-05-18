@@ -106,6 +106,11 @@ struct DispatchTileSignal {
                                    //   NOT used for the per-tile ready signal — that pair
                                    //   was retired in favor of
                                    //   `pool_arrival_count == pool_arrival_target`.
+    // Monotonic "kernel entered" flag. Block 0 thread 0 atomicAdd's at entry;
+    // host queues `cuStreamBatchMemOp` wait_value_geq on the compute stream
+    // before launching kernel_a, so kernel_a's launch doesn't grab SMs before
+    // dispatch_main has at least its block 0 resident.
+    int* started_flag;
 };
 
 struct DispatchShape {
@@ -158,6 +163,8 @@ struct DispatchGradsTileSignal {
                                       //   (consumer spins on count == arrival_target)
     const int* pool_arrival_target;   // [total_tiles] int32  firing target (same as fwd's)
     int64_t dispatch_seq;             // NVL gen-stamp only (`nvl_seq = (seq << 1) | 1`).
+    // Monotonic "kernel entered" flag — see DispatchTileSignal::started_flag.
+    int* started_flag;
 };
 
 struct DispatchGradsShape {
