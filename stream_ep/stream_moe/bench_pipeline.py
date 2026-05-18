@@ -354,7 +354,7 @@ def main():
     # ── Bwd-side: materialize one dispatch_grads result for kernel_y_bwd /
     # kernel_a_bwd / dW1 / dW2 isolated timing. Iterated per-kernel timing
     # for the collective ops (dispatch, dispatch_grads, combine,
-    # combine_grads) lives in `profile_pipeline.py` — C4's single-slot
+    # combine_grads) lives in `profile_pipeline.py` — the single-slot
     # `rdma_channel_meta` region doesn't tolerate isolated rapid-fire at
     # sub-ms cadence (cross-rank wall-time drift races ahead and clobbers
     # the meta slot the lagging rank is still polling).

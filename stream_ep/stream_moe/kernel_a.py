@@ -15,8 +15,7 @@ Forward kernel A of the problem-tile streaming pipeline:
 Kernel A's downstream consumer (kernel Y) runs on the SAME compute stream and
 is FIFO-ordered after A: by the time Y issues its first instruction, A has
 fully retired and its TMA stores are drained. No per-tile A→Y release/acquire
-signal is needed — the historical `a_ready_count` / TileReadyRelease pair was
-deleted in the 3-stream collapse (see logbook entry).
+signal is needed.
 
 Inherits the GEMM mainloop, SwiGLU epilogue, scheduler-warp + pipeline-state
 machinery from `quack.gemm_act.GemmGatedSm90`. Streaming-specific behavior is

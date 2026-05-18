@@ -5,7 +5,7 @@ aggregator.
 This script doubles as the source of truth for collective-kernel per-call
 timing (dispatch / dispatch_grads / combine / combine_grads). `bench_pipeline`
 only times the compute-only kernels in isolation — the collective ops
-need natural per-iter slack to satisfy C4's single-slot rdma_channel_meta
+need natural per-iter slack to satisfy the single-slot `rdma_channel_meta`
 protocol, which the full fwd+bwd pipeline provides but a bench harness in
 pure rapid-fire does not. See `bench_pipeline.py`'s docstring for the
 ablation rows we still keep there.
@@ -17,7 +17,7 @@ What you should see in the resulting chrome trace
   a torch.cuda.Event recorded on the compute stream so kernel Y wins the
   SM race.
 - `compute stream`: streaming_moe_a → streaming_moe_y. Same-stream FIFO
-  covers the A → Y handoff (no per-tile a_ready_count signal). Kernel A's
+  covers the A → Y handoff (no per-tile A→Y signal). Kernel A's
   CTAs spin on pool_arrival_count[tile] == pool_arrival_target[tile] for
   the dispatch ↔ A overlap window. Combine's per-warp sender then picks
   up Y tiles as they retire via the per-token y_done_per_token gate.

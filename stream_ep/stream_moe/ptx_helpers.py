@@ -250,12 +250,8 @@ def red_release_gpu_add_s32(
     contributors have landed. `.release` semantics pair with the consumer's
     `.acquire` load to make the contributor's prior writes (TMA stores,
     SMEM-flushed atomic-scatters, etc.) observable; `.gpu` scope is enough
-    intra-GPU (different streams, same device — same intra-GPU L2 path PR #2
-    established for stamp release-stores).
-
-    Used by `TileReadyRelease` (kernel_a, kernel_y_bwd) to fire `a_ready_count` /
-    `bwd_a_ready_count` per stripe-CTA. Memory clobber semantics identical to
-    `st_release_gpu_global`.
+    intra-GPU (different streams, same device). Memory clobber semantics
+    identical to `st_release_gpu_global`.
     """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
@@ -279,10 +275,10 @@ def red_add_f32(
     atomics per layer at production (TK_padded × num_pid_n_y_bwd ≈ 32K × 8),
     all hot in L2 — throughput-trivial.
 
-    Default ``.gpu``-scope ``.relaxed`` semantics: the cross-stream
-    visibility to combine_grads's sender is carried by each stripe-CTA's
-    ``bwd_a_ready_count`` ``red.release.gpu.global.add`` (in the
-    ``TileReadyRelease`` epilogue end), not by this atomic itself.
+    Default ``.gpu``-scope ``.relaxed`` semantics: cross-stream visibility
+    to combine_grads's sender is carried by same-compute-stream FIFO
+    ordering (kernel_a_bwd retires after kernel_y_bwd and combine_grads
+    waits on the `a_bwd_started` event), not by this atomic itself.
     """
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(

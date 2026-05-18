@@ -1044,7 +1044,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     auto target_rank = role_meta.second;
     EP_DEVICE_ASSERT(num_warps == kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
 
-    // RDMA symmetric layout (same wire format as the legacy internode dispatch).
+    // RDMA symmetric layout.
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
     auto hidden_bytes = shape.hidden_int4 * sizeof(int4);
     auto num_bytes_per_token = get_num_bytes_per_token(shape.hidden_int4, shape.num_topk, shape.num_topk);
@@ -1384,8 +1384,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         }
     } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
         // RDMA consumers and NVL producers. Bulk-copy stage — no slot logic,
-        // no per-(c, src, e) bookkeeping. Wire format on NVL ring is the same
-        // as legacy internode dispatch (data + SourceMeta + topk_idx + topk_weights).
+        // no per-(c, src, e) bookkeeping. Wire format on NVL ring is
+        // data + SourceMeta + topk_idx + topk_weights.
         const auto dst_nvl_rank = target_rank;
 
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
@@ -1930,9 +1930,7 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // the helper warp-shuffles to assemble the per-token (rank, slot) topk
 // list.
 //
-// Streaming variant: biases (bias_0/bias_1) are dropped vs the legacy
-// `combine_token`. The intranode streaming combine never had biases either;
-// they were a legacy DeepEP non-streaming concept.
+// No biases (matches the intranode streaming combine).
 template <int kNumRanks,
           typename dtype_t,
           int kMaxNumRanks,

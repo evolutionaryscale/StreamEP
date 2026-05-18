@@ -7,21 +7,22 @@ uniform protocol:
     while ld_acquire_gpu_global_i32(arrival_count[tile]) != arrival_target[tile]:
         pass
 
-Producers (dispatch's Pass 2, kernel A's `TileReadyRelease`, dispatch_grads's
-Pass 2, kernel_y_bwd's `TileReadyRelease`) each issue one
+Producers (dispatch's Pass 2, dispatch_grads's Pass 2) each issue one
 `red.release.gpu.global.add.s32` per contribution. `.release` semantics on the
 add chain with the consumer's `.acquire` load to publish prior pool / postact
 writes; `.gpu` scope is enough intra-GPU (different streams, same device).
 
-  * Dispatch handoffs (multi-producer): caller passes
-    `pool_arrival_count` / `pool_arrival_target` from the dispatch metadata —
-    `pool_arrival_target[tile]` is the per-tile firing target (variable
-    across tiles).
-  * Epilogue handoffs (multi-stripe single-tile): caller passes
-    `a_ready_count` / `a_ready_target` (or `bwd_a_ready_count` /
-    `bwd_a_ready_target`). The target tensor is filled by the host wrapper
-    with `num_pid_n_producer` everywhere (`torch.full(..., num_pid_n, ...)`)
-    so each tile's target == the producer kernel's stripe count.
+  * Fwd handoff: caller passes `pool_arrival_count` / `pool_arrival_target`
+    from the dispatch metadata. Kernel A spins on these; kernel Y, FIFO-
+    ordered after A on the same compute stream, also passes them (its spin
+    no-ops).
+  * Bwd handoff: caller passes `bwd_dispatch_arrival_count` /
+    `pool_arrival_target` from the dispatch_grads metadata. Kernel_y_bwd
+    spins on these; kernel_a_bwd, FIFO-ordered after Y_bwd on compute,
+    reuses them (its spin no-ops).
+
+`pool_arrival_target[tile]` is the per-tile firing target (variable across
+tiles).
 
 Expert/pid_m are derived from `tile_id` by a warp-cooperative ballot lookup
 over `expert_pool_block_offset` — each scheduler-warp lane loads one entry (or
@@ -77,15 +78,15 @@ class StreamingTileSchedulerArguments:
     per contribution; the consumer terminates once the per-tile count hits the
     per-tile target. Both dispatch and epilogue handoffs share this protocol.
 
-    Dispatch handoffs (multi-producer, variable target across tiles): caller
-    passes `pool_arrival_count` / `pool_arrival_target` from the dispatch
-    metadata. Used by kernel A (fwd) and kernel_y_bwd (bwd).
+    Fwd handoff: caller passes `pool_arrival_count` / `pool_arrival_target`
+    from the dispatch metadata. Used by kernel A; kernel Y (FIFO-ordered
+    after A on the same compute stream) also passes them and its spin
+    no-ops.
 
-    Epilogue handoffs (multi-stripe single-tile, uniform target): caller passes
-    `a_ready_count` / `a_ready_target` (or `bwd_a_ready_count` /
-    `bwd_a_ready_target`). The target tensor is filled with
-    `num_pid_n_producer` everywhere by the host wrapper. Used by kernel Y
-    (fwd) and kernel_a_bwd (bwd).
+    Bwd handoff: caller passes `bwd_dispatch_arrival_count` /
+    `pool_arrival_target` from the dispatch_grads metadata. Used by
+    kernel_y_bwd; kernel_a_bwd (FIFO-ordered after Y_bwd on compute) reuses
+    them and its spin no-ops.
 
     Pool layout: kernel A reads `pool` (expert-major, BLOCK_M-padded) via
     standard strided TMA — no per-tile gather indirection. Each tile's m-row
@@ -344,17 +345,15 @@ class StreamingTileScheduler(TileScheduler):
             #
             # One protocol for every handoff: each producer fires
             # `red.release.gpu.global.add.s32(arrival_count[tile], delta)`;
-            # consumer terminates once count hits the per-tile target. For
-            # dispatch handoffs the target is per-tile variable (set by the
-            # dispatch metadata kernel); for epilogue handoffs the host
-            # wrapper fills it with `num_pid_n_producer` everywhere.
+            # consumer terminates once count hits the per-tile target
+            # (set by the dispatch / dispatch_grads metadata kernel).
             #
             # Cross-iter freshness is load-bearing: `arrival_count` MUST be
-            # fresh-zero per dispatch (CLAUDE.md anti-pattern §2). Stale
-            # state from iter N would let iter N+1's CTAs walk past the
-            # ready spin without waiting for the producer. The C++ slab
-            # zero-inits the fwd `pool_arrival_count` / `a_ready_count`;
-            # the orchestrator zero-inits the bwd analogs.
+            # fresh-zero per dispatch. Stale state from iter N would let
+            # iter N+1's CTAs walk past the ready spin without waiting for
+            # the producer. Dispatch's C++ slab zero-inits
+            # `pool_arrival_count`; dispatch_grads's slab zero-inits
+            # `bwd_dispatch_arrival_count`.
             if cute.arch.lane_idx() == 0:
                 count_ptr = utils.elem_pointer(params.arrival_count, (tile_id,))
                 target = params.arrival_target[tile_id]

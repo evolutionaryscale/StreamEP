@@ -7,24 +7,18 @@ a (M, num_pid_n) staging tensor.
 
 Why a custom op: kernel_y_bwd's epilogue produces the dL/dtopk_weight
 contribution per slot via ``Σ_n postact[m,n] * g[m,n]``. Each pid_n CTA
-covers an N-stripe of the I dim; with the upstream ``ColVecReduce`` the
-per-stripe partials land in ``dL_dweight_per_stripe[slot, n_stripe]`` and the
-orchestrator collapses them post-hoc with a ``.sum(dim=-1)`` torch op. That
-post-hoc reduction is a SECOND kernel on streams.compute_y, which forces a
-``weight_grads_ready`` event into combine_grads's path and destroys the
-per-recv-token streaming the ``bwd_a_done_per_token`` gate was
-designed for (combine has to wait for the .sum() to complete globally
-before its first packet ships).
+covers an N-stripe of the I dim; an upstream ``ColVecReduce`` would land
+per-stripe partials in ``dL_dweight_per_stripe[slot, n_stripe]`` requiring
+a post-hoc ``.sum(dim=-1)`` torch op — a second kernel on
+streams.compute that would force combine_grads to wait globally for the
+sum before its first packet ships, killing per-recv-token streaming.
 
-With per-pid_n fp32 atomic-add into a flat ``dL_dweight[slot]``, the
-per-tile ``bwd_a_ready`` release-store transitively publishes
-``dL_dweight`` along with the rest of the tile's writes (the
-``threadfence_system`` inside ``TileReadyRelease.end()`` is system-scope).
-Combine_grads's existing per-token gate
-(``bwd_a_done_per_token[r]``, fired by kernel_a_bwd which acquires
-``bwd_a_ready``) then transitively makes ``dL_dweight`` visible to
-combine's sender — no explicit cross-stream event, per-token streaming
-restored.
+With per-pid_n fp32 atomic-add directly into a flat ``dL_dweight[slot]``,
+kernel_y_bwd's atomics drain before kernel_a_bwd retires (same-stream
+FIFO) and combine_grads (gated on ``a_bwd_started``) sees the final
+values. Combine_grads's per-token gate
+(``bwd_a_done_per_token[r] >= dispatch_seq``, fired by kernel_a_bwd)
+drives per-recv-token streaming overlap with combine's sender.
 
 Atomic cost: TK_padded × num_pid_n_y_bwd ≈ 32K × 8 = 256K fp32 atomics
 per layer, all hot in L2. Throughput-trivial on H100 — the L2 atomic-add

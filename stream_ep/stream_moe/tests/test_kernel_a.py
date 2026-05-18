@@ -2,17 +2,17 @@
 
 These tests exercise the streaming-design properties directly:
   - test_compile: kernel compiles for a representative shape.
-  - test_single_tile: total_tiles=1, tile_ready pre-set. Numerics: matmul +
+  - test_single_tile: total_tiles=1, arrival pre-fired. Numerics: matmul +
     SwiGLU on pool[0:tile_m, :] vs an eager pytorch reference.
   - test_multi_tile_static: total_tiles=N spread across multiple experts via
-    expert_pool_block_offset; all tile_ready slots pre-set, persistent CTAs
-    absorb all tiles.
+    expert_pool_block_offset; all per-tile arrivals pre-fired, persistent
+    CTAs absorb all tiles.
   - test_producer_consumer: producer kernel on a different stream fires
-    tile_ready entries with delay; kernel A spins then drains.
+    pool_arrival_count entries with delay; kernel A spins then drains.
 
-Linear-claim layout:
-  * tile_ready[total_tiles] int64 — release stamps from dispatch's Pass 2 (or
-    a test stub). Consumer spins until tile_ready[tile_id] >= dispatch_seq.
+Per-tile ready handshake:
+  * (pool_arrival_count, pool_arrival_target) int32 pair. Consumer spins
+    until ``pool_arrival_count[tile] == pool_arrival_target[tile]``.
   * Internal consumer_head[1] int32 (allocated inside `streaming_moe_a`) —
     single global atomic-add counter for linear claims.
 
@@ -135,7 +135,7 @@ def test_streaming_moe_a_compiles(device):
 
 
 def test_streaming_moe_a_single_tile(device):
-    """total_tiles=1, tile_ready pre-set. Validates the full kernel path:
+    """total_tiles=1, arrival pre-fired. Validates the full kernel path:
     linear claim, scheduler 5-int payload, strided pool read, per-tile postact,
     expert lookup via tile_id_to_expert.
     """
@@ -320,9 +320,9 @@ def test_streaming_moe_a_with_preact(device):
 
 
 def test_streaming_moe_a_producer_consumer(device):
-    """Kernel A on compute_a_stream spins on tile_ready while a producer
-    kernel on a separate stream release-stores dispatch_seq slot by slot
-    with delays between fires.
+    """Kernel A on compute_a_stream spins on pool_arrival_count while a
+    producer kernel on a separate stream release-adds into each slot with
+    delays between fires.
     """
     from stream_ep.stream_moe.kernel_a import (
         fire_tiles_with_delay,

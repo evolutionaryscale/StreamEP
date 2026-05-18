@@ -18,8 +18,8 @@ inputs:
      tile_m``); padding rows have ``pool_recv_token == -1``.
   3. Per-(recv_token, k) coverage — every (r, k) routing to a local expert is
      recorded in exactly one pool slot.
-  4. ``tile_ready[tile_id] == dispatch_seq`` for every tile_id in
-     ``[0, total_tiles)``.
+  4. ``pool_arrival_count[tile_id] == pool_arrival_target[tile_id]`` for
+     every tile_id in ``[0, total_tiles)``.
   5. ``tile_id_to_expert`` and ``pool_arrival_target`` agree with the
      ``expert_pool_block_offset`` partition.
   6. ``k_local_remaining[r]`` matches the count of local-expert landings
@@ -205,7 +205,7 @@ def main():
     tile_id_to_expert        = out.tile_id_to_expert.cpu()
     pool_arrival_target      = out.pool_arrival_target.cpu()
     expert_frequency         = out.expert_frequency.cpu()
-    tile_ready               = out.tile_ready.cpu()
+    pool_arrival_count       = out.pool_arrival_count.cpu()
     k_local_remaining      = out.k_local_remaining.cpu()
     recv_token_to_slots      = out.recv_token_to_slots.cpu()
     k_local_total            = out.k_local_total.cpu()
@@ -217,10 +217,11 @@ def main():
         T_recv=T_recv, TK_padded=TK_padded, tile_m=tile_m,
         num_topk=num_topk, this_rank=rank)
 
-    # ─── (4) tile_ready[tile_id] == dispatch_seq for all tile_id. ────────────
-    assert (tile_ready[:total_tiles] == 1).all(), (
-        f"tile_ready not all == dispatch_seq (1); first mismatches at "
-        f"{(tile_ready[:total_tiles] != 1).nonzero().flatten()[:8]}")
+    # ─── (4) pool_arrival_count[tile] == pool_arrival_target[tile]. ─────────
+    pool_arrival_target_v = pool_arrival_target[:total_tiles]
+    assert torch.equal(pool_arrival_count[:total_tiles], pool_arrival_target_v), (
+        "pool_arrival_count not fully fired; first mismatches at "
+        f"{(pool_arrival_count[:total_tiles] != pool_arrival_target_v).nonzero().flatten()[:8]}")
 
     # ─── (5) tile_id_to_expert and pool_arrival_target agree with offsets. ──
     for tile_id in range(total_tiles):
@@ -280,9 +281,10 @@ def main():
     valid = (pool_recv_token >= 0)
     assert torch.equal(out.pool.cpu()[valid], out2.pool.cpu()[valid]), \
         "pool data (valid rows) not deterministic across re-runs"
-    assert (out2.tile_ready[:total_tiles].cpu() == 2).all(), (
-        f"second-run tile_ready not all == 2; first mismatches at "
-        f"{(out2.tile_ready[:total_tiles].cpu() != 2).nonzero().flatten()[:8]}")
+    out2_pac = out2.pool_arrival_count[:total_tiles].cpu()
+    assert torch.equal(out2_pac, pool_arrival_target_v), (
+        "second-run pool_arrival_count not fully fired; first mismatches at "
+        f"{(out2_pac != pool_arrival_target_v).nonzero().flatten()[:8]}")
 
     if rank == 0:
         print(f"PASS: world_size={world_size} T_recv={T_recv} "

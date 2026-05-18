@@ -3,9 +3,8 @@
 Mirrors `test_kernel_a.py`'s structure since kernel_y_bwd uses the
 same streaming scheduler. kernel_y_bwd consumes the dispatch_grads handoff
 via count-vs-target on (``bwd_dispatch_arrival_count``,
-``pool_arrival_target``). The Y_bwd → A_bwd handoff is now implicit
-same-stream FIFO, so the historical ``bwd_a_ready_count`` release-add
-chain is gone.
+``pool_arrival_target``). The Y_bwd → A_bwd handoff is implicit
+same-compute-stream FIFO.
 
 Reference math (SwiGLU bwd folded into the epilogue):
   g[slot, :]                = dL_do_pool[slot] @ W2[e]            (unweighted)

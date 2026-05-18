@@ -170,9 +170,8 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         # postact, g) BEFORE colvec_reduce_accumulate / weight multiply /
         # mD / mPostAct stores. Conditional ASSIGNMENT (not multiply) is
         # required: matmul(garbage, W2) at padding rows can produce inf/NaN,
-        # and `0 * inf = NaN`. This eliminates the host-side zero-init of
-        # `pool` / `dL_do_pool` / `dL_dswiglu_in` / `postact_a_for_dW2` that
-        # was the MVP workaround.
+        # and `0 * inf = NaN`. Removes the need to host-zero-init `pool` /
+        # `dL_do_pool` / `dL_dswiglu_in` / `postact_a_for_dW2`.
         ColVecLoad("mPaddingMask"),
         ColVecReduceAtomic("mColVecReduce"),
     )
@@ -542,12 +541,10 @@ def streaming_moe_y_bwd(
     ``dL_dweight`` is atomic-added in-kernel via ``red.global.add.f32`` —
     each pid_n CTA contributes its in-CTA-reduced row sum to the flat
     ``(TK_padded,)`` fp32 buffer. **Caller MUST zero-init ``dL_dweight``
-    before launch on the same stream.** Each stripe-CTA's per-tile
-    `red.release.gpu.global.add.s32(bwd_a_ready_count, 1)` publishes that
-    CTA's ``dL_dweight`` atomic-adds across the release semantics — so
-    combine_grads's per-token gate (``bwd_a_done_per_token[r]``, fired
-    by kernel_a_bwd which acquires ``bwd_a_ready_count``) makes them
-    visible to combine's sender — no explicit cross-stream event needed.
+    before launch on the same stream.** Kernel_a_bwd runs FIFO-ordered
+    after kernel_y_bwd on the same compute stream, so by the time
+    combine_grads (waiting on `a_bwd_started`) reads ``dL_dweight`` the
+    atomics are drained — no per-tile cross-stream release needed.
 
     ``postact_a_for_dW2`` is TMA-stored via the standard mPostAct path
     (GemmActMixin's TileStore). Each pid_n CTA writes its (tile_M, tile_N)

@@ -702,10 +702,9 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     out.pool_recv_token            = at::from_blob(base + off_pool_recv_token,     {TK_padded},                          keep, i32_opts);
     out.pool_k_slot                = at::from_blob(base + off_pool_k_slot,         {TK_padded},                          keep, i32_opts);
 
-    // FIX FOR CDMC>1: queue Z_post memset BEFORE metadata_done event.
-    // The original design deferred Z_post for streaming overlap, relying on
-    // CDMC=1 FIFO ordering. Under CDMC>1, consumer kernels on separate HW
-    // queues can race against this memset and have their writes clobbered.
+    // Z_post memset must precede metadata_done event so that consumer kernels
+    // gated on the event (potentially on separate HW queues under CDMC>1)
+    // cannot race against this memset and have their writes clobbered.
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
     out.metadata_done_event = EventHandle(stream);
@@ -884,7 +883,9 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     out.pool_k_slot                     = at::from_blob(base + off_pool_k_slot,            {TK_padded},                                  keep, i32_opts);
     out.recv_token_to_slots             = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},                  keep, i32_opts);
 
-    // FIX FOR CDMC>1: queue Z_post memset BEFORE metadata_done event.
+    // Z_post memset must precede metadata_done event (see intranode dispatch
+    // for rationale: consumers gated on the event may run on a separate HW
+    // queue under CDMC>1 and race the memset).
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
     out.metadata_done_event = EventHandle(stream);
@@ -1756,7 +1757,7 @@ bool is_sm90_compiled() {
 }  // namespace stream_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "StreamEP: streaming-tile expert-parallel dispatch / combine (fork of DeepEP)";
+    m.doc() = "StreamEP: streaming-tile expert-parallel dispatch / combine";
 
     pybind11::class_<stream_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(),

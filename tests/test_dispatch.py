@@ -2,7 +2,8 @@
 
 Exercises ``Buffer.dispatch`` (pool-layout: dispatch's receiver writes each
 landed (token, k) pair routing to a local expert into its own pool slot, and
-fires tile_ready in expert-major order at substream end). Verifies:
+release-adds into ``pool_arrival_count`` in expert-major order at substream
+end). Verifies:
 
   1. Pool data correctness — each pool slot matches its source rank's token data.
   2. Pool layout — slots fall in their expert's pool region (bounded by
@@ -10,7 +11,8 @@ fires tile_ready in expert-major order at substream end). Verifies:
      have pool_recv_token == -1.
   3. Per-(recv_token, k) coverage — every (r, k) with recv-side k routing to a
      local expert is recorded in exactly one pool slot.
-  4. tile_ready[tile_id] == dispatch_seq for every tile_id in [0, total_tiles).
+  4. pool_arrival_count[tile_id] == pool_arrival_target[tile_id] for every
+     tile_id in [0, total_tiles) — every tile fully fired by dispatch.
   5. tile_id_to_expert agrees with the slot range.
   6. Bit-determinism: re-running dispatch produces identical pool placement.
 """
@@ -136,9 +138,13 @@ def main():
         f"pool covers {seen_rk.sum()} (rt, k) pairs but expected {expected_seen.sum()}"
     )
 
-    # ─── (3) tile_ready[tile_id] == dispatch_seq for all tile_id.
-    ready = handle.tile_ready[:total_tiles].cpu()
-    assert (ready == 1).all(), f"tile_ready not all == dispatch_seq (1); mismatches at {(ready != 1).nonzero().flatten()[:8]}"
+    # ─── (3) pool_arrival_count[tile] == pool_arrival_target[tile] for all tiles.
+    pool_arrival_count = handle.pool_arrival_count[:total_tiles].cpu()
+    pool_arrival_target_v = pool_arrival_target[:total_tiles]
+    assert torch.equal(pool_arrival_count, pool_arrival_target_v), (
+        "pool_arrival_count not fully fired; mismatches at "
+        f"{(pool_arrival_count != pool_arrival_target_v).nonzero().flatten()[:8]}"
+    )
 
     # ─── (4) tile_id_to_expert agrees with the expert_pool_block_offset partition.
     for tile_id in range(total_tiles):
@@ -168,7 +174,7 @@ def main():
     # ─── (6) Pipeline buffer initialization. k_local_remaining[r] should equal
     #         K_local(r) (the count of local-expert landings for recv-token r),
     #         which is also the count of pool slots for r. y_done_per_token
-    #         and o (and a_ready_count) should be zero-init.
+    #         and o should be zero-init.
     k_local_remaining = handle.k_local_remaining.cpu()
     assert k_local_remaining.shape == (T_recv,), (
         f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)"
@@ -180,10 +186,8 @@ def main():
     )
     compute_done = handle.y_done_per_token.cpu()
     assert (compute_done == 0).all(), "y_done_per_token should be zero-init"
-    a_ready_count_t = handle.a_ready_count[:total_tiles].cpu()
-    assert (a_ready_count_t == 0).all(), "a_ready_count should be zero-init"
-    assert handle.a_ready_count.dtype == torch.int32, (
-        f"a_ready_count must be int32; got {handle.a_ready_count.dtype}"
+    assert handle.pool_arrival_count.dtype == torch.int32, (
+        f"pool_arrival_count must be int32; got {handle.pool_arrival_count.dtype}"
     )
     o_t = handle.o.cpu()
     assert o_t.shape == (T_recv, hidden), f"o shape {o_t.shape} != ({T_recv}, {hidden})"

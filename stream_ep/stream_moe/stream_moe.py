@@ -252,9 +252,7 @@ class StreamMoEFunc(torch.autograd.Function):
             # next to dispatch from the compute stream's queue. The
             # communicate stream waits on the event before launching
             # combine_main, so kernel_y's 132 persistent CTAs win the SM
-            # race against combine's 80. This replaces the historical
-            # device-side `kernel_y_started_sentinel` + cuStreamBatchMemOp
-            # gate (CDMC>1 fix) with a pure torch.cuda.Event.
+            # race against combine's 80.
             y_started = torch.cuda.Event()
             y_started.record()
 

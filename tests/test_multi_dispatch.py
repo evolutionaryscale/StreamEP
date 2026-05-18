@@ -11,7 +11,7 @@ Validates:
   2. Pool layout — slots fall in the right expert's pool region.
   3. Per-(recv_token, k) coverage — every routed-to-local pair has exactly
      one pool slot.
-  4. tile_ready[i] == dispatch_seq for i in [0, total_tiles).
+  4. pool_arrival_count[i] == pool_arrival_target[i] after each dispatch.
   5. pool_arrival_target sized correctly per tile.
 """
 
@@ -89,10 +89,12 @@ def validate_dispatch(
         f"dispatch {dispatch_seq}: pool covers {seen_rk.sum()} pairs, expected {expected_seen.sum()}"
     )
 
-    # (4) tile_ready
-    ready = handle.tile_ready[:total_tiles].cpu()
-    assert (ready == dispatch_seq).all(), (
-        f"dispatch {dispatch_seq}: tile_ready mismatches at {(ready != dispatch_seq).nonzero().flatten()[:8]}"
+    # (4) pool_arrival_count fired to per-tile target
+    arrival_count = handle.pool_arrival_count[:total_tiles].cpu()
+    target_v = pool_arrival_target[:total_tiles]
+    assert torch.equal(arrival_count, target_v), (
+        f"dispatch {dispatch_seq}: pool_arrival_count mismatches at "
+        f"{(arrival_count != target_v).nonzero().flatten()[:8]}"
     )
 
     # (5) pool_arrival_target

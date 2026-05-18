@@ -8,10 +8,11 @@ Verifies:
   1. dL_do_pool[slot] equals the source rank's dL_dy[t_src] for every
      (recv_token r, k_local k) pair with slot >= 0, where (sender_rank, t_src)
      is derived locally from rank-major recv layout + is_token_in_rank.
-  2. bwd_y_ready[tile_id] == dispatch_seq for every tile_id in [0, total_tiles).
+  2. bwd_dispatch_arrival_count[tile_id] == bwd_dispatch_arrival_target[tile_id]
+     for every tile_id in [0, total_tiles).
   3. Bit-determinism across re-runs.
 
-Mirror of test_streaming_dispatch.py for the bwd path.
+Mirror of test_dispatch.py for the bwd path.
 """
 
 from __future__ import annotations
@@ -71,15 +72,15 @@ def main():
     dL_dy = dL_dy.contiguous()
 
     # Run dispatch_grads.
-    dL_do_pool, bwd_y_ready = buf.dispatch_grads(handle, dL_dy, dispatch_seq=1)
+    dL_do_pool, bwd_arrival_count, _grads_started = buf.dispatch_grads(handle, dL_dy, dispatch_seq=1)
     torch.cuda.synchronize()
 
     assert dL_do_pool.shape == (TK_padded, hidden), \
         f"dL_do_pool shape {dL_do_pool.shape} != ({TK_padded}, {hidden})"
     assert dL_do_pool.dtype == torch.bfloat16
-    assert bwd_y_ready.shape == (total_tiles,), \
-        f"bwd_y_ready shape {bwd_y_ready.shape} != ({total_tiles},)"
-    assert bwd_y_ready.dtype == torch.int64
+    assert bwd_arrival_count.shape == (total_tiles,), \
+        f"bwd_arrival_count shape {bwd_arrival_count.shape} != ({total_tiles},)"
+    assert bwd_arrival_count.dtype == torch.int32
 
     # Build expected: for each rank S, gather S's dL_dy + is_token_in_rank.
     # Then construct per-rank's local recv-token → source-token-id mapping
@@ -128,22 +129,23 @@ def main():
                       f"expected {expected[:4]}... got {got[:4]}...")
     assert mismatches == 0, f"[rank {rank}] {mismatches} slot mismatches in dL_do_pool"
 
-    # bwd_y_ready[tile_id] should equal dispatch_seq for every tile.
-    bwd_y_ready_cpu = bwd_y_ready.cpu()
-    expected_seq = 1
-    assert (bwd_y_ready_cpu == expected_seq).all(), (
-        f"bwd_y_ready not fully fired; first deviating tile_id: "
-        f"{(bwd_y_ready_cpu != expected_seq).nonzero().flatten()[:8]}"
+    # bwd_arrival_count[tile_id] should equal pool_arrival_target[tile_id]
+    # (same per-tile target as the fwd dispatch handoff).
+    pool_arrival_target_cpu = handle.pool_arrival_target[:total_tiles].cpu()
+    bwd_arrival_count_cpu = bwd_arrival_count.cpu()
+    assert torch.equal(bwd_arrival_count_cpu, pool_arrival_target_cpu), (
+        f"bwd_arrival_count not fully fired; first deviating tile_id: "
+        f"{(bwd_arrival_count_cpu != pool_arrival_target_cpu).nonzero().flatten()[:8]}"
     )
 
     # Determinism: re-run dispatch_grads with same handle, same input → same output.
-    dL_do_pool2, bwd_y_ready2 = buf.dispatch_grads(handle, dL_dy, dispatch_seq=2)
+    dL_do_pool2, bwd_arrival_count2, _grads_started2 = buf.dispatch_grads(handle, dL_dy, dispatch_seq=2)
     torch.cuda.synchronize()
     valid = (handle.pool_recv_token.cpu() >= 0)
     assert torch.equal(dL_do_pool.cpu()[valid], dL_do_pool2.cpu()[valid]), \
         "dL_do_pool (valid rows) not deterministic"
-    assert (bwd_y_ready2.cpu() == 2).all(), \
-        "bwd_y_ready did not fire to dispatch_seq=2 on second call"
+    assert torch.equal(bwd_arrival_count2.cpu(), pool_arrival_target_cpu), \
+        "bwd_arrival_count did not refire to pool_arrival_target on second call"
 
     if rank == 0:
         print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} "
