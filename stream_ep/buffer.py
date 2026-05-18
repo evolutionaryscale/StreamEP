@@ -109,6 +109,7 @@ class Buffer:
 
     num_sms: int = 20
 
+    @torch.compiler.disable
     def __init__(self,
                  group: Optional[dist.ProcessGroup],
                  num_nvl_bytes: int = 0,
@@ -338,6 +339,7 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
+    @torch.compiler.disable
     def dispatch(self, x: torch.Tensor,
                  topk_idx: torch.Tensor,
                  topk_weights: torch.Tensor,
@@ -447,6 +449,7 @@ class Buffer:
         return out.pool, handle, out.metadata_done_event
 
     # noinspection PyTypeChecker
+    @torch.compiler.disable
     def dispatch_grads(self, handle: 'StreamingHandle', dL_dy: torch.Tensor,
                        *,
                        dispatch_seq: Optional[int] = None,
@@ -504,6 +507,7 @@ class Buffer:
         return dL_do_pool, bwd_dispatch_arrival_count, grads_started_event
 
     # noinspection PyTypeChecker
+    @torch.compiler.disable
     def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
                 *,
                 combine_seq: int = 1,
@@ -558,6 +562,7 @@ class Buffer:
         return recv_x, None
 
     # noinspection PyTypeChecker
+    @torch.compiler.disable
     def combine_grads(self, dL_dx_per_r: torch.Tensor, handle: 'StreamingHandle',
                       weight_grads: torch.Tensor,
                       bwd_a_done_per_token: torch.Tensor,

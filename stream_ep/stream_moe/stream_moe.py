@@ -691,6 +691,7 @@ def _register(reg, obj):
     return h
 
 
+@torch.compiler.disable
 def stream_moe_func(
     buffer: StreamEPBuffer,
     x: torch.Tensor,
@@ -727,9 +728,18 @@ def stream_moe_func(
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
-    Routes through ``torch.ops.stream_ep.moe`` so dynamo treats the layer as
-    opaque; under torch.compile this lets inductor place the right stream
-    syncs on the boundary. In eager mode it's a direct call.
+    Routes through ``torch.ops.stream_ep.moe`` (registered as a custom op
+    so it's opaque to dynamo). On top of that, this entry point is itself
+    ``@torch.compiler.disable``'d: callers can wrap their outer model in
+    ``torch.compile`` without dynamo tracing through any of the streaming-MoE
+    surface. The disable is enforced at the library boundary rather than
+    asked of every consumer because under CDMC>1 the cross-rank
+    ``barrier_block`` in the metadata kernel cannot tolerate per-rank skew
+    from compile-side decisions (autotune, specialize/generalize transitions,
+    cudagraph capture↔replay) — if one rank takes a recompile path the
+    others don't, the barrier deadlocks. The custom op remains the right
+    integration primitive for any caller that does manage to reach it
+    through a compiled graph.
 
     The dW1/dW2 tile knobs (``tile_m_dW1``, ``tile_n_dW1``, ``tile_m_dW2``,
     ``tile_n_dW2``) override the dW grouped GEMM tile shape. ``None`` falls
