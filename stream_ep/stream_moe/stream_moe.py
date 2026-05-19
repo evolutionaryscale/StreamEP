@@ -227,6 +227,44 @@ def _nan_probe(seq: int, **tensors: torch.Tensor) -> None:
         _NAN_PROBE_CURSOR += 1
 
 
+def _int_oob_probe(seq: int, **tensor_bounds: tuple[torch.Tensor, int, int]) -> None:
+    """Async non-syncing out-of-bounds check for integer tensors.
+
+    Companion to `_nan_probe` for ints: `isfinite` is meaningless on int32,
+    so this probes whether any element is outside `[lo, hi]` (inclusive)
+    instead. Use case: validate FWD-saved routing tensors
+    (`recv_token_to_slots`, `recv_gbl_channel_prefix_matrix`) at the end
+    of bwd — if any slot index is OOB, BWD's dispatch_grads was reading
+    corrupt routing data.
+
+    Each argument is `name=(tensor, lo, hi)`. Same pinned-buffer +
+    `non_blocking` D2H mechanism as `_nan_probe`; no host sync.
+    """
+    if not _NAN_PROBE_ENABLED:
+        return
+    global _NAN_PROBE_BUF, _NAN_PROBE_CURSOR, _NAN_PROBE_OVERFLOWED
+    if _NAN_PROBE_BUF is None:
+        _NAN_PROBE_BUF = torch.zeros(
+            _NAN_PROBE_CAPACITY, dtype=torch.uint8, pin_memory=True
+        )
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+    for name, (t, lo, hi) in tensor_bounds.items():
+        if _NAN_PROBE_CURSOR >= _NAN_PROBE_CAPACITY:
+            _NAN_PROBE_OVERFLOWED = True
+            return
+        bad = ((t < lo) | (t > hi)).any().to(torch.uint8)
+        _NAN_PROBE_BUF[_NAN_PROBE_CURSOR].copy_(bad, non_blocking=True)
+        _NAN_PROBE_LABELS.append(
+            f"rank={rank} seq={seq} {name}_oob "
+            f"(bounds=[{lo},{hi}], shape={tuple(t.shape)}, dtype={t.dtype})"
+        )
+        _NAN_PROBE_CURSOR += 1
+
+
 def dump_nan_probe() -> None:
     """Print every probed (call, tensor) whose async-stamped flag is set.
 
@@ -795,16 +833,35 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
     # kernel_y_bwd, dL_dx_per_r from kernel_a_bwd, dL_dx /
     # dL_dtopk_weights from combine_grads, dW1_local / dW2_local from
     # the grouped GEMMs.
-    # Two-tensor probe — minimal so we don't perturb timing enough to
-    # mask the race. `dL_dy_input` = upstream gradient (input to bwd);
-    # `dL_do_pool` = dispatch_grads output. If dL_dy_input is finite
-    # but dL_do_pool is NaN, dispatch_grads itself manufactured the
-    # NaN at this seq. Probing more tensors here re-masks the bug.
+    # Two-tensor float probe — minimal so we don't perturb timing
+    # enough to mask the race. dispatch_grads takes finite dL_dy and
+    # writes NaN to dL_do_pool at internode; probing more tensors here
+    # re-masks the bug.
     _nan_probe(
         seq=handle.dispatch_seq,
         dL_dy_input=dL_dy,
         dL_do_pool=dL_do_pool,
     )
+    # Int-bounds probe on the FWD-saved routing tensors that
+    # dispatch_grads reads to look up output slots. If these are
+    # corrupted between FWD write and BWD read, dispatch_grads scatters
+    # data into wrong rows of dL_do_pool and the NaN we observe is
+    # downstream of routing corruption rather than a kernel bug.
+    #   recv_token_to_slots[r, k] = pool slot, or -1 if not local → bounds [-1, TK_padded - 1]
+    #   recv_gbl_channel_prefix_matrix[src_world, channel] = cumulative
+    #     recv-token offset → bounds [0, T_recv]
+    if handle._dispatch_out is not None and hasattr(
+        handle._dispatch_out, "recv_gbl_channel_prefix_matrix"
+    ) and handle._dispatch_out.recv_gbl_channel_prefix_matrix.numel() > 0:
+        _int_oob_probe(
+            seq=handle.dispatch_seq,
+            recv_token_to_slots=(handle.recv_token_to_slots, -1, TK_padded - 1),
+            recv_gbl_channel_prefix_matrix=(
+                handle._dispatch_out.recv_gbl_channel_prefix_matrix,
+                0,
+                T_recv,
+            ),
+        )
 
     _nvtx_pop()  # moe_bwd_{bid}
 
