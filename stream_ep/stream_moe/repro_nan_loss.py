@@ -89,14 +89,18 @@ class TinyMoEClassifier(nn.Module):
         )
         self.head = nn.Linear(hidden, vocab_size, bias=False, dtype=DTYPE)
 
-        # Shared expert weights across layers (matches repro_fast_fail);
-        # each layer still gets its own stream_moe_func call.
-        self.w1_local = nn.Parameter(
-            torch.randn(local_E, 2 * intermediate, hidden, dtype=DTYPE) * 0.02
-        )
-        self.w2_local = nn.Parameter(
-            torch.randn(local_E, hidden, intermediate, dtype=DTYPE) * 0.02
-        )
+        # Per-layer expert weights (matches production — each MoE layer owns
+        # its own E_local experts). Sharing across layers (as repro_fast_fail
+        # does) would collapse all layers' dW1 / dW2 contributions into a
+        # single gradient buffer, hiding which layer first goes NaN.
+        self.w1_local = nn.ParameterList([
+            nn.Parameter(torch.randn(local_E, 2 * intermediate, hidden, dtype=DTYPE) * 0.02)
+            for _ in range(n_layers)
+        ])
+        self.w2_local = nn.ParameterList([
+            nn.Parameter(torch.randn(local_E, hidden, intermediate, dtype=DTYPE) * 0.02)
+            for _ in range(n_layers)
+        ])
 
         self.buffer = None
         self.streams = None
@@ -128,8 +132,8 @@ class TinyMoEClassifier(nn.Module):
                 topk_idx,
                 topk_weights,
                 is_token_in_rank,
-                self.w1_local,
-                self.w2_local,
+                self.w1_local[layer_idx],
+                self.w2_local[layer_idx],
                 streams=self.streams,
                 num_experts=self.num_experts,
                 tile_m=TILE_M,
@@ -143,14 +147,19 @@ class TinyMoEClassifier(nn.Module):
         return loss
 
 
-def _any_nan_grad(model: nn.Module) -> tuple[bool, str]:
-    """Return (has_nan, first_param_name_with_nan)."""
+def _nan_grad_names(model: nn.Module) -> list[str]:
+    """Return list of `"name: n_nan/numel"` for every parameter whose grad has
+    any NaN/Inf, so the caller can distinguish a localized blip (a few bad
+    rows from a bad atomic) from full-tensor corruption (whole grad NaN)."""
+    out: list[str] = []
     for name, p in model.named_parameters():
         if p.grad is None:
             continue
-        if not torch.isfinite(p.grad).all():
-            return True, name
-    return False, ""
+        bad_mask = ~torch.isfinite(p.grad)
+        n_bad = int(bad_mask.sum().item())
+        if n_bad > 0:
+            out.append(f"{name}: {n_bad}/{p.grad.numel()}")
+    return out
 
 
 def main():
@@ -224,13 +233,12 @@ def main():
 
         loss.backward()
 
-        nan_grad = False
-        nan_grad_name = ""
+        nan_grads: list[str] = []
         if args.check_grads:
-            nan_grad, nan_grad_name = _any_nan_grad(
+            nan_grads = _nan_grad_names(
                 model._orig_mod if hasattr(model, "_orig_mod") else model
             )
-            if nan_grad and first_nan_grad_iter < 0:
+            if nan_grads and first_nan_grad_iter < 0:
                 first_nan_grad_iter = i
 
         optimizer.step()
@@ -239,8 +247,8 @@ def main():
             tag = ""
             if loss_is_nan:
                 tag += " [LOSS_NAN]"
-            if nan_grad:
-                tag += f" [GRAD_NAN: {nan_grad_name}]"
+            if nan_grads:
+                tag += f" [GRAD_NAN: {','.join(nan_grads)}]"
             print(
                 f"[nan-repro] iter {i + 1}/{args.n_iter} "
                 f"loss={loss.item():.4f}{tag}",
