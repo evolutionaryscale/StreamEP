@@ -161,6 +161,13 @@ _NVTX_BWD_COUNT = 0
 import os as _os
 _NVTX_ENABLED = bool(_os.environ.get("STREAM_EP_NVTX"))
 
+# Diagnostic NaN/Inf boundary probe — set STREAM_MOE_NAN_PROBE=1 to
+# enable. Inserts an `isfinite(...).all().item()` sync at the end of
+# `_moe_bwd_impl` and prints any tensor with NaN/Inf, tagged with the
+# rank and dispatch_seq (= layer index within the iter). Off by default
+# because each enabled tensor adds a CPU↔GPU sync per backward call.
+_NAN_PROBE_ENABLED = bool(_os.environ.get("STREAM_MOE_NAN_PROBE"))
+
 
 def _nvtx_push(name: str) -> None:
     if _NVTX_ENABLED:
@@ -170,6 +177,31 @@ def _nvtx_push(name: str) -> None:
 def _nvtx_pop() -> None:
     if _NVTX_ENABLED:
         torch.cuda.nvtx.range_pop()
+
+
+def _nan_probe(seq: int, **tensors: torch.Tensor) -> None:
+    """Print which bwd-stage tensors contain NaN/Inf, tagged by rank+seq.
+
+    Called at end-of-bwd so all streams have joined; each `.item()` is one
+    CPU↔GPU sync. The argument names label the producing kernel so the
+    output reveals which boundary first emits NaN.
+    """
+    if not _NAN_PROBE_ENABLED:
+        return
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+    for name, t in tensors.items():
+        n_bad = int((~torch.isfinite(t)).sum().item())
+        if n_bad > 0:
+            print(
+                f"[nan-probe rank={rank} seq={seq}] {name}: "
+                f"{n_bad}/{t.numel()} nan/inf (shape={tuple(t.shape)}, "
+                f"dtype={t.dtype})",
+                flush=True,
+            )
 
 
 def _moe_fwd_impl(
@@ -564,25 +596,26 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
         # so neither dW destination needs zero-init.
         dW1_local = torch.empty_like(w1_local)
         dW2_local = torch.empty_like(w2_local)
-        # Build cu_seqlens_k / lens_k_dW on the compute stream where the
-        # dW GEMMs will run, FIFO-ordered before the launches below. The
-        # source handle tensors (expert_pool_block_offset,
-        # expert_frequency) were written by fwd dispatch on
-        # communicate; visible on caller_stream after fwd's exit chain,
-        # and visible on compute after the fan-out gate below.
-        cu_seqlens_k = (
-            handle.expert_pool_block_offset.to(torch.int32) * tile_m
-        ).contiguous()
-        lens_k_dW = handle.expert_frequency.to(torch.int32)
 
     # ── Single fan-out gate on caller_stream ───────────────────────────
     streams.communicate.wait_stream(caller_stream)
     streams.compute.wait_stream(caller_stream)
 
-    # Caller-dependent setup op — handle.k_local_total was written on
-    # streams.communicate in fwd; visible on caller_stream after fwd's
-    # exit chain. Copy onto streams.compute after the wait_stream above.
+    # Reads of FWD-written handle tensors (expert_pool_block_offset,
+    # expert_frequency, k_local_total — all on the fwd post-poll bundle,
+    # written on FWD's communicate stream) MUST happen after the fan-out
+    # gate above so compute has joined caller_stream's FWD-completion
+    # state. Doing these `.to()` / arithmetic before the gate was a real
+    # bug at internode: the .to() reads on compute would race against
+    # FWD's communicate writes and pull stale / partially-initialized
+    # values, producing wrong cu_seqlens_k → wrong K-tile bounds in dW2
+    # → reads of garbage padding rows of pool → NaN dW2 grads on
+    # specific experts.
     with torch.cuda.stream(streams.compute):
+        cu_seqlens_k = (
+            handle.expert_pool_block_offset.to(torch.int32) * tile_m
+        ).contiguous()
+        lens_k_dW = handle.expert_frequency.to(torch.int32)
         bwd_k_local_remaining.copy_(handle.k_local_total, non_blocking=True)
 
     # ── Stage 1 — dispatch_grads on streams.communicate ────────────────
@@ -702,6 +735,28 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
     dL_dtopk_weights.record_stream(caller_stream)
     dW1_local.record_stream(caller_stream)
     dW2_local.record_stream(caller_stream)
+
+    # Diagnostic NaN-boundary probe (STREAM_MOE_NAN_PROBE=1). Argument
+    # names label the producing kernel so the output reveals where NaN
+    # first appears: dL_do_pool from dispatch_grads, dL_dswiglu_in /
+    # postact_a_for_dW2 / dL_dweight / bwd_a_done_per_token from
+    # kernel_y_bwd, dL_dx_per_r from kernel_a_bwd, dL_dx /
+    # dL_dtopk_weights from combine_grads, dW1_local / dW2_local from
+    # the grouped GEMMs.
+    _nan_probe(
+        seq=handle.dispatch_seq,
+        dL_do_pool=dL_do_pool,
+        bwd_dispatch_arrival_count=bwd_dispatch_arrival_count,
+        dL_dswiglu_in=dL_dswiglu_in,
+        postact_a_for_dW2=postact_a_for_dW2,
+        dL_dweight=dL_dweight,
+        bwd_a_done_per_token=bwd_a_done_per_token,
+        dL_dx_per_r=dL_dx_per_r,
+        dL_dx=dL_dx,
+        dL_dtopk_weights=dL_dtopk_weights,
+        dW1_local=dW1_local,
+        dW2_local=dW2_local,
+    )
 
     _nvtx_pop()  # moe_bwd_{bid}
 
