@@ -47,6 +47,7 @@ from stream_ep.stream_moe.profile_pipeline import (
     rank_zero_print,
 )
 from stream_ep.stream_moe.stream_moe import (
+    dump_nan_probe,
     make_streams,
     stream_moe_func,
 )
@@ -266,6 +267,11 @@ def main():
         f"[nan-repro] first_nan_loss_iter={first_nan_loss_iter} "
         f"first_nan_grad_iter={first_nan_grad_iter}"
     )
+
+    # Dump any NaN/Inf events the async probes stamped into the pinned
+    # buffer. The torch.cuda.synchronize() above ensures all queued
+    # D2H copies have landed.
+    dump_nan_probe()
 
     torch_dist.destroy_process_group()
 

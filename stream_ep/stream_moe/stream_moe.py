@@ -162,11 +162,19 @@ import os as _os
 _NVTX_ENABLED = bool(_os.environ.get("STREAM_EP_NVTX"))
 
 # Diagnostic NaN/Inf boundary probe — set STREAM_MOE_NAN_PROBE=1 to
-# enable. Inserts an `isfinite(...).all().item()` sync at the end of
-# `_moe_bwd_impl` and prints any tensor with NaN/Inf, tagged with the
-# rank and dispatch_seq (= layer index within the iter). Off by default
-# because each enabled tensor adds a CPU↔GPU sync per backward call.
+# enable. Stamps a pinned host buffer asynchronously per (call, tensor)
+# pair so the heisenbug we're chasing (any CPU↔GPU sync at end-of-bwd
+# masks the remaining expert-grad NaN) doesn't get re-masked by the
+# probe itself. The probe queues `(~isfinite(t)).any().to(uint8)` on the
+# current stream + `pinned_buf[i].copy_(flag, non_blocking=True)` for
+# the async D2H — no host wait. Host reads the buffer via
+# `dump_nan_probe()` after the final `torch.cuda.synchronize()`.
 _NAN_PROBE_ENABLED = bool(_os.environ.get("STREAM_MOE_NAN_PROBE"))
+_NAN_PROBE_CAPACITY = 100_000  # slots — generous for n_iter*n_layers*n_tensors
+_NAN_PROBE_BUF: torch.Tensor | None = None  # pinned uint8 [_NAN_PROBE_CAPACITY]
+_NAN_PROBE_LABELS: list[str] = []
+_NAN_PROBE_CURSOR = 0
+_NAN_PROBE_OVERFLOWED = False
 
 
 def _nvtx_push(name: str) -> None:
@@ -180,28 +188,72 @@ def _nvtx_pop() -> None:
 
 
 def _nan_probe(seq: int, **tensors: torch.Tensor) -> None:
-    """Print which bwd-stage tensors contain NaN/Inf, tagged by rank+seq.
+    """Async non-syncing NaN/Inf check.
 
-    Called at end-of-bwd so all streams have joined; each `.item()` is one
-    CPU↔GPU sync. The argument names label the producing kernel so the
-    output reveals which boundary first emits NaN.
+    For each tensor: launches `(~isfinite(t)).any().to(uint8)` on the
+    current CUDA stream (a single reduction kernel — no host sync), then
+    `pinned_buf[cursor].copy_(flag, non_blocking=True)` to stamp the
+    result D2H into a pinned host buffer. The pinned destination + the
+    non_blocking flag together keep this off the critical path — no
+    `cudaStreamSynchronize`, no implicit host wait — so the probe
+    doesn't perturb stream timing enough to mask the very race we're
+    trying to catch.
+
+    Call `dump_nan_probe()` after a final `torch.cuda.synchronize()` to
+    print every (seq, tensor) pair whose flag came back nonzero.
     """
     if not _NAN_PROBE_ENABLED:
         return
+    global _NAN_PROBE_BUF, _NAN_PROBE_CURSOR, _NAN_PROBE_OVERFLOWED
+    if _NAN_PROBE_BUF is None:
+        _NAN_PROBE_BUF = torch.zeros(
+            _NAN_PROBE_CAPACITY, dtype=torch.uint8, pin_memory=True
+        )
     rank = (
         torch.distributed.get_rank()
         if torch.distributed.is_initialized()
         else 0
     )
     for name, t in tensors.items():
-        n_bad = int((~torch.isfinite(t)).sum().item())
-        if n_bad > 0:
+        if _NAN_PROBE_CURSOR >= _NAN_PROBE_CAPACITY:
+            _NAN_PROBE_OVERFLOWED = True
+            return
+        flag = (~torch.isfinite(t)).any().to(torch.uint8)
+        _NAN_PROBE_BUF[_NAN_PROBE_CURSOR].copy_(flag, non_blocking=True)
+        _NAN_PROBE_LABELS.append(
+            f"rank={rank} seq={seq} {name} "
+            f"(shape={tuple(t.shape)}, dtype={t.dtype})"
+        )
+        _NAN_PROBE_CURSOR += 1
+
+
+def dump_nan_probe() -> None:
+    """Print every probed (call, tensor) whose async-stamped flag is set.
+
+    Caller must `torch.cuda.synchronize()` first so all the queued D2H
+    copies have actually landed. Only rank 0 prints, since the labels
+    embed rank.
+    """
+    if _NAN_PROBE_BUF is None:
+        return
+    buf = _NAN_PROBE_BUF[: _NAN_PROBE_CURSOR].tolist()
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+    n_hits = 0
+    for i, flag in enumerate(buf):
+        if flag:
             print(
-                f"[nan-probe rank={rank} seq={seq}] {name}: "
-                f"{n_bad}/{t.numel()} nan/inf (shape={tuple(t.shape)}, "
-                f"dtype={t.dtype})",
-                flush=True,
+                f"[nan-probe HIT] {_NAN_PROBE_LABELS[i]}", flush=True
             )
+            n_hits += 1
+    if rank == 0:
+        msg = f"[nan-probe] {n_hits}/{_NAN_PROBE_CURSOR} probes saw NaN/Inf"
+        if _NAN_PROBE_OVERFLOWED:
+            msg += f" (probe buffer overflowed at {_NAN_PROBE_CAPACITY} slots)"
+        print(msg, flush=True)
 
 
 def _moe_fwd_impl(
@@ -743,19 +795,15 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
     # kernel_y_bwd, dL_dx_per_r from kernel_a_bwd, dL_dx /
     # dL_dtopk_weights from combine_grads, dW1_local / dW2_local from
     # the grouped GEMMs.
+    # Two-tensor probe — minimal so we don't perturb timing enough to
+    # mask the race. `dL_dy_input` = upstream gradient (input to bwd);
+    # `dL_do_pool` = dispatch_grads output. If dL_dy_input is finite
+    # but dL_do_pool is NaN, dispatch_grads itself manufactured the
+    # NaN at this seq. Probing more tensors here re-masks the bug.
     _nan_probe(
         seq=handle.dispatch_seq,
+        dL_dy_input=dL_dy,
         dL_do_pool=dL_do_pool,
-        bwd_dispatch_arrival_count=bwd_dispatch_arrival_count,
-        dL_dswiglu_in=dL_dswiglu_in,
-        postact_a_for_dW2=postact_a_for_dW2,
-        dL_dweight=dL_dweight,
-        bwd_a_done_per_token=bwd_a_done_per_token,
-        dL_dx_per_r=dL_dx_per_r,
-        dL_dx=dL_dx,
-        dL_dtopk_weights=dL_dtopk_weights,
-        dW1_local=dW1_local,
-        dW2_local=dW2_local,
     )
 
     _nvtx_pop()  # moe_bwd_{bid}
