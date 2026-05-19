@@ -252,6 +252,18 @@ private:
     int dispatch_main_issued_count = 0;
     int dispatch_grads_issued_count = 0;
 
+    // Caller's compute-stream cudaStream_t (set once from Python via
+    // `set_compute_stream_handle`; zero until set). Used to
+    // `record_stream` every per-call `torch::empty`/`torch::zeros` slab
+    // and pool tensor in dispatch / combine / dispatch_grads so the
+    // caching allocator waits for compute (consumer) — not just for
+    // communicate (allocation stream) — before reusing the storage. The
+    // kernel_y / kernel_a writes to slabs like `y_done_per_token`, `o`,
+    // and pool run on `compute`; without this the allocator can recycle
+    // a slab while compute is still touching it and the next iter's
+    // memset clobbers in-flight values.
+    int64_t compute_stream_handle_ = 0;
+
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
@@ -299,6 +311,14 @@ public:
     // Streams: takes a torch CUDAStream — typically the caller's compute stream.
     void wait_dispatch_main_started(int64_t stream_handle);
     void wait_dispatch_grads_started(int64_t stream_handle);
+
+    // Register the caller's compute-stream cudaStream_t. Subsequent
+    // dispatch / combine / dispatch_grads calls record_stream every
+    // per-call slab/pool tensor onto it so the caching allocator waits
+    // for compute (consumer) before reusing the storage. Called once
+    // per (Buffer, StreamHolder) pair by `stream_moe_func`; safe to call
+    // multiple times.
+    void set_compute_stream_handle(int64_t stream_handle);
 
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
     // + one host sync per call: a fused metadata kernel (cross-rank count

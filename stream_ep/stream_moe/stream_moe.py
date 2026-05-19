@@ -548,6 +548,16 @@ def _moe_bwd_impl(ctx, dL_dy, dL_dpreact_a, dL_dpool):
         )
         # dL_dweight: per-pid_n fp32 atomic-add target; MUST zero-init.
         dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
+    # Allocated on `streams.compute` (block above) but read by
+    # `buffer.combine_grads` on `streams.communicate` below. PyTorch's
+    # caching allocator only tracks the allocation stream's events for
+    # reuse — without record_stream the storage can be recycled while
+    # combine_grads is still reading on `communicate`. Symmetric to the
+    # C++-side `record_consumer_stream` plumbing on dispatch slabs (see
+    # `Buffer::set_compute_stream_handle`).
+    dL_dx_per_r.record_stream(streams.communicate)
+    bwd_a_done_per_token.record_stream(streams.communicate)
+    dL_dweight.record_stream(streams.communicate)
 
     with torch.cuda.stream(streams.compute):
         # quack `gemm` with default `add_to_output=False` overwrites D,
@@ -811,6 +821,13 @@ def stream_moe_func(
 
     Returns the cross-rank-reduced output of shape ``[num_tokens, hidden]``.
     """
+    # Register the compute stream so the C++ Buffer's per-dispatch slabs
+    # (`torch::empty`'d on the communicate stream) are record_stream'd onto
+    # `compute` too. Without this, the caching allocator only tracks the
+    # communicate stream and can recycle a slab while kernel_y / kernel_a
+    # on compute are still reading or writing. Cheap; idempotent stores an
+    # int handle, so calling per-layer is fine.
+    buffer.runtime.set_compute_stream_handle(streams.compute.cuda_stream)
     out, _preact_a, _pool = torch.ops.stream_ep.moe(
         x,
         topk_idx,

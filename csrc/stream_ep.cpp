@@ -396,6 +396,10 @@ void Buffer::wait_dispatch_grads_started(int64_t stream_handle) {
                              dispatch_grads_issued_count);
 }
 
+void Buffer::set_compute_stream_handle(int64_t stream_handle) {
+    compute_stream_handle_ = stream_handle;
+}
+
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
@@ -516,6 +520,24 @@ private:
     int64_t cursor_ = 0;
 };
 
+// Tell the caching allocator that the consumer stream identified by
+// `consumer_stream_handle` (raw cudaStream_t cast to int64_t) also touches
+// `t`'s storage. Without this, the allocator only tracks the allocation
+// stream (= caller's current stream = communicate) and can recycle the
+// storage while consumer-stream kernels (kernel_a / kernel_y, bwd path)
+// are still reading or writing. No-op when handle is 0.
+//
+// Only meaningful for tensors whose storage is the caching allocator's
+// (i.e. `torch::empty`/`torch::zeros`); views constructed via `at::from_blob`
+// have a custom deleter and aren't allocator-tracked — recording on a view
+// is silently a no-op.
+inline void record_consumer_stream(const torch::Tensor& t, int64_t consumer_stream_handle) {
+    if (consumer_stream_handle == 0) return;
+    t.record_stream(at::cuda::getStreamFromExternal(
+        reinterpret_cast<cudaStream_t>(consumer_stream_handle),
+        t.device().index()));
+}
+
 void validate_dispatch_inputs(const torch::Tensor& x,
                               const torch::Tensor& topk_idx,
                               const torch::Tensor& topk_weights,
@@ -580,7 +602,8 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
                                        int num_ranks,
                                        int num_channels,
                                        int num_local_experts,
-                                       at::cuda::CUDAStream stream) {
+                                       at::cuda::CUDAStream stream,
+                                       int64_t consumer_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
 
@@ -596,6 +619,7 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
     int64_t off_pool_arrival_target      = b.reserve<int>(total_tiles_max);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
+    record_consumer_stream(bundle, consumer_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
     CUDA_CHECK(cudaMemsetAsync(base, 0, b.total_bytes(), stream));
 
@@ -743,7 +767,8 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
                                          int num_tokens,
                                          int total_tiles,
                                          const torch::TensorOptions& x_options,
-                                         at::cuda::CUDAStream stream) {
+                                         at::cuda::CUDAStream stream,
+                                         int64_t consumer_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
     auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
@@ -774,6 +799,7 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
+    record_consumer_stream(bundle, consumer_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
@@ -833,7 +859,8 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int64_t total_tiles_ma
                                                           int num_rdma_ranks,
                                                           int num_channels,
                                                           int num_local_experts,
-                                                          at::cuda::CUDAStream stream) {
+                                                          at::cuda::CUDAStream stream,
+                                                          int64_t consumer_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
 
@@ -852,6 +879,7 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int64_t total_tiles_ma
     int64_t off_total_tiles_device  = b.reserve<int>(1);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
+    record_consumer_stream(bundle, consumer_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
     CUDA_CHECK(cudaMemsetAsync(base, 0, b.total_bytes(), stream));
 
@@ -917,7 +945,8 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
                                                             int total_tiles,
                                                             int source_meta_bytes,
                                                             const torch::TensorOptions& x_options,
-                                                            at::cuda::CUDAStream stream) {
+                                                            at::cuda::CUDAStream stream,
+                                                            int64_t consumer_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
     auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
@@ -950,6 +979,7 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
+    record_consumer_stream(bundle, consumer_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
@@ -1026,7 +1056,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
 
     // Pre-host-poll bundle: metadata kernel outputs + sender's prefix matrix.
     int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
-    auto pre = allocate_pre_poll_bundle(total_tiles_max, num_ranks, num_channels, num_local_experts, stream);
+    auto pre = allocate_pre_poll_bundle(total_tiles_max, num_ranks, num_channels, num_local_experts, stream, compute_stream_handle_);
 
     intranode::streaming_dispatch_metadata(topk_idx.data_ptr<topk_idx_t>(),
                                            pre.expert_frequency.data_ptr<int>(),
@@ -1084,11 +1114,12 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     // `lens_k` to bound the K-tile via TMA's OOB-zero-fill (bwd dW1's
     // grouped GEMM). Padding rows are never read.
     auto pool = torch::empty({TK_padded, hidden}, x.options());
+    record_consumer_stream(pool, compute_stream_handle_);
 
     auto post = allocate_post_poll_bundle(
         TK_padded, hidden, poll.num_recv_tokens, num_topk,
         num_ranks, num_channels, num_tokens, poll.total_tiles,
-        x.options(), stream);
+        x.options(), stream, compute_stream_handle_);
 
     // Narrow the per-tile arrays from total_tiles_max → total_tiles for the
     // returned views. `narrow` on a from_blob'd tensor returns a view sharing
@@ -1236,12 +1267,14 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     // `lens_k` which bounds the K-tile via TMA's OOB-zero-fill. Padding
     // rows are never functionally read.
     auto dL_do_pool = torch::empty({TK_padded, hidden}, dL_dy.options());
+    record_consumer_stream(dL_do_pool, compute_stream_handle_);
 
     // Per-tile signal arrays. Both zero-init: bwd_dispatch_arrival_count
     // accumulates Pass 2 release-adds; kernel_y_bwd's scheduler spins on
     // `bwd_dispatch_arrival_count[tile] == pool_arrival_target[tile]`.
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
+    record_consumer_stream(bwd_dispatch_arrival_count, compute_stream_handle_);
 
     // Reset IPC ring control bytes (start_offset / end_offset / head_idx /
     // tail_idx) — same 4×num_channels×num_ranks region fwd dispatch zeros at
@@ -1361,6 +1394,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
         ? c10::nullopt
         : c10::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, f32_opts));
     float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
+    if (recv_topk_weights_out.has_value())
+        record_consumer_stream(*recv_topk_weights_out, compute_stream_handle_);
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
@@ -1376,6 +1411,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
 
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    record_consumer_stream(recv_x, compute_stream_handle_);
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * x.element_size() +  // Data buffer
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
@@ -1464,7 +1500,8 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // channel prefix matrices come in two tiers (rdma + gbl).
     int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
     auto pre = allocate_pre_poll_bundle_internode(total_tiles_max, num_ranks, num_rdma_ranks,
-                                                  num_channels, num_local_experts, stream);
+                                                  num_channels, num_local_experts, stream,
+                                                  compute_stream_handle_);
 
     // Streaming SymBuffer offset within rdma_buffer_ptr — placed AFTER the
     // metadata kernel's count payload (legacy count-exchange section of the
@@ -1526,11 +1563,13 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // combine's gather) or uses quack's `lens_k` for OOB-zero-fill (bwd dW
     // grouped GEMM). Padding rows are never read.
     auto pool = torch::empty({TK_padded, hidden}, x.options());
+    record_consumer_stream(pool, compute_stream_handle_);
 
     auto post = allocate_post_poll_bundle_internode(
         TK_padded, hidden, num_recv_tokens, num_rdma_recv_tokens, num_topk,
         num_ranks, num_rdma_ranks, num_channels, num_tokens, total_tiles,
-        internode::get_source_meta_bytes(), x.options(), stream);
+        internode::get_source_meta_bytes(), x.options(), stream,
+        compute_stream_handle_);
 
     auto tile_id_to_expert_n   = pre.tile_id_to_expert.narrow(0, 0, total_tiles);
     auto pool_arrival_target_n = pre.pool_arrival_target.narrow(0, 0, total_tiles);
@@ -1670,8 +1709,10 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto dL_do_pool = torch::zeros({TK_padded, hidden}, dL_dy.options());
+    record_consumer_stream(dL_do_pool, compute_stream_handle_);
     auto i32_opts = at::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
+    record_consumer_stream(bwd_dispatch_arrival_count, compute_stream_handle_);
 
     // No pre-bwd-dispatch cleanup: under the cumulative ring-control
     // protocols (RDMA head/tail amo, RDMA meta sentinel-amo, NVL gen-stamp),
@@ -1804,11 +1845,14 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
     // pre-multiplies pool_topk_weight per row); C++ returns `c10::nullopt`
     // and Python surfaces as `None`.
     auto recv_x = torch::empty({num_combined_tokens, hidden}, x.options());
+    record_consumer_stream(recv_x, compute_stream_handle_);
     auto f32_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
         ? c10::nullopt
         : c10::optional<torch::Tensor>(torch::empty({num_combined_tokens, num_topk}, f32_opts));
     float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
+    if (recv_topk_weights_out.has_value())
+        record_consumer_stream(*recv_topk_weights_out, compute_stream_handle_);
 
     // kNVLSender ships recv-side `x` back to source ranks → it needs the
     // *recv*-side per-(src_world, channel) prefix (`recv_gbl_channel_prefix_matrix`),
@@ -1922,6 +1966,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("destroy", &stream_ep::Buffer::destroy)
         .def("wait_dispatch_main_started", &stream_ep::Buffer::wait_dispatch_main_started)
         .def("wait_dispatch_grads_started", &stream_ep::Buffer::wait_dispatch_grads_started)
+        .def("set_compute_stream_handle", &stream_ep::Buffer::set_compute_stream_handle)
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)
