@@ -51,6 +51,7 @@ fails.
 
 from __future__ import annotations
 
+import argparse
 import os
 
 import torch
@@ -131,27 +132,34 @@ def scenario_half_empty_experts(T: int, K: int, E: int, world_size: int, rank: i
     return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
 
 
-def scenario_per_rank_imbalance(T: int, K: int, E: int, world_size: int, rank: int,
-                                 device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """90% of tokens are routed exclusively to experts owned by rank 1.
-
-    Deterministic: token t is "hot" if (t * 10) // T < 9 (first 90% of tokens).
-    Hot tokens pick K experts from rank-1's range; cold tokens rotate through
-    all experts (uniform-rotating fallback).
+def make_per_rank_imbalance(skew_pct: int):
+    """Factory: returns a scenario that routes ``skew_pct``% of tokens exclusively
+    to experts owned by rank 1. The remaining ``100 - skew_pct``% rotate through
+    all experts (uniform fallback). At skew_pct=0 it's effectively uniform; at
+    skew_pct=100 every token goes to rank 1.
     """
-    num_local_experts = E // world_size
-    target_rank = min(1, world_size - 1)   # rank 1 if world_size >= 2, else rank 0
-    target_e_lo = target_rank * num_local_experts
-    target_e_hi = target_e_lo + num_local_experts
-    # Hot tokens: K experts rotated within rank-1's range.
-    t_ix = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1)
-    k_ix = torch.arange(K, device=device, dtype=torch.int64).unsqueeze(0)
-    hot_idx = target_e_lo + ((t_ix * K + k_ix) % num_local_experts)
-    # Cold tokens: full-E rotation.
-    cold_idx = (t_ix * K + k_ix) % E
-    is_hot = (t_ix * 10 < 9 * T).expand(T, K)
-    topk_idx = torch.where(is_hot, hot_idx, cold_idx).contiguous()
-    return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
+    skew_pct = max(0, min(100, int(skew_pct)))
+
+    def scenario(T: int, K: int, E: int, world_size: int, rank: int,
+                 device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_local_experts = E // world_size
+        target_rank = min(1, world_size - 1)
+        target_e_lo = target_rank * num_local_experts
+        t_ix = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1)
+        k_ix = torch.arange(K, device=device, dtype=torch.int64).unsqueeze(0)
+        hot_idx = target_e_lo + ((t_ix * K + k_ix) % num_local_experts)
+        cold_idx = (t_ix * K + k_ix) % E
+        # Hot iff t * 100 < skew_pct * T (deterministic first-N-fraction split).
+        is_hot = (t_ix * 100 < skew_pct * T).expand(T, K)
+        topk_idx = torch.where(is_hot, hot_idx, cold_idx).contiguous()
+        return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
+    return scenario
+
+
+def scenario_per_rank_imbalance(T, K, E, world_size, rank, device):
+    """90% of tokens to rank 1 — default skew, kept as the canonical scenario name
+    when the test is invoked without --per-rank-skew."""
+    return make_per_rank_imbalance(90)(T, K, E, world_size, rank, device)
 
 
 def scenario_power_law(T: int, K: int, E: int, world_size: int, rank: int,
@@ -268,6 +276,16 @@ def run_scenario(name: str, builder, *,
 
 
 def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--scenario", action="append", default=None,
+                   help="Run only the named scenarios (may repeat). Default: all SCENARIOS in order.")
+    p.add_argument("--per-rank-skew", type=int, default=None,
+                   help="Override skew_pct on the per_rank_imbalance scenario (0-100). "
+                        "Default 90 (the SCENARIOS default).")
+    p.add_argument("--T", type=int, default=SEQ_LEN_PER_RANK,
+                   help="Per-rank token count (default = production SEQ_LEN_PER_RANK).")
+    args = p.parse_args()
+
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -281,15 +299,33 @@ def main():
         f"NUM_EXPERTS={NUM_EXPERTS} must be divisible by world_size={world_size}")
     num_local_experts = NUM_EXPERTS // world_size
 
-    # Production-shape inputs. Override via env for fast intranode iteration.
-    T = int(os.environ.get("STREAM_MOE_SKEW_T", SEQ_LEN_PER_RANK))
-    H_dim = int(os.environ.get("STREAM_MOE_SKEW_H", H))
+    T = args.T
+    H_dim = H
     K = TOPK
     E = NUM_EXPERTS
 
+    # Apply --per-rank-skew override by rebuilding that scenario's builder.
+    scenarios = list(SCENARIOS)
+    if args.per_rank_skew is not None:
+        scenarios = [
+            (f"per_rank_imbalance_{args.per_rank_skew}pct", make_per_rank_imbalance(args.per_rank_skew))
+            if name == "per_rank_imbalance" else (name, builder)
+            for name, builder in scenarios
+        ]
+    # Filter via --scenario if given.
+    if args.scenario:
+        wanted = set(args.scenario)
+        scenarios = [(n, b) for n, b in scenarios if n in wanted or n.startswith("per_rank_imbalance_")]
+        if not scenarios:
+            if rank == 0:
+                print(f"[skewed-experts] no scenarios matched {args.scenario}", flush=True)
+            dist.destroy_process_group()
+            return
+
     if rank == 0:
         print(f"[skewed-experts] world_size={world_size} T={T} H={H_dim} K={K} E={E} "
-              f"local_E={num_local_experts}", flush=True)
+              f"local_E={num_local_experts} per_rank_skew={args.per_rank_skew or 'default(90)'}", flush=True)
+        print(f"[skewed-experts] scenarios: {[n for n, _ in scenarios]}", flush=True)
 
     # Buffer + streams: shared across scenarios.
     buffer = make_buffer(group, NUM_SMS)
@@ -310,7 +346,7 @@ def main():
     # reporting on the next one.
     results: list[tuple[str, str, str]] = []  # (name, status, msg) where status in {PASS, FAIL, SKIPPED}
     bailed = False
-    for name, builder in SCENARIOS:
+    for name, builder in scenarios:
         if bailed:
             results.append((name, "SKIPPED", f"{name}: skipped (prior scenario poisoned CUDA context)"))
             if rank == 0:
