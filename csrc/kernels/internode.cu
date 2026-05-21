@@ -65,16 +65,8 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 // the caller stamps in the LSB (fwd vs bwd of one layer), that's still
 // ~2^30 phase-distinct logical iters — ~16M training steps × 64 layers
 // before any aliasing risk. Effectively infinite for production training.
-__forceinline__ __device__ uint64_t nvl_pack(int64_t seq, int value) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(seq)) << 32) |
-           static_cast<uint64_t>(static_cast<uint32_t>(value));
-}
-__forceinline__ __device__ bool nvl_seq_match(uint64_t packed, int64_t seq) {
-    return static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(seq);
-}
-__forceinline__ __device__ int nvl_unpack_value(uint64_t packed) {
-    return static_cast<int>(static_cast<uint32_t>(packed));
-}
+// `nvl_pack` / `nvl_seq_match` / `nvl_unpack_value` are in `utils.cuh`
+// (shared with intranode).
 
 // Signed-difference atomicMax for the persistent `reader_prev_*` arrays.
 // The on-the-wire NIC AMO is 4-byte (mlx5 ATOMIC_MASKED_FA), so the slot's

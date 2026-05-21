@@ -184,15 +184,51 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
                                 cudaStream_t stream,
                                 int num_sms);
 
-void encode_combine_heads(void** buffer_ptrs,
-                           int* send_head,
-                           int num_channels,
-                           int num_recv_tokens,
-                           int num_memset_int,
-                           int** barrier_signal_ptrs,
-                           int rank,
-                           int num_ranks,
-                           cudaStream_t stream);
+// Total bytes of intranode dispatch's IPC sub-buffer chain on
+// `buffer_ptrs[rank]`: 4 meta regions (start/end/head/tail as uint64
+// genstamped slots) + `channel_x_buffers` + `channel_src_idx_buffers` +
+// `channel_topk_idx_buffers` + `channel_topk_weights_buffers`. Combine
+// kernels offset their base by this value to land in a physically disjoint
+// region of the IPC slab. Replaces the prior shared layout (where
+// combine's head/tail aliased dispatch's start/end_offset and needed the
+// encode_combine_heads bracketed memset to reset) — same shape Bug B.2 was
+// at internode, fixed there via 47a9b16.
+__host__ __device__ inline int64_t intranode_get_dispatch_section_bytes(
+    int num_channels, int num_ranks, int num_recv_buffer_tokens,
+    int hidden_int4, int num_topk) {
+    const int64_t channels = num_channels;
+    const int64_t ranks = num_ranks;
+    const int64_t slots = num_recv_buffer_tokens;
+    const int64_t h4 = hidden_int4;
+    const int64_t topk = num_topk;
+    int64_t bytes = 0;
+    bytes += ranks * ranks * sizeof(int);                                          // rank_prefix_matrix
+    bytes += 4 * channels * ranks * sizeof(uint64_t);                              // start/end/head/tail (genstamped)
+    bytes += channels * ranks * slots * h4 * sizeof(int4);                         // channel_x_buffers
+    bytes += channels * ranks * slots * sizeof(int);                               // channel_src_idx_buffers
+    bytes += channels * ranks * slots * topk * sizeof(topk_idx_t);                 // channel_topk_idx_buffers
+    bytes += channels * ranks * slots * topk * sizeof(float);                      // channel_topk_weights_buffers
+    return (bytes + 127) / 128 * 128;
+}
+
+// Total bytes of intranode combine's IPC sub-buffer chain — 2 meta regions
+// (head/tail genstamped) + `channel_x_buffers` + `channel_topk_weights_buffers`.
+// No src_idx / topk_idx because combine doesn't carry those.
+__host__ __device__ inline int64_t intranode_get_combine_section_bytes(
+    int num_channels, int num_ranks, int num_recv_buffer_tokens,
+    int hidden_int4, int num_topk) {
+    const int64_t channels = num_channels;
+    const int64_t ranks = num_ranks;
+    const int64_t slots = num_recv_buffer_tokens;
+    const int64_t h4 = hidden_int4;
+    const int64_t topk = num_topk;
+    int64_t bytes = 0;
+    bytes += 2 * channels * ranks * sizeof(uint64_t);                              // head/tail (genstamped)
+    bytes += channels * ranks * slots * h4 * sizeof(int4);                         // channel_x_buffers
+    bytes += channels * ranks * slots * sizeof(int);                               // src_idx skip (dispatch writes, combine doesn't read — kept for layout parity)
+    bytes += channels * ranks * slots * topk * sizeof(float);                      // channel_topk_weights_buffers
+    return (bytes + 127) / 128 * 128;
+}
 
 // combine_main_kernel — used by both forward combine and backward combine_grads.
 // Per-direction differences are entirely in args (per_slot_weights tensor,
@@ -221,6 +257,12 @@ void launch_combine_main(cudaDataType_t type,
              int hidden,
              int num_topk,
              void** buffer_ptrs,
+             // Byte offset on each peer's `buffer_ptrs[i]` past dispatch's
+             // sub-buffer chain. Combine's chain lives at
+             // `[dispatch_section_bytes, dispatch_section_bytes +
+             // combine_section_bytes)`, physically disjoint from dispatch.
+             // See `intranode_get_dispatch_section_bytes` above.
+             int64_t dispatch_section_bytes,
              int rank,
              int num_ranks,
              cudaStream_t stream,

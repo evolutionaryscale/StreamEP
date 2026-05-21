@@ -29,6 +29,24 @@
 
 namespace stream_ep {
 
+// (seq32, value32) genstamp pack/unpack for cross-iter slot reuse without
+// memsets. Writer packs `(current_seq, value)` into a uint64 slot. Reader
+// loads uint64, checks seq match; mismatch ⇒ stale residue from a prior
+// iter, treat as "not yet written this iter." Wrap horizon is 32-bit seq
+// (~2^31 phase-distinct iters with the LSB phase bit; ~16M training steps
+// × 64 layers — effectively infinite for production training, paired-skip
+// invariant covers the modular edge).
+__forceinline__ __device__ uint64_t nvl_pack(int64_t seq, int value) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(seq)) << 32) |
+           static_cast<uint64_t>(static_cast<uint32_t>(value));
+}
+__forceinline__ __device__ bool nvl_seq_match(uint64_t packed, int64_t seq) {
+    return static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(seq);
+}
+__forceinline__ __device__ int nvl_unpack_value(uint64_t packed) {
+    return static_cast<int>(static_cast<uint32_t>(packed));
+}
+
 template <int kBytes>
 struct VecInt {};
 template <>

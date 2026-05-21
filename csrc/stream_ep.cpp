@@ -207,6 +207,13 @@ Buffer::Buffer(int rank,
         // No need to synchronize, will do a full device sync during `sync`
         auto current_stream = at::cuda::getCurrentCUDAStream();
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, current_stream));
+        // Once-only NVL slab zero-init. Iter-0 readers of the genstamped
+        // meta slots see packed (seq=0, value=0); seq mismatches the
+        // first kernel's `nvl_seq` (which starts at >= 1 via
+        // Buffer._next_seq), so iter-0 spins until the first sender's
+        // write lands. Replaces the prior per-iter cudaMemsetAsync +
+        // intranode::barrier pair that fired before every dispatch.
+        CUDA_CHECK(cudaMemsetAsync(buffer_ptrs[nvl_rank], 0, num_nvl_bytes, current_stream));
         CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + streaming_section_offset, 0,
                                    streaming_section_bytes, current_stream));
     }
@@ -1084,24 +1091,20 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
                                            expert_alignment,
                                            stream);
 
-    // The dispatch main kernel reads rank_prefix_matrix from buffer_ptrs[rank]
-    // (the IPC slab, offset 0) and the channel queue metadata immediately after.
-    // The queue metadata (start_offset, end_offset, head_idx, tail_idx —
-    // 4 × num_channels × num_ranks ints) must be zeroed each dispatch so the
-    // receiver's spin on `channel_start_offset != 0` doesn't latch onto a stale
-    // value from a prior dispatch.
-    int num_memset_int = num_channels * num_ranks * 4;
-    EP_HOST_ASSERT((num_ranks * num_ranks + num_memset_int) * sizeof(int) <= num_nvl_bytes);
+    // Copy rank_prefix_matrix into the IPC slab head. The queue metadata
+    // that follows (start_offset, end_offset, head_idx, tail_idx — now
+    // 4 × num_channels × num_ranks uint64 genstamped slots) does NOT need
+    // a per-iter memset+barrier here: every reader filters by seq match
+    // (`utils.cuh::nvl_seq_match`), so stale residue from a prior iter
+    // is rejected without zeroing. Iter-0 cleanliness is handled by the
+    // once-only ctor memset of the full slab in `Buffer::initialize`.
+    EP_HOST_ASSERT((num_ranks * num_ranks * sizeof(int))
+                   + (4 * num_channels * num_ranks * sizeof(uint64_t)) <= num_nvl_bytes);
     CUDA_CHECK(cudaMemcpyAsync(buffer_ptrs[nvl_rank],
                                pre.rank_prefix_matrix.data_ptr<int>(),
                                num_ranks * num_ranks * sizeof(int),
                                cudaMemcpyDeviceToDevice,
                                stream));
-    CUDA_CHECK(cudaMemsetAsync(static_cast<int*>(buffer_ptrs[nvl_rank]) + num_ranks * num_ranks,
-                               0,
-                               num_memset_int * sizeof(int),
-                               stream));
-    intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_ranks, stream);
 
     auto poll = host_poll_recv_counts(moe_recv_counter, moe_recv_expert_counter,
                                       streaming_total_tiles, num_local_experts);
@@ -1277,17 +1280,12 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
     record_consumer_stream(bwd_dispatch_arrival_count, compute_stream_handle_);
 
-    // Reset IPC ring control bytes (start_offset / end_offset / head_idx /
-    // tail_idx) — same 4×num_channels×num_ranks region fwd dispatch zeros at
-    // the start of each call (stream_ep.cpp:863-867). Cross-rank barrier ensures
-    // peer ranks finished their own memset before any sender writes begin.
-    int num_memset_int = num_channels * num_ranks * 4;
-    EP_HOST_ASSERT((num_ranks * num_ranks + num_memset_int) * sizeof(int) <= num_nvl_bytes);
-    CUDA_CHECK(cudaMemsetAsync(static_cast<int*>(buffer_ptrs[nvl_rank]) + num_ranks * num_ranks,
-                               0,
-                               num_memset_int * sizeof(int),
-                               stream));
-    intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_ranks, stream);
+    // No per-iter memset+barrier on the IPC ring control bytes — the
+    // (start_offset, end_offset, head_idx, tail_idx) slots are 64-bit
+    // genstamped and reader-filtered by seq match. See the fwd dispatch
+    // launch above for the full reasoning.
+    EP_HOST_ASSERT((num_ranks * num_ranks * sizeof(int))
+                   + (4 * num_channels * num_ranks * sizeof(uint64_t)) <= num_nvl_bytes);
 
     intranode::DispatchGradsIO io{
         .dL_do_pool       = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
@@ -1398,26 +1396,23 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
     if (recv_topk_weights_out.has_value())
         record_consumer_stream(*recv_topk_weights_out, compute_stream_handle_);
 
-    // Launch barrier and reset queue head and tail
-    EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    intranode::encode_combine_heads(buffer_ptrs_gpu,
-                                     send_head.data_ptr<int>(),
-                                     num_channels,
-                                     num_recv_tokens,
-                                     num_channels * num_ranks * 2,
-                                     barrier_signal_ptrs_gpu,
-                                     rank,
-                                     num_ranks,
-                                     stream);
-
-    // Combine data
+    // Combine data. Combine carves its sub-buffer chain from
+    // `buffer_ptrs[i] + dispatch_section_bytes`, physically disjoint from
+    // dispatch's chain at `buffer_ptrs[i] + 0`. The
+    // `encode_combine_heads` kernel that used to live here (barrier +
+    // memset of the aliased (head_idx, tail_idx) slab region) is gone:
+    // genstamped meta slots make memset unnecessary, and combine's slots
+    // no longer overlap dispatch's.
+    int hidden_int4_x = static_cast<int>(hidden * x.element_size() / sizeof(int4));
+    int64_t dispatch_section_bytes = intranode::intranode_get_dispatch_section_bytes(
+        num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens,
+        hidden_int4_x, num_topk);
+    int64_t combine_section_bytes = intranode::intranode_get_combine_section_bytes(
+        num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens,
+        hidden_int4_x, num_topk);
+    EP_HOST_ASSERT(dispatch_section_bytes + combine_section_bytes <= num_nvl_bytes);
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     record_consumer_stream(recv_x, compute_stream_handle_);
-    EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * x.element_size() +  // Data buffer
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
-                   <= num_nvl_bytes);
     intranode::launch_combine_main(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
@@ -1435,6 +1430,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
                        hidden,
                        num_topk,
                        buffer_ptrs_gpu,
+                       dispatch_section_bytes,
                        rank,
                        num_ranks,
                        stream,

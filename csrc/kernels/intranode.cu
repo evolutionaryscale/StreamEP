@@ -45,7 +45,8 @@ __host__ __device__ inline int receiver_state_smem_bytes(int num_ranks, int E_lo
 // the bwd dispatch_grads / combine_grads senders. They all share the same
 // IPC ringbuffer protocol; only the per-call free-slot requirement differs.
 __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
-                                                            int* channel_head_idx,
+                                                            uint64_t* channel_head_idx,
+                                                            int64_t nvl_seq,
                                                             int num_recv_buffer_tokens,
                                                             int num_required_free,
                                                             int rank,
@@ -54,9 +55,14 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
     auto start_time = clock64();
     if (elect_one_sync()) {
         while (true) {
-            // We only consider the worst case (cached_tail - head); counting
-            // the actual freed-but-not-yet-published slots is not worth it.
-            int num_used_slots = cached_tail_idx - ld_volatile_global(channel_head_idx);
+            // Genstamp read: head slot encodes `(seq32, value32)`. Seq
+            // mismatch ⇒ stale residue from a prior iter, treat head as 0
+            // (this iter's start; sender then sees num_used = cached_tail,
+            // and either spins until receiver writes a real head with this
+            // iter's seq, or proceeds if cached_tail leaves enough room).
+            uint64_t raw = static_cast<uint64_t>(ld_volatile_global(channel_head_idx));
+            int head = nvl_seq_match(raw, nvl_seq) ? nvl_unpack_value(raw) : 0;
+            int num_used_slots = cached_tail_idx - head;
             if (num_recv_buffer_tokens - num_used_slots >= num_required_free)
                 break;
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -622,10 +628,15 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
     // `end_offset`: kNumChannels * kNumRanks * sizeof(int)
     // `head_idx`: kNumChannels * kNumRanks * sizeof(int)
     // `tail_idx`: kNumChannels * kNumRanks * sizeof(int)
-    auto channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto channel_end_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    // Meta slots: 64-bit `(seq32, value32)` genstamped. Reader filters by
+    // seq match — stale residue from a prior iter is treated as "not
+    // written" (or as zero head for backpressure). See utils.cuh
+    // `nvl_pack` / `nvl_seq_match` / `nvl_unpack_value`.
+    auto channel_start_offset = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_end_offset = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_head_idx = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_tail_idx = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    const int64_t nvl_seq = tile_signal.dispatch_seq << 1;
 
     // Channel data buffers, stored on the receiver side
     auto channel_x_buffers = Buffer<int4>(
@@ -683,10 +694,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
             end_count = warp_reduce_sum(end_count) + start_count;
 
             // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
-            // NOTES: this is for distinguishing zero tokens
+            // NOTES: this is for distinguishing zero tokens. With
+            // genstamps the seq tag is the primary "written-this-iter"
+            // signal; the negative bias is preserved for symmetry with
+            // internode and so legacy callers still see consistent
+            // values on unpack.
             if (elect_one_sync()) {
-                st_relaxed_sys_global(channel_start_offset.buffer(), -start_count - 1);
-                st_relaxed_sys_global(channel_end_offset.buffer(), -end_count - 1);
+                st_relaxed_sys_global(channel_start_offset.buffer(), nvl_pack(nvl_seq, -start_count - 1));
+                st_relaxed_sys_global(channel_end_offset.buffer(),   nvl_pack(nvl_seq, -end_count   - 1));
                 // Persist inclusive cumulative through this channel for combine.
                 tile_signal.channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = end_count;
             }
@@ -702,6 +717,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             sender_wait_for_queue_space(cached_channel_tail_idx,
                                         channel_head_idx.buffer(),
+                                        nvl_seq,
                                         env.num_recv_buffer_tokens,
                                         env.num_max_send_tokens,
                                         env.rank, responsible_channel,
@@ -758,7 +774,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
             // NOTES: here all warps should share the same new tail
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), nvl_pack(nvl_seq, cached_channel_tail_idx));
         }
 
         // Reverse-scan `send_head[token, responsible_rank]` over the range we
@@ -847,13 +863,19 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         auto rank_prefix_matrix = static_cast<int*>(env.buffer_ptrs[env.rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + env.rank] : 0;
 
-        // Receive channel offset.
+        // Receive channel offset. Genstamp reads: spin until the slot's
+        // seq matches this iter's `nvl_seq` (= "sender wrote this iter").
+        // Stale residue from prior iter mismatches; receiver keeps spinning.
         int total_offset, num_tokens_to_recv;
         if (elect_one_sync()) {
-            while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
-                ;
-            while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
-                ;
+            while (true) {
+                uint64_t raw = static_cast<uint64_t>(ld_volatile_global(channel_start_offset.buffer()));
+                if (nvl_seq_match(raw, nvl_seq)) { total_offset = nvl_unpack_value(raw); break; }
+            }
+            while (true) {
+                uint64_t raw = static_cast<uint64_t>(ld_volatile_global(channel_end_offset.buffer()));
+                if (nvl_seq_match(raw, nvl_seq)) { num_tokens_to_recv = nvl_unpack_value(raw); break; }
+            }
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
                 per_token_out.recv_channel_prefix_matrix[responsible_rank * num_channels + responsible_channel] = total_offset;
@@ -875,8 +897,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             // Wait for queue tail (one thread per rank-group polls; others wait at bar).
+            // Genstamp: ignore stale-seq reads (tail = 0 effectively).
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
+                uint64_t raw = ld_acquire_sys_global(channel_tail_idx.buffer());
+                cached_channel_tail_idx = nvl_seq_match(raw, nvl_seq) ? nvl_unpack_value(raw) : 0;
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
                     shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx;
                     break;
@@ -1011,12 +1035,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                 sub_start += sub_size;
             }
 
-            // Move queue head.
+            // Move queue head. Genstamp-pack with this iter's `nvl_seq` so
+            // the sender's backpressure spin distinguishes a real head
+            // publish from prior-iter residue at the same slot.
             cached_channel_head_idx += batch_total;
             total_offset += batch_total;
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
-                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+                st_relaxed_sys_global(channel_head_idx.buffer(), nvl_pack(nvl_seq, cached_channel_head_idx));
 
             num_tokens_to_recv -= batch_total;
         }
@@ -1145,10 +1171,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
     auto num_channels_total = num_channels * kNumRanks;
     auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
 
-    auto channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto channel_end_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-    auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_start_offset = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_end_offset = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_head_idx = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    auto channel_tail_idx = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+    // Bwd uses the same dispatch_seq but stamps the LSB phase bit so its
+    // writes don't collide with fwd dispatch's at the same dispatch_seq
+    // (same as internode dispatch_grads at internode.cu:2380).
+    const int64_t nvl_seq = (tile_signal.dispatch_seq << 1) | 1;
 
     auto channel_x_buffers = Buffer<int4>(
         ptr, num_channels_total * env.num_recv_buffer_tokens * shape.hidden_int4,
@@ -1208,8 +1238,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
             end_count = warp_reduce_sum(end_count) + start_count;
 
             if (elect_one_sync()) {
-                st_relaxed_sys_global(channel_start_offset.buffer(), -start_count - 1);
-                st_relaxed_sys_global(channel_end_offset.buffer(), -end_count - 1);
+                st_relaxed_sys_global(channel_start_offset.buffer(), nvl_pack(nvl_seq, -start_count - 1));
+                st_relaxed_sys_global(channel_end_offset.buffer(),   nvl_pack(nvl_seq, -end_count   - 1));
             }
         }
         __syncwarp();
@@ -1221,6 +1251,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             sender_wait_for_queue_space(cached_channel_tail_idx,
                                         channel_head_idx.buffer(),
+                                        nvl_seq,
                                         env.num_recv_buffer_tokens,
                                         env.num_max_send_tokens,
                                         env.rank, responsible_channel,
@@ -1245,7 +1276,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
 
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), nvl_pack(nvl_seq, cached_channel_tail_idx));
         }
     } else {
         // Receiver: gather K slots per packet from recv_token_to_slots, write
@@ -1268,10 +1299,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
 
         int total_offset, num_tokens_to_recv;
         if (elect_one_sync()) {
-            while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
-                ;
-            while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
-                ;
+            while (true) {
+                uint64_t raw = static_cast<uint64_t>(ld_volatile_global(channel_start_offset.buffer()));
+                if (nvl_seq_match(raw, nvl_seq)) { total_offset = nvl_unpack_value(raw); break; }
+            }
+            while (true) {
+                uint64_t raw = static_cast<uint64_t>(ld_volatile_global(channel_end_offset.buffer()));
+                if (nvl_seq_match(raw, nvl_seq)) { num_tokens_to_recv = nvl_unpack_value(raw); break; }
+            }
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             num_tokens_to_recv -= total_offset;
         }
@@ -1289,7 +1324,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
+                uint64_t raw = ld_acquire_sys_global(channel_tail_idx.buffer());
+                cached_channel_tail_idx = nvl_seq_match(raw, nvl_seq) ? nvl_unpack_value(raw) : 0;
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
                     shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx;
                     break;
@@ -1351,7 +1387,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
             total_offset += batch_total;
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
-                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+                st_relaxed_sys_global(channel_head_idx.buffer(), nvl_pack(nvl_seq, cached_channel_head_idx));
 
             num_tokens_to_recv -= batch_total;
         }
@@ -1413,83 +1449,17 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 #undef DISPATCH_GRADS_LAUNCH_CASE
 }
 
-template <int kNumRanks>
-__global__ void encode_combine_heads_kernel(
-    void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
-    // Single-block kernel: bracketed slab head/tail memset.
-    //
-    // The blocks 1..N reverse-scan of `send_head` that used to live here was
-    // fused into `dispatch_main_kernel`'s per-channel sender block tail
-    // (writes are local-only — combine reads `send_head` from this rank's
-    // communicate stream FIFO-after dispatch_main on the same rank, no
-    // cross-rank ordering hazard). The cross-rank barrier_block calls remain
-    // because they cover the aliasing between this rank's
-    // (start_offset, end_offset) slots — written by dispatch_main's sender
-    // block at line ~688, read by dispatch_main's receiver block at line
-    // ~818 — and the next combine_main's (channel_head_idx, channel_tail_idx)
-    // slots, which share the same memory (see file-level "Memory layout"
-    // notes above).
-    //
-    // The `num_channels` and `num_recv_tokens` parameters are kept on the
-    // signature for API stability with bwd-side callers; only the
-    // bracketed-memset path runs.
-    (void)num_channels;
-    (void)num_recv_tokens;
-    (void)send_head;
-
-    // Barrier before cleaning
-    barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
-
-    // Clean
-    auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
-    auto ptr = static_cast<int*>(buffer_ptrs[rank]);
-    #pragma unroll
-    for (int i = thread_id; i < num_memset_int; i += num_threads)
-        ptr[i] = 0;
-
-    // Barrier after cleaning
-    barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
-
-    // PDL trigger — combine_main_kernel (the next kernel on this stream)
-    // is marked as a programmatic consumer. Releasing here, after the
-    // bracketed slab cleanup drains, lets combine's CTAs start dispatching
-    // while this kernel's barrier exit completes on peer ranks.
-    griddepcontrol_launch_dependents();
-}
-
-void encode_combine_heads(void** buffer_ptrs,
-                          int* send_head,
-                          int num_channels,
-                          int num_recv_tokens,
-                          int num_memset_int,
-                          int** barrier_signal_ptrs,
-                          int rank,
-                          int num_ranks,
-                          cudaStream_t stream) {
-#define ENCODE_COMBINE_HEADS(ranks)                    \
-    LAUNCH_KERNEL(&cfg,                                \
-                  encode_combine_heads_kernel<ranks>,  \
-                  buffer_ptrs,                         \
-                  send_head,                           \
-                  num_channels,                        \
-                  num_recv_tokens,                     \
-                  num_memset_int,                      \
-                  barrier_signal_ptrs,                 \
-                  rank);                               \
-    break
-
-    // After fusing the reverse-scan into dispatch_main's sender block tail,
-    // encode is a single-block kernel (slab memset bracketed by barrier_block
-    // pairs). `num_channels` and `num_recv_tokens` are passed through for
-    // call-site API stability but are unused in the kernel.
-    (void)num_recv_tokens;
-    const int num_threads = std::max(128, 32 * num_ranks);
-    EP_HOST_ASSERT(num_ranks <= num_threads);
-    EP_HOST_ASSERT(num_threads <= 1024);
-    SETUP_LAUNCH_CONFIG(1, num_threads, stream);
-    SWITCH_RANKS(ENCODE_COMBINE_HEADS);
-#undef ENCODE_COMBINE_HEADS
-}
+// `encode_combine_heads_kernel` was deleted as part of the
+// disjoint-regions + genstamps refactor. Its two former jobs are now
+// handled elsewhere:
+//   - per-channel reverse-scan of `send_head`: fused into
+//     `dispatch_main_kernel`'s sender block tail.
+//   - bracketed slab head/tail memset: no longer needed — combine's
+//     (head_idx, tail_idx) live in a physically disjoint region from
+//     dispatch's (start_offset, end_offset) (see api.cuh
+//     `intranode_get_dispatch_section_bytes`), and the meta slots are
+//     64-bit genstamped so iter-to-iter staleness is filtered by seq
+//     mismatch without needing a memset.
 
 // Combine kernel — used by BOTH forward combine and backward combine_grads.
 // The per-direction differences are all in args:
@@ -1522,25 +1492,34 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                                           int* send_head,
                                                           const int64_t* y_done_per_token,
                                                           int64_t combine_seq,
+                                                          int combine_phase,
                                                           int num_tokens,
                                                           int num_recv_tokens,
                                                           int hidden,
                                                           int num_topk,
                                                           void** buffer_ptrs,
+                                                          // Byte offset on each peer's `buffer_ptrs[i]` past dispatch's
+                                                          // sub-buffer chain (see api.cuh `intranode_get_dispatch_section_bytes`).
+                                                          // Combine's meta + data buffers live at
+                                                          // `buffer_ptrs[i] + dispatch_section_bytes`; physically disjoint from
+                                                          // dispatch's chain at `buffer_ptrs[i] + 0`. Removes the prior
+                                                          // head/tail alias with dispatch's start/end_offset that required
+                                                          // the `encode_combine_heads` memset.
+                                                          int64_t dispatch_section_bytes,
                                                           int rank,
                                                           int num_max_send_tokens,
                                                           int num_recv_buffer_tokens) {
-    // PDL barrier — encode_combine_heads (immediately preceding kernel on
-    // this stream) called `griddepcontrol.launch_dependents` at its tail.
-    // Wait here so the slab cleanup + reverse-scanned send_head are visible.
-    griddepcontrol_wait();
-
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
     const int responsible_channel = sm_id / 2;
+    // Genstamp seq for combine's meta slots. Fwd combine and bwd
+    // combine_grads share the same `combine_seq` (= handle.dispatch_seq)
+    // but stamp the LSB phase bit so they don't collide at the same
+    // physical slot. Mirrors internode combine_main_kernel:3220.
+    const int64_t nvl_seq = (combine_seq << 1) | (combine_phase & 1);
     EP_DEVICE_ASSERT(num_topk <= kMaxTopK);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
@@ -1567,23 +1546,25 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
         const auto send_warp_id_in_rank = send_warp_id / kNumRanks;
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
 
-        // Calculate pointers by the specific layout
-        auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
+        // Calculate pointers by the specific layout. Base offset by
+        // `dispatch_section_bytes` lands us in combine's disjoint
+        // sub-buffer chain (see api.cuh `intranode_get_dispatch_section_bytes`).
+        auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]) +
+                                           dispatch_section_bytes);
         auto num_channels_total = num_channels * kNumRanks;
         auto channel_rank_offset = responsible_channel * kNumRanks + rank;
 
-        // Channel meta data
-        // `head_idx`: kNumChannels * kNumRanks * sizeof(int)
-        // `tail_idx`: kNumChannels * kNumRanks * sizeof(int)
+        // Channel meta data — combine's own (head_idx, tail_idx) as
+        // genstamped uint64.
+        // `head_idx`: kNumChannels * kNumRanks * sizeof(uint64_t)
+        // `tail_idx`: kNumChannels * kNumRanks * sizeof(uint64_t)
         // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
-        // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)   ← skipped (unused by combine; populated by dispatch only)
+        // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)   ← skipped (kept for layout parity with dispatch section)
         // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
-        auto channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
-        auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
+        auto channel_head_idx = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
+        auto channel_tail_idx = Buffer<uint64_t>(ptr, num_channels_total, channel_rank_offset);
         auto channel_x_buffers = Buffer<int4>(
             ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
-        // Skip past src_idx region (slab layout fixed by dispatch; combine
-        // doesn't write or read it).
         ptr = reinterpret_cast<void*>(static_cast<int8_t*>(ptr) +
                                       num_channels_total * num_recv_buffer_tokens * sizeof(int));
         auto channel_topk_weights_buffers = Buffer<float>(
@@ -1606,6 +1587,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
             sender_wait_for_queue_space(current_channel_tail_idx,
                                         channel_head_idx.buffer(),
+                                        nvl_seq,
                                         num_recv_buffer_tokens,
                                         num_round_tokens,
                                         rank, responsible_channel,
@@ -1664,7 +1646,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
             // Move tail index
             asm volatile("bar.sync %0, %1;" ::"r"(send_rank_id), "r"(num_threads_per_rank));
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), nvl_pack(nvl_seq, current_channel_tail_idx));
         }
     } else {
         // Workers for receiving
@@ -1687,8 +1669,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
         asm volatile("bar.sync 0, %0;" ::"r"(kNumThreads));
 
         if (thread_id < 32) {
-            int* channel_head_idx_ptr = static_cast<int*>(buffer_ptrs[rank]) + responsible_channel * kNumRanks + lane_id;
-            int* channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
+            // Combine's (head, tail) slots live in combine's own disjoint
+            // sub-buffer chain at `buffer_ptrs[rank] + dispatch_section_bytes`.
+            // They're 64-bit genstamped; reader filters by `nvl_seq` match.
+            uint64_t* channel_head_idx_ptr = reinterpret_cast<uint64_t*>(
+                static_cast<int8_t*>(buffer_ptrs[rank]) + dispatch_section_bytes)
+                + responsible_channel * kNumRanks + lane_id;
+            uint64_t* channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
 
             // Queue head updater
             int last_head = 0;
@@ -1701,8 +1688,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 if (retired)
                     break;
 
-                // Update queue tail
-                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
+                // Update queue tail. Stale-seq → treat tail as 0 (i.e.,
+                // sender hasn't published this iter yet).
+                uint64_t raw_tail = ld_acquire_sys_global(channel_tail_idx_ptr);
+                channel_tail_idx[lane_id] = nvl_seq_match(raw_tail, nvl_seq) ? nvl_unpack_value(raw_tail) : 0;
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -1711,7 +1700,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                     if (not warp_retired[i])
                         min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
                 if (min_head != std::numeric_limits<int>::max() and min_head > last_head)
-                    st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head);
+                    st_relaxed_sys_global(channel_head_idx_ptr, nvl_pack(nvl_seq, last_head = min_head));
             }
         } else {
             // Receivers
@@ -1725,8 +1714,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
             for (int i = 0; i < kNumRanks; ++i) {
                 auto channel_rank_offset = responsible_channel * kNumRanks + i;
                 auto num_channels_total = num_channels * kNumRanks;
-                // `head_idx` & `tail_idx`: kNumChannels * kNumRanks * sizeof(int)
-                auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[rank]) + 2 * num_channels * kNumRanks * sizeof(int));
+                // Combine sub-buffer base: skip past dispatch's section and
+                // combine's own (head_idx, tail_idx) genstamped uint64
+                // meta to land on `channel_x_buffers`.
+                auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[rank]) +
+                                                   dispatch_section_bytes +
+                                                   2 * num_channels * kNumRanks * sizeof(uint64_t));
 
                 // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
                 channel_x_buffers[i] = Buffer<int4>(ptr,
@@ -1882,6 +1875,7 @@ void launch_combine_main(cudaDataType_t type,
              int hidden,
              int num_topk,
              void** buffer_ptrs,
+             int64_t dispatch_section_bytes,
              int rank,
              int num_ranks,
              cudaStream_t stream,
@@ -1893,6 +1887,10 @@ void launch_combine_main(cudaDataType_t type,
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
+
+    // Fwd combine and bwd combine_grads share `combine_seq` (= handle.dispatch_seq);
+    // the LSB phase bit distinguishes which direction stamped a given slot.
+    const int combine_phase = is_fwd ? 0 : 1;
 
 #define COMBINE_LAUNCH_CASE_IMPL(dtype, ranks, kSendTopkWeights)                                                  \
     {                                                                                                             \
@@ -1910,11 +1908,13 @@ void launch_combine_main(cudaDataType_t type,
                       send_head,                                               \
                       y_done_per_token,                                        \
                       combine_seq,                                             \
+                      combine_phase,                                           \
                       num_tokens,                                              \
                       num_recv_tokens,                                         \
                       hidden,                                                  \
                       num_topk,                                                \
                       buffer_ptrs,                                             \
+                      dispatch_section_bytes,                                  \
                       rank,                                                    \
                       num_max_send_tokens,                                     \
                       num_recv_buffer_tokens);                                 \
@@ -1935,8 +1935,9 @@ void launch_combine_main(cudaDataType_t type,
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
     EP_HOST_ASSERT(num_sms % 2 == 0);
     EP_HOST_ASSERT(kNumThreads >= num_ranks * 32);
-    // PDL consumer of `encode_combine_heads` (same stream, FIFO predecessor).
-    SETUP_LAUNCH_CONFIG_PDL_CONSUMER(num_sms, kNumThreads, stream);
+    // No PDL predecessor — encode_combine_heads was deleted as part of the
+    // disjoint-regions + genstamps refactor.
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE
