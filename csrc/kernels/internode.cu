@@ -1715,7 +1715,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     // data, since `ld.volatile` does not establish a release-
                     // acquire happens-before on the data writes — surfaced under
                     // iter-2 rank-load asymmetry as receiver_exit_mismatch on
-                    // channel 35 (Bug B.2, see markdowns/current_state.md).
+                    // channel 35 (Bug B.2; see markdowns/logbook.md 2026-05-21).
                     uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
