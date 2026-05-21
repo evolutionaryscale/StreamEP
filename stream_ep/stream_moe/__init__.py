@@ -3,10 +3,9 @@
 Public surface:
   - ``stream_moe.stream_moe_func`` — one MoE forward layer (dispatch →
     kernel A → kernel Y → combine on the communicate stream, kernel_a +
-    kernel_y on the compute stream). Dispatches through the registered
-    ``torch.ops.stream_ep.moe`` custom op so dynamo treats the layer as
-    opaque; under torch.compile this lets inductor place the right stream
-    syncs on the boundary.
+    kernel_y on the compute stream). Differentiable via
+    ``StreamMoEFunc(torch.autograd.Function)``; eager-only, see
+    ``stream_moe.py`` docstring on the compile boundary.
   - ``stream_moe.StreamHolder`` / ``stream_moe.make_streams`` —
     dataclass holding the two caller-owned streams + helper to allocate them.
   - ``kernel_a.streaming_moe_a`` /
