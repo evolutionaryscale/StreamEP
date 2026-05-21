@@ -653,13 +653,6 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
                                      int num_local_experts) {
     HostPollResult r{};
     auto start_time = std::chrono::high_resolution_clock::now();
-    // Diagnostic: report once per second on which counters are still -1 and
-    // dump GPU/stream state on timeout. Set STREAM_EP_DEBUG_HOST_POLL=1 to
-    // enable.
-    const bool debug = std::getenv("STREAM_EP_DEBUG_HOST_POLL") != nullptr;
-    const char* rank_env = std::getenv("RANK");
-    const int dbg_rank = rank_env ? std::atoi(rank_env) : -1;
-    int last_log_s = -1;
     while (true) {
         r.num_recv_tokens = static_cast<int>(*moe_recv_counter);
         r.total_tiles     = static_cast<int>(*streaming_total_tiles);
@@ -667,43 +660,9 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
         for (int i = 0; i < num_local_experts and ready; ++i)
             ready &= moe_recv_expert_counter[i] >= 0;
         if (ready) break;
-        int elapsed_s = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::high_resolution_clock::now() - start_time).count());
-        if (debug and elapsed_s != last_log_s and elapsed_s > 0) {
-            int n_expert_ready = 0;
-            for (int i = 0; i < num_local_experts; ++i)
-                n_expert_ready += (moe_recv_expert_counter[i] >= 0);
-            fprintf(stderr, "[host_poll rank=%d] t=%ds counter=%d total_tiles=%d "
-                            "experts_ready=%d/%d\n",
-                    dbg_rank, elapsed_s, r.num_recv_tokens, r.total_tiles,
-                    n_expert_ready, num_local_experts);
-            fflush(stderr);
-            last_log_s = elapsed_s;
-        }
-        if (elapsed_s > NUM_CPU_TIMEOUT_SECS) {
-            // Diagnostic dump before raising. Capture per-counter state then
-            // try cudaDeviceSynchronize(): if it returns, the kernel was
-            // delayed but completes; if it hangs or errors, kernel is stuck.
-            fprintf(stderr, "[host_poll rank=%d TIMEOUT] elapsed=%ds counter=%d "
-                            "total_tiles=%d\n",
-                    dbg_rank, elapsed_s, r.num_recv_tokens, r.total_tiles);
-            for (int i = 0; i < num_local_experts; ++i)
-                fprintf(stderr, "[host_poll rank=%d TIMEOUT]   expert[%d]=%d\n",
-                        dbg_rank, i, static_cast<int>(moe_recv_expert_counter[i]));
-            fflush(stderr);
-            auto sync_t0 = std::chrono::high_resolution_clock::now();
-            cudaError_t sync_err = cudaDeviceSynchronize();
-            auto sync_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::high_resolution_clock::now() - sync_t0).count();
-            fprintf(stderr, "[host_poll rank=%d POST-SYNC] sync_elapsed=%ldms "
-                            "counter=%d total_tiles=%d err=%s\n",
-                    dbg_rank, static_cast<long>(sync_elapsed),
-                    static_cast<int>(*moe_recv_counter),
-                    static_cast<int>(*streaming_total_tiles),
-                    cudaGetErrorString(sync_err));
-            fflush(stderr);
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::high_resolution_clock::now() - start_time).count() > NUM_CPU_TIMEOUT_SECS)
             throw std::runtime_error("DeepEP error: CPU recv timeout");
-        }
     }
     return r;
 }
