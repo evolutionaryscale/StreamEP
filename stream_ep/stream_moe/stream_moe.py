@@ -439,6 +439,15 @@ class StreamMoEFunc(torch.autograd.Function):
         streams: StreamHolder = ctx.streams
         buffer: StreamEPBuffer = ctx.buffer
         handle = ctx.handle
+        # Drop ctx attributes immediately. autograd's grad_fn owns ctx and is
+        # held by the output tensor's graph until that output is dropped —
+        # in a multi-layer model that means every layer's ctx (and every
+        # tensor it references) stays pinned through the iteration. The
+        # saved-tensors machinery handles its own release after backward
+        # returns; the side-channel attributes do not, so explicitly clear
+        # them so handle's tensors (pool_arrival_count et al.) can be freed
+        # at this layer's bwd return rather than at the end of the iter.
+        del ctx.streams, ctx.buffer, ctx.handle
         tile_m: int = ctx.tile_m
         tile_n_a: int = ctx.tile_n_a
         tile_n_y_bwd: int = ctx.tile_n_y_bwd
