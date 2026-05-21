@@ -241,16 +241,39 @@ private:
     int* streaming_total_tiles_mapped = nullptr;
 
     // "Kernel started" flags for the cross-stream launch gate. Each is a
-    // single int32 in device memory. dispatch_main_kernel / dispatch_grads_main_kernel
-    // atomicAdd these once at entry (block 0 thread 0). The host issues
-    // `cuStreamBatchMemOp` wait_value_geq on the compute stream before
-    // launching the consumer kernel (kernel_a / kernel_y_bwd), forcing the
-    // consumer to wait until the dispatch kernel's block 0 is actually
-    // co-resident — so dispatch grabs SMs first.
+    // single int32 in device memory.
+    //
+    // ``dispatch_main_started_flag`` / ``dispatch_grads_started_flag`` are
+    // atomicAdd'd once at entry (block 0 thread 0) by
+    // ``dispatch_main_kernel`` / ``dispatch_grads_main_kernel``. The host
+    // issues ``cuStreamBatchMemOp`` wait_value_geq on the compute stream
+    // before launching the consumer kernel (kernel_a / kernel_y_bwd),
+    // forcing the consumer to wait until the dispatch kernel's block 0 is
+    // actually co-resident — so dispatch grabs SMs first.
+    //
+    // ``kernel_y_started_flag`` / ``kernel_a_bwd_started_flag`` are the
+    // analogous flags for the compute→combine direction. They're bumped
+    // from inside ``StreamingTileScheduler._fetch_next_work_idx`` by the
+    // CTA that wins the ``atomic_add(consumer_head, 1)`` race for
+    // ``linear_idx == 0`` — i.e., the first CTA of the kernel that gets
+    // co-resident on an SM and claims work. The host issues
+    // ``cuStreamBatchMemOp`` wait_value_geq on the communicate stream
+    // before launching ``combine_main`` / ``combine_grads_main``, so
+    // combine's 80-CTA sender grid cannot grab SMs ahead of kernel_y /
+    // kernel_a_bwd's 132-CTA grid. Replaces the prior
+    // ``torch.cuda.Event(y_started)`` / ``Event(a_bwd_started)`` gates,
+    // which only signalled "next kernel's launch packet is queued" — not
+    // "first block is on an SM" — and were empirically insufficient on
+    // internode bwd once the bwd ``encode_combine_heads`` scheduling
+    // slack was removed.
     int* dispatch_main_started_flag = nullptr;
     int* dispatch_grads_started_flag = nullptr;
+    int* kernel_y_started_flag = nullptr;
+    int* kernel_a_bwd_started_flag = nullptr;
     int dispatch_main_issued_count = 0;
     int dispatch_grads_issued_count = 0;
+    int kernel_y_issued_count = 0;
+    int kernel_a_bwd_issued_count = 0;
 
     // Caller's compute-stream cudaStream_t (set once from Python via
     // `set_compute_stream_handle`; zero until set). Used to
@@ -301,16 +324,49 @@ public:
 
     void destroy();
 
-    // Wait on the compute stream until the most-recently-launched
-    // dispatch_main_kernel / dispatch_grads_main_kernel has actually entered
-    // execution (block 0 thread 0 atomicAdd'd the started_flag). Implemented
-    // as a host-queued `cuStreamBatchMemOp` wait_value_geq. The wait fires at
-    // the GPU front-end so the compute stream's pending kernel sits without
-    // consuming an SM; once dispatch has its block 0 co-resident, the wait
-    // passes and the compute kernel can launch onto the remaining SMs.
-    // Streams: takes a torch CUDAStream — typically the caller's compute stream.
+    // Wait on the consumer stream until the most-recently-launched producer
+    // kernel has actually entered execution. Implemented as a host-queued
+    // ``cuStreamBatchMemOp`` wait_value_geq on the int32 started flag, with
+    // the comparison target being the host-side issued count (incremented
+    // once per producer launch). The wait fires at the GPU front-end so the
+    // consumer stream's pending launch sits without consuming an SM; once
+    // the producer kernel's first block is co-resident, the flag bumps,
+    // the wait passes, and the consumer kernel launches.
+    //
+    // dispatch_main / dispatch_grads variants gate kernel_a / kernel_y_bwd
+    // (the compute consumer) behind the dispatch producer. The flag is
+    // bumped from block 0 thread 0 at kernel entry inside the C++
+    // dispatch kernels.
+    //
+    // kernel_y / kernel_a_bwd variants gate combine_main / combine_grads_main
+    // (the communicate consumer) behind the compute producer. The flag is
+    // bumped from the CTA that wins ``linear_idx == 0`` in
+    // ``StreamingTileScheduler._fetch_next_work_idx`` (i.e., the first CTA
+    // of the kernel that is co-resident on an SM and claims a work tile).
+    // The caller must call ``bump_*_issued`` BEFORE launching the producer
+    // so the wait's comparison target is correct.
+    //
+    // Streams: takes a torch CUDAStream — the caller's consumer stream
+    // (compute for dispatch_*, communicate for kernel_*).
     void wait_dispatch_main_started(int64_t stream_handle);
     void wait_dispatch_grads_started(int64_t stream_handle);
+    void wait_kernel_y_started(int64_t stream_handle);
+    void wait_kernel_a_bwd_started(int64_t stream_handle);
+
+    // Increment the host-side issued count for the kernel_y /
+    // kernel_a_bwd launch gates. Called by the orchestrator immediately
+    // BEFORE launching the producer kernel on the compute stream, so a
+    // subsequent ``wait_kernel_*_started`` on the communicate stream has
+    // the right comparison target.
+    void bump_kernel_y_issued();
+    void bump_kernel_a_bwd_issued();
+
+    // Return the started flag device pointers as 1-element int32 CUDA
+    // tensors. The wrapper for streaming_moe_y / streaming_moe_a_bwd
+    // forwards these into StreamingTileSchedulerOptions; the scheduler's
+    // first-CTA-claim atomicAdd's them.
+    torch::Tensor kernel_y_started_flag_tensor() const;
+    torch::Tensor kernel_a_bwd_started_flag_tensor() const;
 
     // Register the caller's compute-stream cudaStream_t. Subsequent
     // dispatch / combine / dispatch_grads calls record_stream every

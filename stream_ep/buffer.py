@@ -261,6 +261,55 @@ class Buffer:
             stream = torch.cuda.current_stream()
         self.runtime.wait_dispatch_grads_started(stream.cuda_stream)
 
+    def wait_kernel_y_started(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Queue a GPU-front-end wait on ``stream`` until the most-recently-launched
+        ``streaming_moe_y`` has at least one CTA co-resident on an SM (the CTA
+        that wins ``linear_idx == 0`` in ``StreamingTileScheduler`` bumps the
+        flag). Use this BEFORE launching ``combine_main`` on the communicate
+        stream so combine's 80-CTA sender grid doesn't grab SMs ahead of
+        kernel_y's 132. Replaces the prior ``torch.cuda.Event(y_started)``
+        gate, which only signalled "kernel_y's launch packet is queued" —
+        not "kernel_y is on an SM" — and surfaces as combine-vs-kernel_y SM
+        contention when no upstream work fills the gap.
+        """
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.runtime.wait_kernel_y_started(stream.cuda_stream)
+
+    def wait_kernel_a_bwd_started(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Same as :meth:`wait_kernel_y_started` but gates ``combine_grads_main``
+        behind ``streaming_moe_a_bwd``'s first-CTA entry on the bwd path."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        self.runtime.wait_kernel_a_bwd_started(stream.cuda_stream)
+
+    def bump_kernel_y_issued(self) -> None:
+        """Increment the host-side issued count for the kernel_y launch gate.
+        Call BEFORE launching ``streaming_moe_y`` on the compute stream so a
+        subsequent ``wait_kernel_y_started`` on the communicate stream has the
+        right comparison target.
+        """
+        self.runtime.bump_kernel_y_issued()
+
+    def bump_kernel_a_bwd_issued(self) -> None:
+        """Same as :meth:`bump_kernel_y_issued` but for the kernel_a_bwd
+        launch gate."""
+        self.runtime.bump_kernel_a_bwd_issued()
+
+    def kernel_y_started_flag_view(self) -> torch.Tensor:
+        """Return the 1-element int32 CUDA tensor wrapping the kernel_y
+        started-flag device storage. Passed into ``streaming_moe_y`` so the
+        scheduler's first-CTA-claim can ``atomicAdd`` it.
+        """
+        return self.runtime.kernel_y_started_flag_tensor()
+
+    def kernel_a_bwd_started_flag_view(self) -> torch.Tensor:
+        """Return the 1-element int32 CUDA tensor wrapping the kernel_a_bwd
+        started-flag device storage. Passed into ``streaming_moe_a_bwd`` so
+        the scheduler's first-CTA-claim can ``atomicAdd`` it.
+        """
+        return self.runtime.kernel_a_bwd_started_flag_tensor()
+
     @staticmethod
     def is_sm90_compiled():
         return stream_ep_cpp.is_sm90_compiled()

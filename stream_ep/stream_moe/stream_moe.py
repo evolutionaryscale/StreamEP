@@ -300,18 +300,15 @@ class StreamMoEFunc(torch.autograd.Function):
                 num_sms=num_sms_a,
             )
 
-            # ── Y-started event ────────────────────────────────────────
-            # Records the position in the compute stream after kernel A's
-            # launch packet and before kernel Y's. When this event fires on
-            # the GPU, kernel A has fully retired and kernel Y's launch is
-            # next to dispatch from the compute stream's queue. The
-            # communicate stream waits on the event before launching
-            # combine_main, so kernel_y's 132 persistent CTAs win the SM
-            # race against combine's 80.
-            y_started = torch.cuda.Event()
-            y_started.record()
-
             # ── Kernel Y on the same compute stream ──────────────────────
+            # Bump the kernel_y issued counter BEFORE launching so a
+            # subsequent ``wait_kernel_y_started`` on the communicate stream
+            # has the right comparison target. Inside the kernel, the CTA
+            # that wins ``linear_idx == 0`` in StreamingTileScheduler
+            # atomicAdd's ``kernel_y_started_flag`` — a stronger signal than
+            # a torch.cuda.Event between A and Y, which only marks "Y's
+            # launch packet is queued" rather than "Y is on an SM".
+            buffer.bump_kernel_y_issued()
             streaming_moe_y(
                 postact_a,
                 w2_local,
@@ -324,6 +321,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.pool_arrival_count,
                 handle.pool_arrival_target,
                 combine_seq=dispatch_seq,
+                started_flag=buffer.kernel_y_started_flag_view(),
                 tile_m=tile_m,
                 tile_n=tile_n_y,
                 cluster_n=2,
@@ -332,12 +330,14 @@ class StreamMoEFunc(torch.autograd.Function):
         _nvtx_pop()  # fwd_compute
 
         # ── Combine on `streams.communicate` (same stream as dispatch) ────
-        # FIFO-ordered after dispatch_main. Waits on the Y-started event so
-        # combine's launch doesn't dispatch ahead of kernel_y's on the GPU
-        # front-end. Combine's per-warp sender then spins on
-        # `y_done_per_token[r] >= dispatch_seq` for per-recv-token streaming.
+        # FIFO-ordered after dispatch_main. Waits on the
+        # ``kernel_y_started_flag`` cross-stream launch gate so combine's
+        # 80-CTA sender grid doesn't grab SMs before kernel_y's 132 CTAs
+        # have at least one block co-resident. Combine's per-warp sender
+        # then spins on ``y_done_per_token[r] >= dispatch_seq`` for
+        # per-recv-token streaming.
         _nvtx_push(f"fwd_combine_{_fid}")
-        streams.communicate.wait_event(y_started)
+        buffer.wait_kernel_y_started(streams.communicate)
         with torch.cuda.stream(streams.communicate):
             # combine_seq defaults to ``handle.dispatch_seq`` per Buffer.combine.
             out, _ = buffer.combine(handle.o, handle)
@@ -592,21 +592,20 @@ class StreamMoEFunc(torch.autograd.Function):
             )
 
             # ── A_bwd_started event ────────────────────────────────────
-            # Recorded after kernel_y_bwd's launch on compute and before
-            # kernel_a_bwd's launch. When the event fires on the GPU,
-            # kernel_y_bwd has retired and kernel_a_bwd's launch packet is
-            # next in compute's queue. The communicate stream waits on
-            # this before launching combine_grads so combine_grads's 80
-            # CTAs don't grab SMs ahead of kernel_a_bwd's 132. Same
-            # primitive as fwd's `y_started` event.
-            a_bwd_started = torch.cuda.Event()
-            a_bwd_started.record()
-
             # ── Stage 3 — kernel_a_bwd on the SAME compute stream ──────
             # FIFO-ordered after kernel_y_bwd retires — no cross-stream
             # release-add is needed. Scheduler reuses
             # (bwd_dispatch_arrival_count, pool_arrival_target) — at-target
             # by the time A_bwd runs because Y_bwd already spun on it.
+            # Bump the kernel_a_bwd issued counter BEFORE launching so the
+            # communicate-stream wait below has the right target. The CTA
+            # that wins ``linear_idx == 0`` in StreamingTileScheduler
+            # atomicAdd's ``kernel_a_bwd_started_flag`` — replaces the
+            # ``torch.cuda.Event(a_bwd_started)`` which only signalled
+            # "A_bwd's launch packet is queued" and was insufficient on
+            # internode bwd where SM-contention with combine_grads
+            # eliminated the overlap.
+            buffer.bump_kernel_a_bwd_issued()
             streaming_moe_a_bwd(
                 dL_dswiglu_in,
                 w1_local,
@@ -618,16 +617,17 @@ class StreamMoEFunc(torch.autograd.Function):
                 bwd_dispatch_arrival_count,
                 handle.pool_arrival_target,
                 dispatch_seq=handle.dispatch_seq,
+                started_flag=buffer.kernel_a_bwd_started_flag_view(),
                 tile_m=tile_m,
                 tile_n=tile_n_a_bwd,
                 num_sms=num_sms_a_bwd,
             )
 
-        # Combine_grads launches when A_bwd is the next dispatch on compute.
+        # Combine_grads launches when A_bwd has at least one CTA co-resident.
         # Per-recv-token streaming overlap (combine_grads sender ↔ A_bwd
         # tail) is driven by `bwd_a_done_per_token[r] >= dispatch_seq`,
         # fired by A_bwd's last contributor per recv-token.
-        streams.communicate.wait_event(a_bwd_started)
+        buffer.wait_kernel_a_bwd_started(streams.communicate)
 
         # ── Stage 4 — combine_grads on streams.communicate ─────────────────
         # Sender per-warp loop spins on bwd_a_done_per_token[r] >=

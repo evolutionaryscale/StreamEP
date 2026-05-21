@@ -82,6 +82,16 @@ class StreamingTileSchedulerOptions(NamedTuple):
     )  # [E_local + 1] int32 — pool-block prefix-sum. Source for the
     # warp-cooperative ballot lookup that retired per-claim `tile_id_to_expert`.
     total_tiles: Int32  # passed as scalar so get_grid_shape doesn't deref device tensor
+    # Optional cross-stream launch-gate "started" flag (single int32 in
+    # device memory). When supplied, the CTA that wins ``linear_idx == 0``
+    # in ``_fetch_next_work_idx`` atomicAdd's this flag once. The host on
+    # the consumer stream (typically communicate) issues
+    # ``cuStreamBatchMemOp wait_value_geq`` against this flag before
+    # launching combine_main / combine_grads_main, so combine's 80-CTA
+    # sender grid can't grab SMs ahead of kernel_y / kernel_a_bwd's
+    # 132-CTA grid. Pass ``None`` to disable (kernel_a / kernel_y_bwd
+    # don't bump anything — only kernel_y / kernel_a_bwd own a flag).
+    started_flag: Optional[cute.Tensor] = None  # [1] int32 device flag
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +183,7 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
             persistence_mode=PersistenceMode.STREAMING,
+            started_flag=scheduler_args.started_flag,
         )
 
     # postact destination: inherited GemmGatedSm90.epi_setup_postact uses

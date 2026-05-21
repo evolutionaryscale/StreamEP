@@ -115,6 +115,13 @@ class StreamingTileSchedulerArguments:
     tile_shape_mn: cutlass.Constexpr[cute.Shape]  # (tile_M, tile_N)
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STREAMING
+    # Optional [1] int32 device flag. When supplied, the CTA that wins
+    # `linear_idx == 0` atomicAdd's this flag once at the top of
+    # `_fetch_next_work_idx`. Used by kernel_y / kernel_a_bwd to signal
+    # to the consumer (combine_main / combine_grads_main on the
+    # communicate stream) that at least one block is co-resident on an
+    # SM. None disables the bump (kernel_a / kernel_y_bwd path).
+    started_flag: Optional[cute.Tensor] = None
 
 
 class StreamingTileScheduler(TileScheduler):
@@ -161,6 +168,7 @@ class StreamingTileScheduler(TileScheduler):
         tile_shape_mn: cutlass.Constexpr[cute.Shape]
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
+        started_flag: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -181,6 +189,7 @@ class StreamingTileScheduler(TileScheduler):
                 tile_shape_mn=args.tile_shape_mn,
                 cluster_shape_mnk=args.cluster_shape_mnk,
                 persistence_mode=args.persistence_mode,
+                started_flag=args.started_flag,
             )
 
     def __init__(
@@ -322,6 +331,20 @@ class StreamingTileScheduler(TileScheduler):
             head_ptr = utils.elem_pointer(params.consumer_head, (Int32(0),))
             linear_idx = utils.atomic_add_i32(1, head_ptr)
         linear_idx = cute.arch.shuffle_sync(linear_idx, 0)
+
+        # Cross-stream launch-gate bump. The CTA that wins `linear_idx == 0`
+        # (the first work-claim across the whole grid) atomicAdd's the
+        # started flag once. Combine on the communicate stream queues a
+        # `cuStreamBatchMemOp wait_value_geq` against this flag, gating
+        # combine's launch until at least one CTA of this kernel is
+        # co-resident on an SM — combine's 80-CTA grid then can't grab SMs
+        # ahead of this kernel's 132. Only kernel_y / kernel_a_bwd carry a
+        # non-None started_flag; for kernel_a / kernel_y_bwd the field is
+        # None and the bump is skipped at compile time.
+        if const_expr(params.started_flag is not None):
+            if linear_idx == Int32(0) and cute.arch.lane_idx() == 0:
+                flag_ptr = utils.elem_pointer(params.started_flag, (Int32(0),))
+                utils.atomic_add_i32(1, flag_ptr)
 
         is_valid_i32 = Int32(linear_idx < total_work)
         pid_n = Int32(0)

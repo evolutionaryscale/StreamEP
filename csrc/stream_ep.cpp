@@ -219,9 +219,15 @@ Buffer::Buffer(int rank,
     // for the cross-stream launch-gate rationale.
     CUDA_CHECK(cudaMalloc(&dispatch_main_started_flag, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&dispatch_grads_started_flag, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&kernel_y_started_flag, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&kernel_a_bwd_started_flag, sizeof(int)));
     CUDA_CHECK(cudaMemsetAsync(dispatch_main_started_flag, 0, sizeof(int),
                                at::cuda::getCurrentCUDAStream()));
     CUDA_CHECK(cudaMemsetAsync(dispatch_grads_started_flag, 0, sizeof(int),
+                               at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(kernel_y_started_flag, 0, sizeof(int),
+                               at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(kernel_a_bwd_started_flag, 0, sizeof(int),
                                at::cuda::getCurrentCUDAStream()));
 
     // MoE counter
@@ -358,6 +364,8 @@ void Buffer::destroy() {
     // Free cross-stream launch-gate flags
     CUDA_CHECK(cudaFree(dispatch_main_started_flag));
     CUDA_CHECK(cudaFree(dispatch_grads_started_flag));
+    CUDA_CHECK(cudaFree(kernel_y_started_flag));
+    CUDA_CHECK(cudaFree(kernel_a_bwd_started_flag));
 
     destroyed = true;
     available = false;
@@ -394,6 +402,40 @@ void Buffer::wait_dispatch_grads_started(int64_t stream_handle) {
     wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
                              dispatch_grads_started_flag,
                              dispatch_grads_issued_count);
+}
+
+void Buffer::wait_kernel_y_started(int64_t stream_handle) {
+    if (kernel_y_issued_count == 0) return;
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
+                             kernel_y_started_flag,
+                             kernel_y_issued_count);
+}
+
+void Buffer::wait_kernel_a_bwd_started(int64_t stream_handle) {
+    if (kernel_a_bwd_issued_count == 0) return;
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
+                             kernel_a_bwd_started_flag,
+                             kernel_a_bwd_issued_count);
+}
+
+void Buffer::bump_kernel_y_issued() {
+    kernel_y_issued_count++;
+}
+
+void Buffer::bump_kernel_a_bwd_issued() {
+    kernel_a_bwd_issued_count++;
+}
+
+torch::Tensor Buffer::kernel_y_started_flag_tensor() const {
+    // Buffer-owned device memory; the deleter is a no-op (cudaFree happens
+    // in destroy()). Returned as a 1-element int32 tensor view.
+    auto opts = at::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA, device_id);
+    return at::from_blob(kernel_y_started_flag, {1}, [](void*) {}, opts);
+}
+
+torch::Tensor Buffer::kernel_a_bwd_started_flag_tensor() const {
+    auto opts = at::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA, device_id);
+    return at::from_blob(kernel_a_bwd_started_flag, {1}, [](void*) {}, opts);
 }
 
 void Buffer::set_compute_stream_handle(int64_t stream_handle) {
@@ -1925,6 +1967,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("destroy", &stream_ep::Buffer::destroy)
         .def("wait_dispatch_main_started", &stream_ep::Buffer::wait_dispatch_main_started)
         .def("wait_dispatch_grads_started", &stream_ep::Buffer::wait_dispatch_grads_started)
+        .def("wait_kernel_y_started", &stream_ep::Buffer::wait_kernel_y_started)
+        .def("wait_kernel_a_bwd_started", &stream_ep::Buffer::wait_kernel_a_bwd_started)
+        .def("bump_kernel_y_issued", &stream_ep::Buffer::bump_kernel_y_issued)
+        .def("bump_kernel_a_bwd_issued", &stream_ep::Buffer::bump_kernel_a_bwd_issued)
+        .def("kernel_y_started_flag_tensor", &stream_ep::Buffer::kernel_y_started_flag_tensor)
+        .def("kernel_a_bwd_started_flag_tensor", &stream_ep::Buffer::kernel_a_bwd_started_flag_tensor)
         .def("set_compute_stream_handle", &stream_ep::Buffer::set_compute_stream_handle)
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)

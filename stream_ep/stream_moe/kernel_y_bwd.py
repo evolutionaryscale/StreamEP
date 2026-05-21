@@ -329,6 +329,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
             persistence_mode=PersistenceMode.STREAMING,
+            started_flag=scheduler_args.started_flag,
         )
 
     @cute.jit

@@ -161,6 +161,7 @@ class StreamingMoeABwd(StreamingMoeY):
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
             persistence_mode=PersistenceMode.STREAMING,
+            started_flag=scheduler_args.started_flag,
         )
 
     @cute.jit
@@ -276,6 +277,8 @@ def _compile_streaming_moe_a_bwd(
         cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
     )
 
+    started_flag_fake = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
+
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
         consumer_head=consumer_head,
@@ -283,6 +286,7 @@ def _compile_streaming_moe_a_bwd(
         pool_arrival_target=pool_arrival_target,
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(0),
+        started_flag=started_flag_fake,
     )
 
     epi_args = StreamingMoeABwd.EpilogueArguments(scatter=scatter)
@@ -324,6 +328,7 @@ def streaming_moe_a_bwd(
     pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (shared with fwd)
     dispatch_seq: int,
     *,
+    started_flag: torch.Tensor | None = None,  # (1,) int32 buffer-owned cross-stream launch-gate flag; first CTA bumps it. None → allocate throwaway (tests / standalone harnesses).
     tile_m: int = 128,
     tile_n: int = 128,
     cluster_m: int = 1,
@@ -467,6 +472,9 @@ def streaming_moe_a_bwd(
         num_pid_n=Int32(num_pid_n),
     )
     epi_args = StreamingMoeABwd.EpilogueArguments(scatter=scatter)
+    if started_flag is None:
+        started_flag = torch.zeros(1, dtype=torch.int32, device=dL_dswiglu_in.device)
+    assert started_flag.shape == (1,) and started_flag.dtype == torch.int32
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
         consumer_head=consumer_head,
@@ -474,6 +482,7 @@ def streaming_moe_a_bwd(
         pool_arrival_target=pool_arrival_target,
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
+        started_flag=started_flag,
     )
     varlen_args = VarlenArguments(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
