@@ -1,10 +1,11 @@
 """Streaming-MoE FWD+BWD under deterministic skewed routing distributions.
 
-Targets Bug B (the routing-skew-dependent dispatch race surfaced in
-`repro_nan_loss --no-compile` at HEAD): runs the full streaming-MoE
-fwd+bwd pipeline (dispatch + kernel_a + kernel_y + combine + bwd chain)
-under a set of explicitly-constructed routing scenarios, each
-exercising a different edge case of the dispatch protocol.
+Targets Bug B (the routing-skew-dependent internode dispatch/combine
+NVL-region aliasing race, fixed in 47a9b16 via disjoint regions): runs
+the full streaming-MoE fwd+bwd pipeline (dispatch + kernel_a + kernel_y
++ combine + bwd chain) under a set of explicitly-constructed routing
+scenarios, each exercising a different edge case of the dispatch
+protocol.
 
 Why "explicitly-constructed": `torch.randint`-based routing makes
 failures luck-dependent. Deterministic scenarios make pass/fail
