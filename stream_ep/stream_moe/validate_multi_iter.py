@@ -1,33 +1,51 @@
 """End-to-end correctness check for the streaming pipeline (fwd + bwd).
 
-Runs `stream_moe_func` for N iterations with the SAME inputs and asserts each
-iteration's output AND four bwd gradients (`dL/dx`, `dL/dtopk_weights`,
-`dL/dW1_local`, `dL/dW2_local`) match a torch-eager full MoE reference. The
-reference is computed in plain torch using all ranks' weights (gathered across
-the group) so that for each source token ``t`` on this rank,
+Each of ``--n_iter`` iterations runs an ``--n_layers``-deep stack of
+``stream_moe_func`` calls (all sharing the same ``w1_local`` / ``w2_local`` /
+``topk_idx`` / ``topk_weights`` leaves) into ONE backward, and asserts the
+final output AND the four bwd gradients (``dL/dx``, ``dL/dtopk_weights``,
+``dL/dW1_local``, ``dL/dW2_local``) match a torch-eager full MoE reference
+stacked the same depth. Reference is plain torch using all ranks' weights
+gathered across the group so that for each source token ``t`` on this rank,
 
     output[t, :] = Σ over k of topk_weights[t, k] * SwiGLU(x[t] @ W1[topk_idx[t, k]]) @ W2[topk_idx[t, k]]
 
-and the four gradients are produced by `torch.autograd.grad` against the same
-graph (NOT finite differences — bf16 noise floor makes FD useless).
+with the depth-N chain applying the same MoE block N times. Reference
+gradients come from ``torch.autograd.grad`` on the stacked graph (NOT finite
+differences — bf16 noise floor makes FD useless).
 
-This catches both (a) the cross-layer-race class the historical kernel-A had
-(iter 0 correct, iter K silently wrong because some CTAs of iter N+1 saw stale
-"all done" state from iter N), now also for the bwd's
-`bwd_dispatch_arrival_count` / `bwd_a_done_per_token` cross-iter signals, and
-(b) any regression in the fwd / bwd pipeline as a whole — including the
-per-token gate's interaction with the release-store path on either direction.
+This catches three classes of bug:
 
-Symptom signature for the cross-layer race: iter 0 PASS, iter K (K >= 1) FAIL,
-on the side (fwd or bwd) that holds stale state. The bench_pipeline.py timing
-harness wouldn't catch it (timing-only), and the per-kernel test suite uses a
-single iter.
+  (a) Cross-iter staleness — iter 0 correct, iter K silently wrong because
+      iter N+1 saw stale "all done" state from iter N (kernel A's
+      ``pool_arrival_count`` chain, bwd's ``bwd_dispatch_arrival_count`` /
+      ``bwd_a_done_per_token`` cross-iter signals).
+  (b) Cross-layer-within-iter staleness — N layers in one autograd graph
+      means each layer's ``ctx`` (and the StreamingHandle it references)
+      live until backward returns at the OUTERMOST call site. Bugs that
+      need multiple layers' state to coexist (the original compile +
+      CDMC>1 hang at 10+ layers; the ctx-pinning peak-memory regression
+      fixed in 6e239b0) only surface at ``--n_layers >= ~10``.
+  (c) Any fwd / bwd pipeline regression — per-token gate ↔ release-store
+      interaction, per-layer dispatch_seq increment, etc.
+
+Symptom signatures: iter 0 PASS / iter K FAIL → cross-iter race. layer 1
+PASS / N-layer FAIL → cross-layer-within-iter staleness or accumulated
+numerical drift past the threshold's scaling (see below).
 
 Launch
 ------
     torchrun --nproc_per_node=8 \\
         -m stream_ep.stream_moe.validate_multi_iter \\
-        [--n_iter 20]
+        [--n_iter 20] [--n_layers 10]
+
+``--n_layers`` is capped at 10. At production seq_len the eager reference's
+autograd graph (each layer is a functional ``Tensor.index_add`` chain over E
+experts → one (T, H) intermediate per expert pinned for backward) maxes out
+the 80 GB H100 around 10-12 layers. The streaming path itself fits well past
+that — the cap is a property of the eager validator, not the pipeline. If a
+deeper-stack regression-check is needed, use the moe_benchmark harness (no
+reference, just hang / NaN detection).
 
 Outputs PASS / FAIL per iter on rank 0, with per-tensor max-abs / max-rel
 diffs for the failing iters.
@@ -47,6 +65,13 @@ in the dW gemm the noise lands at ~0.06 max-abs. This matches sonic-moe's
 bf16 grad tolerance (atol=2e-2 at x_scale=0.02) once scaled to our x_scale=0.1
 and our larger K. Storing preact in fp32 would tighten this 5-10× at the
 cost of ~256 MB / layer; see logbook.
+
+At ``--n_layers > 1`` all (atol, rtol) thresholds are scaled by
+``sqrt(n_layers)`` to absorb bf16 chain noise compounding through the depth-N
+stack — the fail rule (``diff > atol AND rel > rtol``) keeps the test from
+becoming a no-op even at large N because magnitudes also grow proportionally.
+If the scaled thresholds are too tight in practice, tune the heuristic here
+rather than per-tensor.
 """
 
 import argparse
@@ -170,7 +195,31 @@ def main():
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=3)
     p.add_argument("--n_iter", type=int, default=20)
+    p.add_argument(
+        "--n_layers",
+        type=int,
+        default=1,
+        help="Number of stream_moe_func calls chained per iter (shared "
+        "weights / routing). >1 exercises the multi-layer-within-iter "
+        "ctx / dispatch_seq surface. Capped at 10: the eager reference's "
+        "autograd graph (functional index_add chain across E experts per "
+        "layer × N layers) is the limiting factor on an 80 GB H100, not "
+        "the streaming path.",
+    )
     args = p.parse_args()
+    assert 1 <= args.n_layers <= 10, (
+        f"--n_layers={args.n_layers}: must be in [1, 10]. The cap is the "
+        "eager-reference autograd-graph size at production seq_len, not a "
+        "streaming-pipeline limit (see arg help)."
+    )
+
+    # Scale (atol, rtol) by sqrt(n_layers) to absorb bf16 chain noise
+    # compounding through the depth-N stack. See module docstring.
+    tol_scale = max(1.0, args.n_layers ** 0.5)
+    TOL = {
+        name: (atol * tol_scale, rtol * tol_scale)
+        for name, (atol, rtol) in TOL_DEFAULT.items()
+    }
 
     device = init_distributed()
     rank, world_size = get_global_rank(), get_world_size()
@@ -180,11 +229,12 @@ def main():
     rank_zero_print(
         f"[validate] world={world_size} num_sms={args.num_sms} "
         f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-        f"n_warmup={args.n_warmup} n_iter={args.n_iter}"
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
+        f"n_layers={args.n_layers} tol_scale={tol_scale:.2f}"
     )
     rank_zero_print(
         "[validate] per-tensor thresholds (atol, rtol): "
-        + ", ".join(f"{n}={a:.0e}/{r:.0e}" for n, (a, r) in TOL_DEFAULT.items())
+        + ", ".join(f"{n}={a:.0e}/{r:.0e}" for n, (a, r) in TOL.items())
     )
 
     buffer = make_buffer(group, args.num_sms)
@@ -236,9 +286,16 @@ def main():
     topk_w_ref = topk_weights.detach().clone().requires_grad_(True)
     w1_full_ref = w1_full.detach().clone().requires_grad_(True)
     w2_full_ref = w2_full.detach().clone().requires_grad_(True)
-    out_ref = torch_reference_full_moe(
-        x_ref, topk_idx, topk_w_ref, w1_full_ref, w2_full_ref
-    )
+    # Stack the reference N times, mirroring the streaming forward's
+    # shared-weights / shared-routing chain. Each call reads / writes the
+    # same leaves so dL/dW1_full and dL/dW2_full accumulate across the
+    # stack — same shape as the streaming path's grads.
+    h_ref = x_ref
+    for _ in range(args.n_layers):
+        h_ref = torch_reference_full_moe(
+            h_ref, topk_idx, topk_w_ref, w1_full_ref, w2_full_ref
+        )
+    out_ref = h_ref
     dL_dx_ref, dL_dtopk_w_ref, dL_dW1_full_ref, dL_dW2_full_ref = torch.autograd.grad(
         out_ref, [x_ref, topk_w_ref, w1_full_ref, w2_full_ref], grad_outputs=grad_out
     )
@@ -262,22 +319,24 @@ def main():
         topk_w_warm = topk_weights.detach().clone().requires_grad_(True)
         w1_warm = w1_local.detach().clone().requires_grad_(True)
         w2_warm = w2_local.detach().clone().requires_grad_(True)
-        out_warm = stream_moe_func(
-            buffer,
-            x_warm,
-            topk_idx,
-            topk_w_warm,
-            is_token_in_rank,
-            w1_warm,
-            w2_warm,
-            streams=streams,
-            num_experts=NUM_EXPERTS,
-            tile_m=TILE_M,
-            tile_n_a=TILE_N_A,
-            tile_n_y=TILE_N_Y,
-        )
+        h_warm = x_warm
+        for _ in range(args.n_layers):
+            h_warm = stream_moe_func(
+                buffer,
+                h_warm,
+                topk_idx,
+                topk_w_warm,
+                is_token_in_rank,
+                w1_warm,
+                w2_warm,
+                streams=streams,
+                num_experts=NUM_EXPERTS,
+                tile_m=TILE_M,
+                tile_n_a=TILE_N_A,
+                tile_n_y=TILE_N_Y,
+            )
         torch.autograd.grad(
-            out_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out
+            h_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out
         )
     torch.cuda.synchronize()
     barrier(group)
@@ -294,20 +353,23 @@ def main():
         w1_iter = w1_local.detach().clone().requires_grad_(True)
         w2_iter = w2_local.detach().clone().requires_grad_(True)
 
-        out_actual = stream_moe_func(
-            buffer,
-            x_iter,
-            topk_idx,
-            topk_w_iter,
-            is_token_in_rank,
-            w1_iter,
-            w2_iter,
-            streams=streams,
-            num_experts=NUM_EXPERTS,
-            tile_m=TILE_M,
-            tile_n_a=TILE_N_A,
-            tile_n_y=TILE_N_Y,
-        )
+        h = x_iter
+        for _ in range(args.n_layers):
+            h = stream_moe_func(
+                buffer,
+                h,
+                topk_idx,
+                topk_w_iter,
+                is_token_in_rank,
+                w1_iter,
+                w2_iter,
+                streams=streams,
+                num_experts=NUM_EXPERTS,
+                tile_m=TILE_M,
+                tile_n_a=TILE_N_A,
+                tile_n_y=TILE_N_Y,
+            )
+        out_actual = h
         dL_dx_actual, dL_dtopk_w_actual, dL_dW1_local_actual, dL_dW2_local_actual = (
             torch.autograd.grad(
                 out_actual,
@@ -330,7 +392,7 @@ def main():
         n_bad_per_tensor_local = []
         ok = True
         for name, actual, ref in per_tensor_names:
-            atol, rtol = TOL_DEFAULT[name]
+            atol, rtol = TOL[name]
             actual_f = actual.to(torch.float32)
             ref_f = ref.to(torch.float32)
             diff = (actual_f - ref_f).abs()
