@@ -760,6 +760,41 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
+
+        // Reverse-scan `send_head[token, responsible_rank]` over the range we
+        // just wrote, encoding sentinels in-place. Fused from
+        // `encode_combine_heads_kernel`'s former blocks 1..N (the encode kernel
+        // now retains only block 0 / slab memset+barrier). One warp per
+        // rank-group does the scan (other 2 exit). The per-chunk
+        // `bar.sync %0, %1` at the chunk-loop tail above syncs all warps in
+        // this rank-group on each iteration, so by loop exit all
+        // `send_head[*, responsible_rank]` writes are visible to warp 0.
+        // Visibility downstream is by communicate-stream FIFO (this rank's
+        // combine_main_kernel reads the same sentinels) — no new
+        // cross-rank release-acquire pair is needed, and the sentinels carry
+        // through to bwd combine_grads because `handle.send_head` is the
+        // same tensor.
+        if (send_warp_id_in_rank == 0 and per_token_out.send_head != nullptr) {
+            int last_head = kReverseScanSentinel;
+            #pragma unroll
+            for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
+                int token_idx = token_idx_tail - lane_id, expected_head = 0;
+                auto current_head = (token_idx >= token_start_idx)
+                    ? __ldg(per_token_out.send_head + token_idx * kNumRanks + responsible_rank)
+                    : -1;
+                for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++i) {
+                    const int head = __shfl_sync(0xffffffff, current_head, i);
+                    if (head < 0) {
+                        if (lane_id == i)
+                            expected_head = -last_head - 1;
+                    } else {
+                        last_head = head;
+                    }
+                }
+                if (current_head < 0 and token_idx >= token_start_idx)
+                    per_token_out.send_head[token_idx * kNumRanks + responsible_rank] = expected_head;
+            }
+        }
     } else {
         // Workers for receiving — pool layout. Each landed (token, k) pair routing
         // to a local expert e gets its own pool slot, allocated deterministically
@@ -1381,56 +1416,44 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 template <int kNumRanks>
 __global__ void encode_combine_heads_kernel(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
-    const auto sm_id = static_cast<int>(blockIdx.x);
-    if (sm_id == 0) {
-        // Barrier before cleaning
-        barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
+    // Single-block kernel: bracketed slab head/tail memset.
+    //
+    // The blocks 1..N reverse-scan of `send_head` that used to live here was
+    // fused into `dispatch_main_kernel`'s per-channel sender block tail
+    // (writes are local-only — combine reads `send_head` from this rank's
+    // communicate stream FIFO-after dispatch_main on the same rank, no
+    // cross-rank ordering hazard). The cross-rank barrier_block calls remain
+    // because they cover the aliasing between this rank's
+    // (start_offset, end_offset) slots — written by dispatch_main's sender
+    // block at line ~688, read by dispatch_main's receiver block at line
+    // ~818 — and the next combine_main's (channel_head_idx, channel_tail_idx)
+    // slots, which share the same memory (see file-level "Memory layout"
+    // notes above).
+    //
+    // The `num_channels` and `num_recv_tokens` parameters are kept on the
+    // signature for API stability with bwd-side callers; only the
+    // bracketed-memset path runs.
+    (void)num_channels;
+    (void)num_recv_tokens;
+    (void)send_head;
 
-        // Clean
-        auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
-        auto ptr = static_cast<int*>(buffer_ptrs[rank]);
-        #pragma unroll
-        for (int i = thread_id; i < num_memset_int; i += num_threads)
-            ptr[i] = 0;
+    // Barrier before cleaning
+    barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
-        // Barrier after cleaning
-        barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
-    } else {
-        const auto channel_id = sm_id - 1;
-        const auto thread_id = static_cast<int>(threadIdx.x);
-        const auto rank_id = thread_id / 32;
-        const auto lane_id = thread_id % 32;
-        if (rank_id >= kNumRanks)
-            return;
+    // Clean
+    auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
+    auto ptr = static_cast<int*>(buffer_ptrs[rank]);
+    #pragma unroll
+    for (int i = thread_id; i < num_memset_int; i += num_threads)
+        ptr[i] = 0;
 
-        int token_start_idx, token_end_idx;
-        get_channel_task_range(num_recv_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
-
-        int last_head = kReverseScanSentinel;
-        #pragma unroll
-        for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
-            int token_idx = token_idx_tail - lane_id, expected_head = 0;
-            auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
-            for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++i) {
-                const int head = __shfl_sync(0xffffffff, current_head, i);
-                if (head < 0) {
-                    if (lane_id == i)
-                        expected_head = -last_head - 1;
-                } else {
-                    last_head = head;
-                }
-            }
-            if (current_head < 0 and token_idx >= token_start_idx)
-                send_head[token_idx * kNumRanks + rank_id] = expected_head;
-        }
-    }
+    // Barrier after cleaning
+    barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 
     // PDL trigger — combine_main_kernel (the next kernel on this stream)
-    // is marked as a programmatic consumer. Releasing here, after each
-    // block's writes drain (block 0's IPC slab cleanup is bracketed by
-    // its two barrier_block calls; blocks 1..N's send_head reverse-scan
-    // writes are register-resident before this point), lets combine's
-    // CTAs start dispatching while encode's last blocks drain.
+    // is marked as a programmatic consumer. Releasing here, after the
+    // bracketed slab cleanup drains, lets combine's CTAs start dispatching
+    // while this kernel's barrier exit completes on peer ranks.
     griddepcontrol_launch_dependents();
 }
 
@@ -1455,11 +1478,15 @@ void encode_combine_heads(void** buffer_ptrs,
                   rank);                               \
     break
 
+    // After fusing the reverse-scan into dispatch_main's sender block tail,
+    // encode is a single-block kernel (slab memset bracketed by barrier_block
+    // pairs). `num_channels` and `num_recv_tokens` are passed through for
+    // call-site API stability but are unused in the kernel.
+    (void)num_recv_tokens;
     const int num_threads = std::max(128, 32 * num_ranks);
     EP_HOST_ASSERT(num_ranks <= num_threads);
     EP_HOST_ASSERT(num_threads <= 1024);
-    EP_HOST_ASSERT(1 + num_channels <= num_channels * 2);
-    SETUP_LAUNCH_CONFIG(1 + num_channels, num_threads, stream);
+    SETUP_LAUNCH_CONFIG(1, num_threads, stream);
     SWITCH_RANKS(ENCODE_COMBINE_HEADS);
 #undef ENCODE_COMBINE_HEADS
 }
