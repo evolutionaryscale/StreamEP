@@ -1833,14 +1833,25 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
 
     // Pre-combine fixup: sentinel-encode heads in place. Forwarder reads
     // recv-side per-(dst_rdma_rank, channel) ranges, so the prefix matrix
-    // is the recv-side one.
-    internode::encode_combine_heads(
-        hidden_int4, num_topk, num_ranks, num_channels, num_combined_tokens,
-        dispatch_out.send_rdma_head.data_ptr<int>(),
-        dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
-        dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        dispatch_out.send_nvl_head.data_ptr<int>(),
-        stream);
+    // is the recv-side one. Only the fwd combine needs to run encode — bwd
+    // combine_grads reads the SAME ``send_rdma_head`` / ``send_nvl_head``
+    // tensors (persisted across fwd→bwd via the StreamingHandle) which
+    // already hold fwd encode's in-place sentinels. The internode encode is
+    // pure sentinel encoding (no slab cleanup or cross-rank barrier — see
+    // internode.cu encode_combine_heads_kernel), so skipping it for bwd is
+    // safe. Was previously also serving as accidental scheduling slack on
+    // the communicate stream between dispatch_grads and combine_grads — the
+    // kernel_a_bwd launch gate (previous commit) is the explicit
+    // replacement.
+    if (is_fwd) {
+        internode::encode_combine_heads(
+            hidden_int4, num_topk, num_ranks, num_channels, num_combined_tokens,
+            dispatch_out.send_rdma_head.data_ptr<int>(),
+            dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
+            dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+            dispatch_out.send_nvl_head.data_ptr<int>(),
+            stream);
+    }
 
     // Combine output tensors. Fwd: no per-K weight output (kernel Y already
     // pre-multiplies pool_topk_weight per row); C++ returns `c10::nullopt`
