@@ -132,19 +132,19 @@ def scenario_half_empty_experts(T: int, K: int, E: int, world_size: int, rank: i
     return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
 
 
-def make_per_rank_imbalance(skew_pct: int):
+def make_per_rank_imbalance(skew_pct: int, target_rank: int = 1):
     """Factory: returns a scenario that routes ``skew_pct``% of tokens exclusively
-    to experts owned by rank 1. The remaining ``100 - skew_pct``% rotate through
-    all experts (uniform fallback). At skew_pct=0 it's effectively uniform; at
-    skew_pct=100 every token goes to rank 1.
+    to experts owned by ``target_rank``. The remaining ``100 - skew_pct``% rotate
+    through all experts (uniform fallback). At skew_pct=0 it's effectively uniform;
+    at skew_pct=100 every token goes to target_rank.
     """
     skew_pct = max(0, min(100, int(skew_pct)))
 
     def scenario(T: int, K: int, E: int, world_size: int, rank: int,
                  device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_local_experts = E // world_size
-        target_rank = min(1, world_size - 1)
-        target_e_lo = target_rank * num_local_experts
+        clamped_target = min(target_rank, world_size - 1)
+        target_e_lo = clamped_target * num_local_experts
         t_ix = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1)
         k_ix = torch.arange(K, device=device, dtype=torch.int64).unsqueeze(0)
         hot_idx = target_e_lo + ((t_ix * K + k_ix) % num_local_experts)
@@ -284,6 +284,10 @@ def main():
                         "Default 90 (the SCENARIOS default).")
     p.add_argument("--T", type=int, default=SEQ_LEN_PER_RANK,
                    help="Per-rank token count (default = production SEQ_LEN_PER_RANK).")
+    p.add_argument("--num_sms", type=int, default=NUM_SMS,
+                   help="SMs allocated to dispatch/combine (default = NUM_SMS=80).")
+    p.add_argument("--per-rank-target", type=int, default=1,
+                   help="Target rank for per_rank_imbalance scenario (default 1).")
     args = p.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -304,18 +308,33 @@ def main():
     K = TOPK
     E = NUM_EXPERTS
 
-    # Apply --per-rank-skew override by rebuilding that scenario's builder.
+    # Apply --per-rank-skew / --per-rank-target override by rebuilding the scenario.
     scenarios = list(SCENARIOS)
-    if args.per_rank_skew is not None:
+    if args.per_rank_skew is not None or args.per_rank_target != 1:
+        skew = args.per_rank_skew if args.per_rank_skew is not None else 90
+        tgt = args.per_rank_target
         scenarios = [
-            (f"per_rank_imbalance_{args.per_rank_skew}pct", make_per_rank_imbalance(args.per_rank_skew))
+            (f"per_rank_imbalance_skew{skew}_tgt{tgt}",
+             make_per_rank_imbalance(skew, target_rank=tgt))
             if name == "per_rank_imbalance" else (name, builder)
             for name, builder in scenarios
         ]
-    # Filter via --scenario if given.
+    # Filter via --scenario if given. List-based (preserves order + duplicates
+    # so [skew, skew] actually re-runs the same scenario twice — needed for
+    # Bug B.2 mechanism testing).
     if args.scenario:
-        wanted = set(args.scenario)
-        scenarios = [(n, b) for n, b in scenarios if n in wanted or n.startswith("per_rank_imbalance_")]
+        # Allow the user's name "per_rank_imbalance" to match the renamed
+        # scenario (per_rank_imbalance_skewN_tgtR) when --per-rank-skew or
+        # --per-rank-target was supplied.
+        scenarios_by_name = {n: b for n, b in scenarios}
+        def _resolve(name):
+            if name in scenarios_by_name:
+                return (name, scenarios_by_name[name])
+            for n, b in scenarios_by_name.items():
+                if n.startswith("per_rank_imbalance") and name == "per_rank_imbalance":
+                    return (n, b)
+            return None
+        scenarios = [r for name in args.scenario for r in [_resolve(name)] if r is not None]
         if not scenarios:
             if rank == 0:
                 print(f"[skewed-experts] no scenarios matched {args.scenario}", flush=True)
@@ -328,7 +347,7 @@ def main():
         print(f"[skewed-experts] scenarios: {[n for n, _ in scenarios]}", flush=True)
 
     # Buffer + streams: shared across scenarios.
-    buffer = make_buffer(group, NUM_SMS)
+    buffer = make_buffer(group, args.num_sms)
     streams = make_streams(device=device)
 
     # Per-rank expert weights (small N(0, 0.02) so output magnitudes are stable).

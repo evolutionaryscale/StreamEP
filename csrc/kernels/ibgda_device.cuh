@@ -437,7 +437,19 @@ __device__ static __forceinline__ void ibgda_write_amo_add_wqe(nvshmemi_ibgda_de
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     void* rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
     if (is_local_copy) {
-        atomicAdd(static_cast<unsigned long long*>(rptr), value);
+        // .release.sys atomic add: pairs with the consumer's ld.acquire.sys
+        // on the same address (`rdma_channel_tail`), establishing release-
+        // acquire ordering for the sender's prior data writes. Plain
+        // atomicAdd (the historical implementation) is .relaxed.gpu, which
+        // breaks the release-acquire pair when the consumer (forwarder)
+        // also lives on the same GPU but reads via ld.acquire.sys — surfaced
+        // as Bug B.2 on channel 35 where the LOCAL src_rdma=0 path delivered
+        // stale meta to the forwarder.
+        unsigned long long ret;
+        asm volatile("atom.add.release.sys.global.u64 %0, [%1], %2;"
+                     : "=l"(ret)
+                     : "l"(rptr), "l"(static_cast<unsigned long long>(value))
+                     : "memory");
     } else {
         nvshmemi_ibgda_device_qp_t* qp = ibgda_get_rc(pe, qp_id);
 

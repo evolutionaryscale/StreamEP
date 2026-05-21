@@ -254,6 +254,56 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
     return ((raw + a - 1) / a) * a;
 }
 
+// Total bytes occupied by dispatch's NVL sub-buffer chain on
+// `buffer_ptrs[i]`: `nvl_channel_x` + `nvl_channel_prefix_start` +
+// `nvl_channel_prefix_end` + `nvl_channel_head` + `nvl_channel_tail`. Used
+// by the host buffer-size hint AND by `combine_main_kernel` /
+// `combine_grads_main_kernel` to offset their own NVL sub-buffer bases past
+// dispatch's region — see Bug B.2 fix (markdowns/design.md §"Disjoint NVL
+// regions"). Dispatch and combine previously carved sub-buffers from the
+// same offset-0 base with different strides; the resulting cross-channel
+// physical-address aliasing let iter-N combine writes shadow iter-N+1
+// dispatch reads at a high slot index, manifesting as wrong-token
+// `SourceMeta` at the receiver.
+__host__ __device__ inline int64_t get_dispatch_nvl_region_bytes(
+    int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens,
+    int num_channels, int num_rdma_ranks) {
+    const int64_t nvl_peers = static_cast<int64_t>(NUM_MAX_NVL_PEERS);
+    const int64_t channels = num_channels;
+    const int64_t per_slab_x = static_cast<int64_t>(num_max_nvl_chunked_recv_tokens)
+                             * get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
+    const int64_t total_x = per_slab_x * nvl_peers * channels;
+    const int64_t per_channel_prefix = static_cast<int64_t>(num_rdma_ranks)
+                                     * static_cast<int64_t>(sizeof(uint64_t))
+                                     * nvl_peers;
+    const int64_t total_prefix = per_channel_prefix * channels;  // each of start/end
+    const int64_t per_channel_ht = static_cast<int64_t>(sizeof(uint64_t)) * nvl_peers;
+    const int64_t total_ht = per_channel_ht * channels;  // each of head/tail
+    // 1 x_buffer + 2 prefix buffers + 1 head + 1 tail
+    return total_x + 2 * total_prefix + 2 * total_ht;
+}
+
+// Total bytes occupied by combine's NVL sub-buffer chain. Used by host
+// buffer-size hint to size combine's region after dispatch's. Combine has
+// no `prefix_start`/`prefix_end` (its layout is `x` + `head` + `tail`), and
+// combine's `head`/`tail` use `kNumRDMARanks` elements per slab (vs
+// dispatch's `1`).
+__host__ __device__ inline int64_t get_combine_nvl_region_bytes(
+    int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens,
+    int num_channels, int num_rdma_ranks) {
+    const int64_t nvl_peers = static_cast<int64_t>(NUM_MAX_NVL_PEERS);
+    const int64_t channels = num_channels;
+    const int64_t per_slab_x = static_cast<int64_t>(num_max_nvl_chunked_recv_tokens)
+                             * get_num_bytes_per_token(hidden_int4, 0, num_topk);
+    const int64_t total_x = per_slab_x * nvl_peers * channels;
+    const int64_t per_channel_ht = static_cast<int64_t>(num_rdma_ranks)
+                                 * static_cast<int64_t>(sizeof(uint64_t))
+                                 * nvl_peers;
+    const int64_t total_ht = per_channel_ht * channels;
+    // 1 x_buffer + 1 head + 1 tail
+    return total_x + 2 * total_ht;
+}
+
 // RDMA dispatch meta SymBuffer slab size (ints per (channel, dst_rdma) slab).
 // 32 ints = 128 bytes = one H100 L2 cache line. Slots 0..17 carry the data
 // (NUM_MAX_NVL_PEERS*2 start_sum + NUM_MAX_NVL_PEERS*2 end_sum + 2 prefix);

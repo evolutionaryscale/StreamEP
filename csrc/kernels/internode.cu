@@ -1709,7 +1709,14 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 {
-                    uint64_t raw_tail = __shfl_sync(0xffffffff, ld_volatile_global(nvl_channel_tail.buffer()), 0);
+                    // ld.acquire.sys pairs with the forwarder's st.release.sys on
+                    // nvl_channel_tail (line ~1568). Without acquire here the
+                    // receiver could see the new tail but stale prior TMA-store
+                    // data, since `ld.volatile` does not establish a release-
+                    // acquire happens-before on the data writes — surfaced under
+                    // iter-2 rank-load asymmetry as receiver_exit_mismatch on
+                    // channel 35 (Bug B.2, see markdowns/current_state.md).
+                    uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
@@ -1759,7 +1766,12 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     int* base_pool_substream = const_cast<int*>(base_pool_for_channel + src_world * E_local);
                     int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
                     for (int k = 0; k < shape.num_topk; ++k) {
-                        int e_global = static_cast<int>(__ldg(topk_idx_in_msg + k));
+                        // ld_nc_global (= ld.volatile.global with DISABLE_AGGRESSIVE_PTX_INSTRS)
+                        // bypasses the read-only data cache, which is NOT
+                        // invalidated by ld.acquire.sys on a different address.
+                        // Upstream DeepEPV1/V2 also use ld_nc_global here, not
+                        // __ldg — matching part of the Bug B.2 fix.
+                        int e_global = static_cast<int>(ld_nc_global(topk_idx_in_msg + k));
                         int e_local = (e_global >= local_expert_begin and e_global < local_expert_end) ? e_global - local_expert_begin : -1;
                         e_local_row[k] = e_local;
                         if (e_local >= 0) {
@@ -1885,6 +1897,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 st_relaxed_sys_global(nvl_channel_head.buffer(),
                                      nvl_pack(nvl_seq, cached_channel_head_idx));
         }
+
     }
 }
 
@@ -2901,7 +2914,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 {
-                    uint64_t raw_tail = __shfl_sync(0xffffffff, ld_volatile_global(nvl_channel_tail.buffer()), 0);
+                    // ld.acquire.sys pairs with the forwarder's st.release.sys on
+                    // nvl_channel_tail — mirror of fwd dispatch_main's fix for
+                    // Bug B.2.
+                    uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
@@ -3155,6 +3171,17 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     // gates below).
     const auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, num_topk);
 
+    // Bug B.2 fix (markdowns/design.md §"Disjoint NVL regions"): combine's
+    // NVL sub-buffer chain lives at `buffer_ptrs[i] + dispatch_region_offset`,
+    // physically disjoint from dispatch's chain at `buffer_ptrs[i] + 0`.
+    // Avoids cross-kernel address aliasing where iter-N combine writes (at
+    // combine's (ch+1, slab, slot=0, hidden_offset)) would shadow iter-N+1
+    // dispatch reads (at dispatch's (ch, slab, slot=N, meta_offset)) on
+    // GPU L2, manifesting as wrong-token `SourceMeta` at the receiver.
+    const int64_t dispatch_region_offset = get_dispatch_nvl_region_bytes(
+        hidden_int4, num_topk, num_max_nvl_chunked_recv_tokens,
+        num_channels, kNumRDMARanks);
+
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto role_meta = [=]() -> std::pair<WarpRole, int> {
         auto warp_id = thread_id / 32;
@@ -3198,7 +3225,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         // weight (looked up via recv_token_to_slots → per_slot_weights).
         const auto dst_nvl_rank = warp_id;
 
-        auto dst_buffer_ptr = buffer_ptrs[dst_nvl_rank], local_buffer_ptr = buffer_ptrs[nvl_rank];
+        // Offset by dispatch's region size — see Bug B.2 fix above.
+        void* dst_buffer_ptr = static_cast<uint8_t*>(buffer_ptrs[dst_nvl_rank]) + dispatch_region_offset;
+        void* local_buffer_ptr = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dispatch_region_offset;
         auto nvl_channel_x = AsymBuffer<uint8_t>(dst_buffer_ptr,
                                                  num_max_nvl_chunked_recv_tokens * num_bytes_per_token,
                                                  NUM_MAX_NVL_PEERS,
@@ -3411,11 +3440,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
         auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
-        void* local_nvl_buffer = buffer_ptrs[nvl_rank];
+        // Offset by dispatch's region size — see Bug B.2 fix above.
+        void* local_nvl_buffer = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dispatch_region_offset;
         void* nvl_buffers[NUM_MAX_NVL_PEERS];
         #pragma unroll
         for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
-            nvl_buffers[i] = buffer_ptrs[i];
+            nvl_buffers[i] = static_cast<uint8_t*>(buffer_ptrs[i]) + dispatch_region_offset;
         auto nvl_channel_x =
             AsymBuffer<uint8_t>(
                 local_nvl_buffer, num_max_nvl_chunked_recv_tokens * num_bytes_per_token, NUM_MAX_NVL_PEERS, channel_id, num_channels)
@@ -3525,7 +3555,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         // values. The sender's iter-entry force-write +
                         // per-chunk packed writes ensure the slot eventually
                         // carries this iter's tag; pre-tag residue is ignored.
-                        uint64_t raw_tail = ld_volatile_global(nvl_channel_tail.buffer(lane_id));
+                        // ld.acquire.sys pairs with the kNVLSender's st.release.sys
+                        // on nvl_channel_tail (see Bug B.2 fix in fwd dispatch).
+                        uint64_t raw_tail = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
                         if (nvl_seq_match(raw_tail, nvl_seq))
                             cached_nvl_channel_tail_idx = nvl_unpack_value(raw_tail);
                         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
@@ -3638,8 +3670,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     cached_channel_tail_idx =
                         static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))) - prev_rdma_channel_tail_at_entry);
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("DeepEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, tail: %d, "
-                               "waiting: %ld, expect: %d\n",
+                        printf("DeepEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, "
+                               "tail: %d, waiting: %ld, expect: %d\n",
                                channel_id, rdma_rank, nvl_rank, lane_id,
                                cached_channel_tail_idx, token_idx, expected_head);
                         trap();

@@ -172,6 +172,17 @@ class Buffer:
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1:
+            # Disable NVSHMEM's NVLink P2P transport. We do all intra-node
+            # NVLink traffic through our own CUDA IPC `buffer_ptrs[i]` mappings
+            # with direct PTX writes/reads; NVSHMEM is only used for IBGDA
+            # (RDMA). Letting NVSHMEM keep P2P enabled (its default) creates
+            # an additional set of virtual-address mappings for the symmetric
+            # heap on top of our IPC mappings — DeepEPv1 disables this for
+            # the same reason ("ensure we are not using NVLink through
+            # NVSHMEM"). Suspected to interact with Bug B.2 (channel-35
+            # cross-iter NVL ring corruption).
+            os.environ['NVSHMEM_DISABLE_P2P'] = '1'
+
             # Enable IBGDA
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
 

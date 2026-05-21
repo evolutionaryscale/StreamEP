@@ -59,21 +59,29 @@ struct Config {
         const auto num_rdma_ranks = std::max(num_ranks / NUM_MAX_NVL_PEERS, 1);
         const auto num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
         const int num_channels = num_sms / 2;
+        const int hidden_int4 = static_cast<int>(hidden_bytes / sizeof(int4));
 
+        // Disjoint NVL regions: dispatch's sub-buffer chain occupies bytes
+        // [0, D), combine's occupies [D, D + C). Combine kernels offset their
+        // base pointers by `get_dispatch_nvl_region_bytes(hidden_int4,
+        // num_topk_actual, ...)` at launch time (computed from kernel args).
+        // The host upper-bounds with `kNumMaxTopK` so the allocation fits
+        // any runtime `num_topk` without reallocation. See Bug B.2 (markdowns/
+        // design.md §"Disjoint NVL regions"): the prior shared layout caused
+        // iter-N combine writes to alias iter-N+1 dispatch read addresses
+        // via per-channel stride drift between the two kernels.
         size_t num_bytes = 0;
-        // NVL gen-stamp slots (`nvl_channel_prefix_start/end`, `nvl_channel_head`,
-        // `nvl_channel_tail` in `internode::dispatch_main_kernel` and the combine
-        // sender/forwarder/coord) are 64-bit `(seq32, value32)` pairs. Sizing
-        // covers the largest user across dispatch and combine, with one slot of
-        // slack.
-        num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(uint64_t);
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * hidden_bytes;
-#ifndef DISABLE_NVSHMEM
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * internode::get_source_meta_bytes();
-#endif
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK * sizeof(topk_idx_t);
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK * sizeof(float);
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxScales * sizeof(float);
+        num_bytes += internode::get_dispatch_nvl_region_bytes(
+            hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
+            num_channels, num_rdma_ranks);
+        num_bytes += internode::get_combine_nvl_region_bytes(
+            hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
+            num_channels, num_rdma_ranks);
+        // Scales: unused in stream_ep but kept in the upper bound so the
+        // allocation stays compatible with upstream DeepEP slot layouts that
+        // include per-token quant scales.
+        num_bytes += static_cast<size_t>(num_channels) * num_nvl_ranks
+                   * num_max_nvl_chunked_recv_tokens * kNumMaxScales * sizeof(float);
         num_bytes = ((num_bytes + 127) / 128) * 128;
         return num_bytes;
     }
