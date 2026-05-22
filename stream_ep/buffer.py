@@ -107,7 +107,7 @@ class Buffer:
         runtime: the C++ runtime.
     """
 
-    num_sms: int = 20
+    num_sms: int = 64
 
     def __init__(self,
                  group: Optional[dist.ProcessGroup],

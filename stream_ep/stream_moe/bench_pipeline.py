@@ -67,32 +67,29 @@ NUM_EXPERTS = 64
 SEQ_LEN_PER_RANK = 8192
 TOPK = 4
 DTYPE = torch.bfloat16
-NUM_SMS = 80  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
-# i.e. 132 on H100). Sweep at the current pipeline's full
-# fwd+bwd footprint (kernel-bounded measurement, profile traces,
-# 8×H100 production shape) shows fwd_e2e and fwd+bwd_e2e cluster
-# within ~20 µs across {80, 96, 112}, with 80 the slight winner
-# (-52 µs fwd, -70 µs fwd+bwd vs the 132 ceiling). Below 80,
-# bwd combine_grads bloats faster than fwd improves; above 80,
-# the dispatch grid is too wide to leave SMs for kernel A's
-# CTAs to land mid-dispatch (gap_dispatch_to_a +6 µs at 132
-# vs −22 µs at 80 — i.e. kernel A overlaps 22 µs of dispatch's
-# tail). 80 is the sweet spot that maximises streaming overlap
-# without starving combine_grads of channels.
+NUM_SMS = 64  # DeepEP num_sms (channels = num_sms / 2; max = num_device_sms,
+# i.e. 132 on H100). 4-node internode sweep on the full fwd+bwd
+# footprint (32 GPU, T=8192, H=2048, E=384, K=13) picks 64 as the
+# sweet spot: total iter e2e drops to ~6350 µs vs ~6470 µs at 80,
+# with worse numbers in either direction (7080 µs at 32, 6435 µs at
+# 72, 6480 µs at 96, 6590 µs at 128). Fewer-but-larger channels
+# amortize per-channel control overhead better once RDMA latency
+# dominates the dispatch tail.
 TILE_M = 128
 # Decoupled tile_N per kernel — each streaming kernel has a different optimum
 # despite sharing the same per-tile MMA shape:
 #   * kernel A (fwd, gemm_gated) saturates at 256 — large M (TK), HK=H, big N=I.
 #   * kernel Y (fwd, atomic-scatter) also peaks at 256 once tile_n_a_bwd was
 #     decoupled (was 128 in earlier code when shared with kernel_a_bwd).
-#   * kernel_y_bwd is bottlenecked by epilogue (SwiGLU bwd + ColVecReduce
-#     atomic + dual TMA store), not the GEMM mainloop — smaller tile_n=128
-#     shortens the per-tile epilogue critical path.
+#   * kernel_y_bwd wins at 192 on 4-node internode (T=8192, H=2048, E=384,
+#     K=13). N dim = 2I = 768; 192 divides cleanly.
 #   * kernel_a_bwd is a vanilla data-grad GEMM (M=TK, K=2I, N=H) — 2× the
-#     K-axis work of fwd Y; tile_n=256 wins.
+#     K-axis work of fwd Y; tile_n=256 wins. N dim = H = 2048 here; pick
+#     a divisor of H (256 / 128 / 64) — 192 produces silently-wrong
+#     gradients because 2048 % 192 ≠ 0.
 TILE_N_A = 256
 TILE_N_Y = 256
-TILE_N_Y_BWD = 128
+TILE_N_Y_BWD = 192
 TILE_N_A_BWD = 256
 
 
@@ -367,6 +364,7 @@ def main():
             (
                 _dL_do_pool_captured,
                 _bwd_dispatch_arrival_count_captured,
+                _,  # grads_started event (unused in bench)
             ) = buffer.dispatch_grads(
                 handle, dL_dy_in, dispatch_seq=handle.dispatch_seq
             )

@@ -758,7 +758,7 @@ def stream_moe_func(
     tile_m: int = 128,
     tile_n_a: int = 192,
     tile_n_y: int = 256,
-    tile_n_y_bwd: int = 128,
+    tile_n_y_bwd: int = 192,
     tile_n_a_bwd: int = 256,
     tile_m_dW1: int | None = None,
     tile_n_dW1: int | None = 256,
