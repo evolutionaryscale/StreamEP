@@ -220,8 +220,7 @@ __global__ void streaming_dispatch_metadata_phase_a_kernel(
     // Blocks 1..kNumRDMARanks: per-(dst_rdma_rank) channel prefix matrix
     // (sender-side). Computes `gbl_channel_prefix_matrix[dst_world, c]` and
     // `rdma_channel_prefix_matrix[dst_rdma, c]` from THIS rank's topk_idx
-    // (the routing-bitmap derivation that get_dispatch_layout used to
-    // perform host-side; folded into this kernel now). Higher-index blocks
+    // (routing-bitmap derivation, on-device). Higher-index blocks
     // (sm_id > kNumRDMARanks) sit idle here and join the wide-parallel
     // Phase B work after the grid.sync below.
     // ─────────────────────────────────────────────────────────────────────
@@ -1094,10 +1093,13 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
     auto sync_rdma_sender_smem = []() { asm volatile("barrier.sync 0, %0;" ::"r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
+    // Senders-only tail sync (no coordinator), for the post-loop encode pass
+    // that reverse-scans `send_rdma_head` in place to install gap sentinels.
+    auto sync_rdma_sender_tail = []() { asm volatile("barrier.sync 3, %0;" ::"r"(kNumDispatchRDMASenderWarps * 32)); };
 
     // TMA buffer slabs (per (channel-block, NVL-peer-warp)). Forwarder warps and
     // NVL receiver warps both index by `target_rank` ∈ [0, NUM_MAX_NVL_PEERS),
-    // sharing the layout (mirrors legacy). Two-stage pipeline: each warp owns
+    // sharing the layout. Two-stage pipeline: each warp owns
     // two `num_bytes_per_token`-sized stage buffers (16-byte aligned) + two
     // 8-byte mbarriers at the tail. Stage `s` (∈ {0, 1}) is one outstanding
     // TMA load; the next iter's load issues into stage `1-s` before this iter
@@ -1127,6 +1129,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     __shared__ volatile int forward_channel_head[NUM_MAX_NVL_PEERS][kNumRDMARanks];
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
     auto sync_forwarder_smem = []() { asm volatile("barrier.sync 1, %0;" ::"r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
+    // Forwarders-only tail sync (no coordinator), for the post-loop encode
+    // pass that reverse-scans `send_nvl_head` in place. The forwarder
+    // coordinator runs an independent spin loop and would deadlock if
+    // included in this barrier.
+    auto sync_forwarder_tail = []() { asm volatile("barrier.sync 4, %0;" ::"r"(NUM_MAX_NVL_PEERS * 32)); };
 
     if (warp_role == WarpRole::kRDMASender) {
         // Get tasks
@@ -1306,6 +1313,30 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_head + channel_id * kNumRDMARanks + lane_id,
                 static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))));
+        }
+
+        // Reverse-scan `send_rdma_head[channel_token_range, dst_rdma_rank]`
+        // in place to install gap sentinels for combine. Where dispatch wrote
+        // `-1` (no contribution from this token to dst_rdma_rank), encode the
+        // next real future head ahead of it as `-last_head - 1`. Combine's
+        // coordinator computes min_head across receivers per lane to drive
+        // the cross-rank amo that advances the sender's `rdma_channel_head`;
+        // a raw `-1` would collapse the min and deadlock the ring. The
+        // encoded form lets gap-receivers publish a meaningful frontier.
+        // Same shape as intranode dispatch_main's fold; one warp per channel
+        // does the scan with `lane_id = dst_rdma_rank`, walking tokens
+        // serially in reverse (channel range ≤ 1024, lanes parallel).
+        sync_rdma_sender_tail();
+        if (warp_id == 0 and lane_id < kNumRDMARanks) {
+            int last_head = kReverseScanSentinel;
+            for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                int current_head = __ldg(per_token_out.send_rdma_head + token_idx * kNumRDMARanks + lane_id);
+                if (current_head < 0) {
+                    per_token_out.send_rdma_head[token_idx * kNumRDMARanks + lane_id] = -last_head - 1;
+                } else {
+                    last_head = current_head;
+                }
+            }
         }
 
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
@@ -1575,6 +1606,39 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 rdma_channel_meta.recv_buffer(lane_id) + kRdmaMetaSentinelSlot);
             atomicMax(env.dispatch_meta_sentinel_prev + channel_id * kNumRDMARanks + lane_id, latest_sentinel);
         }
+
+        // Reverse-scan `send_nvl_head[(channel, dst_rdma) range, NVL peer]`
+        // in place for combine's forwarder to read encoded gap sentinels.
+        // Each forwarder warp wrote one NVL-peer column during the main
+        // loop; after the sync below, all 8 columns of the channel's
+        // recv-token range are visible. Re-key by dst_rdma_rank: warp `w`
+        // (for `w < kNumRDMARanks`) handles the (channel, w) range,
+        // walking tokens serially in reverse with `lane_id = NVL peer`.
+        // Range bounds derived from recv_rdma_channel_prefix_matrix +
+        // recv_rdma_rank_prefix_sum (both already in scope on this SM).
+        sync_forwarder_tail();
+        if (warp_id < kNumRDMARanks) {
+            const int dst_rdma_rank = warp_id;
+            int token_start_idx = channel_id == 0
+                ? 0
+                : per_token_out.recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
+            int token_end_idx = per_token_out.recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
+            int shift = dst_rdma_rank == 0 ? 0 : inputs.recv_rdma_rank_prefix_sum[dst_rdma_rank - 1];
+            token_start_idx += shift;
+            token_end_idx += shift;
+
+            if (lane_id < NUM_MAX_NVL_PEERS) {
+                int last_head = kReverseScanSentinel;
+                for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                    int current_head = __ldg(per_token_out.send_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
+                    if (current_head < 0) {
+                        per_token_out.send_nvl_head[token_idx * NUM_MAX_NVL_PEERS + lane_id] = -last_head - 1;
+                    } else {
+                        last_head = current_head;
+                    }
+                }
+            }
+        }
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
         if (target_rank > 0)
             return;
@@ -1701,13 +1765,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 {
-                    // ld.acquire.sys pairs with the forwarder's st.release.sys on
-                    // nvl_channel_tail (line ~1568). Without acquire here the
-                    // receiver could see the new tail but stale prior TMA-store
-                    // data, since `ld.volatile` does not establish a release-
-                    // acquire happens-before on the data writes — surfaced under
-                    // iter-2 rank-load asymmetry as receiver_exit_mismatch on
-                    // channel 35 (Bug B.2; see markdowns/logbook.md 2026-05-21).
+                    // ld.acquire.sys pairs with the forwarder's st.release.sys
+                    // on nvl_channel_tail. Without acquire here the receiver
+                    // could see the new tail but stale prior TMA-store data,
+                    // since `ld.volatile` does not establish a release-acquire
+                    // happens-before on the data writes.
                     uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
@@ -1761,8 +1823,8 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                         // ld_nc_global (= ld.volatile.global with DISABLE_AGGRESSIVE_PTX_INSTRS)
                         // bypasses the read-only data cache, which is NOT
                         // invalidated by ld.acquire.sys on a different address.
-                        // Upstream DeepEPV1/V2 also use ld_nc_global here, not
-                        // __ldg — matching part of the Bug B.2 fix.
+                        // __ldg here would let a stale cached topk_idx escape
+                        // the release-acquire ordering on nvl_channel_tail.
                         int e_global = static_cast<int>(ld_nc_global(topk_idx_in_msg + k));
                         int e_local = (e_global >= local_expert_begin and e_global < local_expert_end) ? e_global - local_expert_begin : -1;
                         e_local_row[k] = e_local;
@@ -1934,8 +1996,9 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // contributing source ranks for one recv-token.
 //
 // `is_token_in_rank` = "this lane's rank actually contributed to this
-// token" — derived from `head_idx >= 0` (sentinel-encoded, set by
-// encode_combine_heads). Lane `i` holds the head + flag for rank `i`;
+// token" — derived from `head_idx >= 0` (sentinel-encoded in
+// dispatch_main_kernel's sender / forwarder SM tail). Lane `i` holds
+// the head + flag for rank `i`;
 // the helper warp-shuffles to assemble the per-token (rank, slot) topk
 // list.
 //
@@ -2084,184 +2147,6 @@ __device__ int combine_token(bool is_token_in_rank,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// encode_combine_heads — pre-combine fixup. See api.cuh for the architectural
-// contract; this is the kernel body. Block layout (single warp per block):
-//
-//   blocks [0, num_channels):
-//             reverse-order sentinel encoding of `combined_rdma_head`
-//             ([num_combined_tokens, num_rdma_ranks]). One block per
-//             channel; lane_id = dst_rdma_rank. Walks the channel's
-//             recv-token range in reverse and replaces `< 0` entries
-//             with `-last_head - 1`.
-//   blocks [num_channels, num_channels * (1 + num_rdma_ranks)):
-//             reverse-order sentinel encoding of `combined_nvl_head`
-//             ([num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]). One block per
-//             (channel, dst_rdma_rank); TMA-batched along the token axis,
-//             lane_id = NVL peer. Same `last_head` reverse-cumulative
-//             pattern, just along the NVL lane.
-//
-// Block-per-(channel | (channel, dst_rdma_rank)) avoids the warp-per-
-// channel packing that capped num_channels ≤ 32 (one block ≤ 32 warps).
-// Independent work items per block — no cross-block sync.
-//
-// TODO(fuse-into-combine): the reverse-scan logic in this kernel could
-// move into `combine_main_kernel` at the same per-(channel)/per-(channel,
-// dst_rdma_rank) granularity — combine's kRDMAReceiver and kNVLAndRDMA
-// Forwarder warps already own those scopes. Fusing eliminates the
-// separate kernel launch (~10-15 µs), the HBM round-trip on send_*_head
-// (combine could read once, encode in registers/SMEM, consume), and the
-// FIFO-implies-gate reasoning currently linking the two kernels. The four
-// sender-side / prefix-matrix sentinels we acquire here would move into
-// combine_main verbatim. Cost: ~50-80 LOC of reverse-scan logic + a SMEM
-// scratch in combine_main (which already runs near its SMEM budget — need
-// to measure). Tracked at Stage 1 acceptance time as a follow-up; see
-// markdowns/cdmc-partial-fix.md §"Stage 1 — Prefix-matrix sentinel".
-// ─────────────────────────────────────────────────────────────────────────────
-template <int kNumTMABytesPerWarp>
-__global__ void encode_combine_heads_kernel(
-    int* combined_rdma_head,
-    int num_combined_tokens,
-    int num_channels,
-    const int* rdma_channel_prefix_matrix,
-    const int* rdma_rank_prefix_sum,
-    int* combined_nvl_head,
-    int num_ranks) {
-    auto block_id = static_cast<int>(blockIdx.x);
-    auto lane_id = get_lane_id();
-
-    auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-
-    if (block_id < num_channels) {
-        // rdma_head reverse pass for `channel = block_id`. lane_id = dst_rdma_rank.
-        EP_DEVICE_ASSERT(num_rdma_ranks <= 32);
-
-        if (lane_id < num_rdma_ranks) {
-            int channel = block_id;
-            int token_start_idx, token_end_idx;
-            get_channel_task_range(num_combined_tokens, num_channels, channel, token_start_idx, token_end_idx);
-
-            // Sentinel for "no real head ahead"; any combine receiver that hits
-            // this is past the channel's tail.
-            int last_head = kReverseScanSentinel;
-            for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
-                auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
-                if (current_head < 0) {
-                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
-                } else {
-                    last_head = current_head;
-                }
-            }
-        }
-
-    } else {
-        // nvl_head reverse pass for one (channel, dst_rdma_rank). lane_id = NVL peer.
-        EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Too many NVL peers");
-
-        int nvl_block = block_id - num_channels;
-        int channel = nvl_block % num_channels;
-        int dst_rdma_rank = nvl_block / num_channels;
-
-        constexpr int tma_batch_size = kNumTMABytesPerWarp - sizeof(uint64_t);
-        constexpr int num_bytes_per_token = sizeof(int) * NUM_MAX_NVL_PEERS;
-        constexpr int num_tokens_per_batch = tma_batch_size / num_bytes_per_token;
-        EP_STATIC_ASSERT(num_bytes_per_token % 16 == 0, "num_bytes_per_token should be divisible by 16");
-
-        extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-        auto tma_buffer = smem_tma_buffer;
-        auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + tma_batch_size);
-        uint32_t tma_phase = 0;
-        if (elect_one_sync()) {
-            mbarrier_init(tma_mbarrier, 1);
-            fence_barrier_init();
-        }
-        __syncwarp();
-
-        int token_start_idx = channel == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel - 1];
-        int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel];
-        int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-        token_start_idx += shift, token_end_idx += shift;
-
-        int last_head = kReverseScanSentinel;
-        for (int batch_end_idx = token_end_idx; batch_end_idx > token_start_idx; batch_end_idx -= num_tokens_per_batch) {
-            auto batch_start_idx = max(token_start_idx, batch_end_idx - num_tokens_per_batch);
-
-            if (elect_one_sync()) {
-                tma_load_1d(tma_buffer,
-                            combined_nvl_head + batch_start_idx * NUM_MAX_NVL_PEERS,
-                            tma_mbarrier,
-                            (batch_end_idx - batch_start_idx) * num_bytes_per_token);
-                mbarrier_arrive_and_expect_tx(tma_mbarrier, (batch_end_idx - batch_start_idx) * num_bytes_per_token);
-            }
-            mbarrier_wait(tma_mbarrier, tma_phase);
-            __syncwarp();
-
-            for (int token_idx = batch_end_idx - 1; token_idx >= batch_start_idx; --token_idx) {
-                if (lane_id < NUM_MAX_NVL_PEERS) {
-                    auto current_head =
-                        reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
-                    if (current_head < 0) {
-                        reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
-                            -last_head - 1;
-                    } else {
-                        last_head = current_head;
-                    }
-                }
-            }
-            tma_store_fence();
-            __syncwarp();
-
-            if (elect_one_sync())
-                tma_store_1d(tma_buffer,
-                             combined_nvl_head + batch_start_idx * NUM_MAX_NVL_PEERS,
-                             (batch_end_idx - batch_start_idx) * num_bytes_per_token);
-            tma_store_wait<0>();
-            __syncwarp();
-        }
-    }
-
-    // PDL trigger — the next kernel on this stream (combine_main) is marked
-    // as a programmatic consumer. Releasing here, after all combined_*_head
-    // writes are drained (TMA store waits above + reverse-scan sentinel pass
-    // for rdma_head completes before reaching this point per block), lets
-    // combine_main's CTAs start dispatching while encode's last CTAs drain.
-    griddepcontrol_launch_dependents();
-}
-
-void encode_combine_heads(int hidden_int4,
-                          int num_topk,
-                          int num_ranks,
-                          int num_channels,
-                          int num_combined_tokens,
-                          int* combined_rdma_head,
-                          const int* rdma_channel_prefix_matrix,
-                          const int* rdma_rank_prefix_sum,
-                          int* combined_nvl_head,
-                          cudaStream_t stream) {
-    // Block-per-(channel | (channel, dst_rdma_rank)), 1 warp per block.
-    // 4096 B SMEM per nvl_head block packs ~127 tokens/batch
-    // (= (4096 − 8) / (4 × NUM_MAX_NVL_PEERS)). rdma_head blocks don't use
-    // SMEM but share the same launch attribute (cheap). Grid scales linearly
-    // with num_channels and num_rdma_ranks — no per-block warp cap.
-    constexpr int kNumTMABytesPerWarp = 4096;
-    constexpr int num_threads = 32;
-    const int smem_size = kNumTMABytesPerWarp;
-    const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-    const int num_blocks = num_channels * (1 + num_rdma_ranks);
-
-    EP_HOST_ASSERT(num_channels > 0 and num_rdma_ranks > 0);
-
-    auto kernel = encode_combine_heads_kernel<kNumTMABytesPerWarp>;
-    SETUP_LAUNCH_CONFIG(num_blocks, num_threads, stream);
-    SET_SHARED_MEMORY_FOR_TMA(kernel);
-    LAUNCH_KERNEL(&cfg, kernel,
-                  combined_rdma_head, num_combined_tokens, num_channels,
-                  rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
-                  combined_nvl_head,
-                  num_ranks);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // dispatch_grads_main_kernel — bwd dispatch, mirrors `dispatch_main_kernel`
 // shape (kRDMASender / kRDMASenderCoordinator / kRDMAAndNVLForwarder /
 // kForwarderCoordinator / kNVLReceivers) but for the bwd path: ships
@@ -2274,9 +2159,9 @@ void encode_combine_heads(int hidden_int4,
 //
 // Wire format reuses fwd's per-token bytes layout (data + SourceMeta +
 // topk_idx + topk_weights bytes). Bwd writes only the data + SourceMeta
-// regions; topk_* bytes are untouched (zero from encode_combine_heads
-// cleanup). Saves layout-divergence complexity at the cost of ~5–10%
-// wasted RDMA + NVL bandwidth per token.
+// regions; topk_* bytes are untouched. Saves layout-divergence
+// complexity at the cost of ~5–10% wasted RDMA + NVL bandwidth per
+// token.
 // ─────────────────────────────────────────────────────────────────────────────
 template <int kNumRDMARanks,
           int kNumTMABytesPerWarp,
@@ -2590,13 +2475,12 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 if (synced_num_tokens_to_send == 0)
                     continue;
 
-                // DeepEP commit 77f97f7 ("Fix the tail loading issue"): broadcast
-                // lane-0's read so all lanes agree on processed_tail. Without
-                // this, lane-divergent reads of rdma_send_channel_tail cause
-                // the coordinator to make inconsistent progress decisions and
-                // stall on iter 2+ of multi-iter workloads. The fix is already
-                // present at line 1129 in dispatch_main_kernel; this is the bwd
-                // copy that missed it.
+                // Broadcast lane-0's read so all lanes agree on
+                // processed_tail. Without the __shfl_sync, lane-divergent
+                // reads of rdma_send_channel_tail let the coordinator make
+                // inconsistent progress decisions and stall on iter 2+ of
+                // multi-iter workloads. Mirrors the same broadcast in
+                // dispatch_main_kernel's RDMA sender coordinator.
                 int processed_tail = __shfl_sync(0xffffffff, ld_acquire_cta(rdma_send_channel_tail + dst_rdma_rank), 0);
                 int synced_last_issued_tail = __shfl_sync(0xffffffff, last_issued_tail, dst_rdma_rank);
                 int num_tokens_processed = processed_tail - synced_last_issued_tail;
@@ -2906,9 +2790,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 {
-                    // ld.acquire.sys pairs with the forwarder's st.release.sys on
-                    // nvl_channel_tail — mirror of fwd dispatch_main's fix for
-                    // Bug B.2.
+                    // ld.acquire.sys pairs with the forwarder's st.release.sys
+                    // on nvl_channel_tail — mirror of fwd dispatch_main's
+                    // release-acquire pairing on the same slot.
                     uint64_t raw_tail = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
                     if (nvl_seq_match(raw_tail, nvl_seq))
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
@@ -3132,15 +3016,6 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     uint32_t* combine_reader_prev_tail) {
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
-    // PDL barrier — encode_combine_heads (immediately preceding kernel on
-    // this stream) called `griddepcontrol.launch_dependents` at its tail.
-    // Wait here so any subsequent read of `combined_rdma_head` /
-    // `combined_nvl_head` sees the encoded sentinels, not stale values from
-    // before encode's reverse-scan pass. CTAs scheduled into idle SMs while
-    // encode's tail drains spend the wait on launch + initial register
-    // setup — no useful work is lost.
-    griddepcontrol_wait();
-
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
@@ -3163,10 +3038,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
     // gates below).
     const auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, num_topk);
 
-    // Bug B.2 fix (markdowns/design.md §"Disjoint NVL regions"): combine's
-    // NVL sub-buffer chain lives at `buffer_ptrs[i] + dispatch_region_offset`,
-    // physically disjoint from dispatch's chain at `buffer_ptrs[i] + 0`.
-    // Avoids cross-kernel address aliasing where iter-N combine writes (at
+    // Combine's NVL sub-buffer chain lives at
+    // `buffer_ptrs[i] + dispatch_region_offset`, physically disjoint from
+    // dispatch's chain at `buffer_ptrs[i] + 0`. Disjointness avoids
+    // cross-kernel address aliasing where iter-N combine writes (at
     // combine's (ch+1, slab, slot=0, hidden_offset)) would shadow iter-N+1
     // dispatch reads (at dispatch's (ch, slab, slot=N, meta_offset)) on
     // GPU L2, manifesting as wrong-token `SourceMeta` at the receiver.
@@ -3217,7 +3092,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         // weight (looked up via recv_token_to_slots → per_slot_weights).
         const auto dst_nvl_rank = warp_id;
 
-        // Offset by dispatch's region size — see Bug B.2 fix above.
+        // Offset by dispatch's region size for disjoint NVL regions.
         void* dst_buffer_ptr = static_cast<uint8_t*>(buffer_ptrs[dst_nvl_rank]) + dispatch_region_offset;
         void* local_buffer_ptr = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dispatch_region_offset;
         auto nvl_channel_x = AsymBuffer<uint8_t>(dst_buffer_ptr,
@@ -3432,7 +3307,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
         auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
-        // Offset by dispatch's region size — see Bug B.2 fix above.
+        // Offset by dispatch's region size for disjoint NVL regions.
         void* local_nvl_buffer = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dispatch_region_offset;
         void* nvl_buffers[NUM_MAX_NVL_PEERS];
         #pragma unroll
@@ -3502,11 +3377,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             uint32_t prev_rdma_channel_head_at_entry =
                 combine_reader_prev_head[channel_id * kNumRDMARanks + dst_rdma_rank];
 
-            // `recv_rdma_channel_prefix_matrix` was gated by
-            // `encode_combine_heads` (which runs first on the same combine
-            // stream) — same-stream FIFO covers our read here. The gbl
-            // matrix gate inside kNVLSender (above) is independent and
-            // remains. See markdowns/cdmc-partial-fix.md §"Stage 1".
+            // `recv_rdma_channel_prefix_matrix` was written by dispatch's
+            // forwarder SM (preceding kernel on the same stream) — same-
+            // stream FIFO covers our read here. The gbl matrix gate inside
+            // kNVLSender (above) is independent and remains.
             int num_tokens_to_combine = recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
             int num_tokens_prefix = channel_id == 0 ? 0 : recv_rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
             num_tokens_to_combine -= num_tokens_prefix;
@@ -3548,7 +3422,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         // per-chunk packed writes ensure the slot eventually
                         // carries this iter's tag; pre-tag residue is ignored.
                         // ld.acquire.sys pairs with the kNVLSender's st.release.sys
-                        // on nvl_channel_tail (see Bug B.2 fix in fwd dispatch).
+                        // on nvl_channel_tail — release-acquire ordering for the
+                        // sender's prior TMA stores.
                         uint64_t raw_tail = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
                         if (nvl_seq_match(raw_tail, nvl_seq))
                             cached_nvl_channel_tail_idx = nvl_unpack_value(raw_tail);
@@ -3849,14 +3724,7 @@ void launch_combine_main(cudaDataType_t type,
     EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens >= num_warps_per_forwarder);
     EP_HOST_ASSERT(type == CUDA_R_16BF);
 
-    // PDL consumer of `encode_combine_heads` (same stream, FIFO-preceding
-    // launch). encode triggers `griddepcontrol.launch_dependents` at its
-    // tail; combine's CTAs start dispatching from the SM scheduler while
-    // encode's last CTAs drain, hiding combine's launch overhead. The
-    // entry-point `griddepcontrol.wait` in `combine_main_kernel` blocks
-    // until encode signals completion, so any read of combined_*_head
-    // sees the encoded sentinels.
-    SETUP_LAUNCH_CONFIG_PDL_CONSUMER(num_channels * 2, (num_forwarder_warps + 1) * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_channels * 2, (num_forwarder_warps + 1) * 32, stream);
     SWITCH_RDMA_RANKS(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE_IMPL

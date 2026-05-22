@@ -118,9 +118,9 @@ struct StreamingDispatchOutputs {
     // Produced by the metadata kernel (the four prefix tensors below) and by
     // the dispatch_main kernel's forwarder + NVL receiver (`send_rdma_head` /
     // `send_nvl_head` / `recv_rdma_channel_prefix_matrix` /
-    // `recv_gbl_channel_prefix_matrix` / `recv_src_meta`). The combine path
-    // (yet to be refactored) will consume these alongside `encode_combine_heads`'s
-    // `combined_rdma_head` / `combined_nvl_head` outputs.
+    // `recv_gbl_channel_prefix_matrix` / `recv_src_meta`). `send_rdma_head`
+    // and `send_nvl_head` are in-place sentinel-encoded at the tail of
+    // dispatch_main_kernel; combine consumes the encoded form directly.
     torch::Tensor rdma_channel_prefix_matrix;       // [num_rdma_ranks, num_channels]
     torch::Tensor recv_rdma_rank_prefix_sum;        // [num_rdma_ranks]
     torch::Tensor gbl_channel_prefix_matrix;        // [num_world_ranks, num_channels]
@@ -260,12 +260,10 @@ private:
     // ``cuStreamBatchMemOp`` wait_value_geq on the communicate stream
     // before launching ``combine_main`` / ``combine_grads_main``, so
     // combine's 80-CTA sender grid cannot grab SMs ahead of kernel_y /
-    // kernel_a_bwd's 132-CTA grid. Replaces the prior
-    // ``torch.cuda.Event(y_started)`` / ``Event(a_bwd_started)`` gates,
-    // which only signalled "next kernel's launch packet is queued" — not
-    // "first block is on an SM" — and were empirically insufficient on
-    // internode bwd once the bwd ``encode_combine_heads`` scheduling
-    // slack was removed.
+    // kernel_a_bwd's 132-CTA grid. A queued-launch event only signals
+    // "next kernel's launch packet is queued" — not "first block is on
+    // an SM" — and is insufficient on internode bwd where SM contention
+    // with combine can starve the producer.
     int* dispatch_main_started_flag = nullptr;
     int* dispatch_grads_started_flag = nullptr;
     int* kernel_y_started_flag = nullptr;
@@ -488,21 +486,15 @@ public:
         int64_t dispatch_seq,
         const Config& config);
 
-    // Streaming-MoE combine (internode, pool layout). Two kernels per call:
-    // `internode::encode_combine_heads` (buffer cleanup + reverse-order
-    // sentinel encoding of `send_rdma_head` / `send_nvl_head`) followed by
-    // `internode::launch_combine_main` (three-warp-role NVL→RDMA→origin
-    // reduction). Mirrors `Buffer::intranode_combine`'s two-kernel-one-method
-    // pattern (`stream_ep.cpp:1218 + 1235`); same arg semantics for the
-    // unified surface (x = handle.o for fwd / dL/dx_per_r for bwd;
+    // Streaming-MoE combine (internode, pool layout). Single
+    // `internode::launch_combine_main` call: three-warp-role NVL→RDMA→
+    // origin reduction. Sentinel-encoded `send_rdma_head` / `send_nvl_head`
+    // are consumed directly (encoded by dispatch_main_kernel's tail).
+    // Mirrors `Buffer::intranode_combine`'s arg semantics for the unified
+    // surface (x = handle.o for fwd / dL/dx_per_r for bwd;
     // per_slot_weights = pool_topk_weight for fwd / weight_grads for bwd;
     // y_done_per_token / combine_seq drive the streaming gate at
     // `kNVLSender`).
-    //
-    // Both passes mutate `dispatch_out.send_rdma_head` and
-    // `dispatch_out.send_nvl_head` in place (the sentinel encoding from the
-    // first pass IS the input to the second) — caller should treat them as
-    // consumed after this call.
     //
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()`.
     // See `intranode_combine` for `is_fwd` semantics — same contract.

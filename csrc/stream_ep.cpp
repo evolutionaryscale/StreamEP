@@ -211,8 +211,9 @@ Buffer::Buffer(int rank,
         // meta slots see packed (seq=0, value=0); seq mismatches the
         // first kernel's `nvl_seq` (which starts at >= 1 via
         // Buffer._next_seq), so iter-0 spins until the first sender's
-        // write lands. Replaces the prior per-iter cudaMemsetAsync +
-        // intranode::barrier pair that fired before every dispatch.
+        // write lands. The genstamp protocol means subsequent iters need
+        // no per-iter memset + barrier — stale residue is rejected by
+        // seq-mismatch on read.
         CUDA_CHECK(cudaMemsetAsync(buffer_ptrs[nvl_rank], 0, num_nvl_bytes, current_stream));
         CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + streaming_section_offset, 0,
                                    streaming_section_bytes, current_stream));
@@ -549,10 +550,8 @@ constexpr inline int64_t align16(int64_t x) {
 
 // 16-byte-aligned offset accumulator for packing typed sub-tensors into a
 // single int8 slab (see allocate_pre_poll_bundle / allocate_post_poll_bundle).
-// Replaces the manual `int64_t off_X = align16(off_prev + size_prev)` chain
-// with one `reserve<T>(count)` per field — single source of truth for the
-// layout, and reordering fields no longer requires manually re-threading the
-// `off_prev + size_prev` chain.
+// One `reserve<T>(count)` per field; single source of truth for the layout,
+// so reordering fields doesn't require re-threading offset arithmetic.
 class SlabBuilder {
 public:
     template <typename T>
@@ -1398,11 +1397,9 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
 
     // Combine data. Combine carves its sub-buffer chain from
     // `buffer_ptrs[i] + dispatch_section_bytes`, physically disjoint from
-    // dispatch's chain at `buffer_ptrs[i] + 0`. The
-    // `encode_combine_heads` kernel that used to live here (barrier +
-    // memset of the aliased (head_idx, tail_idx) slab region) is gone:
-    // genstamped meta slots make memset unnecessary, and combine's slots
-    // no longer overlap dispatch's.
+    // dispatch's chain at `buffer_ptrs[i] + 0`. No pre-combine barrier or
+    // memset is needed: genstamped meta slots reject stale residue on
+    // read, and combine's slots never overlap dispatch's.
     int hidden_int4_x = static_cast<int>(hidden * x.element_size() / sizeof(int4));
     int64_t dispatch_section_bytes = intranode::intranode_get_dispatch_section_bytes(
         num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens,
@@ -1501,9 +1498,9 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
                                                   compute_stream_handle_);
 
     // Streaming SymBuffer offset within rdma_buffer_ptr — placed AFTER the
-    // metadata kernel's count payload (legacy count-exchange section of the
-    // IPC slab, absorbed into `streaming_dispatch_metadata`). The fixed
-    // offset keeps the kernel's SymBuffer math consistent.
+    // metadata kernel's count payload. The count-exchange and streaming-
+    // superset payloads share `rdma_buffer_ptr`; the fixed offset keeps the
+    // kernel's SymBuffer math consistent across them.
     int64_t streaming_rdma_offset =
         2 * static_cast<int64_t>(num_rdma_ranks) *
         (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int);
@@ -1714,9 +1711,8 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
     // No pre-bwd-dispatch cleanup: under the cumulative ring-control
     // protocols (RDMA head/tail amo, RDMA meta sentinel-amo, NVL gen-stamp),
     // every polled slot disambiguates this iter's value from prior-iter
-    // residue without an inter-iter memset. The dispatch stream's sequencing
-    // (fwd dispatch → cleanup_dispatch_buffers → bwd dispatch_grads in the
-    // legacy flow) is now just (fwd dispatch → bwd dispatch_grads).
+    // residue without an inter-iter memset. The dispatch stream sequences
+    // straight fwd dispatch → bwd dispatch_grads.
 
     internode::DispatchGradsIO io{
         .dL_do_pool        = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
@@ -1779,17 +1775,12 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Streaming-MoE combine (internode, pool layout). Two kernels per call,
-// mirroring `Buffer::intranode_combine`'s two-kernel-one-method pattern
-// (`stream_ep.cpp:1218 + 1235`):
-//
-//   1. `internode::encode_combine_heads` — buffer cleanup +
-//      sentinel-encode `send_rdma_head` / `send_nvl_head` in place.
-//   2. `internode::launch_combine_main` — NVL→RDMA→origin reduction with
-//      streaming gate at kNVLSender (gated by y_done_per_token).
-//
-// Both run on the caller's current stream; stream-order causality
-// guarantees the sentinel-encoded heads are visible to combine_main.
+// Streaming-MoE combine (internode, pool layout). Single kernel launch:
+// `internode::launch_combine_main` — NVL→RDMA→origin reduction with
+// streaming gate at kNVLSender (gated by y_done_per_token). The
+// sentinel-encoded `send_rdma_head` / `send_nvl_head` are produced by
+// dispatch_main_kernel's sender / forwarder SM tails; stream-order
+// causality (same communicate stream) guarantees visibility here.
 // ─────────────────────────────────────────────────────────────────────────────
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combine(
     const torch::Tensor& x,
@@ -1827,28 +1818,6 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Pre-combine fixup: sentinel-encode heads in place. Forwarder reads
-    // recv-side per-(dst_rdma_rank, channel) ranges, so the prefix matrix
-    // is the recv-side one. Only the fwd combine needs to run encode — bwd
-    // combine_grads reads the SAME ``send_rdma_head`` / ``send_nvl_head``
-    // tensors (persisted across fwd→bwd via the StreamingHandle) which
-    // already hold fwd encode's in-place sentinels. The internode encode is
-    // pure sentinel encoding (no slab cleanup or cross-rank barrier — see
-    // internode.cu encode_combine_heads_kernel), so skipping it for bwd is
-    // safe. Was previously also serving as accidental scheduling slack on
-    // the communicate stream between dispatch_grads and combine_grads — the
-    // kernel_a_bwd launch gate (previous commit) is the explicit
-    // replacement.
-    if (is_fwd) {
-        internode::encode_combine_heads(
-            hidden_int4, num_topk, num_ranks, num_channels, num_combined_tokens,
-            dispatch_out.send_rdma_head.data_ptr<int>(),
-            dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
-            dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
-            dispatch_out.send_nvl_head.data_ptr<int>(),
-            stream);
-    }
-
     // Combine output tensors. Fwd: no per-K weight output (kernel Y already
     // pre-multiplies pool_topk_weight per row); C++ returns `c10::nullopt`
     // and Python surfaces as `None`.
@@ -1871,8 +1840,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
         recv_x.data_ptr(), recv_topk_weights_ptr,
         x.data_ptr(), per_slot_weights.data_ptr<float>(),
         dispatch_out.recv_token_to_slots.data_ptr<int>(),
-        dispatch_out.send_rdma_head.data_ptr<int>(),       // (now sentinel-encoded by encode_combine_heads)
-        dispatch_out.send_nvl_head.data_ptr<int>(),        // (now sentinel-encoded by encode_combine_heads)
+        dispatch_out.send_rdma_head.data_ptr<int>(),       // sentinel-encoded by dispatch_main_kernel tail
+        dispatch_out.send_nvl_head.data_ptr<int>(),        // sentinel-encoded by dispatch_main_kernel tail
         dispatch_out.recv_src_meta.data_ptr(),
         dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
         dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),

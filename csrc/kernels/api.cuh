@@ -152,9 +152,9 @@ struct DispatchGradsRouting {
     const int* recv_token_to_slots;   // [T_recv, num_topk]                     bwd Pass B slot lookup
     const int* base_pool;             // [num_channels, num_ranks, E_local]     Pass 2: per-substream slot start
     const int* seen_per_substream;    // [num_channels, num_ranks, E_local]     Pass 2: per-substream-per-expert recv count
-    // Passed explicitly (NOT read from IPC slab leading bytes) — fwd combine's
-    // `encode_combine_heads` zeros that region before bwd runs, so the IPC
-    // slab can't be the source. Persistent tensor lives on the StreamingHandle.
+    // Passed explicitly (NOT read from IPC slab leading bytes) — the IPC
+    // slab's leading bytes are reused across iters and may carry stale
+    // residue. Persistent tensor lives on the StreamingHandle.
     const int* rank_prefix_matrix;    // [num_ranks, num_ranks]                receiver: per-source-rank token offset
 };
 
@@ -189,10 +189,10 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 // genstamped slots) + `channel_x_buffers` + `channel_src_idx_buffers` +
 // `channel_topk_idx_buffers` + `channel_topk_weights_buffers`. Combine
 // kernels offset their base by this value to land in a physically disjoint
-// region of the IPC slab. Replaces the prior shared layout (where
-// combine's head/tail aliased dispatch's start/end_offset and needed the
-// encode_combine_heads bracketed memset to reset) — same shape Bug B.2 was
-// at internode, fixed there via 47a9b16.
+// region of the IPC slab. Disjointness is load-bearing: a shared layout
+// where combine's head/tail aliased dispatch's start/end_offset would let
+// iter-N combine writes shadow iter-N+1 dispatch reads via per-channel
+// stride drift, surfacing as wrong-token SourceMeta at the receiver.
 __host__ __device__ inline int64_t intranode_get_dispatch_section_bytes(
     int num_channels, int num_ranks, int num_recv_buffer_tokens,
     int hidden_int4, int num_topk) {
@@ -301,12 +301,11 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
 // `nvl_channel_prefix_end` + `nvl_channel_head` + `nvl_channel_tail`. Used
 // by the host buffer-size hint AND by `combine_main_kernel` /
 // `combine_grads_main_kernel` to offset their own NVL sub-buffer bases past
-// dispatch's region — see Bug B.2 fix (markdowns/design.md §"Disjoint NVL
-// regions"). Dispatch and combine previously carved sub-buffers from the
-// same offset-0 base with different strides; the resulting cross-channel
-// physical-address aliasing let iter-N combine writes shadow iter-N+1
-// dispatch reads at a high slot index, manifesting as wrong-token
-// `SourceMeta` at the receiver.
+// dispatch's region into a physically disjoint slab. Dispatch and combine
+// must NOT share an offset-0 base with different strides: the resulting
+// cross-channel physical-address aliasing would let iter-N combine writes
+// shadow iter-N+1 dispatch reads at a high slot index, manifesting as
+// wrong-token `SourceMeta` at the receiver.
 __host__ __device__ inline int64_t get_dispatch_nvl_region_bytes(
     int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens,
     int num_channels, int num_rdma_ranks) {
@@ -437,7 +436,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int64_t num_nvl_bytes);
 
 // Argument groupings for the streaming internode dispatch main kernel. Same
-// six-struct shape as `intranode::Dispatch*` (api.cuh:76–121); internode-
+// six-struct shape as `intranode::Dispatch*` above; internode-
 // specific deltas live inside `DispatchPerTokenOut` (combine plumbing —
 // recv_src_meta + send_rdma_head + send_nvl_head + recv_*_channel_prefix_*),
 // `DispatchInputs` (sender/forwarder reads from metadata kernel), and
@@ -541,8 +540,7 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // `bwd_dispatch_arrival_count`),
 // scaled to the RDMA + NVL hierarchy. Reuses fwd dispatch's wire format
 // — the per-token bytes carry data + SourceMeta + topk_* but bwd only
-// writes/reads the data region; metadata bytes are zero from
-// `encode_combine_heads`'s buffer cleanup.
+// writes/reads the data region; metadata bytes are untouched.
 struct DispatchGradsIO {
     int4* dL_do_pool;                 // [TK_padded, hidden_int4] receiver writes K times per recv-token
     const int4* dL_dy;                // [num_tokens, hidden_int4] sender reads
@@ -591,29 +589,6 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
                                 int num_rdma_ranks,
                                 int num_channels,
                                 cudaStream_t stream);
-
-// Pre-combine fixup: in-place reverse-order sentinel encoding of
-// `combined_rdma_head` (input: dispatch's `send_rdma_head`) and
-// `combined_nvl_head` (input: dispatch's `send_nvl_head`). For tokens whose
-// head entry is `< 0` (no contribution from that source), encode the *next*
-// real head ahead of it as `-last_head - 1`; combine's receivers use this
-// to skip cleanly past gaps without re-reading the counter region.
-//
-// (The legacy buffer-cleanup half of this kernel — IBGDA quiet + RDMA team
-// sync + NVL barrier + memset of dispatch ring-control regions — is gone:
-// every polled slot is iter-disambiguated by the cumulative head/tail /
-// RDMA meta sentinel-amo / NVL gen-stamp protocols. Block 0 of the kernel
-// is now an early return to preserve block-id offsets in blocks 1+.)
-void encode_combine_heads(int hidden_int4,
-                           int num_topk,
-                           int num_ranks,
-                           int num_channels,
-                           int num_combined_tokens,
-                           int* combined_rdma_head,
-                           const int* rdma_channel_prefix_matrix,
-                           const int* rdma_rank_prefix_sum,
-                           int* combined_nvl_head,
-                           cudaStream_t stream);
 
 // combine_main_kernel — used by both forward combine and backward
 // combine_grads. Same arg surface as `intranode::launch_combine_main` for the
