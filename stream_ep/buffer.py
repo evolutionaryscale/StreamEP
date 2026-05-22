@@ -177,10 +177,9 @@ class Buffer:
             # with direct PTX writes/reads; NVSHMEM is only used for IBGDA
             # (RDMA). Letting NVSHMEM keep P2P enabled (its default) creates
             # an additional set of virtual-address mappings for the symmetric
-            # heap on top of our IPC mappings — DeepEPv1 disables this for
-            # the same reason ("ensure we are not using NVLink through
-            # NVSHMEM"). Suspected to interact with Bug B.2 (channel-35
-            # cross-iter NVL ring corruption).
+            # heap on top of our IPC mappings — risks cross-iter NVL ring
+            # corruption from coherence interactions between the two
+            # mapping sets.
             os.environ['NVSHMEM_DISABLE_P2P'] = '1'
 
             # Enable IBGDA
@@ -223,12 +222,12 @@ class Buffer:
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
 
-        # Monotonic per-Buffer dispatch counter. Per design.md §"Cross-dispatch
-        # reuse": the seq keys the Y → combine `y_done_per_token` release-stamp
-        # and the NVL gen-stamp protocol. It must be globally monotonic per
-        # Buffer (a per-instance counter would collide across layers sharing
-        # this Buffer). Allocated on dispatch when caller passes
-        # ``dispatch_seq=None``; explicit override still supported for tests.
+        # Monotonic per-Buffer dispatch counter. The seq keys the Y → combine
+        # `y_done_per_token` release-stamp and the NVL gen-stamp protocol;
+        # it must be globally monotonic per Buffer (a per-layer counter
+        # would collide across layers sharing this Buffer). Allocated on
+        # dispatch when caller passes ``dispatch_seq=None``; explicit
+        # override still supported for tests.
         self._next_seq = 0
 
     def destroy(self):
@@ -267,10 +266,10 @@ class Buffer:
         that wins ``linear_idx == 0`` in ``StreamingTileScheduler`` bumps the
         flag). Use this BEFORE launching ``combine_main`` on the communicate
         stream so combine's 80-CTA sender grid doesn't grab SMs ahead of
-        kernel_y's 132. Replaces the prior ``torch.cuda.Event(y_started)``
-        gate, which only signalled "kernel_y's launch packet is queued" —
-        not "kernel_y is on an SM" — and surfaces as combine-vs-kernel_y SM
-        contention when no upstream work fills the gap.
+        kernel_y's 132. A queued-launch event would only signal "kernel_y's
+        launch packet is queued" — not "kernel_y is on an SM" — and surfaces
+        as combine-vs-kernel_y SM contention when no upstream work fills
+        the gap.
         """
         if stream is None:
             stream = torch.cuda.current_stream()

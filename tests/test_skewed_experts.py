@@ -1,16 +1,15 @@
 """Streaming-MoE FWD+BWD under deterministic skewed routing distributions.
 
-Targets Bug B (the routing-skew-dependent internode dispatch/combine
-NVL-region aliasing race, fixed in 47a9b16 via disjoint regions): runs
-the full streaming-MoE fwd+bwd pipeline (dispatch + kernel_a + kernel_y
-+ combine + bwd chain) under a set of explicitly-constructed routing
-scenarios, each exercising a different edge case of the dispatch
-protocol.
+Stresses the dispatch / combine NVL-region protocol under routing
+distributions that production randomness rarely hits: runs the full
+streaming-MoE fwd+bwd pipeline (dispatch + kernel_a + kernel_y + combine
++ bwd chain) under a set of explicitly-constructed routing scenarios,
+each exercising a different edge case of the dispatch protocol.
 
 Why "explicitly-constructed": `torch.randint`-based routing makes
 failures luck-dependent. Deterministic scenarios make pass/fail
-reproducible across runs and let us bisect / iterate on the bug
-without re-rolling the routing seed.
+reproducible across runs and let us bisect / iterate without
+re-rolling the routing seed.
 
 Why "world-size agnostic": same script under
 ``./scripts/srun_1node.sh -m stream_ep.tests.test_skewed_experts`` (1-node
@@ -321,8 +320,8 @@ def main():
             for name, builder in scenarios
         ]
     # Filter via --scenario if given. List-based (preserves order + duplicates
-    # so [skew, skew] actually re-runs the same scenario twice — needed for
-    # Bug B.2 mechanism testing).
+    # so [skew, skew] actually re-runs the same scenario twice — needed when
+    # a flake reproduces only after a re-issue of the same routing).
     if args.scenario:
         # Allow the user's name "per_rank_imbalance" to match the renamed
         # scenario (per_rank_imbalance_skewN_tgtR) when --per-rank-skew or

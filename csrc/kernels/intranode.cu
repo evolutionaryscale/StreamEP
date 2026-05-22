@@ -87,26 +87,24 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 //   - e_inbox[c, src, e]: per-(channel, src, local_expert) (token, k) count
 //   - u_inbox[c, src]:    per-(channel, src) UNIQUE token count
 //
-// Phases (vs v1: 1-5 are the same single-block path; 6-8 are now grid-wide):
+// Phases:
 //   1-5 (block 0): build local SMEM histogram from topk_idx, bulk-store to
 //        peers' IPC inboxes, bracketed by two `barrier_block` calls so peer
 //        writes are observable on the post-barrier read.
 //   GRID SYNC.
 //   6 (all blocks, grid-stride): copy inbox -> seen_per_substream, then a
-//      grid-stride atomicAdd reduce into expert_frequency. Replaces v1's
-//      thread-per-expert serial sum (E_local threads, the rest idle).
+//      grid-stride atomicAdd reduce into expert_frequency.
 //   GRID SYNC.
 //   7 (block 0 thread 0): smem_pool_blk prefix, total_tiles, mapped counters,
 //      rank_prefix_matrix column. Small serial work — O(E + kNumRanks).
 //   GRID SYNC.
 //   8 (one block per expert, round-robin): base_pool parallel prefix-scan
 //      over (c, src) lex order. Per expert: SMEM-staged scan with cooperative
-//      threads. Replaces v1's per-thread `acc += seen[cs, e]` 320-iter serial
-//      dependency loop. E ≤ num_blocks at production, so all experts run in
+//      threads. E ≤ num_blocks at production, so all experts run in
 //      parallel in one grid wave.
 //   GRID SYNC.
 //   9 (all blocks, grid-stride): tile_id_to_expert + pool_arrival_target —
-//      one thread per tile. Replaces v1's per-expert serial tile walk.
+//      one thread per tile.
 //
 // Pool layout: each expert's region in `pool` starts at
 // `expert_pool_block_offset[e] * BLOCK_M` (BLOCK_M = tile_m) and is padded up to
@@ -115,15 +113,14 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 // Phase A (cross-rank IPC exchange): single block, 60 KB SMEM, NOT cooperative.
 // Builds local SMEM histogram by scanning topk_idx, bracketed by two
 // barrier_block calls so peer writes are observable on the post-barrier read.
-// This kernel does ONLY Phase 1-5 from the v1 single-kernel design; Phase 6-9
-// lives in `_phase_b_kernel` below, launched FIFO-after on the same stream.
-// Splitting lets phase B run with much smaller per-block SMEM (~1.5 KB vs
-// 60 KB), which:
+// This kernel runs Phases 1-5 only; Phases 6-9 live in `_phase_b_kernel`
+// below, launched FIFO-after on the same stream. The split lets phase B
+// run with much smaller per-block SMEM (~1.5 KB vs 60 KB), which:
 //   (a) avoids the cooperative-launch occupancy ceiling (1 block/SM at 60 KB
 //       SMEM → 32 cooperative blocks fit cleanly across 132 SMs);
 //   (b) lets the cooperative scheduler pack more concurrent blocks per SM in
-//       Phase B (4-6 at ~5 KB), so SM-availability variance from the prior
-//       iter's combine tail no longer pins this kernel to 1-block-per-SM.
+//       Phase B (4-6 at ~5 KB), so SM-availability variance from a prior
+//       iter's combine tail doesn't pin this kernel to 1-block-per-SM.
 template <int kNumRanks>
 __global__ void streaming_dispatch_metadata_phase_a_kernel(
         const topk_idx_t* topk_idx,
@@ -369,7 +366,7 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
     //
     // One block per expert (round-robin if E > num_blocks). Within a block:
     // chunked warp-parallel scan (Kogge-Stone within warp + warp 0 scans
-    // warp sums). Replaces the per-thread acc-serial-dep loop of v1.
+    // warp sums).
     // ──────────────────────────────────────────────────────────────────────
     const int cs_total = num_channels * kNumRanks;
     int* s_scan = smem;                          // [cs_total] scan workspace.
@@ -697,8 +694,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
             // NOTES: this is for distinguishing zero tokens. With
             // genstamps the seq tag is the primary "written-this-iter"
             // signal; the negative bias is preserved for symmetry with
-            // internode and so legacy callers still see consistent
-            // values on unpack.
+            // internode unpack.
             if (elect_one_sync()) {
                 st_relaxed_sys_global(channel_start_offset.buffer(), nvl_pack(nvl_seq, -start_count - 1));
                 st_relaxed_sys_global(channel_end_offset.buffer(),   nvl_pack(nvl_seq, -end_count   - 1));
@@ -1067,9 +1063,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
         // beyond the block. ``__threadfence()`` (device-scope) is sufficient
         // because all consumers (kernel A acquiring ``pool_arrival_count``;
         // kernel Y reading the pool scalars after Y_started) run on the SAME
-        // GPU. ``.sys`` scope was previously used as a carry-over from
-        // before the 2-stream graph cleanup — cheaper to fence within L2
-        // than across the PCIe / NVLink boundary.
+        // GPU. Device scope is cheaper than ``.sys`` — fences land in L2
+        // rather than crossing the PCIe / NVLink boundary.
         __threadfence();
         asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
         if (recv_thread_id_in_rank == 0) {
@@ -1502,9 +1497,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                                                           // sub-buffer chain (see api.cuh `intranode_get_dispatch_section_bytes`).
                                                           // Combine's meta + data buffers live at
                                                           // `buffer_ptrs[i] + dispatch_section_bytes`; physically disjoint from
-                                                          // dispatch's chain at `buffer_ptrs[i] + 0`. Removes the prior
-                                                          // head/tail alias with dispatch's start/end_offset that required
-                                                          // the `encode_combine_heads` memset.
+                                                          // dispatch's chain at `buffer_ptrs[i] + 0`. Disjointness avoids any
+                                                          // alias of combine's head/tail with dispatch's start/end_offset.
                                                           int64_t dispatch_section_bytes,
                                                           int rank,
                                                           int num_max_send_tokens,
@@ -1518,7 +1512,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
     // Genstamp seq for combine's meta slots. Fwd combine and bwd
     // combine_grads share the same `combine_seq` (= handle.dispatch_seq)
     // but stamp the LSB phase bit so they don't collide at the same
-    // physical slot. Mirrors internode combine_main_kernel:3220.
+    // physical slot. Mirrors internode `combine_main_kernel`'s NVL gen-stamp.
     const int64_t nvl_seq = (combine_seq << 1) | (combine_phase & 1);
     EP_DEVICE_ASSERT(num_topk <= kMaxTopK);
 

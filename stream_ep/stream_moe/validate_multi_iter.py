@@ -23,9 +23,9 @@ This catches three classes of bug:
   (b) Cross-layer-within-iter staleness — N layers in one autograd graph
       means each layer's ``ctx`` (and the StreamingHandle it references)
       live until backward returns at the OUTERMOST call site. Bugs that
-      need multiple layers' state to coexist (the original compile +
-      CDMC>1 hang at 10+ layers; the ctx-pinning peak-memory regression
-      fixed in 6e239b0) only surface at ``--n_layers >= ~10``.
+      need multiple layers' state to coexist (compile + CDMC>1 deadlock
+      at 10+ layers; ctx-pinning peak-memory regressions) only surface
+      at ``--n_layers >= ~10``.
   (c) Any fwd / bwd pipeline regression — per-token gate ↔ release-store
       interaction, per-layer dispatch_seq increment, etc.
 

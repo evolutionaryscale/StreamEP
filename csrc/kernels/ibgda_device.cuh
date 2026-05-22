@@ -440,11 +440,10 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         // .release.sys atomic add: pairs with the consumer's ld.acquire.sys
         // on the same address (`rdma_channel_tail`), establishing release-
         // acquire ordering for the sender's prior data writes. Plain
-        // atomicAdd (the historical implementation) is .relaxed.gpu, which
-        // breaks the release-acquire pair when the consumer (forwarder)
-        // also lives on the same GPU but reads via ld.acquire.sys — surfaced
-        // as Bug B.2 on channel 35 where the LOCAL src_rdma=0 path delivered
-        // stale meta to the forwarder.
+        // atomicAdd is .relaxed.gpu, which breaks the release-acquire pair
+        // on the same-GPU LOCAL src_rdma path where the forwarder reads via
+        // ld.acquire.sys — the consumer can observe the new tail but stale
+        // data.
         unsigned long long ret;
         asm volatile("atom.add.release.sys.global.u64 %0, [%1], %2;"
                      : "=l"(ret)

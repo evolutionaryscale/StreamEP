@@ -111,7 +111,7 @@ __device__ __forceinline__ void st_release_sys_global(const int64_t* ptr, int64_
 // streams, same device). Cheaper than `_sys_global`: stays in L2, no NVLink
 // coherence traversal. Use for `a_ready` / `y_done_per_token` / etc.
 // Cross-rank stamps (channel_tail_idx, nvl_channel_tail, rdma_channel_tail)
-// must keep `_sys_global`. See markdowns/optimizations.md §2.
+// must keep `_sys_global` for peer-GPU coherence.
 __device__ __forceinline__ void st_release_gpu_global(const int64_t* ptr, int64_t val) {
     asm volatile("st.release.gpu.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
 }

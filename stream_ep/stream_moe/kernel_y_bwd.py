@@ -133,9 +133,8 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
       - ColVecReduceAtomic("mColVecReduce") for in-kernel atomic-add of the
         per-slot dL/dweight dot product (per-pid_n CTAs reduce intra-warp /
         cross-warp then ``red.global.add.f32`` into a flat ``(M,)`` fp32
-        buffer; eliminates the post-hoc ``.sum(dim=-1)`` torch op + the
-        ``weight_grads_ready`` cross-stream event the orchestrator used to
-        carry).
+        buffer; the in-kernel atomic collapses across pid_n stripes so no
+        post-hoc ``.sum(dim=-1)`` or cross-stream event is needed).
 
     kernel_a_bwd runs on the same compute stream and FIFO-orders after Y_bwd
     retires, so dL_dweight's atomic-adds and the mPostAct TMA stores are
@@ -429,8 +428,7 @@ def _compile_streaming_moe_y_bwd(
     # ColVecReduceAtomic destination — flat per-slot fp32 buffer that all
     # pid_n CTAs atomic-add into via red.global.add.f32. Shape (Mflat,).
     # No num_pid_n dim — the atomic-add collapses across stripes in-kernel,
-    # eliminating the post-hoc .sum() torch op + the cross-stream
-    # weight_grads_ready event the orchestrator used to need.
+    # so no post-hoc .sum() torch op or cross-stream event is needed.
     mColVecReduce = fake_tensor(
         cutlass.Float32, (Mflat_sym,), leading_dim=0, divisibility=1
     )

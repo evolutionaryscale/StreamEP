@@ -1,11 +1,10 @@
 """End-to-end test for the streaming-MoE internode dispatch (pool layout).
 
-Mirrors ``tests/test_streaming_dispatch.py`` (which exercises the intranode
-streaming path) for the internode topology — 2 RDMA × 8 NVL = 16 GPUs via
-``./srun_internode.sh``. Drives the new C++ entry point
-``Buffer.runtime.internode_dispatch`` directly (not yet wired through
-``Buffer.dispatch``'s topology branch — that switchover lands in a later
-commit alongside the legacy ``Buffer.internode_dispatch`` deletion).
+Mirrors ``tests/test_dispatch.py`` (which exercises the intranode streaming
+path) for the internode topology — 2 RDMA × 8 NVL = 16 GPUs. Drives the
+C++ entry point ``Buffer.runtime.internode_dispatch`` directly so the
+test can assert on the raw outputs of the dispatch kernel without going
+through ``Buffer.dispatch``'s topology branch.
 
 Verifies, against an eager reference computed from all-gather'd per-rank
 inputs:

@@ -322,9 +322,7 @@ class AtomicScatterStore(EpiOp):
                     # ``.gpu`` scope is sufficient: kernel_y (compute stream)
                     # and combine_main_kernel (communicate stream) run on the
                     # same GPU, so L2 coherence handles cross-stream
-                    # visibility. The previous ``.sys`` scope was a
-                    # diagnostic carry-over from before the 2-stream graph
-                    # cleanup; ``membar.gl`` is meaningfully cheaper than
+                    # visibility. ``membar.gl`` is meaningfully cheaper than
                     # ``membar.sys`` on a per-token gate.
                     st_release_gpu_global(done_ptr, combine_seq)
 

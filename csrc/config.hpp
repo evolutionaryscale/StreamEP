@@ -66,10 +66,10 @@ struct Config {
         // base pointers by `get_dispatch_nvl_region_bytes(hidden_int4,
         // num_topk_actual, ...)` at launch time (computed from kernel args).
         // The host upper-bounds with `kNumMaxTopK` so the allocation fits
-        // any runtime `num_topk` without reallocation. See Bug B.2 (markdowns/
-        // design.md §"Disjoint NVL regions"): the prior shared layout caused
-        // iter-N combine writes to alias iter-N+1 dispatch read addresses
-        // via per-channel stride drift between the two kernels.
+        // any runtime `num_topk` without reallocation. Disjointness is
+        // load-bearing: a shared layout would let iter-N combine writes
+        // alias iter-N+1 dispatch read addresses via per-channel stride
+        // drift between the two kernels.
         size_t num_bytes = 0;
         num_bytes += internode::get_dispatch_nvl_region_bytes(
             hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
