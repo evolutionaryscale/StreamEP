@@ -474,6 +474,16 @@ def streaming_moe_a(
         W1.shape[2] == H
     ), f"W1 dim 2 (H) must match pool dim 1; got W1.shape={tuple(W1.shape)}, H={H}"
     two_I = W1.shape[1]
+    # tile_n MUST divide the output N dim. The grouped GEMM emits one CTA per
+    # (pid_m, pid_n) and writes a full tile_n-wide slab via TMA; partial-tile
+    # tail handling silently corrupts adjacent memory. kernel A's output N is
+    # 2I (mD/preact) or I (mPostAct/postact); both must be divisible.
+    assert two_I % tile_n == 0, (
+        f"tile_n ({tile_n}) must divide 2I ({two_I}); 2I % tile_n = {two_I % tile_n}"
+    )
+    assert I % tile_n == 0, (
+        f"tile_n ({tile_n}) must divide I ({I}); I % tile_n = {I % tile_n}"
+    )
     if preact_a is not None:
         assert preact_a.is_cuda and preact_a.dim() == 3
         assert preact_a.shape == (total_tiles, tile_m, two_I), (

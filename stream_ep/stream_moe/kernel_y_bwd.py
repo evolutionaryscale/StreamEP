@@ -608,6 +608,12 @@ def streaming_moe_y_bwd(
         f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected "
         f"{(E_local, H, I)}"
     )
+    # tile_n MUST divide the output N dim (= I, the moe_intermediate_size).
+    # Non-divisible tile_n produces silently-wrong stores in the data-grad
+    # GEMM's partial-tile path.
+    assert I % tile_n == 0, (
+        f"tile_n ({tile_n}) must divide I ({I}); I % tile_n = {I % tile_n}"
+    )
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert pool_topk_weight.shape == (dL_do_pool.shape[0],)
     assert pool_topk_weight.dtype == torch.float32

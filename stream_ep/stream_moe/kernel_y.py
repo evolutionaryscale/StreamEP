@@ -801,6 +801,12 @@ def streaming_moe_y(
         f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected "
         f"{(E_local, H, I)}"
     )
+    # tile_n MUST divide the output N dim (= H). Non-divisible tile_n produces
+    # partial-tile stores that silently corrupt adjacent memory in the
+    # atomic-scatter epilogue.
+    assert H % tile_n == 0, (
+        f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
+    )
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
     assert pool_topk_weight.shape == (total_tiles * tile_m,)

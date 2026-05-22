@@ -382,6 +382,12 @@ def streaming_moe_a_bwd(
         two_I,
         H,
     ), f"W1 must be (E_local, 2*I, H) = {(E_local, two_I, H)}; got {tuple(W1.shape)}"
+    # tile_n MUST divide the output N dim (= H). Non-divisible tile_n produces
+    # silently-wrong stores in the data-grad GEMM's partial-tile path (the
+    # bug that bit production at H=2048 with tile_n=192).
+    assert H % tile_n == 0, (
+        f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
+    )
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
     assert bwd_k_local_remaining.shape == (T_recv,)
