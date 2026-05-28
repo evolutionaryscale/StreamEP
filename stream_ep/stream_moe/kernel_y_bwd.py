@@ -61,7 +61,7 @@ Per tile:
     5. Pack (dgate, dup) bf16x2 → fp32 view; standard mD TMA-store lands
        the result in `dL_dswiglu_in[tile, :2I]` (bf16 (M, 2I) on the host
        viewed as fp32 (M, I) — same f32-recast trick on the output side as
-       on input). ``postact_a_for_dW2`` rides ``mPostAct`` (TileStore) — bf16
+       on input). ``postact_a_for_dW2`` rides ``mAuxOut`` (TileStore) — bf16
        (M, I) plain TMA-store, same path GemmActMixin uses for fwd postact.
 
 Folding SwiGLU bwd here (vs running it as a separate step before kernel_a_bwd)
@@ -122,9 +122,9 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store.
 
     Inherits the standard mD TMA-store path from GemmDefaultEpiMixin (via
-    GemmActMixin), plus a SECOND TMA-store path via ``TileStore("mPostAct")``
+    GemmActMixin), plus a SECOND TMA-store path via ``TileStore("mAuxOut")``
     that we repurpose for ``postact_a_for_dW2`` (host shape bf16 (M, I), no
-    f32-recast — plain bf16 store, same layout fwd kernel A's mPostAct uses).
+    f32-recast — plain bf16 store, same layout fwd kernel A's mAuxOut uses).
     Both mC (preact) and mD (dL/dswiglu_in) still use the f32-recast trick —
     host-side storage is bf16 (M, 2I), kernel sees fp32 (M, I) and recasts
     back to bf16x2 in-epilogue (`implicit_dtype = bf16`, mirroring quack's
@@ -137,7 +137,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         post-hoc ``.sum(dim=-1)`` or cross-stream event is needed).
 
     kernel_a_bwd runs on the same compute stream and FIFO-orders after Y_bwd
-    retires, so dL_dweight's atomic-adds and the mPostAct TMA stores are
+    retires, so dL_dweight's atomic-adds and the mAuxOut TMA stores are
     automatically visible — no per-stripe-CTA release-add is needed.
 
     `epi_visit_subtile` is fully overridden — runs `dswiglu` against
@@ -156,7 +156,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     GemmActMixin's ``act_fn`` field is unused — we override
     ``epi_visit_subtile`` to compute the weighted-postact register tensor
     directly and return it (the framework's standard ``epi_convert_postact``
-    path then casts fp32 → bf16 for the ``mPostAct`` TMA store). Pass
+    path then casts fp32 → bf16 for the ``mAuxOut`` TMA store). Pass
     ``act_fn=None`` in EpilogueArguments.
     """
 
@@ -167,7 +167,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         # fp32 by ColVecLoad's begin_loop) so `epi_visit_subtile` can detect
         # padding rows (recv_token < 0) and conditionally zero (dgate, dup,
         # postact, g) BEFORE colvec_reduce_accumulate / weight multiply /
-        # mD / mPostAct stores. Conditional ASSIGNMENT (not multiply) is
+        # mD / mAuxOut stores. Conditional ASSIGNMENT (not multiply) is
         # required: matmul(garbage, W2) at padding rows can produce inf/NaN,
         # and `0 * inf = NaN`. Removes the need to host-zero-init `pool` /
         # `dL_do_pool` / `dL_dswiglu_in` / `postact_a_for_dW2`.
@@ -178,7 +178,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
-        mPostAct: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
+        mAuxOut: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
         # Unused: overridden `epi_visit_subtile` bypasses `act_fn`. See class docstring.
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
@@ -197,7 +197,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
         """SwiGLU bwd in registers: outputs `dL/dswiglu_in` (M, 2I) packed
         as bf16x2 in fp32 via mD's f32-recast trick AND ``postact_a_for_dW2``
-        (M, I) bf16 via mPostAct (returned as ``tRS_rPostAct``).
+        (M, I) bf16 via mAuxOut (returned as ``tRS_rPostAct``).
         ColVecReduceAtomic-accumulates `dL/dweight = postact · g` using the
         postact byproduct of `dswiglu`, atomic-adding into a flat per-slot
         fp32 buffer.
@@ -231,7 +231,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
               (Mflat, 2I), viewed as fp32 (Mflat, I) before launch — the
               kernel sees fp32 mD with implicit_dtype=bf16 packing.
               ``tRS_rPostAct`` (weighted, fp32) is returned for the framework
-              to convert and TMA-store via mPostAct (bf16 (M, I)).
+              to convert and TMA-store via mAuxOut (bf16 (M, I)).
         """
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         tDrPadMask = epi_loop_tensors["mPaddingMask"]
@@ -260,7 +260,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         # through dL_do_pool[padding] @ W2 may produce inf/NaN there.
         # Conditional ASSIGNMENT (not multiply) zeros the four register
         # tensors so downstream consumers — colvec_reduce_accumulate (step 3),
-        # weight multiply (step 4), mD TMA-store (dL_dswiglu_in), and mPostAct
+        # weight multiply (step 4), mD TMA-store (dL_dswiglu_in), and mAuxOut
         # TMA-store (postact_a_for_dW2) — see clean zeros at padding rows.
         # `0 * inf = NaN` would slip through a multiply-based mask; the
         # ternary compiles to PTX `select.f32`, no NaN propagation.
@@ -297,7 +297,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         tRS_rdXY_b16 = cute.make_rmem_tensor(tRS_rdXY_f32.layout, implicit_dtype)
         tRS_rdXY_b16.store(tRS_rdXY_f32.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_b16, Float32).load())
-        # Return weighted postact for the framework's mPostAct TMA-store path.
+        # Return weighted postact for the framework's mAuxOut TMA-store path.
         # epi_convert_postact (inherited) handles fp32 → bf16 (postact_dtype).
         return tRS_rPostAct
 
@@ -327,7 +327,8 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
-            persistence_mode=PersistenceMode.STREAMING,
+            scheduler_warp_id=self.ab_load_warp_id,
+            persistence_mode=PersistenceMode.DYNAMIC,
             started_flag=scheduler_args.started_flag,
         )
 
@@ -433,11 +434,11 @@ def _compile_streaming_moe_y_bwd(
         cutlass.Float32, (Mflat_sym,), leading_dim=0, divisibility=1
     )
 
-    # mPostAct: postact_a_for_dW2 (M, I) bf16 — dW2 grouped GEMM's input,
+    # mAuxOut: postact_a_for_dW2 (M, I) bf16 — dW2 grouped GEMM's input,
     # written via TileStore TMA path (same machinery GemmActMixin uses for
     # fwd postact). Plain bf16 (no f32-recast); each pid_n CTA writes a
     # (tile_M, tile_N) slab with no cross-CTA collisions, so no atomics.
-    mPostAct = fake_tensor(b_dtype, (Mflat_sym, I_sym), leading_dim=1, divisibility=8)
+    mAuxOut = fake_tensor(b_dtype, (Mflat_sym, I_sym), leading_dim=1, divisibility=8)
 
     # Scheduler tensors
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
@@ -459,7 +460,7 @@ def _compile_streaming_moe_y_bwd(
     )
 
     epi_args = StreamingMoeYBwd.EpilogueArguments(
-        mPostAct=mPostAct,
+        mAuxOut=mAuxOut,
         act_fn=None,
         mColVecBroadcast=pool_topk_weight,
         mPaddingMask=pool_recv_token,
@@ -545,7 +546,7 @@ def streaming_moe_y_bwd(
     combine_grads (waiting on `a_bwd_started`) reads ``dL_dweight`` the
     atomics are drained — no per-tile cross-stream release needed.
 
-    ``postact_a_for_dW2`` is TMA-stored via the standard mPostAct path
+    ``postact_a_for_dW2`` is TMA-stored via the standard mAuxOut path
     (GemmActMixin's TileStore). Each pid_n CTA writes its (tile_M, tile_N)
     slab; no cross-CTA collisions, no atomics.
 
@@ -589,7 +590,7 @@ def streaming_moe_y_bwd(
         (total_tiles*tile_m, I) before launch — each fp32 element packs
         (dgate_n, dup_n) as bf16x2. Kernel writes as mD. (f32-recast trick.)
       - ``postact_a_for_dW2``: bf16 (total_tiles, tile_m, I), viewed flat
-        as bf16 (total_tiles*tile_m, I). Kernel writes as mPostAct. Plain
+        as bf16 (total_tiles*tile_m, I). Kernel writes as mAuxOut. Plain
         bf16 store (no f32-recast).
     The two f32-recast tensors share the same `implicit_dtype` (bf16) which
     the kernel uses to recast between fp32 storage and bf16x2 math views.
@@ -648,7 +649,7 @@ def streaming_moe_y_bwd(
         dL_dswiglu_in.element_size() == 2
     ), "dL_dswiglu_in must be 16-bit (bf16/fp16) for the f32-recast trick"
     # postact_a_for_dW2: bf16 (total_tiles, tile_m, I) — TMA-stored via
-    # mPostAct. Same dtype as W2 (bf16); plain bf16 write, no f32-recast.
+    # mAuxOut. Same dtype as W2 (bf16); plain bf16 write, no f32-recast.
     assert postact_a_for_dW2.is_cuda and postact_a_for_dW2.dim() == 3
     assert postact_a_for_dW2.shape == (total_tiles, tile_m, I), (
         f"postact_a_for_dW2 must be (total_tiles, tile_m, I) = "
@@ -748,7 +749,7 @@ def streaming_moe_y_bwd(
     consumer_head = torch.zeros(1, dtype=torch.int32, device=dL_do_pool.device)
 
     # Flatten postact_a_for_dW2 (total_tiles, tile_m, I) → (Mflat, I) bf16
-    # for the mPostAct TMA path. No f32-recast — plain bf16 store.
+    # for the mAuxOut TMA path. No f32-recast — plain bf16 store.
     postact_a_for_dW2_flat = postact_a_for_dW2.view(total_tiles * tile_m, I)
     assert postact_a_for_dW2_flat.shape == (total_tiles * tile_m, I), (
         f"postact_a_for_dW2_flat shape mismatch: got "
@@ -756,7 +757,7 @@ def streaming_moe_y_bwd(
     )
 
     epi_args = StreamingMoeYBwd.EpilogueArguments(
-        mPostAct=postact_a_for_dW2_flat,
+        mAuxOut=postact_a_for_dW2_flat,
         act_fn=None,  # weighted-postact computed inline in epi_visit_subtile
         mColVecBroadcast=pool_topk_weight,
         mPaddingMask=pool_recv_token,

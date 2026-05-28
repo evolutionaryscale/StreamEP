@@ -53,16 +53,24 @@ class ColVecReduceAtomic(ColVecReduce):
 
     Inherits ``begin``, ``begin_loop``, ``param_fields``, ``to_params``,
     ``smem_bytes``, ``smem_struct_field``, ``get_smem_tensor`` from
-    ``ColVecReduce`` unchanged — the only behavioural change is in
-    ``end()``.
+    ``ColVecReduce`` unchanged — the only behavioural change is in the
+    end-of-loop flush.
+
+    v0.4.1 framework calls the per-subtile method ``end_loop`` (with the
+    last-N-subtile gate moved inside the method). v0.3.11 called a single
+    post-loop ``end()`` after the per-subtile fold. We override
+    ``end_loop`` and gate on ``epi_coord[1] == epi_tile_shape[1] - 1`` to
+    fire exactly once per CTA tile, matching the v0.3.11 post-loop
+    invocation point.
     """
 
     @cute.jit
-    def end(
+    def end_loop(
         self,
         gemm,
         param,
         state,
+        epi_coord,
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
@@ -79,6 +87,12 @@ class ColVecReduceAtomic(ColVecReduce):
         as in the parent class, just against a 1D target.
         """
         if const_expr(param is None):
+            return
+        # Last-N-subtile gate (v0.4.1 calls end_loop per subtile).
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        if const_expr(epi_coord[1] != epi_tile_shape[1] - 1):
             return
         tDrReduce, sDrReduce = state[0], state[1]
         tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
@@ -102,10 +116,10 @@ class ColVecReduceAtomic(ColVecReduce):
 
         warp_N = warp_layout_MN[1]
         warps_in_N = const_expr(cute.size(warp_N))
-        max_warps_in_n = const_expr(self.max_warps_in_n)
-        assert (
-            warps_in_N <= max_warps_in_n
-        ), "ColVecReduceAtomic warp_N exceeds smem staging"
+        # The v0.3.11 `max_warps_in_n` safety check is gone: v0.4.1's
+        # ColVecReduce.smem_struct_field sizes the staging area from
+        # `warp_shape_mnk` (passed to smem_bytes), which is by construction
+        # >= warps_in_N at runtime. The parent class handles the bound.
 
         partition_for_epilogue_fn = partial(
             partition_for_epilogue,

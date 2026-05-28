@@ -112,7 +112,7 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
-        mPostAct: cute.Tensor
+        mAuxOut: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
@@ -182,12 +182,13 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
-            persistence_mode=PersistenceMode.STREAMING,
+            scheduler_warp_id=self.ab_load_warp_id,
+            persistence_mode=PersistenceMode.DYNAMIC,
             started_flag=scheduler_args.started_flag,
         )
 
     # postact destination: inherited GemmGatedSm90.epi_setup_postact uses
-    # `varlen_manager.offset_batch_epi(mPostAct, batch_idx)` (shift by
+    # `varlen_manager.offset_batch_epi(mAuxOut, batch_idx)` (shift by
     # cu_seqlens_m[batch_idx]) + `local_tile((pid_m, pid_n))`. The combined
     # row offset is `cu_seqlens_m[batch_idx] + pid_m * tile_m =
     # expert_pool_block_offset[e] * tile_m + (tile_id - expert_pool_block_offset[e])
@@ -244,8 +245,8 @@ def _compile_streaming_moe_a(
     else:
         mD = None
     mC = None
-    # mPostAct: flat (total_tiles * tile_m, I), n-major (I contiguous).
-    mPostAct = fake_tensor(
+    # mAuxOut: flat (total_tiles * tile_m, I), n-major (I contiguous).
+    mAuxOut = fake_tensor(
         postact_dtype, (Mflat_sym, I_sym), leading_dim=1, divisibility=8
     )
 
@@ -272,7 +273,7 @@ def _compile_streaming_moe_a(
     )
 
     epi_args = StreamingMoeA.EpilogueArguments(
-        mPostAct=mPostAct,
+        mAuxOut=mAuxOut,
         act_fn=gate_fn_map[activation],
         rounding_mode=RoundingMode.RN,
     )
@@ -477,7 +478,7 @@ def streaming_moe_a(
     # tile_n MUST divide the output N dim. The grouped GEMM emits one CTA per
     # (pid_m, pid_n) and writes a full tile_n-wide slab via TMA; partial-tile
     # tail handling silently corrupts adjacent memory. kernel A's output N is
-    # 2I (mD/preact) or I (mPostAct/postact); both must be divisible.
+    # 2I (mD/preact) or I (mAuxOut/postact); both must be divisible.
     assert two_I % tile_n == 0, (
         f"tile_n ({tile_n}) must divide 2I ({two_I}); 2I % tile_n = {two_I % tile_n}"
     )
@@ -557,7 +558,7 @@ def streaming_moe_a(
     consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
     epi_args = StreamingMoeA.EpilogueArguments(
-        mPostAct=postact_flat,
+        mAuxOut=postact_flat,
         act_fn=None,  # Constexpr; pass None at call time
         rounding_mode=None,  # Constexpr; pass None at call time
     )

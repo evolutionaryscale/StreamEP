@@ -160,7 +160,8 @@ class StreamingMoeABwd(StreamingMoeY):
             total_tiles=scheduler_args.total_tiles,
             tile_shape_mn=self.cta_tile_shape_mnk[:2],
             cluster_shape_mnk=self.cluster_shape_mnk,
-            persistence_mode=PersistenceMode.STREAMING,
+            scheduler_warp_id=self.ab_load_warp_id,
+            persistence_mode=PersistenceMode.DYNAMIC,
             started_flag=scheduler_args.started_flag,
         )
 

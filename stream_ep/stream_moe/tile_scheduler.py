@@ -114,7 +114,14 @@ class StreamingTileSchedulerArguments:
     total_tiles: Int32  # passed as scalar so launch-time get_grid_shape doesn't deref device tensor
     tile_shape_mn: cutlass.Constexpr[cute.Shape]  # (tile_M, tile_N)
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
-    persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STREAMING
+    # Warp id of the producer (atomic-claim) warp. Each kernel passes
+    # `self.ab_load_warp_id` here (or the math-side equivalent if those ever
+    # need to act as scheduler). The `initial_work_tile_info` override below
+    # compares `cute.arch.warp_idx()` against this value to identify the
+    # single producer per CTA, replacing the v0.3.11 `is_scheduler_warp`
+    # parameter that the caller used to pass into `setup_initial_work_tile`.
+    scheduler_warp_id: cutlass.Constexpr[Int32]
+    persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.DYNAMIC
     # Optional [1] int32 device flag. When supplied, the CTA that wins
     # `linear_idx == 0` atomicAdd's this flag once at the top of
     # `_fetch_next_work_idx`. Used by kernel_y / kernel_a_bwd to signal
@@ -167,6 +174,7 @@ class StreamingTileScheduler(TileScheduler):
         num_pid_n_fdd: FastDivmod
         tile_shape_mn: cutlass.Constexpr[cute.Shape]
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+        scheduler_warp_id: cutlass.Constexpr[Int32]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
         started_flag: Optional[cute.Tensor] = None
 
@@ -188,6 +196,7 @@ class StreamingTileScheduler(TileScheduler):
                 num_pid_n_fdd=FastDivmod(num_pid_n),
                 tile_shape_mn=args.tile_shape_mn,
                 cluster_shape_mnk=args.cluster_shape_mnk,
+                scheduler_warp_id=args.scheduler_warp_id,
                 persistence_mode=args.persistence_mode,
                 started_flag=args.started_flag,
             )
@@ -541,16 +550,30 @@ class StreamingTileScheduler(TileScheduler):
                     )
 
     @cute.jit
-    def setup_initial_work_tile(
-        self, is_scheduler_warp: bool | Boolean = False, *, loc=None, ip=None
-    ) -> cutlass.utils.WorkTileInfo:
-        """For streaming, the first work tile must come from the producer's
-        atomic-claim + queue spin + sched_smem write — there is no static
-        initial `_current_work_idx`. Both producer and consumer warps call
-        this; producer's `advance_to_next_work` does the fetch+write, consumer's
-        is a no-op; both then read the populated sched_smem via
-        `get_current_work`.
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        """Streaming variant of the base `initial_work_tile_info`.
+
+        The first work tile must come from the producer's atomic-claim +
+        queue spin + sched_smem write — there is no static initial
+        `_current_work_idx` to decompose. Both v0.4.1 call sites
+        (`quack/gemm_sm90.py:682` AB-load context, `:810` math context)
+        invoke this with no args; we recompute `is_scheduler_warp` here from
+        `cute.arch.warp_idx() == self.params.scheduler_warp_id` (kernel side
+        sets `scheduler_warp_id = self.ab_load_warp_id`). The producer warp
+        runs the atomic claim + smem write inside `advance_to_next_work`;
+        every other warp is a no-op claim that returns immediately and then
+        consumer-waits in `get_current_work`.
+
+        Math warps at the `:810` call site always see
+        `warp_idx != scheduler_warp_id` (they live in a disjoint warp range),
+        so they fall through to the consumer-wait path automatically. The
+        pipeline's release-acquire pairing across the producer write and
+        consumer read covers cross-warp visibility.
         """
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        is_scheduler_warp = warp_idx == self.params.scheduler_warp_id
+        if const_expr(cute.size(self.params.cluster_shape_mnk) > 1):
+            is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
         self.advance_to_next_work(is_scheduler_warp=is_scheduler_warp, loc=loc, ip=ip)
         return self.get_current_work(loc=loc, ip=ip)
 
