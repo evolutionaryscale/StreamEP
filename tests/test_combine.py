@@ -22,8 +22,8 @@ Two test cases:
 Driver convention: torchrun env-driven (``RANK`` / ``WORLD_SIZE`` /
 ``LOCAL_RANK``), matching ``test_streaming_dispatch.py``. Run as:
 
-    torchrun --nproc_per_node=2 DeepEP/tests/test_streaming_combine.py
-    torchrun --nproc_per_node=8 DeepEP/tests/test_streaming_combine.py
+    torchrun --nproc_per_node=2 StreamEP/tests/test_combine.py
+    torchrun --nproc_per_node=8 StreamEP/tests/test_combine.py
 """
 
 from __future__ import annotations

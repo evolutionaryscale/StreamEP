@@ -15,8 +15,8 @@ analytical reference is:
 
 Driver convention matches the rest of the streaming tests:
 
-    torchrun --nproc_per_node=2 DeepEP/tests/test_streaming_combine_grads.py
-    torchrun --nproc_per_node=8 DeepEP/tests/test_streaming_combine_grads.py
+    torchrun --nproc_per_node=2 StreamEP/tests/test_combine_grads.py
+    torchrun --nproc_per_node=8 StreamEP/tests/test_combine_grads.py
 """
 
 from __future__ import annotations

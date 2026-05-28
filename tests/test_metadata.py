@@ -261,7 +261,7 @@ def main():
         "--num_sms",
         type=int,
         default=80,
-        help="DeepEP num_sms (sets num_channels = num_sms // 2).",
+        help="num_sms (sets num_channels = num_sms // 2).",
     )
     parser.add_argument(
         "--n_iter",
