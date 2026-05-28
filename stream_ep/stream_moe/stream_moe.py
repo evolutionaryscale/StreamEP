@@ -289,47 +289,59 @@ class StreamMoEFunc(torch.autograd.Function):
                 dtype=x.dtype,
                 device=pool.device,
             )
-            streaming_moe_a(
-                pool,
-                w1_local,
-                postact_a,
-                handle.expert_pool_block_offset,
-                handle.pool_arrival_count,
-                handle.pool_arrival_target,
-                preact_a=preact_a,
-                tile_m=tile_m,
-                tile_n=tile_n_a,
-                cluster_n=2,
-                num_sms=num_sms_a,
-            )
+            # Empty-rank guard: when no token is routed to any of this rank's
+            # local experts, ``total_tiles == 0`` ⟹ ``T_recv == 0``. Skipping
+            # kernel A / kernel Y is required because their CuTeDSL launches
+            # reject grid_x=0 with cudaErrorInvalidConfiguration. The bump /
+            # wait pair around kernel_y is skipped together — host counter
+            # and device started_flag stay in sync at their prior values.
+            # ``dispatch_main`` always launched (sender side has source-token
+            # work regardless), so the wait_dispatch_main_started flag is
+            # already bumped from above; no skip there. ``combine`` below
+            # still runs — its receiver side gathers contributions for our
+            # source tokens, and the sender side has T_recv=0 work.
+            if handle.total_tiles > 0:
+                streaming_moe_a(
+                    pool,
+                    w1_local,
+                    postact_a,
+                    handle.expert_pool_block_offset,
+                    handle.pool_arrival_count,
+                    handle.pool_arrival_target,
+                    preact_a=preact_a,
+                    tile_m=tile_m,
+                    tile_n=tile_n_a,
+                    cluster_n=2,
+                    num_sms=num_sms_a,
+                )
 
-            # ── Kernel Y on the same compute stream ──────────────────────
-            # Bump the kernel_y issued counter BEFORE launching so a
-            # subsequent ``wait_kernel_y_started`` on the communicate stream
-            # has the right comparison target. Inside the kernel, the CTA
-            # that wins ``linear_idx == 0`` in StreamingTileScheduler
-            # atomicAdd's ``kernel_y_started_flag`` — a stronger signal than
-            # a torch.cuda.Event between A and Y, which only marks "Y's
-            # launch packet is queued" rather than "Y is on an SM".
-            buffer.bump_kernel_y_issued()
-            streaming_moe_y(
-                postact_a,
-                w2_local,
-                handle.o,
-                handle.pool_recv_token,
-                handle.pool_topk_weight,
-                handle.k_local_remaining,
-                handle.y_done_per_token,
-                handle.expert_pool_block_offset,
-                handle.pool_arrival_count,
-                handle.pool_arrival_target,
-                combine_seq=dispatch_seq,
-                started_flag=buffer.kernel_y_started_flag_view(),
-                tile_m=tile_m,
-                tile_n=tile_n_y,
-                cluster_n=2,
-                num_sms=num_sms_y,
-            )
+                # ── Kernel Y on the same compute stream ──────────────────────
+                # Bump the kernel_y issued counter BEFORE launching so a
+                # subsequent ``wait_kernel_y_started`` on the communicate stream
+                # has the right comparison target. Inside the kernel, the CTA
+                # that wins ``linear_idx == 0`` in StreamingTileScheduler
+                # atomicAdd's ``kernel_y_started_flag`` — a stronger signal than
+                # a torch.cuda.Event between A and Y, which only marks "Y's
+                # launch packet is queued" rather than "Y is on an SM".
+                buffer.bump_kernel_y_issued()
+                streaming_moe_y(
+                    postact_a,
+                    w2_local,
+                    handle.o,
+                    handle.pool_recv_token,
+                    handle.pool_topk_weight,
+                    handle.k_local_remaining,
+                    handle.y_done_per_token,
+                    handle.expert_pool_block_offset,
+                    handle.pool_arrival_count,
+                    handle.pool_arrival_target,
+                    combine_seq=dispatch_seq,
+                    started_flag=buffer.kernel_y_started_flag_view(),
+                    tile_m=tile_m,
+                    tile_n=tile_n_y,
+                    cluster_n=2,
+                    num_sms=num_sms_y,
+                )
         _nvtx_pop()  # fwd_compute
 
         # ── Combine on `streams.communicate` (same stream as dispatch) ────
@@ -340,7 +352,8 @@ class StreamMoEFunc(torch.autograd.Function):
         # then spins on ``y_done_per_token[r] >= dispatch_seq`` for
         # per-recv-token streaming.
         _nvtx_push(f"fwd_combine_{_fid}")
-        buffer.wait_kernel_y_started(streams.communicate)
+        if handle.total_tiles > 0:
+            buffer.wait_kernel_y_started(streams.communicate)
         with torch.cuda.stream(streams.communicate):
             # combine_seq defaults to ``handle.dispatch_seq`` per Buffer.combine.
             out, _ = buffer.combine(handle.o, handle)
@@ -576,59 +589,65 @@ class StreamMoEFunc(torch.autograd.Function):
         # == pool_arrival_target[tile] terminates immediately because
         # dispatch_grads has fully retired (wait_stream above).
         # Writes dL_dswiglu_in, postact_a_for_dW2, dL_dweight (atomic).
-        with torch.cuda.stream(streams.compute):
-            streaming_moe_y_bwd(
-                dL_do_pool,
-                w2_local,
-                dL_dswiglu_in,
-                postact_a_for_dW2,
-                handle.pool_topk_weight,
-                handle.pool_recv_token,
-                preact_a,
-                dL_dweight,
-                handle.expert_pool_block_offset,
-                bwd_dispatch_arrival_count,
-                handle.pool_arrival_target,
-                tile_m=tile_m,
-                tile_n=tile_n_y_bwd,
-                num_sms=num_sms_y_bwd,
-            )
+        # Empty-rank guard: mirror of fwd — skip kernel_y_bwd / kernel_a_bwd
+        # (and their bump/wait pair) when this rank produced no tiles in
+        # fwd. combine_grads still runs; dW1/dW2 GEMMs are skipped and the
+        # dW destinations are zero'd below.
+        if total_tiles > 0:
+            with torch.cuda.stream(streams.compute):
+                streaming_moe_y_bwd(
+                    dL_do_pool,
+                    w2_local,
+                    dL_dswiglu_in,
+                    postact_a_for_dW2,
+                    handle.pool_topk_weight,
+                    handle.pool_recv_token,
+                    preact_a,
+                    dL_dweight,
+                    handle.expert_pool_block_offset,
+                    bwd_dispatch_arrival_count,
+                    handle.pool_arrival_target,
+                    tile_m=tile_m,
+                    tile_n=tile_n_y_bwd,
+                    num_sms=num_sms_y_bwd,
+                )
 
-            # ── Stage 3 — kernel_a_bwd on the SAME compute stream ──────
-            # FIFO-ordered after kernel_y_bwd retires — no cross-stream
-            # release-add is needed. Scheduler reuses
-            # (bwd_dispatch_arrival_count, pool_arrival_target) — at-target
-            # by the time A_bwd runs because Y_bwd already spun on it.
-            # Bump the kernel_a_bwd issued counter BEFORE launching so the
-            # communicate-stream wait below has the right target. The CTA
-            # that wins ``linear_idx == 0`` in StreamingTileScheduler
-            # atomicAdd's ``kernel_a_bwd_started_flag``; the
-            # ``wait_kernel_a_bwd_started`` GPU-front-end gate on
-            # ``communicate`` reads this flag, so combine_grads cannot
-            # grab SMs ahead of A_bwd's first co-resident CTA.
-            buffer.bump_kernel_a_bwd_issued()
-            streaming_moe_a_bwd(
-                dL_dswiglu_in,
-                w1_local,
-                dL_dx_per_r,
-                handle.pool_recv_token,
-                bwd_k_local_remaining,
-                bwd_a_done_per_token,
-                handle.expert_pool_block_offset,
-                bwd_dispatch_arrival_count,
-                handle.pool_arrival_target,
-                dispatch_seq=handle.dispatch_seq,
-                started_flag=buffer.kernel_a_bwd_started_flag_view(),
-                tile_m=tile_m,
-                tile_n=tile_n_a_bwd,
-                num_sms=num_sms_a_bwd,
-            )
+                # ── Stage 3 — kernel_a_bwd on the SAME compute stream ──────
+                # FIFO-ordered after kernel_y_bwd retires — no cross-stream
+                # release-add is needed. Scheduler reuses
+                # (bwd_dispatch_arrival_count, pool_arrival_target) — at-target
+                # by the time A_bwd runs because Y_bwd already spun on it.
+                # Bump the kernel_a_bwd issued counter BEFORE launching so the
+                # communicate-stream wait below has the right target. The CTA
+                # that wins ``linear_idx == 0`` in StreamingTileScheduler
+                # atomicAdd's ``kernel_a_bwd_started_flag``; the
+                # ``wait_kernel_a_bwd_started`` GPU-front-end gate on
+                # ``communicate`` reads this flag, so combine_grads cannot
+                # grab SMs ahead of A_bwd's first co-resident CTA.
+                buffer.bump_kernel_a_bwd_issued()
+                streaming_moe_a_bwd(
+                    dL_dswiglu_in,
+                    w1_local,
+                    dL_dx_per_r,
+                    handle.pool_recv_token,
+                    bwd_k_local_remaining,
+                    bwd_a_done_per_token,
+                    handle.expert_pool_block_offset,
+                    bwd_dispatch_arrival_count,
+                    handle.pool_arrival_target,
+                    dispatch_seq=handle.dispatch_seq,
+                    started_flag=buffer.kernel_a_bwd_started_flag_view(),
+                    tile_m=tile_m,
+                    tile_n=tile_n_a_bwd,
+                    num_sms=num_sms_a_bwd,
+                )
 
         # Combine_grads launches when A_bwd has at least one CTA co-resident.
         # Per-recv-token streaming overlap (combine_grads sender ↔ A_bwd
         # tail) is driven by `bwd_a_done_per_token[r] >= dispatch_seq`,
         # fired by A_bwd's last contributor per recv-token.
-        buffer.wait_kernel_a_bwd_started(streams.communicate)
+        if total_tiles > 0:
+            buffer.wait_kernel_a_bwd_started(streams.communicate)
 
         # ── Stage 4 — combine_grads on streams.communicate ─────────────────
         # Sender per-warp loop spins on bwd_a_done_per_token[r] >=
@@ -659,41 +678,53 @@ class StreamMoEFunc(torch.autograd.Function):
         #     (which is gated on the kernel_a_bwd_started flag and runs
         #     comm-bound), so the useful dW ↔ combine_grads overlap is
         #     preserved.
-        with torch.cuda.stream(streams.compute):
-            # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
-            postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
-            gemm(
-                dL_do_pool.t(),
-                postact_a_for_dW2_flat.t(),
-                dW2_local,
-                None,
-                None,
-                tile_M=tile_m_dW2,
-                tile_N=tile_n_dW2,
-                cluster_M=cluster_m_dW2,
-                cluster_N=cluster_n_dW2,
-                pingpong=pingpong_dW2,
-                max_swizzle_size=swizzle_dW2,
-                cu_seqlens_k=cu_seqlens_k,
-                lens_k=lens_k_dW,
-            )
-            # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
-            dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
-            gemm(
-                dL_dswiglu_in_flat.t(),
-                pool.t(),
-                dW1_local,
-                None,
-                None,
-                tile_M=tile_m_dW1,
-                tile_N=tile_n_dW1,
-                cluster_M=cluster_m_dW1,
-                cluster_N=cluster_n_dW1,
-                pingpong=pingpong_dW1,
-                max_swizzle_size=swizzle_dW1,
-                cu_seqlens_k=cu_seqlens_k,
-                lens_k=lens_k_dW,
-            )
+        # Empty-rank guard: skip the dW1/dW2 grouped GEMMs and zero the
+        # destinations. With ``total_tiles == 0`` the per-expert K-lens are
+        # all zero — the GEMMs would have zero work, but quack's grouped-GEMM
+        # path isn't guaranteed to handle all-zero ``cu_seqlens_k`` / ``lens_k``
+        # gracefully. dW1_local / dW2_local were allocated as
+        # ``torch.empty_like`` so they hold uninitialized garbage; the genuine
+        # gradient is zero, so explicit ``.zero_()`` is correct.
+        if total_tiles > 0:
+            with torch.cuda.stream(streams.compute):
+                # dW2[e] = postact_a_for_dW2[slot_range_e].T @ dL_do_pool[slot_range_e]
+                postact_a_for_dW2_flat = postact_a_for_dW2.view(TK_padded, I)
+                gemm(
+                    dL_do_pool.t(),
+                    postact_a_for_dW2_flat.t(),
+                    dW2_local,
+                    None,
+                    None,
+                    tile_M=tile_m_dW2,
+                    tile_N=tile_n_dW2,
+                    cluster_M=cluster_m_dW2,
+                    cluster_N=cluster_n_dW2,
+                    pingpong=pingpong_dW2,
+                    max_swizzle_size=swizzle_dW2,
+                    cu_seqlens_k=cu_seqlens_k,
+                    lens_k=lens_k_dW,
+                )
+                # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
+                dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
+                gemm(
+                    dL_dswiglu_in_flat.t(),
+                    pool.t(),
+                    dW1_local,
+                    None,
+                    None,
+                    tile_M=tile_m_dW1,
+                    tile_N=tile_n_dW1,
+                    cluster_M=cluster_m_dW1,
+                    cluster_N=cluster_n_dW1,
+                    pingpong=pingpong_dW1,
+                    max_swizzle_size=swizzle_dW1,
+                    cu_seqlens_k=cu_seqlens_k,
+                    lens_k=lens_k_dW,
+                )
+        else:
+            with torch.cuda.stream(streams.compute):
+                dW1_local.zero_()
+                dW2_local.zero_()
 
         # ── Exit chain back to caller_stream ───────────────────────────────
         caller_stream.wait_stream(streams.communicate)
