@@ -3,7 +3,7 @@
 Setup
 -----
 - Run Buffer.dispatch once to produce a StreamingHandle (multi-GPU required
-  for the dispatcher).
+  for StreamEP's dispatcher).
 - Pool layout puts data into expert-major BLOCK_M-padded tiles. Both kernel A
   (gemm_gated) and kernel Y (gemm + atomic-scatter into o[T_recv, H]) read
   from the pool via the standard varlen_m strided TMA path.
@@ -67,7 +67,7 @@ NUM_EXPERTS = 64
 SEQ_LEN_PER_RANK = 8192
 TOPK = 4
 DTYPE = torch.bfloat16
-NUM_SMS = 64  # num_sms (channels = num_sms / 2; max = num_device_sms,
+NUM_SMS = 64  # StreamEP num_sms (channels = num_sms / 2; max = num_device_sms,
 # i.e. 132 on H100). 4-node internode sweep on the full fwd+bwd
 # footprint (32 GPU, T=8192, H=2048, E=384, K=13) picks 64 as the
 # sweet spot: total iter e2e drops to ~6350 µs vs ~6470 µs at 80,
@@ -128,7 +128,7 @@ def main():
         "--num_sms_dispatch",
         type=int,
         default=NUM_SMS,
-        help="num_sms (channel count; dispatch grid uses ~2×).",
+        help="StreamEP num_sms (channel count; dispatch grid uses ~2×).",
     )
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
@@ -215,7 +215,7 @@ def main():
     # Reference y buffer for kernel Y baseline (TK_padded rows, then scattered).
     y_ref = torch.empty(TK_padded, H, dtype=DTYPE, device=device)
 
-    # `o` is `handle.o` from Buffer.dispatch, sized [T_recv, H], zero-init. Kernel Y
+    # `o` is `handle.o` from StreamEP's Buffer.dispatch, sized [T_recv, H], zero-init. Kernel Y
     # writes via PTX-predicated atomic-scatter (no trash row).
     o_buf = handle.o
 
@@ -303,7 +303,7 @@ def main():
         )
 
     def run_streaming_y_only():
-        # Reset per-call accumulator state. (Production pipeline:
+        # Reset per-call accumulator state. (Production pipeline: StreamEP's
         # Buffer.dispatch zeros these; here we time kernel Y in isolation across many
         # calls so we reset by hand.)
         handle.k_local_remaining.copy_(_k_local_remaining_init)
@@ -616,7 +616,7 @@ def main():
     # ────────────────────────────────────────────────────────────────────
     # End-to-end pipeline timing: dispatch + A + Y + combine on 3 streams.
     # ────────────────────────────────────────────────────────────────────
-    # Each iteration runs a fresh dispatch (so the Buffer allocates fresh
+    # Each iteration runs a fresh dispatch (so StreamEP's Buffer allocates fresh
     # per-token state) followed by kernel A + kernel Y on the compute stream
     # (same-stream FIFO) and combine on the communicate stream (FIFO after
     # dispatch). Cross-stream visibility:

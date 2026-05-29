@@ -305,7 +305,7 @@ def _compile_streaming_moe_a(
 # matching `pool_arrival_target[i]` value (single-producer simulation of
 # dispatch's Pass 2 release-add chain — when count == target, kernel A's
 # scheduler spin unblocks). Used by tests to validate kernel A's per-tile
-# count-vs-target spin without the dispatcher.
+# count-vs-target spin without StreamEP's dispatcher.
 # ---------------------------------------------------------------------------
 class _StreamingTileProducer:
     @cute.jit
@@ -428,7 +428,7 @@ def streaming_moe_a(
         this function is called from (so the kernel's TMA stores are naturally
         ordered with the allocation; otherwise stale memory may leak through).
       - ensuring ``pool_arrival_count`` / ``pool_arrival_target`` are
-        populated by the producer (``Buffer.dispatch`` Pass 2 or a
+        populated by the producer (StreamEP's ``Buffer.dispatch`` Pass 2 or a
         test stub) on a stream that ``red.release.gpu.global.add.s32``s into
         ``pool_arrival_count[tile_id]`` until it equals
         ``pool_arrival_target[tile_id]``. Kernel A's per-tile count-vs-target

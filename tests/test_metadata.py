@@ -261,7 +261,7 @@ def main():
         "--num_sms",
         type=int,
         default=80,
-        help="num_sms (sets num_channels = num_sms // 2).",
+        help="StreamEP num_sms (sets num_channels = num_sms // 2).",
     )
     parser.add_argument(
         "--n_iter",

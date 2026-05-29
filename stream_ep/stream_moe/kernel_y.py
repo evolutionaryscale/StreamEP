@@ -793,7 +793,7 @@ def streaming_moe_y(
         other masked lanes are handled via PTX-level predicated atomic-add
         (no trash row needed).
       - allocating ``k_local_remaining`` with the K_local count for each
-        recv-token (``Buffer.dispatch`` sets this in Pass B's per-pool-slot block).
+        recv-token (StreamEP's ``Buffer.dispatch`` sets this in Pass B's per-pool-slot block).
       - allocating ``y_done_per_token`` zero-initialized.
       - passing the same ``pool_arrival_count`` / ``pool_arrival_target`` that
         kernel A's scheduler waited on. By the time kernel Y issues its first
