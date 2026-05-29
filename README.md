@@ -13,7 +13,8 @@ The headline feature is **per-tile streaming**: dispatch fires release-stamps on
   - `tile_scheduler.StreamingTileScheduler` — Quack `TileScheduler` subclass with a per-tile-ready spin acquire (`tile_ready` for kernel A, `a_ready` for kernel Y) and `cute.lens_k`-based variable-K tile sizes that ride the GEMM's TMA OOB-zero-fill to handle dispatch-padding rows at zero compute cost.
   - `epi_ops` — composable Quack EpiOps (`TileReadyRelease`, `AtomicScatterStore`).
   - `ptx_helpers` — system-scope `st_release_sys_global`, `ld_acquire_sys_global`, `red_add_bf16x2`, etc. Used for cross-stream signaling without Torch event overhead.
-  - `stream_moe.StreamMoEFunc` — the autograd boundary that orchestrates dispatch → kernel A → kernel Y → combine on four caller-owned streams (and dispatch_grads → kernel_y_bwd → kernel_a_bwd → combine_grads on the same four streams in backward, with dW1 / dW2 grouped GEMMs landing on a dedicated `grads` stream so they don't contend with the streaming-kernel critical path).
+  - `stream_moe.stream_moe_func` — public layer entry point. Orchestrates dispatch → kernel A → kernel Y → combine on **two caller-owned streams** (`compute` and `communicate`) and the symmetric backward (dispatch_grads → kernel_y_bwd → kernel_a_bwd → combine_grads + dW1 / dW2 on the compute stream). All grouped-GEMM tile / cluster / pingpong / num_sms knobs are picked internally from `w1_local.shape`; the public surface is just `(buffer, x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local, streams, num_experts)`.
+  - `Buffer.num_sms` is auto-picked from world size in `Buffer.__init__` (80 SMs at ≤2 nodes, 64 SMs at ≥3 nodes; override via `Buffer.set_num_sms`).
 
 ## Streaming dispatch in one paragraph
 
@@ -26,35 +27,44 @@ The dispatch / combine ring protocol underneath (channel send/recv buffers, NVL 
 - FP8 dispatch path (~200 LoC). bf16 only.
 - Low-latency inference kernels (`internode_ll.cu` + `Buffer::low_latency_*` methods, ~1700 LoC). High-throughput training only.
 - `csrc/kernels/layout.cu` and `Buffer::get_dispatch_layout` (~200 LoC). The streaming dispatch synthesizes its own routing metadata via `streaming_dispatch_metadata` in a single kernel launch.
-- CMake build path (`csrc/CMakeLists.txt`, `csrc/kernels/CMakeLists.txt`). Builds via `setup.py` driven by [`build_stream_ep.sh`](#build) inside a pixi env.
+- CMake build path (`csrc/CMakeLists.txt`, `csrc/kernels/CMakeLists.txt`). Builds via `setup.py` directly.
 
 ## Build
 
-StreamEP is built editable inside a consumer pixi environment that already provides torch (cu128), NVSHMEM 3.5.19, CUDA 12.8, and the `nvidia/*` pip wheels with the dev headers (cusparse / cublas / cusolver) the build needs:
+Build environment requirements: torch 2.8 (cu128), CUDA 12.8, upstream NVSHMEM 3.5.19 (`nvidia-nvshmem-cu12==3.5.19` pip wheel), and the `nvidia/*` pip wheels providing the dev headers (cusparse / cublas / cusolver) the C++ extension needs.
 
 ```bash
-pixi run --manifest-path /path/to/consumer/pixi.toml bash build_stream_ep.sh --clean
+# editable install (incremental rebuilds via `python setup.py build_ext --inplace`)
+pip install --no-build-isolation --no-deps -e .
+
+# wheel
+pip wheel --no-build-isolation --no-deps --wheel-dir dist .
 ```
 
-Produces an editable install of `stream_ep` (Python package) backed by `stream_ep_cpp` (C++ extension). Coexists with upstream `deep_ep` in the same env if both are installed — different module names, different `.so` filenames, so neither shadows the other.
+Produces `stream_ep` (Python package) backed by `stream_ep_cpp` (C++ extension). Coexists with upstream `deep_ep` in the same env if both are installed — different module names, different `.so` filenames, so neither shadows the other.
 
 ## Tests
 
-DeepEP-style stand-alone scripts (no pytest):
+Multi-rank tests under `tests/` are torchrun-style stand-alone scripts (each one reads `RANK`/`WORLD_SIZE`/`LOCAL_RANK` from env and calls `dist.init_process_group` directly — no pytest harness):
 
 ```bash
 # Cross-rank streaming-dispatch correctness (8 GPU intranode):
-pixi run --manifest-path .../pixi.toml python tests/test_dispatch.py
-pixi run --manifest-path .../pixi.toml python tests/test_combine.py
-pixi run --manifest-path .../pixi.toml python tests/test_dispatch_grads.py
-pixi run --manifest-path .../pixi.toml python tests/test_combine_grads.py
+torchrun --standalone --nproc-per-node=8 tests/test_dispatch.py
+torchrun --standalone --nproc-per-node=8 tests/test_combine.py
+torchrun --standalone --nproc-per-node=8 tests/test_dispatch_grads.py
+torchrun --standalone --nproc-per-node=8 tests/test_combine_grads.py
+torchrun --standalone --nproc-per-node=8 tests/test_skewed_experts.py
 ```
 
-The streaming-MoE kernel tests at `stream_ep/stream_moe/tests/` are pytest-driven (single-process, small shapes — they exercise the kernel logic, not multi-rank dispatch):
+Streaming-MoE kernel tests at `stream_ep/stream_moe/tests/` are pytest-driven (single-process, small shapes — they exercise the kernel logic, not multi-rank dispatch):
 
 ```bash
-pixi run --manifest-path .../pixi.toml pytest stream_ep/stream_moe/tests/ -v
+pytest stream_ep/stream_moe/tests/ -v
 ```
+
+Internode tests (`tests/test_*_internode.py`) need ≥2 nodes.
+
+For broader context on testing conventions and design rationale, see [`CHANGES.md`](CHANGES.md).
 
 ## License
 
