@@ -13,7 +13,7 @@
 #include "exception.cuh"
 #include "utils.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 EP_STATIC_ASSERT(NVSHMEMI_IBGDA_MIN_QP_DEPTH >= 64, "Invalid QP minimum depth");
 
@@ -47,7 +47,6 @@ __device__ static __forceinline__ uint32_t HtoBE32(uint32_t x) {
 }
 
 __device__ static __forceinline__ uint16_t HtoBE16(uint16_t x) {
-    // TODO: simplify PTX using 16-bit instructions
     auto a = static_cast<uint32_t>(x);
     uint32_t d;
     asm volatile(
@@ -438,7 +437,18 @@ __device__ static __forceinline__ void ibgda_write_amo_add_wqe(nvshmemi_ibgda_de
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     void* rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
     if (is_local_copy) {
-        atomicAdd(static_cast<unsigned long long*>(rptr), value);
+        // .release.sys atomic add: pairs with the consumer's ld.acquire.sys
+        // on the same address (`rdma_channel_tail`), establishing release-
+        // acquire ordering for the sender's prior data writes. Plain
+        // atomicAdd is .relaxed.gpu, which breaks the release-acquire pair
+        // on the same-GPU LOCAL src_rdma path where the forwarder reads via
+        // ld.acquire.sys — the consumer can observe the new tail but stale
+        // data.
+        unsigned long long ret;
+        asm volatile("atom.add.release.sys.global.u64 %0, [%1], %2;"
+                     : "=l"(ret)
+                     : "l"(rptr), "l"(static_cast<unsigned long long>(value))
+                     : "memory");
     } else {
         nvshmemi_ibgda_device_qp_t* qp = ibgda_get_rc(pe, qp_id);
 
@@ -503,4 +513,4 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_i
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
 }
 
-}  // namespace deep_ep
+}  // namespace stream_ep

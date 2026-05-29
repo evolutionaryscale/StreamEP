@@ -26,7 +26,7 @@ if __name__ == '__main__':
             import nvidia.nvshmem as nvshmem  # noqa: F401
         except (ModuleNotFoundError, AttributeError, IndexError):
             print(
-                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n'
+                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode features are disabled\n'
             )
             disable_nvshmem = True
     else:
@@ -37,9 +37,30 @@ if __name__ == '__main__':
 
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
+    # `-lineinfo` adds source-line debug info without disabling optimizations,
+    # so compute-sanitizer / nsight can map kernel PCs back to .cu source
+    # lines. Cost: ~5% larger .so + ~negligible launch overhead. Always on.
+    nvcc_flags.append('-lineinfo')
+    sources = ['csrc/stream_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu']
     include_dirs = ['csrc/']
     library_dirs = []
+
+    # Conda's CUDA toolkit ships core headers but not cusparse/cublas/cusolver/etc.
+    # Those headers only live in the pip-installed `nvidia/*` wheels that torch
+    # pulls in. Torch's CUDAContextLight.h includes <cusparse.h>, so we add
+    # every `nvidia/<lib>/include` dir to `include_dirs`. Doing this here (vs.
+    # via CPATH in a build script) keeps the build self-contained — both
+    # `pip install -e .` (e.g. driven by pixi) and `python setup.py
+    # build_ext --inplace` work without an env-var preamble.
+    try:
+        import nvidia
+        nvidia_root = Path(nvidia.__file__).resolve().parent
+        for inc in sorted(nvidia_root.glob('*/include')):
+            if inc.is_dir():
+                include_dirs.append(str(inc))
+    except ModuleNotFoundError:
+        pass
+
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
 
@@ -48,7 +69,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
+        sources.append('csrc/kernels/internode.cu')
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
@@ -62,7 +83,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
-        # Disable internode and low-latency kernels
+        # Disable internode kernels
         assert disable_nvshmem
     else:
         # Prefer H800 series
@@ -113,11 +134,11 @@ if __name__ == '__main__':
     except Exception as _:
         revision = ''
 
-    setuptools.setup(name='deep_ep',
+    setuptools.setup(name='stream_ep',
                      version='1.2.1' + revision,
-                     packages=setuptools.find_packages(include=['deep_ep']),
+                     packages=setuptools.find_packages(include=['stream_ep', 'stream_ep.*']),
                      ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
+                         CUDAExtension(name='stream_ep_cpp',
                                        include_dirs=include_dirs,
                                        library_dirs=library_dirs,
                                        sources=sources,

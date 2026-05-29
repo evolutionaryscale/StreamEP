@@ -3,7 +3,7 @@
 #include "configs.cuh"
 #include "exception.cuh"
 
-namespace deep_ep {
+namespace stream_ep {
 
 template <typename dtype_t>
 struct Buffer {
@@ -128,4 +128,4 @@ public:
     }
 };
 
-}  // namespace deep_ep
+}  // namespace stream_ep

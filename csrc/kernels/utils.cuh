@@ -27,7 +27,25 @@
         }                                                                                                                             \
     }
 
-namespace deep_ep {
+namespace stream_ep {
+
+// (seq32, value32) genstamp pack/unpack for cross-iter slot reuse without
+// memsets. Writer packs `(current_seq, value)` into a uint64 slot. Reader
+// loads uint64, checks seq match; mismatch ⇒ stale residue from a prior
+// iter, treat as "not yet written this iter." Wrap horizon is 32-bit seq
+// (~2^31 phase-distinct iters with the LSB phase bit; ~16M training steps
+// × 64 layers — effectively infinite for production training, paired-skip
+// invariant covers the modular edge).
+__forceinline__ __device__ uint64_t nvl_pack(int64_t seq, int value) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(seq)) << 32) |
+           static_cast<uint64_t>(static_cast<uint32_t>(value));
+}
+__forceinline__ __device__ bool nvl_seq_match(uint64_t packed, int64_t seq) {
+    return static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(seq);
+}
+__forceinline__ __device__ int nvl_unpack_value(uint64_t packed) {
+    return static_cast<int>(static_cast<uint32_t>(packed));
+}
 
 template <int kBytes>
 struct VecInt {};
@@ -85,6 +103,39 @@ __device__ __forceinline__ void st_release_sys_global(const int* ptr, int val) {
     asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 }
 
+__device__ __forceinline__ void st_release_sys_global(const int64_t* ptr, int64_t val) {
+    asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
+// GPU-scope release-store for intra-GPU producer→consumer stamps (different
+// streams, same device). Cheaper than `_sys_global`: stays in L2, no NVLink
+// coherence traversal. Use for `a_ready` / `y_done_per_token` / etc.
+// Cross-rank stamps (channel_tail_idx, nvl_channel_tail, rdma_channel_tail)
+// must keep `_sys_global` for peer-GPU coherence.
+__device__ __forceinline__ void st_release_gpu_global(const int64_t* ptr, int64_t val) {
+    asm volatile("st.release.gpu.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
+__device__ __forceinline__ void st_relaxed_sys_global(const uint64_t* ptr, uint64_t val) {
+    asm volatile("st.relaxed.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
+__device__ __forceinline__ void st_release_sys_global(const uint64_t* ptr, uint64_t val) {
+    asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
+__device__ __forceinline__ int64_t ld_acquire_sys_global(const int64_t* ptr) {
+    int64_t ret;
+    asm volatile("ld.acquire.sys.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ int64_t ld_acquire_gpu_global(const int64_t* ptr) {
+    int64_t ret;
+    asm volatile("ld.acquire.gpu.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    return ret;
+}
+
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
     asm volatile("st.release.cta.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 }
@@ -111,6 +162,42 @@ __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int
     int ret;
     asm volatile("atom.add.release.sys.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
     return ret;
+}
+
+// Pool-block fire helper. Given a contiguous slot range
+// `[slot_start_e, slot_start_e + n_writes_for_e)` that one substream / warp
+// just landed for some expert, walk the pool blocks the range overlaps,
+// and `red.release.gpu.global.add.s32 arrival_count[block_id] +=
+// writes_in_block` for each. The release semantics on the add pair with
+// the consumer's acquire-spin on `arrival_count[tile_id] ==
+// arrival_target[tile_id]` (see `tile_scheduler.py:_fetch_next_work_idx`)
+// — when the count hits target, all contributors have landed AND the
+// release-pair makes their pool writes visible.
+//
+// Single PTX op per atomic (no separate tip-check + stamp-store pair); the
+// per-tile "ready" signal is the count reaching its target, not a separate
+// int64 stamp. Caller still must `threadfence_system` BEFORE calling so
+// pool writes are system-visible for the eventual cross-rank combine send;
+// `red.release.gpu` provides only intra-GPU acquire/release pairing with
+// the on-device consumer (kernel A / kernel_y_bwd).
+//
+// Used in 4 places (fwd/bwd × intranode/internode) — each passes its own
+// per-tile `arrival_count` tensor (fwd: pool_arrival_count;
+// bwd: bwd_dispatch_arrival_count).
+__device__ __forceinline__ void fire_pool_blocks(
+    int slot_start_e, int n_writes_for_e, int tile_m,
+    int* arrival_count) {
+    int slot_end_e = slot_start_e + n_writes_for_e;
+    int first_block = slot_start_e / tile_m;
+    int last_block = (slot_end_e - 1) / tile_m;
+    for (int block_id = first_block; block_id <= last_block; ++block_id) {
+        int block_slot_start = block_id * tile_m;
+        int block_slot_end = block_slot_start + tile_m;
+        int writes_in_block =
+            min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
+        asm volatile("red.release.gpu.global.add.s32 [%0], %1;"
+                     ::"l"(&arrival_count[block_id]), "r"(writes_in_block));
+    }
 }
 
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
@@ -384,6 +471,12 @@ __device__ __forceinline__ void tma_store_fence() {
 constexpr uint64_t kEvictFirst = 0x12f0000000000000;
 constexpr uint64_t kEvictNormal = 0x1000000000000000;
 
+// Sentinel for the reverse-cumulative head-encoding scan: bigger than any
+// real head index. The actual cap is `T_recv * num_topk` which is well under
+// 2^20 at any production shape, so 2^25 is conservative and still leaves
+// 2^6 = 64x headroom before int overflow in any cumulative arithmetic.
+constexpr int kReverseScanSentinel = 1 << 25;
+
 __device__ __forceinline__ void tma_load_1d(
     const void* smem_ptr, const void* gmem_ptr, uint64_t* mbar_ptr, int num_bytes, bool evict_first = true) {
     auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
@@ -411,7 +504,13 @@ __device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* g
 
 template <int N>
 __device__ __forceinline__ void tma_store_wait() {
-    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
+    // Non-`.read` variant waits for proxy-async store completion, not just
+    // L2 read-visibility. Required when followed by `threadfence_system` +
+    // a release-add on `pool_arrival_count` / release-store on `a_ready`
+    // — the `.read` form does not order against a consumer on another stream
+    // issuing `cp.async.bulk` loads. DeepEPV2 and DeepGEMM both use this
+    // stronger form.
+    asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
 
 #endif
@@ -526,7 +625,7 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
             break;
 
         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
-            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
+            printf("StreamEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
             trap();
         }
     }
@@ -637,4 +736,4 @@ __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
 }
 
-}  // namespace deep_ep
+}  // namespace stream_ep
