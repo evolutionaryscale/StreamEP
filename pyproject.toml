@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stream-ep"
-version = "0.1.3"
+version = "0.1.4"
 # Declared explicitly so uv installs torch FIRST (the env's existing pin) and
 # stream-ep's setup.py can import it at metadata-prep time under
 # no-build-isolation. Without this, uv has no dep edge to enforce ordering.

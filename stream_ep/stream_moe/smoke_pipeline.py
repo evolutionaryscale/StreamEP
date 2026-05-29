@@ -22,9 +22,6 @@ from stream_ep.stream_moe.profile_pipeline import (
     NUM_EXPERTS,
     NUM_SMS,
     SEQ_LEN_PER_RANK,
-    TILE_M,
-    TILE_N_A,
-    TILE_N_Y,
     TOPK,
     H,
     I,
@@ -111,9 +108,6 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
-            tile_m=TILE_M,
-            tile_n_a=TILE_N_A,
-            tile_n_y=TILE_N_Y,
         )
         out.sum().backward()
     torch.cuda.synchronize()
@@ -136,9 +130,6 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
-            tile_m=TILE_M,
-            tile_n_a=TILE_N_A,
-            tile_n_y=TILE_N_Y,
         )
         out.sum().backward()
     torch.cuda.synchronize()

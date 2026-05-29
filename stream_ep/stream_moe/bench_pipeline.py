@@ -640,13 +640,6 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
-            tile_m=args.tile_m,
-            tile_n_a=args.tile_n_a,
-            tile_n_y=args.tile_n_y,
-            tile_n_y_bwd=args.tile_n_y_bwd,
-            tile_n_a_bwd=args.tile_n_a_bwd,
-            num_sms_a=args.num_sms_a,
-            num_sms_y=args.num_sms_y,
         )
 
     # End-to-end timing uses real CUDA events around the whole pipeline.
@@ -682,13 +675,6 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
-            tile_m=args.tile_m,
-            tile_n_a=args.tile_n_a,
-            tile_n_y=args.tile_n_y,
-            tile_n_y_bwd=args.tile_n_y_bwd,
-            tile_n_a_bwd=args.tile_n_a_bwd,
-            num_sms_a=args.num_sms_a,
-            num_sms_y=args.num_sms_y,
         )
         out.sum().backward()
         x.grad = None

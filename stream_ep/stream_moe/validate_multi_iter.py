@@ -96,9 +96,6 @@ from stream_ep.stream_moe.profile_pipeline import (
     NUM_EXPERTS,
     NUM_SMS,
     SEQ_LEN_PER_RANK,
-    TILE_M,
-    TILE_N_A,
-    TILE_N_Y,
     TOPK,
     H,
     I,
@@ -331,9 +328,6 @@ def main():
                 w2_warm,
                 streams=streams,
                 num_experts=NUM_EXPERTS,
-                tile_m=TILE_M,
-                tile_n_a=TILE_N_A,
-                tile_n_y=TILE_N_Y,
             )
         torch.autograd.grad(
             h_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out
@@ -365,9 +359,6 @@ def main():
                 w2_iter,
                 streams=streams,
                 num_experts=NUM_EXPERTS,
-                tile_m=TILE_M,
-                tile_n_a=TILE_N_A,
-                tile_n_y=TILE_N_Y,
             )
         out_actual = h
         dL_dx_actual, dL_dtopk_w_actual, dL_dW1_local_actual, dL_dW2_local_actual = (

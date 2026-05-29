@@ -107,7 +107,15 @@ class Buffer:
         runtime: the C++ runtime.
     """
 
+    # Default high-throughput-kernel SM count. Mutated by ``set_num_sms`` and
+    # (when the user hasn't pinned a value) by ``__init__`` based on world size.
     num_sms: int = 64
+    # True iff ``set_num_sms`` was called explicitly. When False, ``__init__``
+    # auto-picks ``num_sms`` from the group size: 80 SMs for intra-/2-node
+    # NVL-dominated runs, 64 SMs from 4+ nodes where RDMA tail latency rewards
+    # fewer but larger per-channel chunks. Bench-tuned in
+    # ``stream_ep/stream_moe/bench_pipeline.py``.
+    _num_sms_explicit: bool = False
 
     def __init__(self,
                  group: Optional[dist.ProcessGroup],
@@ -132,8 +140,20 @@ class Buffer:
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
+
+        Sets ``Buffer.num_sms`` from world size if no explicit override was
+        installed via ``set_num_sms``: 80 SMs at ≤2 nodes, 64 SMs at ≥3 nodes.
         """
         check_nvlink_connections(group)
+
+        # Auto-pick num_sms from world size unless the caller already pinned
+        # a value with ``set_num_sms``. Computed before the runtime is
+        # constructed and before ``NVSHMEM_IBGDA_NUM_RC_PER_PE`` is set so it
+        # can pick up the new value.
+        if not Buffer._num_sms_explicit:
+            group_size = group.size() if group is not None else (comm.Get_size() if comm is not None else 1)
+            nodes = (group_size + 7) // 8
+            Buffer.num_sms = 80 if nodes <= 2 else 64
 
         # Initialize the CPP runtime
         if group is not None:
@@ -316,7 +336,10 @@ class Buffer:
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
         """
-        Set the number of SMs to use in high-throughput kernels.
+        Pin the number of SMs used in high-throughput kernels.
+
+        Suppresses the world-size-based auto-pick in ``Buffer.__init__`` for
+        all subsequent ``Buffer`` constructions in this process.
 
         Arguments:
             new_num_sms: the new number to be set.
@@ -324,6 +347,7 @@ class Buffer:
 
         assert new_num_sms % 2 == 0, 'The SM count must be even'
         Buffer.num_sms = new_num_sms
+        Buffer._num_sms_explicit = True
 
     def get_local_buffer_tensor(self,
                                 dtype: torch.dtype,

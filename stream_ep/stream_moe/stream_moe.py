@@ -99,6 +99,107 @@ from stream_ep.stream_moe.kernel_y_bwd import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Internal tile-config picker. All knobs the matched-pair GEMMs accept are
+# bench-tuned defaults; per-call divisibility constraints on the 4 tile_n
+# values are checked here and substituted with the largest power-of-2 ≤ 256
+# that satisfies the constraint when the default doesn't fit. The caller side
+# of ``stream_moe_func`` only sees ``(I, H)`` and gets a fully-resolved
+# config back — there are no public tile / cluster / num_sms kwargs.
+# ---------------------------------------------------------------------------
+
+
+def _largest_pow2_divisor(x: int, cap: int) -> int:
+    """Largest power-of-two ≤ ``cap`` that divides ``x``."""
+    t = cap
+    while t > 1 and x % t != 0:
+        t //= 2
+    return t
+
+
+@dataclass(frozen=True)
+class _TileConfig:
+    """Internal: every tuning knob the matched-pair GEMMs accept."""
+
+    tile_m: int
+    # fwd kernel A output N = 2I; must divide both 2I and I.
+    tile_n_a: int
+    # fwd kernel Y output N = H; must divide H.
+    tile_n_y: int
+    # bwd kernel Y output N = I; must divide I.
+    tile_n_y_bwd: int
+    # bwd kernel A output N = H; must divide H.
+    tile_n_a_bwd: int
+    # dW GEMM tiles; ``None`` falls back to (tile_m, tile_n_a) inside the
+    # backward; dW2 also accepts None tile_n meaning "use kernel A default".
+    tile_m_dW1: int | None
+    tile_n_dW1: int | None
+    tile_m_dW2: int | None
+    tile_n_dW2: int | None
+    # dW grouped-GEMM cluster / pingpong / swizzle (quack epilogue tuning).
+    cluster_m_dW1: int
+    cluster_n_dW1: int
+    cluster_m_dW2: int
+    cluster_n_dW2: int
+    pingpong_dW1: bool
+    pingpong_dW2: bool
+    swizzle_dW1: int
+    swizzle_dW2: int
+    # Persistent-kernel SM counts. ``None`` defers to quack's default for
+    # ``streaming_moe_{a,y}{,_bwd}``.
+    num_sms_a: int | None
+    num_sms_y: int | None
+    num_sms_a_bwd: int | None
+    num_sms_y_bwd: int | None
+
+
+def _pick_tile_config(I: int, H: int) -> _TileConfig:
+    """Pick a tile config from the weight shapes.
+
+    Prefers the bench-tuned defaults (tile_n_a=192, tile_n_y=256,
+    tile_n_y_bwd=192, tile_n_a_bwd=256) where they satisfy the kernel's
+    divisibility constraint; otherwise substitutes the largest power-of-2
+    ≤ 256 that does. The constraints come from the grouped-GEMM tile
+    scheduler — one CTA per (tile_m, tile_n) output tile; if ``N`` isn't an
+    integer number of ``tile_n`` chunks the last CTA writes out of bounds.
+    """
+    two_I = 2 * I
+
+    def pick(default: int, constraint: int) -> int:
+        if constraint % default == 0:
+            return default
+        return _largest_pow2_divisor(constraint, cap=256)
+
+    tile_n_a = pick(192, two_I)
+    # kernel_a also asserts I % tile_n_a == 0 (kernel_a.py:485).
+    if I % tile_n_a != 0:
+        tile_n_a = _largest_pow2_divisor(I, cap=256)
+
+    return _TileConfig(
+        tile_m=128,
+        tile_n_a=tile_n_a,
+        tile_n_y=pick(256, H),
+        tile_n_y_bwd=pick(192, I),
+        tile_n_a_bwd=pick(256, H),
+        tile_m_dW1=None,
+        tile_n_dW1=256,
+        tile_m_dW2=None,
+        tile_n_dW2=None,
+        cluster_m_dW1=2,
+        cluster_n_dW1=2,
+        cluster_m_dW2=1,
+        cluster_n_dW2=1,
+        pingpong_dW1=False,
+        pingpong_dW2=False,
+        swizzle_dW1=8,
+        swizzle_dW2=8,
+        num_sms_a=None,
+        num_sms_y=None,
+        num_sms_a_bwd=None,
+        num_sms_y_bwd=None,
+    )
+
+
 @dataclass(frozen=True)
 class StreamHolder:
     """The two caller-owned streams driving one streaming-MoE layer.
@@ -786,35 +887,15 @@ def stream_moe_func(
     *,
     streams: StreamHolder,
     num_experts: int,
-    tile_m: int = 128,
-    tile_n_a: int = 192,
-    tile_n_y: int = 256,
-    tile_n_y_bwd: int = 192,
-    tile_n_a_bwd: int = 256,
-    tile_m_dW1: int | None = None,
-    tile_n_dW1: int | None = 256,
-    tile_m_dW2: int | None = None,
-    tile_n_dW2: int | None = None,
-    cluster_m_dW1: int = 2,
-    cluster_n_dW1: int = 2,
-    cluster_m_dW2: int = 1,
-    cluster_n_dW2: int = 1,
-    pingpong_dW1: bool = False,
-    pingpong_dW2: bool = False,
-    swizzle_dW1: int = 8,
-    swizzle_dW2: int = 8,
-    num_sms_a: int | None = None,
-    num_sms_y: int | None = None,
-    num_sms_a_bwd: int | None = None,
-    num_sms_y_bwd: int | None = None,
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
-    The dW1/dW2 tile knobs (``tile_m_dW1``, ``tile_n_dW1``, ``tile_m_dW2``,
-    ``tile_n_dW2``) override the dW grouped GEMM tile shape. ``None`` falls
-    back to the fwd kernel A tile (``tile_m`` / ``tile_n_a``). The dW2 GEMM
-    has output N = ``moe_intermediate_size`` while dW1 has N = ``hidden_size``,
-    so optimal tiles are usually different per side.
+    Tile / cluster / swizzle / persistent-kernel-SM tuning is picked
+    internally from ``w1_local``'s shape via :func:`_pick_tile_config` —
+    bench-tuned defaults with a power-of-2 fallback per kernel's tile_n
+    divisibility constraint. There are no public tuning kwargs; callers that
+    need to sweep specific shapes go through the kernel-level wrappers
+    (``streaming_moe_a``, ``streaming_moe_y``, ...) directly.
 
     Returns the cross-rank-reduced output of shape ``[num_tokens, hidden]``
     produced by the combine receiver — the standard MoE forward output for
@@ -825,6 +906,11 @@ def stream_moe_func(
     ``@torch.compiler.disable`` at the consumer boundary; see this module's
     docstring for the underlying constraint.
     """
+    # w1_local shape is [E_local, 2*I, H]; derive I and H to pick tiles.
+    _, two_I, H = w1_local.shape
+    I = two_I // 2
+    cfg = _pick_tile_config(I, H)
+
     # Register the compute stream so the C++ Buffer's per-dispatch slabs
     # (``torch::empty``'d on the communicate stream) are record_stream'd onto
     # ``compute`` too. Without this, the caching allocator only tracks the
@@ -842,25 +928,25 @@ def stream_moe_func(
         w1_local,
         w2_local,
         num_experts,
-        tile_m,
-        tile_n_a,
-        tile_n_y,
-        tile_n_y_bwd,
-        tile_n_a_bwd,
-        tile_m_dW1,
-        tile_n_dW1,
-        tile_m_dW2,
-        tile_n_dW2,
-        cluster_m_dW1,
-        cluster_n_dW1,
-        cluster_m_dW2,
-        cluster_n_dW2,
-        pingpong_dW1,
-        pingpong_dW2,
-        swizzle_dW1,
-        swizzle_dW2,
-        num_sms_a,
-        num_sms_y,
-        num_sms_a_bwd,
-        num_sms_y_bwd,
+        cfg.tile_m,
+        cfg.tile_n_a,
+        cfg.tile_n_y,
+        cfg.tile_n_y_bwd,
+        cfg.tile_n_a_bwd,
+        cfg.tile_m_dW1,
+        cfg.tile_n_dW1,
+        cfg.tile_m_dW2,
+        cfg.tile_n_dW2,
+        cfg.cluster_m_dW1,
+        cfg.cluster_n_dW1,
+        cfg.cluster_m_dW2,
+        cfg.cluster_n_dW2,
+        cfg.pingpong_dW1,
+        cfg.pingpong_dW2,
+        cfg.swizzle_dW1,
+        cfg.swizzle_dW2,
+        cfg.num_sms_a,
+        cfg.num_sms_y,
+        cfg.num_sms_a_bwd,
+        cfg.num_sms_y_bwd,
     )

@@ -65,9 +65,6 @@ from stream_ep.stream_moe.profile_pipeline import (
     NUM_EXPERTS,
     NUM_SMS,
     SEQ_LEN_PER_RANK,
-    TILE_M,
-    TILE_N_A,
-    TILE_N_Y,
     TOPK,
     make_buffer,
 )
@@ -250,9 +247,6 @@ def run_scenario(name: str, builder, *,
             w2_local,
             streams=streams,
             num_experts=E,
-            tile_m=TILE_M,
-            tile_n_a=TILE_N_A,
-            tile_n_y=TILE_N_Y,
         )
         out_sum = out.sum()
         out_sum.backward()
