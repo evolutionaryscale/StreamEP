@@ -66,7 +66,7 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
             if (num_recv_buffer_tokens - num_used_slots >= num_required_free)
                 break;
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                printf("stream-ep timeout for %s, rank %d, responsible_channel = %d\n",
+                printf("StreamEP timeout for %s, rank %d, responsible_channel = %d\n",
                        role, rank, responsible_channel);
                 trap();
             }
@@ -902,7 +902,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(
                     break;
                 }
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
+                    printf("StreamEP timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
                            env.rank, responsible_channel, num_tokens_to_recv);
                     trap();
                 }
@@ -1326,7 +1326,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
                     break;
                 }
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep timeout for dispatch_grads receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
+                    printf("StreamEP timeout for dispatch_grads receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
                            env.rank, responsible_channel, num_tokens_to_recv);
                     trap();
                 }
@@ -1603,7 +1603,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                     auto gate_start = clock64();
                     while (ld_acquire_gpu_global(&y_done_per_token[my_token]) < combine_seq) {
                         if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
-                            printf("stream-ep timeout for combine sender gate, rank %d, channel %d, token %d\n",
+                            printf("StreamEP timeout for combine sender gate, rank %d, channel %d, token %d\n",
                                    rank, responsible_channel, static_cast<int>(my_token));
                             trap();
                         }
@@ -1743,7 +1743,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine_main_kernel(dtype_t* r
                 while (__any_sync(0xffffffff, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                     // Timeout check
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("stream-ep timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n",
+                        printf("StreamEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n",
                                rank,
                                responsible_channel,
                                expected_head);

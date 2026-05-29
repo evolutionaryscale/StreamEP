@@ -1220,7 +1220,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 cached_rdma_channel_head =
                     static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))) - prev_rdma_channel_head_at_entry);
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
+                    printf("StreamEP dispatch RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, cached_rdma_channel_head, rdma_tail_idx);
                     trap();
                 }
@@ -1360,7 +1360,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         auto start_time = clock64();
         while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                printf("stream-ep RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",
+                printf("StreamEP RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, last_issued_tail, num_tokens_to_send);
                 trap();
             }
@@ -1453,7 +1453,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
+                    printf("StreamEP dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
                     trap();
                 }
@@ -1485,7 +1485,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                     cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
+                    printf("StreamEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank);
                     trap();
                 }
@@ -1502,7 +1502,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                         break;
                 }
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                    printf("stream-ep dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
+                    printf("StreamEP dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank);
                     trap();
                 }
@@ -1714,7 +1714,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 break;
             }
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                printf("stream-ep dispatch NVL receiver timeout (prefix), channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d\n",
+                printf("StreamEP dispatch NVL receiver timeout (prefix), channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank);
                 trap();
             }
@@ -1775,7 +1775,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
+                    printf("StreamEP dispatch NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank);
                     trap();
                 }
@@ -2365,7 +2365,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 cached_rdma_channel_head =
                     static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))) - prev_rdma_channel_head_at_entry);
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch_grads RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
+                    printf("StreamEP dispatch_grads RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, cached_rdma_channel_head, rdma_tail_idx);
                     trap();
                 }
@@ -2464,7 +2464,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         auto start_time = clock64();
         while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                printf("stream-ep dispatch_grads RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",
+                printf("StreamEP dispatch_grads RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, last_issued_tail, num_tokens_to_send);
                 trap();
             }
@@ -2556,7 +2556,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch_grads forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
+                    printf("StreamEP dispatch_grads forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
                     trap();
                 }
@@ -2583,7 +2583,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                     cached_nvl_channel_head = nvl_unpack_value(raw_head);
 
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch_grads forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
+                    printf("StreamEP dispatch_grads forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank);
                     trap();
                 }
@@ -2600,7 +2600,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                         break;
                 }
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                    printf("stream-ep dispatch_grads forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
+                    printf("StreamEP dispatch_grads forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank);
                     trap();
                 }
@@ -2759,7 +2759,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 break;
             }
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                printf("stream-ep dispatch_grads NVL receiver timeout (prefix), channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d\n",
+                printf("StreamEP dispatch_grads NVL receiver timeout (prefix), channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank);
                 trap();
             }
@@ -2798,7 +2798,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                         cached_channel_tail_idx = nvl_unpack_value(raw_tail);
                 }
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("stream-ep dispatch_grads NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
+                    printf("StreamEP dispatch_grads NVL receiver timeout (tail), channel: %d, RDMA: %d, nvl: %d, src NVL: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank);
                     trap();
                 }
@@ -3170,7 +3170,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                     uint64_t raw_head = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
                     int head_seq_ok = nvl_seq_match(raw_head, nvl_seq) ? nvl_unpack_value(raw_head) : -1;
-                    printf("stream-ep combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head (seq-ok or -1): %d, tail: "
+                    printf("StreamEP combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head (seq-ok or -1): %d, tail: "
                            "%d, start: %d, end: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id,
                            head_seq_ok,
@@ -3204,7 +3204,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                             if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
                                 auto observed = ld_acquire_gpu_global(&y_done_per_token[first_token_idx]);
                                 auto reread = ld_acquire_gpu_global(&y_done_per_token[first_token_idx]);
-                                printf("stream-ep combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
+                                printf("StreamEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                        "token: %ld, seq: %ld, observed: %ld, reread: %ld, addr: %p\n",
                                        channel_id, rdma_rank, nvl_rank, dst_nvl_rank,
                                        static_cast<int64_t>(first_token_idx), combine_seq,
@@ -3269,7 +3269,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                             auto gate_start = clock64();
                             while (ld_acquire_gpu_global(&y_done_per_token[next_token_idx]) < combine_seq) {
                                 if (clock64() - gate_start > NUM_TIMEOUT_CYCLES) {
-                                    printf("stream-ep combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
+                                    printf("StreamEP combine NVL sender gate timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, "
                                            "token: %ld, seq: %ld\n",
                                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank,
                                            static_cast<int64_t>(next_token_idx), combine_seq);
@@ -3397,7 +3397,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     if (num_max_rdma_chunked_recv_tokens - num_used_slots >= num_chunked_tokens)
                         break;
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("stream-ep combine forwarder (RDMA check) timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, iter_head: %d, "
+                        printf("StreamEP combine forwarder (RDMA check) timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, iter_head: %d, "
                                "tail: %d, chunked: %d\n",
                                channel_id, rdma_rank, nvl_rank, dst_rdma_rank, cur_iter_head,
                                token_start_idx, num_chunked_tokens);
@@ -3428,7 +3428,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                         if (nvl_seq_match(raw_tail, nvl_seq))
                             cached_nvl_channel_tail_idx = nvl_unpack_value(raw_tail);
                         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
-                            printf("stream-ep combine forwarder (NVL check) timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, dst RDMA: %d, "
+                            printf("StreamEP combine forwarder (NVL check) timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, dst RDMA: %d, "
                                    "tail: %d, waiting: %d, total: %d, sub: %d, large: %d, expected: %d\n",
                                    channel_id, rdma_rank, nvl_rank, lane_id, dst_rdma_rank,
                                    cached_nvl_channel_tail_idx, token_idx, num_tokens_to_combine,
@@ -3537,7 +3537,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
                     cached_channel_tail_idx =
                         static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))) - prev_rdma_channel_tail_at_entry);
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("stream-ep combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, "
+                        printf("StreamEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, "
                                "tail: %d, waiting: %ld, expect: %d\n",
                                channel_id, rdma_rank, nvl_rank, lane_id,
                                cached_channel_tail_idx, token_idx, expected_head);

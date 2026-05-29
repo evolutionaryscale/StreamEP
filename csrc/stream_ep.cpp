@@ -266,7 +266,7 @@ Buffer::~Buffer() noexcept(false) {
     if (not explicitly_destroy) {
         destroy();
     } else if (not destroyed) {
-        printf("WARNING: destroy() was not called before stream-ep buffer destruction, which can leak resources.\n");
+        printf("WARNING: destroy() was not called before StreamEP buffer destruction, which can leak resources.\n");
         fflush(stdout);
     }
 }
@@ -710,7 +710,7 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
         if (ready) break;
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time).count() > NUM_CPU_TIMEOUT_SECS)
-            throw std::runtime_error("stream-ep error: CPU recv timeout");
+            throw std::runtime_error("StreamEP error: CPU recv timeout");
     }
     return r;
 }
@@ -1546,7 +1546,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         if (ready) break;
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - t0).count() > NUM_CPU_TIMEOUT_SECS)
-            throw std::runtime_error("stream-ep error: internode_dispatch CPU timeout");
+            throw std::runtime_error("StreamEP error: internode_dispatch CPU timeout");
     }
     int64_t TK_padded = static_cast<int64_t>(total_tiles) * tile_m;
 
