@@ -1698,7 +1698,20 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
     int num_experts = num_local_experts * num_ranks;
     int total_tiles = static_cast<int>(dispatch_out.tile_id_to_expert.size(0));
     int tile_m = (total_tiles == 0) ? 0 : static_cast<int>(TK_padded / total_tiles);
-    EP_HOST_ASSERT(tile_m > 0 and "tile_m must be derivable from TK_padded / total_tiles");
+    // total_tiles == 0 (empty-recv rank: this rank's local experts received
+    // nothing in fwd, so no bwd pool to fan into) is a legitimate runtime
+    // state under extreme expert-skew routings (e.g. test_skewed_experts'
+    // all_to_first_K with K <= num_local_experts), NOT an error. We still
+    // launch the kernel because:
+    //   1. Sender side has work — this rank's local layer has dL/dy for
+    //      `num_tokens` source tokens that must be shipped to expert ranks.
+    //   2. Receiver / forwarder side must publish empty meta + bump the
+    //      sentinel slot so remote-RDMA-peer forwarders waiting on our
+    //      `rdma_channel_meta` don't time out.
+    // tile_m is used inside the NVL-receiver path (slot/tile_m, fire_pool_blocks)
+    // which is gated by `num_recv_tokens > 0` and never executes on this
+    // rank, so tile_m=0 is safe at the kernel level.
+    EP_HOST_ASSERT((total_tiles == 0) or (tile_m > 0));
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
