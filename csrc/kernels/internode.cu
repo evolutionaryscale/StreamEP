@@ -3302,10 +3302,24 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         }
     } else {
         // Combiners and coordinators
+        //
+        // Offset by dispatch's RDMA region size for disjoint RDMA regions.
+        // Without this offset, combine's smaller per-token stride
+        // (`num_topk` ints of `topk_idx` omitted vs dispatch's stride)
+        // would place its head/tail SymBuffers inside dispatch's data
+        // region, letting fwd-combine writes shadow bwd-dispatch_grads
+        // reads — manifests as a forwarder timeout reading RDMA meta. See
+        // `get_dispatch_rdma_region_bytes` in api.cuh; structurally
+        // identical to the NVL-side `dispatch_region_offset` above.
+        const int64_t dispatch_rdma_region_offset = get_dispatch_rdma_region_bytes(
+            hidden_int4, num_topk, num_max_rdma_chunked_recv_tokens,
+            num_channels, kNumRDMARanks);
+        void* combine_rdma_buffer_ptr =
+            static_cast<uint8_t*>(rdma_buffer_ptr) + dispatch_rdma_region_offset;
         auto rdma_channel_data = SymBuffer<int8_t>(
-            rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
-        auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
-        auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+            combine_rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
+        auto rdma_channel_head = SymBuffer<uint64_t, false>(combine_rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+        auto rdma_channel_tail = SymBuffer<uint64_t, false>(combine_rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
         // Offset by dispatch's region size for disjoint NVL regions.
         void* local_nvl_buffer = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dispatch_region_offset;

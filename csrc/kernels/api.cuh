@@ -299,13 +299,14 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
 // Total bytes occupied by dispatch's NVL sub-buffer chain on
 // `buffer_ptrs[i]`: `nvl_channel_x` + `nvl_channel_prefix_start` +
 // `nvl_channel_prefix_end` + `nvl_channel_head` + `nvl_channel_tail`. Used
-// by the host buffer-size hint AND by `combine_main_kernel` /
-// `combine_grads_main_kernel` to offset their own NVL sub-buffer bases past
-// dispatch's region into a physically disjoint slab. Dispatch and combine
-// must NOT share an offset-0 base with different strides: the resulting
-// cross-channel physical-address aliasing would let iter-N combine writes
-// shadow iter-N+1 dispatch reads at a high slot index, manifesting as
-// wrong-token `SourceMeta` at the receiver.
+// by the host buffer-size hint AND by `combine_main_kernel` to offset its
+// own NVL sub-buffer base past dispatch's region into a physically disjoint
+// slab. Dispatch and combine must NOT share an offset-0 base with different
+// strides: the resulting cross-channel physical-address aliasing would let
+// iter-N combine writes shadow iter-N+1 dispatch reads at a high slot
+// index, manifesting as wrong-token `SourceMeta` at the receiver. The RDMA
+// side carries the same constraint — see `get_dispatch_rdma_region_bytes`
+// below.
 __host__ __device__ inline int64_t get_dispatch_nvl_region_bytes(
     int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens,
     int num_channels, int num_rdma_ranks) {
@@ -358,6 +359,68 @@ __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
 #define kRdmaMetaSentinelSlot 30
 static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
               "Meta data slots overflow the 0..17 region of the 32-int slab");
+
+// Total bytes occupied by dispatch's RDMA SymBuffer chain on
+// `env.rdma_buffer_ptr`: `rdma_channel_data` (decoupled, send+recv) +
+// L2-line-align slack (up to NUM_BUFFER_ALIGNMENT_BYTES, inserted by
+// `align_meta_base_to_l2_line`) + `rdma_channel_meta` (decoupled) +
+// `rdma_channel_head` + `rdma_channel_tail` (non-decoupled). Used by the
+// host RDMA-buffer-size hint AND by `combine_main_kernel` to offset its
+// own RDMA sub-buffer base past dispatch's region. Dispatch's per-token
+// stride includes `topk_idx` (`num_topk` ints) while combine's omits it;
+// without an offset, combine carves from `rdma_buffer_ptr + 0` with its
+// smaller stride and its head/tail bytes land inside dispatch's data
+// region. The resulting fwd-combine write → bwd-dispatch_grads read
+// shadow manifests as a forwarder timeout reading RDMA meta. Mirrors
+// `get_dispatch_nvl_region_bytes`.
+__host__ __device__ inline int64_t get_dispatch_rdma_region_bytes(
+    int hidden_int4, int num_topk, int num_max_rdma_chunked_recv_tokens,
+    int num_channels, int num_rdma_ranks) {
+    const int64_t channels = num_channels;
+    const int64_t rdma_ranks = num_rdma_ranks;
+    // rdma_channel_data: SymBuffer<uint8_t> (decoupled): num_elems *
+    // num_rdma_ranks * num_channels * 2 (send+recv) bytes.
+    const int64_t bytes_per_token =
+        get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
+    const int64_t data_bytes =
+        2 * static_cast<int64_t>(num_max_rdma_chunked_recv_tokens)
+          * bytes_per_token * rdma_ranks * channels;
+    // L2-line-alignment slack from `align_meta_base_to_l2_line`. The actual
+    // runtime slack is 0..127 bytes; the host-side offset upper-bounds at
+    // NUM_BUFFER_ALIGNMENT_BYTES so combine's base is past any possible
+    // dispatch end.
+    const int64_t align_slack =
+        static_cast<int64_t>(NUM_BUFFER_ALIGNMENT_BYTES);
+    // rdma_channel_meta: SymBuffer<int> (decoupled).
+    const int64_t meta_bytes =
+        2 * static_cast<int64_t>(kRdmaMetaSlabInts)
+          * static_cast<int64_t>(sizeof(int)) * rdma_ranks * channels;
+    // rdma_channel_head + rdma_channel_tail: SymBuffer<uint64_t, false>
+    // (non-decoupled), num_elems = 1.
+    const int64_t ht_bytes =
+        2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
+    return data_bytes + align_slack + meta_bytes + ht_bytes;
+}
+
+// Total bytes occupied by combine's RDMA SymBuffer chain: `rdma_channel_data`
+// (decoupled, combine's smaller per-token stride — `topk_idx` omitted) +
+// `rdma_channel_head` + `rdma_channel_tail` (non-decoupled). Used by host
+// buffer-size hint to size combine's region after dispatch's. No meta
+// SymBuffer and no L2-line align slack on the combine chain.
+__host__ __device__ inline int64_t get_combine_rdma_region_bytes(
+    int hidden_int4, int num_topk, int num_max_rdma_chunked_recv_tokens,
+    int num_channels, int num_rdma_ranks) {
+    const int64_t channels = num_channels;
+    const int64_t rdma_ranks = num_rdma_ranks;
+    const int64_t bytes_per_token =
+        get_num_bytes_per_token(hidden_int4, 0, num_topk);
+    const int64_t data_bytes =
+        2 * static_cast<int64_t>(num_max_rdma_chunked_recv_tokens)
+          * bytes_per_token * rdma_ranks * channels;
+    const int64_t ht_bytes =
+        2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
+    return data_bytes + ht_bytes;
+}
 
 // Streaming-MoE consolidated dispatch metadata for internode (RDMA + NVL).
 // Folded single-kernel architecture mirroring `intranode::streaming_dispatch_metadata`'s
