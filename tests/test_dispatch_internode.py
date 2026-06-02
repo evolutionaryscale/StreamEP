@@ -144,8 +144,6 @@ def main():
         f"This test requires multi-RDMA (world_size > 8, world_size % 8 == 0); "
         f"got {world_size}")
 
-    num_sms = 24
-    Buffer.set_num_sms(num_sms)
     num_experts = 64
     num_local_experts = num_experts // world_size
     num_topk = 4

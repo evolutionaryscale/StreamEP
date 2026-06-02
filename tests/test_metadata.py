@@ -181,6 +181,30 @@ def compute_metadata_reference(
         (expert_frequency + expert_alignment - 1) // expert_alignment
     ) * expert_alignment
 
+    # ── gbl_channel_prefix_matrix + rdma_channel_prefix_matrix from THIS
+    # rank's perspective. Both are CUMULATIVE across channels (the kernel
+    # cumsums after the per-channel write). gbl[dst_world, c] = cumulative
+    # count of THIS rank's tokens in channels 0..c routing to dst_world (any-K).
+    # rdma[dst_rdma, c] = cumulative count of unique tokens going to dst_rdma
+    # (= 1 per token if any K hits any nvl_rank in dst_rdma).
+    this_topk = all_topk_idx[rank]  # (T, K)
+    valid_this = this_topk >= 0
+    dst_world_this = torch.where(valid_this, this_topk // E_local, torch.full_like(this_topk, -1))
+    in_rank_this = torch.zeros(T, num_ranks, dtype=torch.bool, device=device)
+    for k in range(K):
+        vk = valid_this[:, k]
+        if not bool(vk.any()):
+            continue
+        tk = torch.arange(T, device=device)[vk]
+        rk = dst_world_this[:, k][vk]
+        in_rank_this[tk, rk] = True
+    t_idx_1d = torch.arange(T, device=device)
+    channel_1d = torch.clamp(t_idx_1d // tokens_per_channel, max=num_channels - 1)
+    gbl_per_channel = torch.zeros(num_ranks, num_channels, dtype=torch.int32, device=device)
+    for c in range(num_channels):
+        gbl_per_channel[:, c] = in_rank_this[channel_1d == c].sum(dim=0).to(torch.int32)
+    gbl_channel_prefix_matrix_ref = gbl_per_channel.cumsum(dim=1).to(torch.int32)
+
     out = {
         "expert_frequency": expert_frequency,
         "expert_pool_block_offset": expert_pool_block_offset,
@@ -192,6 +216,7 @@ def compute_metadata_reference(
         "total_tiles": total_tiles,
         "moe_recv_counter": moe_recv_counter,
         "moe_recv_expert_counter": moe_recv_expert_counter,
+        "gbl_channel_prefix_matrix": gbl_channel_prefix_matrix_ref,
     }
 
     if is_internode:
@@ -204,6 +229,15 @@ def compute_metadata_reference(
         per_rdma_unique = per_src.view(kNumRDMARanks, num_max_nvl_peers).sum(dim=1)
         out["recv_rdma_rank_prefix_sum"] = per_rdma_unique.cumsum(0).to(torch.int32)
         out["recv_gbl_rank_prefix_sum"] = per_src.cumsum(0).to(torch.int32)
+
+        # rdma_channel_prefix_matrix[dst_rdma, c] cumulative count of THIS
+        # rank's tokens going to ANY nvl in dst_rdma in channels 0..c.
+        # = per-token "does any K hit any expert in dst_rdma's experts" / channel.
+        is_in_rdma_this = in_rank_this.view(T, kNumRDMARanks, num_max_nvl_peers).any(dim=-1)  # (T, kNumRDMARanks)
+        rdma_per_channel = torch.zeros(kNumRDMARanks, num_channels, dtype=torch.int32, device=device)
+        for c in range(num_channels):
+            rdma_per_channel[:, c] = is_in_rdma_this[channel_1d == c].sum(dim=0).to(torch.int32)
+        out["rdma_channel_prefix_matrix"] = rdma_per_channel.cumsum(dim=1).to(torch.int32)
 
     return out
 
@@ -260,8 +294,8 @@ def main():
     parser.add_argument(
         "--num_sms",
         type=int,
-        default=80,
-        help="StreamEP num_sms (sets num_channels = num_sms // 2).",
+        default=None,
+        help="StreamEP num_sms override; default = Buffer auto-pick by world size.",
     )
     parser.add_argument(
         "--n_iter",
@@ -278,11 +312,11 @@ def main():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
-    Buffer.set_num_sms(args.num_sms)
+    if args.num_sms is not None:
+        Buffer.set_num_sms(args.num_sms)
 
     expert_alignment = 1  # default in C++ launch path (no quack alignment)
     num_local_experts = args.num_experts // world_size
-    num_channels = args.num_sms // 2
 
     # Size NVL / RDMA bytes (mirror the rest of the test suite).
     hidden_bytes = args.hidden * 2
@@ -299,11 +333,12 @@ def main():
             cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes
         )
     buf = Buffer(group, nvl_bytes, rdma_bytes)
+    num_channels = Buffer.num_sms // 2
 
     is_internode = args.internode
     if rank == 0:
         print(
-            f"[metadata] world={world_size} num_sms={args.num_sms} "
+            f"[metadata] world={world_size} num_sms={Buffer.num_sms} "
             f"num_channels={num_channels} T={args.num_tokens} K={args.num_topk} "
             f"E={args.num_experts} E_local={num_local_experts} "
             f"tile_m={args.tile_m} is_internode={is_internode} "
@@ -375,6 +410,23 @@ def main():
         rpm_actual_col = handle.rank_prefix_matrix[:, rank]
         fail += diff_int(rpm_actual_col, ref["rank_prefix_column"], f"iter{it} rank_prefix_matrix[:,rank]")
         fail += diff_scalar(handle.total_tiles, ref["total_tiles"], f"iter{it} total_tiles")
+
+        # Validate the metadata kernel's channel-prefix outputs against the
+        # eager reference. These were NOT covered by the original test and the
+        # dispatch forwarder/sender read them directly — a mismatch here is the
+        # class of bug behind the 8-node over-subscription hang. Both are
+        # internode-only outputs (empty for intranode).
+        if is_internode:
+            fail += diff_int(
+                handle._dispatch_out.gbl_channel_prefix_matrix,
+                ref["gbl_channel_prefix_matrix"],
+                f"iter{it} gbl_channel_prefix_matrix",
+            )
+            fail += diff_int(
+                handle._dispatch_out.rdma_channel_prefix_matrix,
+                ref["rdma_channel_prefix_matrix"],
+                f"iter{it} rdma_channel_prefix_matrix",
+            )
 
         # Note: pool_recv_token is downstream of metadata + post-poll bundle —
         # its count of non-padding rows must match moe_recv_counter, but we don't

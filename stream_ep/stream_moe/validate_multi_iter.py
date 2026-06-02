@@ -188,7 +188,8 @@ def torch_reference_full_moe(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--num_sms", type=int, default=NUM_SMS)
+    p.add_argument("--num_sms", type=int, default=None,
+                   help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=3)
     p.add_argument("--n_iter", type=int, default=20)
@@ -223,8 +224,10 @@ def main():
     group = torch_dist.group.WORLD
     local_E = NUM_EXPERTS // world_size
 
+    buffer = make_buffer(group, args.num_sms)
+
     rank_zero_print(
-        f"[validate] world={world_size} num_sms={args.num_sms} "
+        f"[validate] world={world_size} num_sms={buffer.num_sms} "
         f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
         f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
         f"n_layers={args.n_layers} tol_scale={tol_scale:.2f}"
@@ -233,8 +236,6 @@ def main():
         "[validate] per-tensor thresholds (atol, rtol): "
         + ", ".join(f"{n}={a:.0e}/{r:.0e}" for n, (a, r) in TOL.items())
     )
-
-    buffer = make_buffer(group, args.num_sms)
 
     # Build GLOBAL weights (same across ranks via shared seed). w1_local /
     # w2_local are the rank's slice for the streaming pipeline; the eager

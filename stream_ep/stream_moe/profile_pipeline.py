@@ -126,8 +126,9 @@ def make_skewed_topk_idx(
     )
 
 
-def make_buffer(group, num_sms):
-    StreamEPBuffer.set_num_sms(num_sms)
+def make_buffer(group, num_sms=None):
+    if num_sms is not None:
+        StreamEPBuffer.set_num_sms(num_sms)
     hidden_bytes = H * 2
     nvl_bytes, rdma_bytes = 0, 0
     for cfg in (
@@ -153,7 +154,8 @@ def main():
         "Default: /tmp/stream_moe_profile_<YYYYmmdd_HHMMSS>/ (rank-0 picked, "
         "broadcast to peers so all ranks write to the same directory).",
     )
-    p.add_argument("--num_sms", type=int, default=NUM_SMS)
+    p.add_argument("--num_sms", type=int, default=None,
+                   help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
@@ -256,7 +258,7 @@ def main():
     if rank == 0:
         print(f"writing traces to {args.profile_dir}/", flush=True)
         print(
-            f"config: world={world_size} num_sms={args.num_sms} "
+            f"config: world={world_size} num_sms={StreamEPBuffer.num_sms} "
             f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
             f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y}",
             flush=True,

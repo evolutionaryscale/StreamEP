@@ -127,8 +127,9 @@ def main():
     p.add_argument(
         "--num_sms_dispatch",
         type=int,
-        default=NUM_SMS,
-        help="StreamEP num_sms (channel count; dispatch grid uses ~2×).",
+        default=None,
+        help="StreamEP num_sms override (channel count = num_sms/2); "
+             "default = Buffer auto-pick by world size.",
     )
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
@@ -253,7 +254,7 @@ def main():
         print(
             f"\nconfig: H={H} I={I} E_total={NUM_EXPERTS} E_local={local_E} "
             f"K={TOPK} T_per_rank={SEQ_LEN_PER_RANK} world={world_size} "
-            f"num_sms_dispatch={args.num_sms_dispatch} "
+            f"num_sms_dispatch={buffer.num_sms} "
             f"num_sms_a={args.num_sms_a} num_sms_y={args.num_sms_y} "
             f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y}"
         )
