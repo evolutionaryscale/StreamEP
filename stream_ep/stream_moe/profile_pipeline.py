@@ -2,13 +2,11 @@
 per-kernel summary table parsed from the profiler's in-memory event
 aggregator.
 
-This script doubles as the source of truth for collective-kernel per-call
-timing (dispatch / dispatch_grads / combine / combine_grads). `bench_pipeline`
-only times the compute-only kernels in isolation — the collective ops
+This is the source of truth for collective-kernel per-call timing
+(dispatch / dispatch_grads / combine / combine_grads): the collective ops
 need natural per-iter slack to satisfy the single-slot `rdma_channel_meta`
-protocol, which the full fwd+bwd pipeline provides but a bench harness in
-pure rapid-fire does not. See `bench_pipeline.py`'s docstring for the
-ablation rows we still keep there.
+protocol, which the full fwd+bwd pipeline provides but a rapid-fire bench
+loop does not. It also reports end-to-end overlap savings and peak memory.
 
 What you should see in the resulting chrome trace
 -------------------------------------------------
@@ -49,7 +47,7 @@ from stream_ep.stream_moe.stream_moe import (
 
 
 # torchrun-driven distributed helpers. Kept here so smoke_pipeline /
-# validate_multi_iter / bench_pipeline can reuse them by importing from
+# validate_multi_iter can reuse them by importing from
 # profile_pipeline.
 def init_distributed() -> torch.device:
     """Init NCCL process group from torchrun env vars; return the local cuda device."""
@@ -93,7 +91,7 @@ NUM_EXPERTS = 384
 SEQ_LEN_PER_RANK = 8192
 TOPK = 13
 DTYPE = torch.bfloat16
-NUM_SMS = 64  # See bench_pipeline.py for sweep justification.
+NUM_SMS = 64  # 64 SMs (32 channels): tuned for 4+ node RDMA-dominated runs.
 TILE_M = 128
 TILE_N_A = 192
 TILE_N_Y = 256
@@ -282,6 +280,14 @@ def main():
     torch.cuda.synchronize()
     barrier(group)
 
+    # [mem] reset peak counters after warmup so the reported peak reflects the
+    # steady-state profiled iters, not one-time JIT/compile allocations. Note:
+    # this tracks torch's caching allocator only (pool / activations / weights /
+    # GEMM workspaces). The NVL + RDMA comm buffers are allocated outside torch
+    # (cuMem / NVSHMEM symmetric heap), so the ring-depth knob does NOT show up
+    # here — see the comm-buffer sizes printed below for that.
+    torch.cuda.reset_peak_memory_stats()
+
     n_wait, n_warmup, n_active = 1, 2, 5
     n_steps = n_wait + n_warmup + n_active
     schedule = torch.profiler.schedule(
@@ -376,12 +382,12 @@ def main():
         # and the streaming-moe kernels claim their events before the `gemm`
         # catch-all (which then collects only the dW1 / dW2 quack.gemm calls).
         target_kernels = [
-            # Collective ops (removed from bench_pipeline; this is their home).
+            # Collective ops — this script is their timing home.
             "streaming_dispatch_metadata_kernel",
             "dispatch_main_kernel",
             "dispatch_grads_main_kernel",
             "combine_main_kernel",
-            # Compute kernels (cross-reference with bench_pipeline isolated rows).
+            # Compute kernels.
             "streaming_moe_a_bwd",
             "streaming_moe_y_bwd",
             "streaming_moe_a",
@@ -522,6 +528,23 @@ def main():
             "  (fwd and bwd don't overlap with each other by construction — "
             "autograd boundary at out.sum().backward())"
         )
+        print()
+        print("=== memory (rank 0) ===")
+        print(f"  peak allocated (torch caching allocator):  {torch.cuda.max_memory_allocated() / 2**30:7.2f} GiB")
+        print(f"  peak reserved  (torch caching allocator):  {torch.cuda.max_memory_reserved() / 2**30:7.2f} GiB")
+        # Comm buffers live outside torch (cuMem NVL + NVSHMEM RDMA symmetric
+        # heap), so they don't appear above. Report their sizes explicitly —
+        # the RDMA size scales with num_max_rdma_chunked_recv_tokens (the ring
+        # depth), so this is the number that moves under a 128-vs-256 change.
+        _hb = H * 2
+        _dc = StreamEPBuffer.get_dispatch_config(world_size)
+        _cc = StreamEPBuffer.get_combine_config(world_size)
+        _rdma = max(_dc.get_rdma_buffer_size_hint(_hb, world_size),
+                    _cc.get_rdma_buffer_size_hint(_hb, world_size))
+        _nvl = max(_dc.get_nvl_buffer_size_hint(_hb, world_size),
+                   _cc.get_nvl_buffer_size_hint(_hb, world_size))
+        print(f"  comm buffers (outside torch): NVL {_nvl / 2**30:6.2f} GiB   "
+              f"RDMA {_rdma / 2**30:6.2f} GiB  (RDMA scales with ring depth)")
         print()
         # Per-kernel table — useful for cross-referencing the symbols that
         # got matched to each role above.

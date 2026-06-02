@@ -69,7 +69,7 @@ The streaming dispatch synthesizes its own routing metadata (rank counts, channe
 
 `Buffer.num_sms` auto-picks from world size in `Buffer.__init__`: 80 SMs at ≤2 nodes (NVL-dominated, more parallel channels wins), 64 SMs at ≥3 nodes (RDMA tail latency budget rewards fewer larger chunks). Both bench-sweep-tuned. Explicit override is available via `Buffer.set_num_sms`.
 
-The kernel-level wrappers (`streaming_moe_a`, `streaming_moe_y`, ...) still expose all tile/SM args directly — that's the sweep-tuning entry point used by `bench_pipeline.py` and `profile_pipeline.py`.
+The kernel-level wrappers (`streaming_moe_a`, `streaming_moe_y`, ...) still expose all tile/SM args directly — that's the sweep-tuning entry point used by `profile_pipeline.py`.
 
 ## What's removed
 
