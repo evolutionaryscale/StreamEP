@@ -1192,13 +1192,21 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         // Iterate over tokens and copy into buffer.
         //
         // The RDMA head slot accumulates across all iters (peer's forwarder
-        // coordinator publishes deltas via amo_nonfetch_add). Seed
-        // prev_at_entry from the persistent reader-state array (written
-        // at the prior kernel's exit, stream-ordered, race-free). Iter-
-        // local cached_rdma_channel_head tracks this iter's advance only.
+        // coordinator publishes deltas via amo_nonfetch_add). The iter-start
+        // baseline is the cumulative head RIGHT NOW: this iter's consumer has
+        // not begun draining yet, so the live counter equals the prior-iters
+        // cumulative and `cached_rdma_channel_head = ld(head) - prev` starts at
+        // exactly 0. Read it live at entry rather than a baseline snapshotted at
+        // the PRIOR kernel's sender-exit: that snapshot was captured too early
+        // (the consumer's forwarder coordinator keeps advancing rdma_channel_head
+        // after the sender exits), so it was too low, the iter-local head started
+        // > 0, the full-ring gate fired late, and the sender overwrote un-drained
+        // ring slots once a (channel,src) token count exceeded the ring depth
+        // (wrap). Reading live is exact and safe: a not-yet-landed remote amo only
+        // lowers it -> over-stall, never over-write.
         int64_t token_idx;
         uint32_t prev_rdma_channel_head_at_entry = lane_id < kNumRDMARanks
-            ? env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
+            ? static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)))
             : 0u;
         int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
@@ -2340,10 +2348,13 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         }
         sync_rdma_sender_smem();
 
-        // See dispatch_main_kernel kRDMASender for the prev-at-entry rationale.
+        // See dispatch_main_kernel kRDMASender for the prev-at-entry rationale:
+        // read the LIVE cumulative head at entry (=0 iter-local at start), not a
+        // baseline snapshotted at the prior sender-exit (too low -> wrap overwrite
+        // once a (channel,src) count exceeds the RDMA recv ring depth).
         int64_t token_idx;
         uint32_t prev_rdma_channel_head_at_entry = lane_id < kNumRDMARanks
-            ? env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
+            ? static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)))
             : 0u;
         int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
@@ -3302,10 +3313,24 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
         }
     } else {
         // Combiners and coordinators
+        //
+        // Offset by dispatch's RDMA region size for disjoint RDMA regions.
+        // Without this offset, combine's smaller per-token stride
+        // (`num_topk` ints of `topk_idx` omitted vs dispatch's stride)
+        // would place its head/tail SymBuffers inside dispatch's data
+        // region, letting fwd-combine writes shadow bwd-dispatch_grads
+        // reads — manifests as a forwarder timeout reading RDMA meta. See
+        // `get_dispatch_rdma_region_bytes` in api.cuh; structurally
+        // identical to the NVL-side `dispatch_region_offset` above.
+        const int64_t dispatch_rdma_region_offset = get_dispatch_rdma_region_bytes(
+            hidden_int4, num_topk, num_max_rdma_chunked_recv_tokens,
+            num_channels, kNumRDMARanks);
+        void* combine_rdma_buffer_ptr =
+            static_cast<uint8_t*>(rdma_buffer_ptr) + dispatch_rdma_region_offset;
         auto rdma_channel_data = SymBuffer<int8_t>(
-            rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
-        auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
-        auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+            combine_rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
+        auto rdma_channel_head = SymBuffer<uint64_t, false>(combine_rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+        auto rdma_channel_tail = SymBuffer<uint64_t, false>(combine_rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
         // Offset by dispatch's region size for disjoint NVL regions.
         void* local_nvl_buffer = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dispatch_region_offset;
@@ -3373,9 +3398,13 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine_main_ker
             sync_forwarder_smem();
 
             int cached_nvl_channel_tail_idx = 0;
-            // Combine head slot accumulates across iters; seed prev_at_entry.
+            // Combine head slot accumulates across iters; the iter-start baseline
+            // is the live cumulative head NOW (=0 iter-local at start). Read it
+            // live rather than a prior-exit snapshot — see dispatch_main_kernel
+            // kRDMASender: the prior-exit baseline was too low -> ring overwrite
+            // once a combine (channel,dst) count exceeds the recv ring depth.
             uint32_t prev_rdma_channel_head_at_entry =
-                combine_reader_prev_head[channel_id * kNumRDMARanks + dst_rdma_rank];
+                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(dst_rdma_rank)));
 
             // `recv_rdma_channel_prefix_matrix` was written by dispatch's
             // forwarder SM (preceding kernel on the same stream) — same-

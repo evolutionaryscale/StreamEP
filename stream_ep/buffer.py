@@ -113,8 +113,8 @@ class Buffer:
     # True iff ``set_num_sms`` was called explicitly. When False, ``__init__``
     # auto-picks ``num_sms`` from the group size: 80 SMs for intra-/2-node
     # NVL-dominated runs, 64 SMs from 4+ nodes where RDMA tail latency rewards
-    # fewer but larger per-channel chunks. Bench-tuned in
-    # ``stream_ep/stream_moe/bench_pipeline.py``.
+    # fewer but larger per-channel chunks. Tuned via
+    # ``stream_ep/stream_moe/profile_pipeline.py``.
     _num_sms_explicit: bool = False
 
     def __init__(self,

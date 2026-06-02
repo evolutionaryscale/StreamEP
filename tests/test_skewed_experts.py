@@ -278,8 +278,8 @@ def main():
                         "Default 90 (the SCENARIOS default).")
     p.add_argument("--T", type=int, default=SEQ_LEN_PER_RANK,
                    help="Per-rank token count (default = production SEQ_LEN_PER_RANK).")
-    p.add_argument("--num_sms", type=int, default=NUM_SMS,
-                   help="SMs allocated to dispatch/combine (default = NUM_SMS=80).")
+    p.add_argument("--num_sms", type=int, default=None,
+                   help="SMs override; default = Buffer auto-pick by world size.")
     p.add_argument("--per-rank-target", type=int, default=1,
                    help="Target rank for per_rank_imbalance scenario (default 1).")
     args = p.parse_args()

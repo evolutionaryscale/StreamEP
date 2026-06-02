@@ -100,20 +100,30 @@ struct Config {
         EP_HOST_ASSERT(num_sms % 2 == 0);
         const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
         const int num_channels = num_sms / 2;
+        const int hidden_int4 = static_cast<int>(hidden_bytes / sizeof(int4));
 
+        // Disjoint RDMA regions: dispatch's sub-buffer chain occupies bytes
+        // [0, D_rdma), combine's occupies [D_rdma, D_rdma + C_rdma).
+        // combine_main_kernel offsets its RDMA SymBuffer bases by
+        // `get_dispatch_rdma_region_bytes(hidden_int4, num_topk_actual, ...)`
+        // at launch time (computed from kernel args). The host upper-bounds
+        // with `kNumMaxTopK` so the allocation fits any runtime `num_topk`
+        // without reallocation. Disjointness is load-bearing for the same
+        // reason as the NVL side — see `get_dispatch_rdma_region_bytes` in
+        // api.cuh and the analogous NVL block in `get_nvl_buffer_size_hint`
+        // above.
         size_t num_bytes = 0;
-        // Up-to-128B padding inserted between the data SymBuffer and the meta
-        // SymBuffer so each meta slab maps to exactly one H100 L2 line. See
-        // `align_meta_base_to_l2_line` in internode.cu and `kRdmaMetaSlabInts`
-        // in api.cuh.
-        num_bytes += NUM_BUFFER_ALIGNMENT_BYTES;
-        num_bytes += num_channels * num_rdma_ranks * kRdmaMetaSlabInts * 2 * sizeof(int);
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * internode::get_source_meta_bytes() * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(topk_idx_t) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(float) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxScales * sizeof(float) * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * sizeof(int4) * 2;
+        num_bytes += internode::get_dispatch_rdma_region_bytes(
+            hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens,
+            num_channels, num_rdma_ranks);
+        num_bytes += internode::get_combine_rdma_region_bytes(
+            hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens,
+            num_channels, num_rdma_ranks);
+        // Scales: unused in stream_ep but kept in the upper bound so the
+        // allocation stays compatible with upstream DeepEP slot layouts that
+        // include per-token quant scales. Mirrors the NVL hint above.
+        num_bytes += static_cast<size_t>(num_channels) * num_rdma_ranks
+                   * num_max_rdma_chunked_recv_tokens * kNumMaxScales * sizeof(float) * 2;
         num_bytes = ((num_bytes + 127) / 128) * 128;
         return num_bytes;
 #else

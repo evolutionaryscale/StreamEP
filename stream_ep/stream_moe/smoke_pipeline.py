@@ -43,7 +43,8 @@ from stream_ep.stream_moe.profile_pipeline import (
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--num_sms", type=int, default=NUM_SMS)
+    p.add_argument("--num_sms", type=int, default=None,
+                   help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=3)
     p.add_argument("--n_iter", type=int, default=5)
@@ -54,15 +55,14 @@ def main():
     group = torch_dist.group.WORLD
     local_E = NUM_EXPERTS // world_size
 
-    rank_zero_print(
-        f"[smoke] config: world={world_size} num_sms={args.num_sms} "
-        f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-        f"n_warmup={args.n_warmup} n_iter={args.n_iter}"
-    )
-
     t0 = time.time()
     buffer = make_buffer(group, args.num_sms)
     rank_zero_print(f"[smoke] buffer init: {time.time() - t0:.2f}s")
+    rank_zero_print(
+        f"[smoke] config: world={world_size} num_sms={buffer.num_sms} "
+        f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter}"
+    )
 
     g = torch.Generator(device=device).manual_seed(42)
     w1_full = (

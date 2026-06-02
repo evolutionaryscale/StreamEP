@@ -36,8 +36,7 @@ from stream_ep import Buffer
 from utils import cleanup_dist, make_inputs
 
 
-def make_buffer(group, num_sms, hidden_bytes):
-    Buffer.set_num_sms(num_sms)
+def make_buffer(group, hidden_bytes):
     nvl_bytes, rdma_bytes = 0, 0
     for cfg in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
         nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes)
@@ -116,7 +115,6 @@ def main():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
-    num_sms = 24
     num_experts = 64
     num_topk = 4
     num_tokens = 256
@@ -125,7 +123,7 @@ def main():
     dtype = torch.bfloat16
     hidden_bytes = hidden * 2
 
-    buf = make_buffer(group, num_sms, hidden_bytes)
+    buf = make_buffer(group, hidden_bytes)
 
     # ─── Test 1: basic combine. Single dispatch + populated o + combine.
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(

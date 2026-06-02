@@ -36,8 +36,6 @@ def main():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
-    num_sms = 24
-    Buffer.set_num_sms(num_sms)
     num_experts = 64
     num_local_experts = num_experts // world_size
     num_topk = 4
