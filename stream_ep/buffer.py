@@ -146,14 +146,19 @@ class Buffer:
         """
         check_nvlink_connections(group)
 
-        # Auto-pick num_sms from world size unless the caller already pinned
-        # a value with ``set_num_sms``. Computed before the runtime is
-        # constructed and before ``NVSHMEM_IBGDA_NUM_RC_PER_PE`` is set so it
-        # can pick up the new value.
-        if not Buffer._num_sms_explicit:
-            group_size = group.size() if group is not None else (comm.Get_size() if comm is not None else 1)
-            nodes = (group_size + 7) // 8
-            Buffer.num_sms = 80 if nodes <= 2 else 64
+        # Auto-pick num_sms from world size unless the caller already pinned a
+        # value with ``set_num_sms``. Idempotent. Resolving here keeps direct
+        # ``Buffer(...)`` callers correct, but callers that pre-size the comm
+        # buffers from ``Config(Buffer.num_sms, ...)`` (e.g. ``make_buffer``)
+        # MUST resolve num_sms via ``autopick_num_sms`` / ``set_num_sms`` BEFORE
+        # computing those sizes — otherwise the allocation uses the stale
+        # default num_sms while the kernels launch at the auto-picked value,
+        # indexing per-channel ring regions past the smaller allocation (OOB at
+        # <=2 nodes, where auto-pick (80) != default (64)). Done before the
+        # runtime is constructed and before ``NVSHMEM_IBGDA_NUM_RC_PER_PE`` is
+        # set so it picks up the resolved value.
+        group_size = group.size() if group is not None else (comm.Get_size() if comm is not None else 1)
+        Buffer.autopick_num_sms(group_size)
 
         # Initialize the CPP runtime
         if group is not None:
@@ -349,6 +354,25 @@ class Buffer:
         Buffer.num_sms = new_num_sms
         Buffer._num_sms_explicit = True
 
+    @staticmethod
+    def autopick_num_sms(group_size: int) -> int:
+        """Resolve ``num_sms`` from world size unless an explicit override was
+        installed via ``set_num_sms``: 80 SMs at <=2 nodes, 64 SMs at >=3 nodes.
+        Returns the resolved value.
+
+        Idempotent and safe to call repeatedly. **Any caller that sizes comm
+        buffers from ``Config(Buffer.num_sms, ...)`` before constructing the
+        ``Buffer`` must call this (or ``set_num_sms``) first** — otherwise the
+        buffers are sized for the stale default ``num_sms`` while the kernels
+        later launch at the auto-picked value, indexing per-channel ring regions
+        past the smaller allocation (out-of-bounds at <=2 nodes, where the
+        auto-pick (80) differs from the default (64)).
+        """
+        if not Buffer._num_sms_explicit:
+            nodes = (group_size + 7) // 8
+            Buffer.num_sms = 80 if nodes <= 2 else 64
+        return Buffer.num_sms
+
     def get_local_buffer_tensor(self,
                                 dtype: torch.dtype,
                                 size: Optional[torch.Size] = None,
@@ -392,6 +416,16 @@ class Buffer:
             config: the recommended config.
         """
 
+        # Resolve the world-size num_sms auto-pick BEFORE building the config
+        # (which bakes in Buffer.num_sms). Both make_buffer and the evoscale
+        # StreamMoEWrapper size the comm buffers from this config and then
+        # construct the Buffer, so resolving num_sms here makes the
+        # allocation's num_sms match the later kernel-launch num_sms — otherwise
+        # buffers sized for the default num_sms get indexed by the auto-picked
+        # value's channels (OOB at <=2 nodes). No-op once set_num_sms or a prior
+        # resolve has run. See autopick_num_sms.
+        Buffer.autopick_num_sms(num_ranks)
+
         # TODO: automatically tune
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
@@ -428,6 +462,9 @@ class Buffer:
         Returns:
             config: the recommended config.
         """
+
+        # Resolve num_sms before building the config (see get_dispatch_config).
+        Buffer.autopick_num_sms(num_ranks)
 
         # TODO: automatically tune
         config_map = {
