@@ -130,6 +130,15 @@ struct StreamingDispatchOutputs {
     torch::Tensor send_rdma_head;                   // [num_tokens, num_rdma_ranks]
     torch::Tensor send_nvl_head;                    // [num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]
     torch::Tensor recv_src_meta;                    // [T_recv, get_source_meta_bytes()]  uint8
+
+    // Release the forward-only `o` buffer (kernel-Y atomic-scatter target,
+    // consumed by fwd combine, never read in backward). The orchestrator calls
+    // this after fwd combine so o's standalone allocation (allocate_post_poll_
+    // bundle) is freed rather than pinned through bwd by this struct, which is
+    // saved on ctx via the handle. handle.o=None alone is insufficient because
+    // this struct (handle._dispatch_out) holds the other reference. All other
+    // members are bwd-needed (routing / slab views), so only o is released.
+    void release_o() { o = torch::Tensor(); }
 };
 
 struct Buffer {
