@@ -124,10 +124,10 @@ def make_skewed_topk_idx(
     )
 
 
-def make_buffer(group, num_sms=None):
+def make_buffer(group, num_sms=None, hidden=H):
     if num_sms is not None:
         StreamEPBuffer.set_num_sms(num_sms)
-    hidden_bytes = H * 2
+    hidden_bytes = hidden * 2
     nvl_bytes, rdma_bytes = 0, 0
     for cfg in (
         StreamEPBuffer.get_dispatch_config(group.size()),
@@ -155,6 +155,16 @@ def main():
     p.add_argument("--num_sms", type=int, default=None,
                    help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
+    # MoE shape overrides — default to the profile shape; pass 82ba5b's
+    # (H=3072 I=768 E=256 K=8) to measure the recompute cost at the real
+    # GEMM size (2I·H), which is what determines whether the bwd preact_a
+    # recompute hides behind dispatch_grads' comm. Defaults come via globals()
+    # because main() rebinds H/I/NUM_EXPERTS/TOPK as locals below — a bare
+    # `default=H` would be an UnboundLocalError on that soon-to-be-local name.
+    p.add_argument("--hidden", type=int, default=globals()["H"], help="d_model (82ba5b=3072)")
+    p.add_argument("--intermediate", type=int, default=globals()["I"], help="per-expert I (82ba5b=768)")
+    p.add_argument("--num_experts", type=int, default=globals()["NUM_EXPERTS"], help="total experts E (82ba5b=256)")
+    p.add_argument("--topk", type=int, default=globals()["TOPK"], help="top-k K (82ba5b=8)")
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)
@@ -196,6 +206,12 @@ def main():
     p.add_argument("--skew_hot_weight", type=float, default=4.0)
     args = p.parse_args()
 
+    # MoE shape from args (defaults = the module-level profile shape).
+    H = args.hidden
+    I = args.intermediate
+    NUM_EXPERTS = args.num_experts
+    TOPK = args.topk
+
     device = init_distributed()
     rank, world_size = get_global_rank(), get_world_size()
     group = torch_dist.group.WORLD
@@ -213,7 +229,7 @@ def main():
         torch_dist.broadcast_object_list(obj_list, src=0)
         args.profile_dir = obj_list[0]
 
-    buffer = make_buffer(group, args.num_sms)
+    buffer = make_buffer(group, args.num_sms, hidden=H)
 
     # Replicated W1 / W2 across ranks (each rank slices its E_local share).
     g = torch.Generator(device=device).manual_seed(42)
@@ -359,6 +375,19 @@ def main():
     )
     fwd_e2e_us = fwd_times_us[len(fwd_times_us) // 2]
     bwd_e2e_us = bwd_times_us[len(bwd_times_us) // 2]
+    # Step-time spread (jumpiness): per-step fwd+bwd total, min/median/max over
+    # the active region. A large max/min ratio under --recompute_preact vs
+    # without it is the signature of the recompute stalling the streaming
+    # irregularly (variable overlap with dispatch_grads per step).
+    bwd_min_us, bwd_max_us = bwd_times_us[0], bwd_times_us[-1]
+    total_times_us = sorted(
+        (fwd_starts[i].elapsed_time(fwd_ends[i]) + bwd_starts[i].elapsed_time(bwd_ends[i]))
+        * 1e3
+        for i in active_range
+    )
+    total_min_us = total_times_us[0]
+    total_med_us = total_times_us[len(total_times_us) // 2]
+    total_max_us = total_times_us[-1]
 
     if rank == 0:
         events = prof.key_averages()
@@ -538,6 +567,12 @@ def main():
             "  (fwd and bwd don't overlap with each other by construction — "
             "autograd boundary at out.sum().backward())"
         )
+        print()
+        print("=== step-time spread (jumpiness check) ===")
+        print(f"  bwd   min / median / max:  {bwd_min_us:7.1f} / {bwd_e2e_us:7.1f} / {bwd_max_us:7.1f} μs"
+              f"   (max/min = {bwd_max_us / max(bwd_min_us, 1e-9):.2f}×)")
+        print(f"  total min / median / max:  {total_min_us:7.1f} / {total_med_us:7.1f} / {total_max_us:7.1f} μs"
+              f"   (max/min = {total_max_us / max(total_min_us, 1e-9):.2f}×)")
         print()
         print("=== memory (rank 0) ===")
         print(f"  peak allocated (torch caching allocator):  {torch.cuda.max_memory_allocated() / 2**30:7.2f} GiB")

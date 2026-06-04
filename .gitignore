@@ -8,6 +8,8 @@ build/
 .vscode/
 */cmake-build-*/
 deep_ep.egg-info/
+stream_ep.egg-info/
+dist/
 logbook.md
 autoresearch.md
 next-step.md
