@@ -160,6 +160,13 @@ def main():
     p.add_argument("--num_sms_a_bwd", type=int, default=None)
     p.add_argument("--num_sms_y_bwd", type=int, default=None)
     p.add_argument("--prioritize_communicate", action="store_true")
+    p.add_argument(
+        "--recompute_preact",
+        action="store_true",
+        help="Activation-checkpoint preact_a: skip the fwd [2I] save and "
+        "recompute it from pool @ W1 in bwd. Measures the recompute's e2e "
+        "cost and peak-memory saving vs the default (save preact_a).",
+    )
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
     p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
@@ -258,7 +265,8 @@ def main():
         print(
             f"config: world={world_size} num_sms={StreamEPBuffer.num_sms} "
             f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-            f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y}",
+            f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y} "
+            f"recompute_preact={args.recompute_preact}",
             flush=True,
         )
 
@@ -275,6 +283,7 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
+            activation_checkpoint=args.recompute_preact,
         )
         out.sum().backward()
     torch.cuda.synchronize()
@@ -327,6 +336,7 @@ def main():
                     w2_local,
                     streams=streams,
                     num_experts=NUM_EXPERTS,
+                    activation_checkpoint=args.recompute_preact,
                 )
             fwd_ends[step].record()
             bwd_starts[step].record()
