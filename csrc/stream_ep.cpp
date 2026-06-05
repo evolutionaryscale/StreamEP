@@ -350,7 +350,6 @@ void Buffer::destroy() {
         if (dispatch_reader_prev_tail)     CUDA_CHECK(cudaFree(dispatch_reader_prev_tail));
         if (combine_reader_prev_head)      CUDA_CHECK(cudaFree(combine_reader_prev_head));
         if (combine_reader_prev_tail)      CUDA_CHECK(cudaFree(combine_reader_prev_tail));
-        if (dispatch_meta_sentinel_prev)   CUDA_CHECK(cudaFree(dispatch_meta_sentinel_prev));
         if (enable_shrink) {
             internode::free(mask_buffer_ptr);
             internode::free(sync_buffer_ptr);
@@ -512,12 +511,10 @@ void Buffer::sync(const std::vector<int>& device_ids,
         CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail,    prev_array_bytes_32));
         CUDA_CHECK(cudaMalloc(&combine_reader_prev_head,     prev_array_bytes_32));
         CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail,     prev_array_bytes_32));
-        CUDA_CHECK(cudaMalloc(&dispatch_meta_sentinel_prev,  prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(dispatch_reader_prev_head,    0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail,    0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(combine_reader_prev_head,     0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(combine_reader_prev_tail,     0, prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(dispatch_meta_sentinel_prev,  0, prev_array_bytes_32));
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -739,8 +736,11 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
 //          sender state + backward-only scaffolding. With the 3-stream graph
 //          all consumers serialize after dispatch via the layer-end exit
 //          chain on caller_stream — no race possible):
-//     k_local_remaining, y_done_per_token, o,
+//     k_local_remaining, y_done_per_token,
 //     recv_token_to_slots, k_local_total
+//   (`o` is allocated standalone, NOT in the slab — it is forward-only and a
+//    standalone allocation can be freed after fwd combine instead of being
+//    pinned through bwd by the slab's shared deleter. See allocate_post_poll_bundle.)
 struct PostPollBundle {
     // Z_pre + N region views.
     torch::Tensor pool_topk_weight;
@@ -801,9 +801,10 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // Z_post region (zeroed after metadata_done).
     int64_t off_k_local_remaining    = b.reserve<int>(num_recv_tokens);
     int64_t off_y_done_per_token = b.reserve<int64_t>(num_recv_tokens);
-    int64_t off_o                      = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
     int64_t off_recv_token_to_slots    = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
     int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
+    // NOTE: `o` is NOT reserved in the slab — it is allocated standalone below
+    // so its storage can be freed after fwd combine (forward-only; see below).
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     record_consumer_stream(bundle, consumer_stream_handle);
@@ -827,11 +828,25 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // cannot race against this memset and have their writes clobbered.
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
+    // `o` (kernel-Y atomic-scatter accumulation target) is allocated standalone,
+    // NOT as a slab view. The slab's shared `keep` deleter pins ALL its views'
+    // storage alive until the last view dies — i.e. through backward, since
+    // bwd-needed views (pool_topk_weight, recv_token_to_slots, ...) share the
+    // slab. But `o` is forward-only (consumed by combine, never read in bwd),
+    // ~T_recv×hidden bytes; a standalone allocation lets the orchestrator free
+    // it right after fwd combine (stream_moe.py sets handle.o=None). Zeroed on
+    // `stream` BEFORE metadata_done_event so the compute stream observes the
+    // zero-init via the same event kernel A/Y wait on. Zero-init is load-bearing:
+    // kernel Y accumulates K_local(r)>=1 contributions per row via red.global.add.
+    out.o = torch::empty({num_recv_tokens, hidden}, x_options);
+    record_consumer_stream(out.o, consumer_stream_handle);
+    CUDA_CHECK(cudaMemsetAsync(out.o.data_ptr(), 0x00,
+                               static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token, stream));
+
     out.metadata_done_event = EventHandle(stream);
 
     out.k_local_remaining    = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                        keep, i32_opts);
     out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                        keep, i64_opts);
-    out.o                      = at::from_blob(base + off_o,                      {num_recv_tokens, hidden},                keep, x_options);
     out.recv_token_to_slots    = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},              keep, i32_opts);
     out.k_local_total          = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                        keep, i32_opts);
 
@@ -982,8 +997,9 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // Z_post region (zeroed after metadata_done event).
     int64_t off_k_local_remaining    = b.reserve<int>(num_recv_tokens);
     int64_t off_y_done_per_token = b.reserve<int64_t>(num_recv_tokens);
-    int64_t off_o                      = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token);
     int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
+    // NOTE: `o` is NOT reserved in the slab — allocated standalone below
+    // (forward-only; freed after fwd combine). See intranode allocator.
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     record_consumer_stream(bundle, consumer_stream_handle);
@@ -1012,11 +1028,19 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // queue under CDMC>1 and race the memset).
     CUDA_CHECK(cudaMemsetAsync(base + n_end, 0x00, b.total_bytes() - n_end, stream));
 
+    // `o` allocated standalone (not a slab view) so it can be freed after fwd
+    // combine instead of being pinned through bwd by the shared slab deleter;
+    // it is forward-only. See intranode allocate_post_poll_bundle for the full
+    // rationale. Zeroed on `stream` before the event (atomic-scatter target).
+    out.o = torch::empty({num_recv_tokens, hidden}, x_options);
+    record_consumer_stream(out.o, consumer_stream_handle);
+    CUDA_CHECK(cudaMemsetAsync(out.o.data_ptr(), 0x00,
+                               static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token, stream));
+
     out.metadata_done_event = EventHandle(stream);
 
     out.k_local_remaining             = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                            keep, i32_opts);
     out.y_done_per_token          = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                            keep, i64_opts);
-    out.o                               = at::from_blob(base + off_o,                      {num_recv_tokens, hidden},                    keep, x_options);
     out.k_local_total                   = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                            keep, i32_opts);
 
     return out;
@@ -1621,7 +1645,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
         .reader_prev_head                    = dispatch_reader_prev_head,
         .reader_prev_tail                    = dispatch_reader_prev_tail,
-        .dispatch_meta_sentinel_prev         = dispatch_meta_sentinel_prev,
     };
 
     internode::launch_dispatch_main(pool_out, per_token_out, inputs, tile_signal,
@@ -1768,7 +1791,6 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
         .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
         .reader_prev_head                    = dispatch_reader_prev_head,
         .reader_prev_tail                    = dispatch_reader_prev_tail,
-        .dispatch_meta_sentinel_prev         = dispatch_meta_sentinel_prev,
     };
 
     // Recorded before the main kernel launch — bwd orchestrator's compute
@@ -1927,6 +1949,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("k_local_remaining",        &stream_ep::StreamingDispatchOutputs::k_local_remaining)
         .def_readonly("y_done_per_token",     &stream_ep::StreamingDispatchOutputs::y_done_per_token)
         .def_readonly("o",                          &stream_ep::StreamingDispatchOutputs::o)
+        .def("release_o",                           &stream_ep::StreamingDispatchOutputs::release_o)
         .def_readonly("recv_token_to_slots",        &stream_ep::StreamingDispatchOutputs::recv_token_to_slots)
         .def_readonly("k_local_total",                   &stream_ep::StreamingDispatchOutputs::k_local_total)
         .def_readonly("total_tiles",                     &stream_ep::StreamingDispatchOutputs::total_tiles)

@@ -346,17 +346,29 @@ __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
     return total_x + 2 * total_ht;
 }
 
-// RDMA dispatch meta SymBuffer slab size (ints per (channel, dst_rdma) slab).
-// 32 ints = 128 bytes = one H100 L2 cache line. Slots 0..17 carry the data
-// (NUM_MAX_NVL_PEERS*2 start_sum + NUM_MAX_NVL_PEERS*2 end_sum + 2 prefix);
-// slots 18..29 are padding; slot 30 is the cumulative-across-iters sentinel
-// (8-byte-aligned, mlx5 ATOMIC_FAA target); slot 31 is reserved. The
-// sentinel-amo coherence trick (sender bulk_put + amo on slot 30; reader
-// observes slot 30 > prev_at_entry then reads slots 0..17 plain) requires
-// each slab to occupy exactly one L2 line. The meta SymBuffer base is
+// RDMA dispatch meta SymBuffer slab size (ints per (channel, dst_rdma) ring
+// slab). 32 ints = 128 bytes = one H100 L2 cache line. Slots 0..17 carry the
+// data (NUM_MAX_NVL_PEERS*2 start_sum + NUM_MAX_NVL_PEERS*2 end_sum + 2 prefix);
+// slots 18..29 are padding; slot 30 is the absolute gen-stamp
+// (kRdmaMetaGenstampSlot); slot 31 is reserved. The meta SymBuffer base is
 // 128B-aligned by `align_meta_base_to_l2_line` in internode.cu.
 #define kRdmaMetaSlabInts 32
-#define kRdmaMetaSentinelSlot 30
+// [genstamp] Slot 30 carries this iter's absolute `nvl_seq`: the sender writes
+// it via a 2nd RC-ordered put issued after the data put, and the forwarder
+// eager-spins until it matches. Absolute identity (replacing the old relative
+// `> prev` sentinel) means a peer running an iteration ahead can no longer have
+// this iter's meta silently mis-read.
+#define kRdmaMetaGenstampSlot 30
+// [genstamp ring] Each (channel, src_rdma) meta region holds this many slabs.
+// The sender writes iter N to slab `(dispatch_seq % depth)`; the ring protects
+// iter N's slab only while the peer is < depth iterations ahead (first overwrite
+// of my slab is at seq_peer = seq_self + depth, i.e. collision when lap >= depth).
+// depth 4 proved MARGINAL: the rapid-fire pure-comm oracle (no compute to damp
+// rank drift) flakes — lap occasionally reaches 4 (test_dispatch_grads_stress
+// hangs non-deterministically at depth 4). Testing depth 64; memory is ~free
+// (~0.5% of the RDMA data ring). If even a deep ring flakes the lap is not
+// reliably bounded and the meta needs head/tail backpressure instead.
+#define kRdmaMetaRingDepth 64
 static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
               "Meta data slots overflow the 0..17 region of the 32-int slab");
 
@@ -391,9 +403,10 @@ __host__ __device__ inline int64_t get_dispatch_rdma_region_bytes(
     // dispatch end.
     const int64_t align_slack =
         static_cast<int64_t>(NUM_BUFFER_ALIGNMENT_BYTES);
-    // rdma_channel_meta: SymBuffer<int> (decoupled).
+    // rdma_channel_meta: SymBuffer<int> (decoupled), kRdmaMetaRingDepth slabs
+    // per (channel, src_rdma) for the gen-stamp ring.
     const int64_t meta_bytes =
-        2 * static_cast<int64_t>(kRdmaMetaSlabInts)
+        2 * static_cast<int64_t>(kRdmaMetaRingDepth) * static_cast<int64_t>(kRdmaMetaSlabInts)
           * static_cast<int64_t>(sizeof(int)) * rdma_ranks * channels;
     // rdma_channel_head + rdma_channel_tail: SymBuffer<uint64_t, false>
     // (non-decoupled), num_elems = 1.
@@ -577,13 +590,6 @@ struct DispatchEnv {
     // end of fwd is visible at the start of bwd).
     uint32_t* reader_prev_head;
     uint32_t* reader_prev_tail;
-    // Persistent prev-sentinel array for the RDMA dispatch meta region.
-    // [num_channels × num_rdma_ranks] int32. Same lifetime/protocol as
-    // reader_prev_{head,tail}, but tracks the slab[c, src_rdma].slot[30]
-    // sentinel (cumulative amo). The forwarder seeds prev at warp entry,
-    // spins on `ld(slot 30) > prev`, reads raw data slots 0..17 once
-    // tripped, and atomicMaxes the latest slot 30 value back at exit.
-    int* dispatch_meta_sentinel_prev;
 };
 
 void launch_dispatch_main(const DispatchPoolOut& pool_out,

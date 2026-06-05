@@ -130,6 +130,15 @@ struct StreamingDispatchOutputs {
     torch::Tensor send_rdma_head;                   // [num_tokens, num_rdma_ranks]
     torch::Tensor send_nvl_head;                    // [num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]
     torch::Tensor recv_src_meta;                    // [T_recv, get_source_meta_bytes()]  uint8
+
+    // Release the forward-only `o` buffer (kernel-Y atomic-scatter target,
+    // consumed by fwd combine, never read in backward). The orchestrator calls
+    // this after fwd combine so o's standalone allocation (allocate_post_poll_
+    // bundle) is freed rather than pinned through bwd by this struct, which is
+    // saved on ctx via the handle. handle.o=None alone is insufficient because
+    // this struct (handle._dispatch_out) holds the other reference. All other
+    // members are bwd-needed (routing / slab views), so only o is released.
+    void release_o() { o = torch::Tensor(); }
 };
 
 struct Buffer {
@@ -177,17 +186,6 @@ private:
     uint32_t* dispatch_reader_prev_tail = nullptr;
     uint32_t* combine_reader_prev_head  = nullptr;
     uint32_t* combine_reader_prev_tail  = nullptr;
-    // Persistent prev-sentinel array for the RDMA dispatch meta region (C3).
-    // The meta SymBuffer's slot 30 ("kRdmaMetaSentinelSlot") accumulates
-    // across iters via amo_nonfetch_add — sender bulk_puts the 18 data ints
-    // into slots 0..17, then issues an amo on slot 30 to invalidate the L2
-    // line and signal availability. The forwarder reads its prev from this
-    // array at warp entry, spins on `ld(slot 30) > prev`, reads raw data
-    // slots, and atomicMaxes the latest cumulative back at exit.
-    // Sized [max_num_channels × num_rdma_ranks] int32. Same lifetime as
-    // reader_prev_*; freed in destructor; shared by fwd dispatch + bwd
-    // dispatch_grads (same dispatch stream).
-    int* dispatch_meta_sentinel_prev = nullptr;
 
     // Shrink mode buffer
     bool enable_shrink = false;
