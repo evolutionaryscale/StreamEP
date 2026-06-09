@@ -187,6 +187,15 @@ private:
     uint32_t* combine_reader_prev_head  = nullptr;
     uint32_t* combine_reader_prev_tail  = nullptr;
 
+    // Persistent per-(channel, dst_rdma) meta write counter for `meta_head`
+    // backpressure (RDMA dispatch). Same [max_num_channels × num_rdma_ranks]
+    // uint32 shape / lifetime as the reader_prev arrays above; zero-init in the
+    // ctor, freed in the dtor. +1 each time the sender writes that dst's meta
+    // slab; the sender gates the next overwrite on the slowest forwarder warp's
+    // `meta_head` reaching this count. Shared by fwd dispatch + bwd
+    // dispatch_grads (single shared meta slab; call-order counter).
+    uint32_t* dispatch_meta_writes      = nullptr;
+
     // Shrink mode buffer
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;

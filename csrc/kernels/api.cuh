@@ -360,14 +360,16 @@ __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
 // this iter's meta silently mis-read.
 #define kRdmaMetaGenstampSlot 30
 // [genstamp ring] Each (channel, src_rdma) meta region holds this many slabs.
-// The sender writes iter N to slab `(dispatch_seq % depth)`; the ring protects
-// iter N's slab only while the peer is < depth iterations ahead (first overwrite
-// of my slab is at seq_peer = seq_self + depth, i.e. collision when lap >= depth).
-// depth 4 proved MARGINAL: the rapid-fire pure-comm oracle (no compute to damp
-// rank drift) flakes — lap occasionally reaches 4 (test_dispatch_grads_stress
-// hangs non-deterministically at depth 4). Testing depth 64; memory is ~free
-// (~0.5% of the RDMA data ring). If even a deep ring flakes the lap is not
-// reliably bounded and the meta needs head/tail backpressure instead.
+// The sender writes iter N to slab `(dispatch_seq % depth)`. With `meta_head`
+// backpressure (see the sender wait + forwarder AMO in internode.cu) the sender
+// physically cannot overwrite a slab before all NUM_MAX_NVL_PEERS forwarder
+// warps that read it have consumed the prior occupant, so correctness no longer
+// depends on the ring being deeper than the cross-rank lap — depth is purely a
+// run-ahead throughput knob. depth=1 is the correctness-first setting (single
+// slab; the sender runs at most one call ahead of the slowest reader). Raising
+// it spends extra meta slabs for more sender run-ahead and additionally needs
+// per-slab last-write tracking on the sender (the depth>1 "A" variant); see
+// markdowns/rdma_meta_backpressure.md.
 #define kRdmaMetaRingDepth 64
 static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
               "Meta data slots overflow the 0..17 region of the 32-int slab");
@@ -376,7 +378,8 @@ static_assert((NUM_MAX_NVL_PEERS * 2 + 2) <= 18,
 // `env.rdma_buffer_ptr`: `rdma_channel_data` (decoupled, send+recv) +
 // L2-line-align slack (up to NUM_BUFFER_ALIGNMENT_BYTES, inserted by
 // `align_meta_base_to_l2_line`) + `rdma_channel_meta` (decoupled) +
-// `rdma_channel_head` + `rdma_channel_tail` (non-decoupled). Used by the
+// `rdma_channel_head` + `rdma_channel_tail` + `meta_head` (non-decoupled;
+// meta_head holds one backpressure slot per (consumer_rdma, dst_nvl)). Used by the
 // host RDMA-buffer-size hint AND by `combine_main_kernel` to offset its
 // own RDMA sub-buffer base past dispatch's region. Dispatch's per-token
 // stride includes `topk_idx` (`num_topk` ints) while combine's omits it;
@@ -412,7 +415,13 @@ __host__ __device__ inline int64_t get_dispatch_rdma_region_bytes(
     // (non-decoupled), num_elems = 1.
     const int64_t ht_bytes =
         2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
-    return data_bytes + align_slack + meta_bytes + ht_bytes;
+    // meta_head: SymBuffer<uint64_t, false> (non-decoupled), one slot per
+    // (consumer_rdma_rank, dst_nvl) per channel so the meta sender can wait on
+    // the slowest of the NUM_MAX_NVL_PEERS forwarder warps that read each slab.
+    const int64_t mh_bytes =
+        static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks
+          * static_cast<int64_t>(NUM_MAX_NVL_PEERS) * channels;
+    return data_bytes + align_slack + meta_bytes + ht_bytes + mh_bytes;
 }
 
 // Total bytes occupied by combine's RDMA SymBuffer chain: `rdma_channel_data`
@@ -590,6 +599,16 @@ struct DispatchEnv {
     // end of fwd is visible at the start of bwd).
     uint32_t* reader_prev_head;
     uint32_t* reader_prev_tail;
+    // Persistent per-(channel, dst_rdma) meta write counter for `meta_head`
+    // backpressure. [num_channels × num_rdma_ranks] uint32, zero-init, +1 each
+    // time the sender writes that dst's meta slab. The sender waits until the
+    // slowest of dst's NUM_MAX_NVL_PEERS forwarder warps has advanced its
+    // `meta_head` slot to this count before overwriting the slab (depth=1: read
+    // baseline of the prior occupant). Shared by fwd dispatch + bwd
+    // dispatch_grads — they share the single meta slab, and the counter
+    // advancing in call order (fwd_0..fwd_L, bwd_L..bwd_0) is what makes the
+    // fwd→bwd slab handoff safe without phase partitioning.
+    uint32_t* dispatch_meta_writes;
 };
 
 void launch_dispatch_main(const DispatchPoolOut& pool_out,

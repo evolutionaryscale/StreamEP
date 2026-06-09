@@ -1050,6 +1050,15 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         kRdmaMetaRingDepth * kRdmaMetaSlabInts, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+    // [meta backpressure] One slot per (consumer_rdma_rank, dst_nvl). The meta
+    // sender waits until the slowest of dst's NUM_MAX_NVL_PEERS forwarder warps
+    // has advanced its slot to env.dispatch_meta_writes[channel, dst] before it
+    // reuses the slab; each forwarder warp AMO-adds +1 to its own slot right
+    // after its gen-stamp gate passes. Lives on this (sender) rank's symmetric
+    // region, advanced remotely by the consumer (mirrors rdma_channel_head).
+    // Declared identically in fwd dispatch_main + bwd dispatch_grads so both map
+    // to the same symmetric offset and share the counter in call order.
+    auto meta_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks * NUM_MAX_NVL_PEERS, channel_id, num_channels);
 
     // NVL buffer layouts (rs_wr = "read for senders, write for receivers";
     // ws_rr = "write for senders, read for receivers").
@@ -1151,6 +1160,40 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         // forwarder is on the same GPU and observes the data via the L2.
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
+            // [meta backpressure] depth-1: do not reuse dst's meta slab until all
+            // NUM_MAX_NVL_PEERS forwarder warps on dst have read the prior
+            // occupant. meta_need = #prior writes to (channel,dst); meta_head[d]
+            // = #reads by dst's forwarder warp d (each AMO-adds +1 every call,
+            // incl. zero-token, so no slot stalls -> no deadlock). Spin until the
+            // slowest reader (min over the 8 slots) has caught up.
+            const int meta_writes_idx = channel_id * kNumRDMARanks + dst_rdma_rank;
+            const uint32_t meta_need = env.dispatch_meta_writes[meta_writes_idx];
+            uint32_t mh = 0;
+            {
+                auto bp_start = clock64();
+                while (true) {
+                    mh = lane_id < NUM_MAX_NVL_PEERS
+                        ? static_cast<uint32_t>(ld_acquire_sys_global(
+                              meta_head.buffer(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id)))
+                        : 0xffffffffu;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        mh = min(mh, __shfl_xor_sync(0xffffffffu, mh, off));
+                    // Run-ahead: slab (k % depth)'s prior occupant is write
+                    // k-depth, so we only need forwarders to have consumed write
+                    // (meta_need - (depth-1)), not fully caught up. depth-1
+                    // reduces to the original `mh >= meta_need`.
+                    if (static_cast<int32_t>(mh - meta_need + (kRdmaMetaRingDepth - 1)) >= 0)
+                        break;
+                    if (clock64() - bp_start >= NUM_TIMEOUT_CYCLES) {
+                        if (lane_id == 0)
+                            printf("StreamEP dispatch meta backpressure timeout, phase: %d, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, need: %u, mh: %u\n",
+                                   static_cast<int>(nvl_seq & 1), channel_id, rdma_rank, nvl_rank, dst_rdma_rank, meta_need, mh);
+                        trap();
+                    }
+                }
+            }
+            __syncwarp();
             // [genstamp ring] rotate through kRdmaMetaRingDepth slabs by
             // dispatch_seq (= nvl_seq >> 1) so a peer up to depth-1 iters ahead
             // writes a DIFFERENT slab — its overwrite can't clobber this iter's
@@ -1200,6 +1243,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 __threadfence();
                 dst_ptr[kRdmaMetaGenstampSlot] = static_cast<int>(nvl_seq);
             }
+            // [meta backpressure] record this write; the next overwrite of dst's
+            // slab waits for these readers (depth-1). Single writer per
+            // (channel,dst) per call; stream-ordered to the next dispatch kernel.
+            if (lane_id == 0)
+                env.dispatch_meta_writes[meta_writes_idx] += 1;
         }
         sync_rdma_sender_smem();
 
@@ -1477,11 +1525,23 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("StreamEP dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
-                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
+                    printf("StreamEP dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, cur_gen: %d, want: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, static_cast<int>(cur_gen), static_cast<int>(nvl_seq));
                     trap();
                 }
             }
+            // [meta backpressure] this (src=lane_id, dst_nvl) warp consumed src's
+            // meta this call: advance src's meta_head slot [my rdma_rank, dst_nvl]
+            // by +1. Fires for EVERY src every call (the gen-stamp gate above
+            // passes every call, incl. zero-token), so the sender's min-over-8
+            // wait never stalls. Mirrors the data-head coordinator AMO; local src
+            // (lane_id == rdma_rank) routes to a release.sys atomicAdd.
+            nvshmemi_ibgda_amo_nonfetch_add(
+                meta_head.buffer(rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank),
+                1,
+                translate_dst_rdma_rank<false>(lane_id, nvl_rank),
+                channel_id + num_channels,
+                lane_id == rdma_rank);
         }
         __syncwarp();
 
@@ -2244,6 +2304,15 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         kRdmaMetaRingDepth * kRdmaMetaSlabInts, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+    // [meta backpressure] One slot per (consumer_rdma_rank, dst_nvl). The meta
+    // sender waits until the slowest of dst's NUM_MAX_NVL_PEERS forwarder warps
+    // has advanced its slot to env.dispatch_meta_writes[channel, dst] before it
+    // reuses the slab; each forwarder warp AMO-adds +1 to its own slot right
+    // after its gen-stamp gate passes. Lives on this (sender) rank's symmetric
+    // region, advanced remotely by the consumer (mirrors rdma_channel_head).
+    // Declared identically in fwd dispatch_main + bwd dispatch_grads so both map
+    // to the same symmetric offset and share the counter in call order.
+    auto meta_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks * NUM_MAX_NVL_PEERS, channel_id, num_channels);
 
     void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
     int rs_wr_rank = 0, ws_rr_rank = 0;
@@ -2322,6 +2391,40 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         // keeps their gen-stamps distinct even at the same dispatch_seq.
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
+            // [meta backpressure] depth-1: do not reuse dst's meta slab until all
+            // NUM_MAX_NVL_PEERS forwarder warps on dst have read the prior
+            // occupant. meta_need = #prior writes to (channel,dst); meta_head[d]
+            // = #reads by dst's forwarder warp d (each AMO-adds +1 every call,
+            // incl. zero-token, so no slot stalls -> no deadlock). Spin until the
+            // slowest reader (min over the 8 slots) has caught up.
+            const int meta_writes_idx = channel_id * kNumRDMARanks + dst_rdma_rank;
+            const uint32_t meta_need = env.dispatch_meta_writes[meta_writes_idx];
+            uint32_t mh = 0;
+            {
+                auto bp_start = clock64();
+                while (true) {
+                    mh = lane_id < NUM_MAX_NVL_PEERS
+                        ? static_cast<uint32_t>(ld_acquire_sys_global(
+                              meta_head.buffer(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id)))
+                        : 0xffffffffu;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        mh = min(mh, __shfl_xor_sync(0xffffffffu, mh, off));
+                    // Run-ahead: slab (k % depth)'s prior occupant is write
+                    // k-depth, so we only need forwarders to have consumed write
+                    // (meta_need - (depth-1)), not fully caught up. depth-1
+                    // reduces to the original `mh >= meta_need`.
+                    if (static_cast<int32_t>(mh - meta_need + (kRdmaMetaRingDepth - 1)) >= 0)
+                        break;
+                    if (clock64() - bp_start >= NUM_TIMEOUT_CYCLES) {
+                        if (lane_id == 0)
+                            printf("StreamEP dispatch meta backpressure timeout, phase: %d, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, need: %u, mh: %u\n",
+                                   static_cast<int>(nvl_seq & 1), channel_id, rdma_rank, nvl_rank, dst_rdma_rank, meta_need, mh);
+                        trap();
+                    }
+                }
+            }
+            __syncwarp();
             // [genstamp ring] rotate through kRdmaMetaRingDepth slabs by
             // dispatch_seq (= nvl_seq >> 1) so a peer up to depth-1 iters ahead
             // writes a DIFFERENT slab — its overwrite can't clobber this iter's
@@ -2371,6 +2474,11 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 __threadfence();
                 dst_ptr[kRdmaMetaGenstampSlot] = static_cast<int>(nvl_seq);
             }
+            // [meta backpressure] record this write; the next overwrite of dst's
+            // slab waits for these readers (depth-1). Single writer per
+            // (channel,dst) per call; stream-ordered to the next dispatch kernel.
+            if (lane_id == 0)
+                env.dispatch_meta_writes[meta_writes_idx] += 1;
         }
         sync_rdma_sender_smem();
 
@@ -2598,11 +2706,23 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 }
 
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("StreamEP dispatch_grads forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
-                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
+                    printf("StreamEP dispatch_grads forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, cur_gen: %d, want: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, static_cast<int>(cur_gen), static_cast<int>(nvl_seq));
                     trap();
                 }
             }
+            // [meta backpressure] this (src=lane_id, dst_nvl) warp consumed src's
+            // meta this call: advance src's meta_head slot [my rdma_rank, dst_nvl]
+            // by +1. Fires for EVERY src every call (the gen-stamp gate above
+            // passes every call, incl. zero-token), so the sender's min-over-8
+            // wait never stalls. Mirrors the data-head coordinator AMO; local src
+            // (lane_id == rdma_rank) routes to a release.sys atomicAdd.
+            nvshmemi_ibgda_amo_nonfetch_add(
+                meta_head.buffer(rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank),
+                1,
+                translate_dst_rdma_rank<false>(lane_id, nvl_rank),
+                channel_id + num_channels,
+                lane_id == rdma_rank);
         }
         __syncwarp();
         sync_forwarder_smem();
