@@ -45,22 +45,6 @@ if __name__ == '__main__':
     include_dirs = ['csrc/']
     library_dirs = []
 
-    # Conda's CUDA toolkit ships core headers but not cusparse/cublas/cusolver/etc.
-    # Those headers only live in the pip-installed `nvidia/*` wheels that torch
-    # pulls in. Torch's CUDAContextLight.h includes <cusparse.h>, so we add
-    # every `nvidia/<lib>/include` dir to `include_dirs`. Doing this here (vs.
-    # via CPATH in a build script) keeps the build self-contained — both
-    # `pip install -e .` (e.g. driven by pixi) and `python setup.py
-    # build_ext --inplace` work without an env-var preamble.
-    try:
-        import nvidia
-        nvidia_root = Path(nvidia.__file__).resolve().parent
-        for inc in sorted(nvidia_root.glob('*/include')):
-            if inc.is_dir():
-                include_dirs.append(str(inc))
-    except ModuleNotFoundError:
-        pass
-
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
 
