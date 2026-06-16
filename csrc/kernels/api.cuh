@@ -348,9 +348,9 @@ __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
 
 // Total bytes occupied by dispatch's RDMA SymBuffer chain on
 // `env.rdma_buffer_ptr`: `rdma_channel_data` (decoupled, send+recv) +
-// `rdma_channel_head` + `rdma_channel_tail` (non-decoupled). The design-C
-// routing header rides `rdma_channel_data` (no separate meta channel, no
-// L2-line align). Used by the host RDMA-buffer-size hint AND by
+// `rdma_channel_head` + `rdma_channel_tail` (non-decoupled). Routing header
+// rides `rdma_channel_data`; no separate meta region. Used by the host
+// RDMA-buffer-size hint AND by
 // `combine_main_kernel` to offset its own RDMA sub-buffer base past dispatch's
 // region. Dispatch's per-token stride includes `topk_idx` (`num_topk` ints)
 // while combine's omits it; without an offset, combine carves from

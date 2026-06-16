@@ -29,12 +29,9 @@ struct SourceMeta {
     // counter announces slot ARRIVAL, but data-vs-counter write VISIBILITY at
     // the target is not guaranteed by the wire (RC orders NIC execution, not
     // PCIe/NVLink placement). The forwarder accepts a slot only once its tag
-    // matches the position it expects — mirroring the NVL rings' nvl_pack
-    // seq-tag design, but occupancy-granular: a position tag (unlike an iter
-    // tag) also rejects a stale PREVIOUS-WRAP occupant within the same iter.
-    // False-accept horizon: 2^16 positions = ring_size * (2^16/ring) wraps;
-    // credit flow control bounds slot staleness to <~2 iters, so unreachable.
-    // Bits 0..7 remain the NVL mask (accessor below unaffected); 8..15 reserved.
+    // matches the position it expects. False-accept horizon: 2^16 positions =
+    // ring_size * (2^16/ring) wraps; credit flow control bounds slot staleness
+    // to <~2 iters, so unreachable. Bits 0..7 remain the NVL mask.
     __device__ __forceinline__ SourceMeta(int rdma_rank, const bool* is_token_in_nvl_ranks, int ring_pos_tag) {
         src_rdma_rank = rdma_rank;
         is_token_in_nvl_rank_bits = is_token_in_nvl_ranks[0];
@@ -1044,12 +1041,9 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
         env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
     // [data-ring header] The per-(channel, src_rdma) routing header rides
-    // rdma_channel_data as ring position `baseline` (design C). The old separate
-    // RDMA metadata channel (its slab ring + backpressure ring + arrival
-    // counter + the 128 B L2-line align before it) is gone. The SymBuffer chain
-    // is now data -> head -> tail, matching `get_dispatch_rdma_region_bytes`
-    // (which sets combine's RDMA base offset). data ends int4-aligned, so the
-    // uint64 head/tail need no extra alignment.
+    // rdma_channel_data at ring position `baseline`. The SymBuffer chain is
+    // data -> head -> tail, matching `get_dispatch_rdma_region_bytes`; data
+    // ends int4-aligned, so the uint64 head/tail need no extra alignment.
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
@@ -1155,19 +1149,12 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
         // Iterate over tokens and copy into buffer.
         //
-        // The RDMA head slot accumulates across all iters (peer's forwarder
-        // coordinator publishes deltas via amo_nonfetch_add). The iter-start
-        // baseline comes from the persistent reader_prev_head array, which
-        // accumulates EXACT per-iter sent counts (prev + this iter's total at
-        // sender exit). The coordinator's end-of-iter residual flush
-        // guarantees cumulative credits == cumulative sent at every iter
-        // boundary, so this baseline equals the head's eventual settled
-        // value. A LIVE read here is NOT safe: it races in-flight PRIOR-iter
-        // credit AMOs — a late credit lowers the entry read, then lands
-        // mid-iter and inflates the relative head, letting the sender
-        // overwrite un-drained ring slots (corruption). With the exact
-        // baseline, in-flight stragglers only make the relative head
-        // temporarily NEGATIVE -> over-stall, never over-write.
+        // The iter-start baseline comes from the persistent reader_prev_head
+        // array (EXACT cumulative per-iter sent counts), not a LIVE read of the
+        // head: a live read races in-flight PRIOR-iter credit AMOs that can
+        // inflate the relative head and let the sender overwrite un-drained
+        // slots. With the exact baseline, in-flight stragglers only make the
+        // relative head temporarily NEGATIVE -> over-stall, never over-write.
         int64_t token_idx;
         uint32_t prev_rdma_channel_head_at_entry = lane_id < kNumRDMARanks
             ? env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
@@ -1394,7 +1381,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             // word (a token's tag offset) = nvl_seq & 0xffff. nvl_seq is >= 2
             // (1-based dispatch seq << 1) so the tag is never 0 — the forwarder's
             // tag-spin can't false-match zeroed/stale memory before the header
-            // lands. Independent of the staged ints, so no ordering vs them.
+            // lands.
             if (lane_id == 0)
                 *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(hdr_ptr) + hidden_bytes) =
                     static_cast<uint64_t>(nvl_seq & 0xffffu) << 48;
@@ -1514,18 +1501,12 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             : 0;
 
         // [data-ring header] Arrival gate + data-visibility fence, mirroring the
-        // token path exactly:
-        //   1. Spin on the data-ring tail AMO to cover the header position
-        //      (>= 1). The header is the iter's first ring position (bumped
-        //      before the token chunks), so >= 1 means it landed — the same AMO
-        //      the token drain reads, used here purely as the arrival signal.
-        //   2. Spin on the slot's generation tag (== nvl_seq & 0xffff): the
-        //      identical slot-tag spin the token loop uses below, fencing the
-        //      put data against the tail AMO (the put can lag the AMO, §8.18).
-        //      nvl_seq is non-zero so the spin can't false-match zeroed/stale
-        //      memory before the header lands. Then read the 18 routing ints
-        //      (tag visible ⇒ slot visible — the same trust the token TMA copy
-        //      relies on). No checksum, no meta channel, no side-band signal.
+        // token path: spin on the data-ring tail AMO to cover the header
+        // position (>= 1 means it landed), then spin on the slot's generation
+        // tag (== nvl_seq & 0xffff) to fence the put data against the tail AMO,
+        // since the put can lag the AMO. nvl_seq is non-zero so the spin can't
+        // false-match zeroed/stale memory. Tag visible ⇒ slot visible, so the
+        // 18 routing ints can then be read directly.
         if (lane_id < kNumRDMARanks) {
             auto hdr_buf = rdma_channel_data.recv_buffer(lane_id)
                            + static_cast<size_t>(ring_phase_base) * num_bytes_per_token;
@@ -1575,17 +1556,14 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         sync_forwarder_smem();
 
         // Authoritative per-lane recv count for this iter (from the header).
-        // Used by the exact reader_prev_tail writeback at exit (cross-gen
-        // rebase race fix).
+        // Used by the exact reader_prev_tail writeback at exit.
         const int rdma_recv_count_this_iter = num_tokens_to_recv_from_rdma;
 
-        // [data-ring header] Credit the header slot up front: it is a freed ring
-        // position the moment this gate read it, but a zero-token src never
-        // enters the drain loop below (which is what otherwise publishes credit
-        // via forward_channel_head). Seed every src column to 1 so the
-        // forwarder-coordinator advances rdma_channel_head by the header even
-        // for empty links; the drain loop raises N>0 columns to src_rdma_tail+1.
-        // After the barrier above, so it never races the coordinator's zero-init.
+        // [data-ring header] Credit the header slot up front: seed every src
+        // column to 1 so the coordinator advances rdma_channel_head by the
+        // header even for zero-token srcs that never enter the drain loop; the
+        // drain loop raises N>0 columns to src_rdma_tail+1. After the barrier
+        // above, so it never races the coordinator's zero-init.
         if (lane_id < kNumRDMARanks)
             forward_channel_head[dst_nvl_rank][lane_id] = 1;
         __syncwarp();
@@ -1777,13 +1755,10 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
         // Writeback the EXACT cumulative tail (prev_at_entry + this iter's
         // authoritative count) to the persistent array. A live
-        // ld(rdma_channel_tail) here races in-flight NEXT-iter tail AMOs
-        // (fire-and-forget): folding early next-iter tokens into the next
-        // kernel's baseline misaligns its drain window -> token
-        // misattribution (silent corruption) and/or under-counted arrivals
-        // (drain wedge). All forwarder warps compute the same exact value;
-        // atomicMax keeps monotonicity, stream-ordered with the next
-        // kernel's read.
+        // ld(rdma_channel_tail) here races in-flight NEXT-iter tail AMOs and
+        // would misalign the next kernel's drain window. All forwarder warps
+        // compute the same exact value; atomicMax keeps monotonicity,
+        // stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id,
@@ -2449,12 +2424,9 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
     auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
         env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
     // [data-ring header] The per-(channel, src_rdma) routing header rides
-    // rdma_channel_data as ring position `baseline` (design C). The old separate
-    // RDMA metadata channel (its slab ring + backpressure ring + arrival
-    // counter + the 128 B L2-line align before it) is gone. The SymBuffer chain
-    // is now data -> head -> tail, matching `get_dispatch_rdma_region_bytes`
-    // (which sets combine's RDMA base offset). data ends int4-aligned, so the
-    // uint64 head/tail need no extra alignment.
+    // rdma_channel_data at ring position `baseline`. The SymBuffer chain is
+    // data -> head -> tail, matching `get_dispatch_rdma_region_bytes`; data
+    // ends int4-aligned, so the uint64 head/tail need no extra alignment.
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
 
@@ -2888,8 +2860,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         sync_forwarder_smem();
 
         // Authoritative per-lane recv count for this iter (from the meta).
-        // Used by the exact reader_prev_tail writeback at exit (cross-gen
-        // rebase race fix).
+        // Used by the exact reader_prev_tail writeback at exit.
         const int rdma_recv_count_this_iter = num_tokens_to_recv_from_rdma;
 
         // [data-ring header] Credit the header slot up front (seed 1) so a
@@ -3067,13 +3038,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
         // Writeback the EXACT cumulative tail (prev_at_entry + this iter's
         // authoritative count) to the persistent array. A live
-        // ld(rdma_channel_tail) here races in-flight NEXT-iter tail AMOs
-        // (fire-and-forget): folding early next-iter tokens into the next
-        // kernel's baseline misaligns its drain window -> token
-        // misattribution (silent corruption) and/or under-counted arrivals
-        // (drain wedge). All forwarder warps compute the same exact value;
-        // atomicMax keeps monotonicity, stream-ordered with the next
-        // kernel's read.
+        // ld(rdma_channel_tail) here races in-flight NEXT-iter tail AMOs and
+        // would misalign the next kernel's drain window. All forwarder warps
+        // compute the same exact value; atomicMax keeps monotonicity,
+        // stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id,

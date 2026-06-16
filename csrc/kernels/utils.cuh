@@ -53,8 +53,8 @@ __forceinline__ __device__ int nvl_unpack_value(uint64_t packed) {
 // and dead downstream, so the forwarder rewrites them in the staged smem
 // copy before the NVL TMA store. The NVL receiver accepts a slot only when
 // its tag matches the (seq, position) it is consuming — the acceptance
-// pattern that closed the RDMA-ring cross-gen races (hang doc §8.10),
-// applied to the NVL hop's per-gen slot restart. False-accept horizon: a
+// pattern that closed the RDMA-ring cross-gen races, applied to the NVL
+// hop's per-gen slot restart. False-accept horizon: a
 // stale occupancy passes only if seq matches mod 128 AND position matches
 // mod 512; within a gen, re-occupancies of a slot differ by the ring size
 // (288 ≢ 0 mod 512 for ≤16 wraps); across gens the seq differs.

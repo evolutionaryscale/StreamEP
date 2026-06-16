@@ -11,8 +11,8 @@ therefore match the non-checkpointed path within that tolerance.
 What "match" means here has two components: (1) the streaming bwd accumulates
 ``dL_dweight`` (fp32 atomic-add), ``dL_dx_per_r`` (bf16x2 atomic-add) and the
 fwd kernel-Y scatter in non-deterministic order, so two runs with the SAME flag
-already differ at the floating-point-reassociation level (`markdowns/design.md`
-§Determinism: pool *placement* is deterministic, atomic-add *order* is not);
+already differ at the floating-point-reassociation level (pool *placement* is
+deterministic, atomic-add *order* is not);
 (2) the recompute's different-kernel GEMM adds a bf16-accumulation difference on
 top, which scales with tensor magnitude. So a bit-exact ``torch.equal`` would
 fail even off-vs-off. We measure the off-vs-off run-to-run noise floor, allow a
@@ -20,8 +20,8 @@ bf16-relative term, and assert the off-vs-ON difference is within that bound —
 a real recompute bug (wrong preact) blows past it by orders of magnitude.
 
 The recompute lives entirely in the compute kernels, which are identical
-intranode vs internode (`design.md` §Internode-specific notes), so 1-node
-coverage exercises the full feature. Driver convention matches the rest of
+intranode vs internode, so 1-node coverage exercises the full feature. Driver
+convention matches the rest of
 the streaming tests:
 
     torchrun --nproc_per_node=8 StreamEP/tests/test_activation_checkpoint.py

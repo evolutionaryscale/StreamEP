@@ -210,10 +210,8 @@ def main():
         help="Pipeline-stress mode: skip the eager reference and gradient "
         "comparison; run the streaming stack + backward only, asserting "
         "finiteness. Lifts the n_layers<=10 reference cap — use for deep "
-        "stacks reproducing the benchmark's per-step structure "
-        "(markdowns/internode_hang_state_2026-06-10.md §8.13: the bench "
-        "wedge needs the per-layer join + compute/signal stages this "
-        "harness has and the pure-comm stress test lacks).",
+        "stacks reproducing the benchmark's per-step structure (per-layer "
+        "join + compute/signal stages that the pure-comm stress test lacks).",
     )
     p.add_argument(
         "--side_ar_mb",
@@ -231,7 +229,7 @@ def main():
         default=None,
         help="Memory-stress: allocate ballast after buffer creation so only "
         "~this many GB remain free (mirrors the bench's near-full-memory "
-        "allocator behavior, one of the §8.13 laggard-gate suspects).",
+        "allocator behavior).",
     )
     p.add_argument(
         "--vary_routing",
@@ -260,7 +258,7 @@ def main():
         help="With --leave_free_gb: global rank 0 ballasts this many EXTRA "
         "GB, so it alone OOMs (or allocator-thrashes) mid-burst while every "
         "peer is healthy — probes whether a single-rank OOM tears down "
-        "cleanly or forms the §8.13 launch partition (peers parked in comm "
+        "cleanly or forms a launch partition (peers parked in comm "
         "kernels against the dead/stalled rank).",
     )
     args = p.parse_args()

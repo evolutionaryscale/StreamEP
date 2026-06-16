@@ -751,15 +751,12 @@ class StreamMoEFunc(torch.autograd.Function):
                 preact_a = torch.empty(
                     total_tiles, tile_m, two_I, dtype=dtype, device=device
                 )
-                # Recompute preact = pool @ w1 with a plain grouped-M GEMM (the
-                # same quack `gemm` the dW path uses): pool is fully materialized
-                # from the fwd save, so there is no streaming to exploit — a
-                # streaming kernel's tile-scheduler/arrival-spin and its
-                # mandatory SwiGLU+postact output would be pure overhead here.
-                # cu_seqlens_m = the per-expert padded token offsets
-                # (identical to dW's cu_seqlens_k); the per-expert weight w1[e]
-                # is selected by the M-group index. Padding rows are computed
-                # (each M-row is independent) and masked downstream by
+                # Recompute preact = pool @ w1 with a plain grouped-M GEMM (pool
+                # is fully materialized from the fwd save, so a streaming kernel
+                # would be pure overhead). cu_seqlens_m = the per-expert padded
+                # token offsets (identical to dW's cu_seqlens_k); the per-expert
+                # weight w1[e] is selected by the M-group index. Padding rows are
+                # computed (each M-row is independent) and masked downstream by
                 # kernel_y_bwd's mPaddingMask, exactly as the fwd kernel-A path.
                 # Not bit-identical to fwd's preact (different tiling) but same
                 # math within the bf16 recompute-noise floor checkpointing

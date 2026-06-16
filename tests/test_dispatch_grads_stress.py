@@ -59,7 +59,7 @@ from utils import cleanup_dist
 #      stream_ep.cpp:1709), and
 #   2. per-thread kernel wait-channel + state from /proc (privilege-free), and
 #   3. a best-effort native stack (py-spy --native / gdb; needs ptrace perms).
-# The DISCRIMINATOR (see markdowns/internode_dispatch_hang.md §3): is the main
+# The DISCRIMINATOR: is the main
 # thread parked INSIDE `buf.dispatch_grads(...)` -> the launch never happened
 # because the host is stuck in torch::zeros/cudaMalloc (HOST launch-stall), or
 # parked at `torch.cuda.synchronize()` / `dist.barrier()` with every
@@ -206,17 +206,16 @@ def main():
     p.add_argument("--tile_m", type=int, default=128)
     p.add_argument("--num_sms", type=int, default=None)
     p.add_argument("--slack", action="store_true",
-                   help="Insert a cross-rank barrier after each dispatch_grads. "
-                        "Tests the single-slot rdma_channel_meta race: if --slack "
-                        "makes the hang vanish, the bug is iter N+1's remote meta "
-                        "put overwriting the slot before iter N's forwarder reads it.")
+                   help="Insert a cross-rank barrier after each dispatch_grads, "
+                        "adding per-iter slack so iters can't run back-to-back. "
+                        "If --slack makes the hang vanish, the bug needs "
+                        "consecutive iters overlapping in the RDMA ring.")
     p.add_argument("--leave_free_gb", type=float, default=None,
                    help="Memory-stress: allocate ballast so only ~this many GB "
                         "remain free, pushing the caching allocator near capacity. "
                         "The dropless per-dispatch pool (size varies every iter via "
                         "random_routing) then forces cudaMalloc/cudaFree mid-burst "
-                        "-- the suspected stall that lets a peer lap the "
-                        "kRdmaMetaRingDepth ring and clobber a meta slab.")
+                        "-- the suspected stall that lets a peer lap the ring.")
     p.add_argument("--frag", action="store_true",
                    help="With --leave_free_gb: also fragment the remaining headroom "
                         "(alloc varied blocks, free alternating -> cached holes, NO "
@@ -237,31 +236,17 @@ def main():
     p.add_argument("--lag_asym", action="store_true",
                    help="Apply --lag_ms/--lag_once_s/--side_load_mm on NODE-0 "
                         "ranks only (rank < 8) instead of one rank per node "
-                        "symmetrically. A symmetric lag cannot park anyone at "
-                        "the RDMA meta-wait: the only ranks that consume each "
-                        "other's RDMA metas are the same-nvl-position lane "
-                        "peers — the lagged set itself — so they sleep and "
-                        "wake together and the park lands on same-node NVL "
-                        "prefix waits instead (hang doc §8.13 run 2's 'zero "
-                        "meta probes'). An ASYMMETRIC lag makes the un-lagged "
-                        "lane peer spin at the RDMA meta-wait for the full "
-                        "lag BEFORE the put lands — the §8.24 reader-side "
-                        "visibility-wedge precondition (poll-installed stale "
-                        "L2 line vs inbound RDMA write).")
+                        "symmetrically, so an un-lagged lane peer spins at the "
+                        "RDMA wait for the full lag before the put lands.")
     p.add_argument("--lag_fwd", action="store_true",
                    help="With --lag_ms: also lag the forward dispatch calls "
                         "(default: backward dispatch_grads burst only).")
     p.add_argument("--lag_once_s", type=float, default=0.0,
-                   help="Launch-partition repro (the bench wedge shape, doc "
-                        "§8.12): ONE long GPU-side spin (this many seconds, keep "
-                        "below the ~100 s GPU watchdog) before the mid-burst "
-                        "dispatch_grads (bwd layer num_layers//2) of every step, "
-                        "on the --lag_nvl_ranks ranks. The un-lagged ranks run a "
-                        "full generation ahead and park (expect 'stuck nvl-room' "
-                        "used~ring, head 0 at >10 s); when the laggard arrives "
-                        "the run either recovers (PASS => parking is benign, the "
-                        "wedge needs the pipeline's gating cycle) or hangs "
-                        "(=> in-kernel cross-gen NVL bug, repro'd). 0 = off.")
+                   help="Launch-partition repro: ONE long GPU-side spin (this "
+                        "many seconds, keep below the ~100 s GPU watchdog) before "
+                        "the mid-burst dispatch_grads (bwd layer num_layers//2) of "
+                        "every step, on the --lag_nvl_ranks ranks, so the un-lagged "
+                        "ranks run a full generation ahead and park. 0 = off.")
     p.add_argument("--side_load_mm", type=int, default=0,
                    help="Mid-kernel SM-contention repro: enqueue this many "
                         "8192^2 bf16 matmuls on a SIDE stream of the "
@@ -280,10 +265,8 @@ def main():
     p.add_argument("--side_load_all", action="store_true",
                    help="Apply --side_load_mm/--side_load_once_mm on ALL "
                         "ranks (bench-like: every GPU computes), not just "
-                        "the --lag_nvl_ranks/--lag_asym lag set. The rank "
-                        "that matters for the §8.24 visibility question is "
-                        "the PARKED READER (the un-lagged lane peer), which "
-                        "the lag-set gating excludes by construction.")
+                        "the --lag_nvl_ranks/--lag_asym lag set, so the parked "
+                        "reader (the un-lagged lane peer) also runs under load.")
     p.add_argument("--side_ar_once_mb", type=int, default=0,
                    help="With --lag_once_s: enqueue a burst of NCCL "
                         "all-reduces (this many MB each, x --side_ar_once_n) "
