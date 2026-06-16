@@ -204,12 +204,78 @@ def main():
         "layer × N layers) is the limiting factor on an 80 GB H100, not "
         "the streaming path.",
     )
-    args = p.parse_args()
-    assert 1 <= args.n_layers <= 10, (
-        f"--n_layers={args.n_layers}: must be in [1, 10]. The cap is the "
-        "eager-reference autograd-graph size at production seq_len, not a "
-        "streaming-pipeline limit (see arg help)."
+    p.add_argument(
+        "--no_ref",
+        action="store_true",
+        help="Pipeline-stress mode: skip the eager reference and gradient "
+        "comparison; run the streaming stack + backward only, asserting "
+        "finiteness. Lifts the n_layers<=10 reference cap — use for deep "
+        "stacks reproducing the benchmark's per-step structure "
+        "(markdowns/internode_hang_state_2026-06-10.md §8.13: the bench "
+        "wedge needs the per-layer join + compute/signal stages this "
+        "harness has and the pure-comm stress test lacks).",
     )
+    p.add_argument(
+        "--side_ar_mb",
+        type=int,
+        default=0,
+        help="FSDP stand-in (pipeline-stress): register a backward hook on "
+        "each layer's output that all-reduces this many MB over NCCL, so a "
+        "collective runs between consecutive layers' backward stages — "
+        "emulating the bench's inter-layer FSDP reduce-scatters (SM + "
+        "dependency coupling with the comm kernels). 0 = off.",
+    )
+    p.add_argument(
+        "--leave_free_gb",
+        type=float,
+        default=None,
+        help="Memory-stress: allocate ballast after buffer creation so only "
+        "~this many GB remain free (mirrors the bench's near-full-memory "
+        "allocator behavior, one of the §8.13 laggard-gate suspects).",
+    )
+    p.add_argument(
+        "--vary_routing",
+        action="store_true",
+        help="Pipeline-stress (--no_ref only): redraw RANDOM topk_idx / "
+        "is_token_in_rank per layer per iter (stress-test style), like the "
+        "bench's per-forward routing. The default harness routing is a "
+        "deterministic round-robin — identical num_recv / pool sizes every "
+        "gen and zero cross-rank load skew. Variable routing restores the "
+        "bench's per-gen variable-size allocations (allocator churn) and "
+        "per-rank load imbalance (organic launch skew).",
+    )
+    p.add_argument(
+        "--fixed_rand_routing",
+        action="store_true",
+        help="Control for --vary_routing: ONE random routing draw (same "
+        "generator/seed as --vary_routing's first draw), reused for every "
+        "layer and iter. Realistic traffic volume and per-pair imbalance, "
+        "but ZERO per-gen variance — discriminates 'variance is the "
+        "trigger' from 'realistic volume/density is the trigger'.",
+    )
+    p.add_argument(
+        "--rank0_extra_gb",
+        type=float,
+        default=0.0,
+        help="With --leave_free_gb: global rank 0 ballasts this many EXTRA "
+        "GB, so it alone OOMs (or allocator-thrashes) mid-burst while every "
+        "peer is healthy — probes whether a single-rank OOM tears down "
+        "cleanly or forms the §8.13 launch partition (peers parked in comm "
+        "kernels against the dead/stalled rank).",
+    )
+    args = p.parse_args()
+    assert not (args.vary_routing and not args.no_ref), (
+        "--vary_routing requires --no_ref (the eager reference assumes one "
+        "shared routing draw)"
+    )
+    if args.no_ref:
+        assert 1 <= args.n_layers <= 64, f"--n_layers={args.n_layers}: [1, 64]"
+    else:
+        assert 1 <= args.n_layers <= 10, (
+            f"--n_layers={args.n_layers}: must be in [1, 10]. The cap is the "
+            "eager-reference autograd-graph size at production seq_len, not a "
+            "streaming-pipeline limit (see arg help; --no_ref lifts it)."
+        )
 
     # Scale (atol, rtol) by sqrt(n_layers) to absorb bf16 chain noise
     # compounding through the depth-N stack. See module docstring.
@@ -280,34 +346,97 @@ def main():
         torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1
     ).contiguous()
 
-    x_ref = x.detach().clone().requires_grad_(True)
-    topk_w_ref = topk_weights.detach().clone().requires_grad_(True)
-    w1_full_ref = w1_full.detach().clone().requires_grad_(True)
-    w2_full_ref = w2_full.detach().clone().requires_grad_(True)
-    # Stack the reference N times, mirroring the streaming forward's
-    # shared-weights / shared-routing chain. Each call reads / writes the
-    # same leaves so dL/dW1_full and dL/dW2_full accumulate across the
-    # stack — same shape as the streaming path's grads.
-    h_ref = x_ref
-    for _ in range(args.n_layers):
-        h_ref = torch_reference_full_moe(
-            h_ref, topk_idx, topk_w_ref, w1_full_ref, w2_full_ref
+    if args.no_ref:
+        # Pipeline-stress mode: no reference, no comparison (see --no_ref).
+        out_ref = dL_dx_ref = dL_dtopk_w_ref = None
+        dL_dW1_local_ref = dL_dW2_local_ref = None
+    else:
+        x_ref = x.detach().clone().requires_grad_(True)
+        topk_w_ref = topk_weights.detach().clone().requires_grad_(True)
+        w1_full_ref = w1_full.detach().clone().requires_grad_(True)
+        w2_full_ref = w2_full.detach().clone().requires_grad_(True)
+        # Stack the reference N times, mirroring the streaming forward's
+        # shared-weights / shared-routing chain. Each call reads / writes the
+        # same leaves so dL/dW1_full and dL/dW2_full accumulate across the
+        # stack — same shape as the streaming path's grads.
+        h_ref = x_ref
+        for _ in range(args.n_layers):
+            h_ref = torch_reference_full_moe(
+                h_ref, topk_idx, topk_w_ref, w1_full_ref, w2_full_ref
+            )
+        out_ref = h_ref
+        dL_dx_ref, dL_dtopk_w_ref, dL_dW1_full_ref, dL_dW2_full_ref = torch.autograd.grad(
+            out_ref, [x_ref, topk_w_ref, w1_full_ref, w2_full_ref], grad_outputs=grad_out
         )
-    out_ref = h_ref
-    dL_dx_ref, dL_dtopk_w_ref, dL_dW1_full_ref, dL_dW2_full_ref = torch.autograd.grad(
-        out_ref, [x_ref, topk_w_ref, w1_full_ref, w2_full_ref], grad_outputs=grad_out
-    )
-    out_ref = out_ref.detach()
-    # `.clone()` (not `.contiguous()` — contiguous on an already-contiguous
-    # slice returns the SAME view, keeping the global tensor's storage pinned)
-    # so the (world_size - 1) / world_size of the global dW gradients can be
-    # released after we cache the per-rank slabs.
-    dL_dW1_local_ref = dL_dW1_full_ref[rank * local_E : (rank + 1) * local_E].clone()
-    dL_dW2_local_ref = dL_dW2_full_ref[rank * local_E : (rank + 1) * local_E].clone()
-    del dL_dW1_full_ref, dL_dW2_full_ref
-    del x_ref, topk_w_ref, w1_full_ref, w2_full_ref
+        out_ref = out_ref.detach()
+        # `.clone()` (not `.contiguous()` — contiguous on an already-contiguous
+        # slice returns the SAME view, keeping the global tensor's storage pinned)
+        # so the (world_size - 1) / world_size of the global dW gradients can be
+        # released after we cache the per-rank slabs.
+        dL_dW1_local_ref = dL_dW1_full_ref[rank * local_E : (rank + 1) * local_E].clone()
+        dL_dW2_local_ref = dL_dW2_full_ref[rank * local_E : (rank + 1) * local_E].clone()
+        del dL_dW1_full_ref, dL_dW2_full_ref
+        del x_ref, topk_w_ref, w1_full_ref, w2_full_ref
 
     streams = make_streams()
+
+    # Memory-stress ballast (see --leave_free_gb): held alive for the whole
+    # run so every per-iter allocation works against near-full memory.
+    ballast = None
+    if args.leave_free_gb is not None:
+        torch.cuda.synchronize()
+        GiB = 1 << 30
+        free0, total0 = torch.cuda.mem_get_info()
+        consume = max(0, free0 - int(args.leave_free_gb * GiB))
+        if rank == 0 and args.rank0_extra_gb > 0:
+            consume = min(free0, consume + int(args.rank0_extra_gb * GiB))
+        if consume > 0:
+            ballast = torch.empty(consume, dtype=torch.uint8, device=device)
+        free1, _ = torch.cuda.mem_get_info()
+        rank_zero_print(
+            f"[validate] ballast: leave_free_gb={args.leave_free_gb} "
+            f"free {free0 / GiB:.1f} -> {free1 / GiB:.1f} of {total0 / GiB:.1f} GB"
+        )
+
+    # Variable routing (see --vary_routing): per-(iter, layer) random draws,
+    # seeded per rank like the stress test. topk_weights stays the shared
+    # leaf (its VALUES need not vary for allocator/skew stress; only the
+    # indices drive num_recv / pool sizes / per-rank load).
+    route_gen = torch.Generator(device=device).manual_seed(7000 + rank)
+
+    def draw_routing():
+        logits = torch.randn(
+            args.seq_len, NUM_EXPERTS, device=device, generator=route_gen
+        )
+        idx = torch.topk(logits, TOPK, dim=-1).indices.to(torch.int64).contiguous()
+        r_idx = idx // local_E
+        in_rank = torch.zeros(
+            (args.seq_len, world_size), dtype=torch.bool, device=device
+        )
+        for r in range(world_size):
+            in_rank[:, r] = (r_idx == r).any(dim=-1)
+        return idx, in_rank
+
+    assert not (args.fixed_rand_routing and args.vary_routing), (
+        "--fixed_rand_routing and --vary_routing are mutually exclusive"
+    )
+    if args.fixed_rand_routing:
+        topk_idx, is_token_in_rank = draw_routing()
+
+    # FSDP stand-in (see --side_ar_mb): pre-init the NCCL communicator now so
+    # the first in-backward all_reduce isn't a communicator-bootstrap sync.
+    ar_buf = None
+    if args.side_ar_mb > 0:
+        ar_buf = torch.ones(
+            args.side_ar_mb * (1 << 20) // 2, dtype=torch.bfloat16, device=device
+        )
+        torch_dist.all_reduce(ar_buf)
+        torch.cuda.synchronize()
+
+    def _side_ar_hook(grad: torch.Tensor) -> torch.Tensor:
+        torch_dist.all_reduce(ar_buf)
+        return grad
+
     barrier(group)
 
     # Warmup (no validation). Detach + clone per warmup iter so the warmup's
@@ -319,12 +448,15 @@ def main():
         w2_warm = w2_local.detach().clone().requires_grad_(True)
         h_warm = x_warm
         for _ in range(args.n_layers):
+            layer_idx, layer_in_rank = (
+                draw_routing() if args.vary_routing else (topk_idx, is_token_in_rank)
+            )
             h_warm = stream_moe_func(
                 buffer,
                 h_warm,
-                topk_idx,
+                layer_idx,
                 topk_w_warm,
-                is_token_in_rank,
+                layer_in_rank,
                 w1_warm,
                 w2_warm,
                 streams=streams,
@@ -350,17 +482,22 @@ def main():
 
         h = x_iter
         for _ in range(args.n_layers):
+            layer_idx, layer_in_rank = (
+                draw_routing() if args.vary_routing else (topk_idx, is_token_in_rank)
+            )
             h = stream_moe_func(
                 buffer,
                 h,
-                topk_idx,
+                layer_idx,
                 topk_w_iter,
-                is_token_in_rank,
+                layer_in_rank,
                 w1_iter,
                 w2_iter,
                 streams=streams,
                 num_experts=NUM_EXPERTS,
             )
+            if args.side_ar_mb > 0:
+                h.register_hook(_side_ar_hook)
         out_actual = h
         dL_dx_actual, dL_dtopk_w_actual, dL_dW1_local_actual, dL_dW2_local_actual = (
             torch.autograd.grad(
@@ -370,6 +507,31 @@ def main():
             )
         )
         torch.cuda.synchronize()
+
+        if args.no_ref:
+            # Pipeline-stress mode: liveness is the assertion (reaching here
+            # means the 34-layer fwd + bwd joined); check finiteness only.
+            ok = bool(
+                torch.isfinite(out_actual).all().item()
+                and torch.isfinite(dL_dx_actual).all().item()
+                and torch.isfinite(dL_dW1_local_actual).all().item()
+                and torch.isfinite(dL_dW2_local_actual).all().item()
+            )
+            ok_t = torch.tensor([1 if ok else 0], device=device, dtype=torch.int32)
+            torch_dist.all_reduce(ok_t, op=torch_dist.ReduceOp.MIN)
+            all_ok = ok_t.item() == 1
+            free_b, total_b = torch.cuda.mem_get_info()
+            rank_zero_print(
+                f"[validate] iter {step:3d} seq={seq}: "
+                f"{'PASS' if all_ok else 'FAIL (non-finite)'} (no_ref) | "
+                f"alloc={torch.cuda.memory_allocated() / (1 << 30):.1f} "
+                f"peak={torch.cuda.max_memory_allocated() / (1 << 30):.1f} "
+                f"reserved={torch.cuda.memory_reserved() / (1 << 30):.1f} "
+                f"free={free_b / (1 << 30):.1f} of {total_b / (1 << 30):.1f} GB"
+            )
+            if not all_ok:
+                fail_count += 1
+            continue
 
         # Compare every (actual, ref) pair under per-tensor (atol, rtol).
         # Fail iff BOTH absolute and relative diff thresholds are violated.

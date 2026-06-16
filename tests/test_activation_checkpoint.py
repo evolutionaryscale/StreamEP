@@ -1,22 +1,23 @@
 """Gradient-equivalence test for the ``activation_checkpoint`` flag.
 
 ``stream_moe_func(..., activation_checkpoint=True)`` skips saving ``preact_a``
-in forward and recomputes it from ``pool @ w1_local`` in backward (the
-kernel-A GEMM, re-run with an immediate-claim scheduler). The recompute uses
-the SAME kernel and the SAME saved inputs (pool, w1) as forward, so the
-reconstructed ``preact_a`` is bit-identical to the value forward would have
-stored — hence every downstream gradient must match the non-checkpointed
-path.
+in forward and recomputes it from ``pool @ w1_local`` in backward with a plain
+grouped-M GEMM (``quack.gemm`` with ``cu_seqlens_m``). Because that is a
+DIFFERENT kernel than forward's gated kernel A, the reconstructed ``preact_a``
+matches forward's within bf16 GEMM-accumulation tolerance (not bit-identical) —
+same math, different tile/accumulation order. Every downstream gradient must
+therefore match the non-checkpointed path within that tolerance.
 
-What "match" means here: the streaming bwd accumulates ``dL_dweight`` (fp32
-atomic-add), ``dL_dx_per_r`` (bf16x2 atomic-add) and the fwd kernel-Y scatter
-in non-deterministic order, so two runs with the SAME flag already differ at
-the floating-point-reassociation level (`markdowns/design.md` §Determinism:
-pool *placement* is deterministic, atomic-add *order* is not). A bit-exact
-``torch.equal`` would therefore fail even off-vs-off. So we measure the
-off-vs-off run-to-run noise floor and assert the off-vs-ON difference is
-within that same floor — a real recompute bug (wrong preact) would blow the
-difference far past the atomic-reassociation noise.
+What "match" means here has two components: (1) the streaming bwd accumulates
+``dL_dweight`` (fp32 atomic-add), ``dL_dx_per_r`` (bf16x2 atomic-add) and the
+fwd kernel-Y scatter in non-deterministic order, so two runs with the SAME flag
+already differ at the floating-point-reassociation level (`markdowns/design.md`
+§Determinism: pool *placement* is deterministic, atomic-add *order* is not);
+(2) the recompute's different-kernel GEMM adds a bf16-accumulation difference on
+top, which scales with tensor magnitude. So a bit-exact ``torch.equal`` would
+fail even off-vs-off. We measure the off-vs-off run-to-run noise floor, allow a
+bf16-relative term, and assert the off-vs-ON difference is within that bound —
+a real recompute bug (wrong preact) blows past it by orders of magnitude.
 
 The recompute lives entirely in the compute kernels, which are identical
 intranode vs internode (`design.md` §Internode-specific notes), so 1-node
@@ -118,23 +119,32 @@ def main():
             f"{base_a[k].shape} vs {recomp[k].shape}"
         )
 
-    # Per-tensor: off-vs-ON diff must be within the off-vs-off noise floor.
-    # ``slack`` allows the recompute run to sit at a different (still valid)
-    # point in the atomic-reassociation distribution; a real bug (wrong
-    # preact_a) would exceed the floor by orders of magnitude, not 4x.
+    # Per-tensor: off-vs-ON diff must be within max(atomic-noise floor,
+    # bf16-GEMM tolerance). ``slack`` lets the recompute sit at a different
+    # (still valid) point in the atomic-reassociation distribution; ``rtol``
+    # covers the bf16 accumulation-order difference of the recompute's separate
+    # grouped-M GEMM kernel — which scales with tensor magnitude, so a fixed
+    # atol alone would get tight at production shapes. A real bug (wrong
+    # preact_a) blows past both by orders of magnitude / O(1) relative.
     slack = 4.0
-    atol = 1e-3  # absolute floor for tensors whose noise floor is ~0
+    atol = 1e-3   # absolute floor for tensors whose values + noise are ~0
+    rtol = 2e-2   # bf16 GEMM-accumulation tolerance (separate recompute kernel)
     failures = []
     report = []
     for k in ("out", "dx", "dtopk", "dw1", "dw2"):
         noise = max_abs_diff(base_a[k], base_b[k])
         test = max_abs_diff(base_a[k], recomp[k])
-        bound = max(slack * noise, atol)
-        report.append(f"{k}: off-vs-on={test:.3e}  off-vs-off(noise)={noise:.3e}  bound={bound:.3e}")
+        scale = base_a[k].abs().max().item()
+        bound = max(slack * noise, atol, rtol * scale)
+        report.append(
+            f"{k}: off-vs-on={test:.3e}  off-vs-off(noise)={noise:.3e}  "
+            f"rtol*scale={rtol * scale:.3e}  bound={bound:.3e}"
+        )
         if test > bound:
             failures.append(
                 f"{k}: off-vs-on diff {test:.4e} exceeds bound {bound:.4e} "
-                f"(noise floor {noise:.4e}) — recompute is NOT equivalent"
+                f"(noise {noise:.4e}, rtol*scale {rtol * scale:.4e}) "
+                f"— recompute is NOT equivalent"
             )
 
     if rank == 0:

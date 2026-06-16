@@ -56,6 +56,22 @@ def main():
     p.add_argument("--num_experts", type=int, default=256)
     p.add_argument("--topk", type=int, default=8)
     p.add_argument("--num_tokens", type=int, default=8192)
+    p.add_argument("--rand_routing", action="store_true",
+                   help="Draw a FRESH RANDOM topk_idx per layer via torch.rand "
+                        "(default: fixed uniform round-robin). Random routing = "
+                        "top-K of uniform scores (K distinct experts/token), "
+                        "seeded per rank, so per-rank recv volumes are uneven "
+                        "and vary layer-to-layer — the realistic, asymmetric "
+                        "stress (vs the light, balanced round-robin). Drive "
+                        "memory toward OOM with --num_layers / --num_tokens; "
+                        "no artificial ballast or side-collectives here.")
+    p.add_argument("--activation_checkpoint", action="store_true",
+                   help="Pass activation_checkpoint=True to stream_moe_func "
+                        "(matches the bench's model.moe_activation_checkpoint). "
+                        "Drops preact_a from fwd retention and RECOMPUTES it in "
+                        "bwd — shifts the memory peak from forward into backward "
+                        "(where the comm forwarders spin), so the near-OOM "
+                        "reclaim storm lands in dispatch_grads, not forward.")
     args = p.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -91,21 +107,51 @@ def main():
 
     torch.manual_seed(100 + rank)
     x0 = (torch.randn(T, H, dtype=torch.bfloat16, device=device) * 0.1).contiguous()
-    topk_idx = uniform_topk_idx(T, K, E, rank, device)
     topk_weights = torch.softmax(
         torch.randn(T, K, dtype=torch.float32, device=device), dim=-1).contiguous()
     num_local_experts = E // world_size
-    rank_idx = topk_idx // num_local_experts
-    is_token_in_rank = torch.zeros((T, world_size), dtype=torch.bool, device=device)
-    for r in range(world_size):
-        is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
+
+    def is_token_in_rank_of(idx):
+        rank_idx = idx // num_local_experts
+        tir = torch.zeros((T, world_size), dtype=torch.bool, device=device)
+        for r in range(world_size):
+            tir[:, r] = (rank_idx == r).any(dim=-1)
+        return tir
+
+    # Routing. Default: fixed uniform round-robin, precomputed once. With
+    # --rand_routing: a fresh random draw PER LAYER (top-K of torch.rand scores
+    # = K distinct experts/token), seeded per rank so recv volumes are uneven
+    # across ranks and vary layer-to-layer.
+    route_gen = torch.Generator(device=device).manual_seed(7000 + rank)
+
+    def draw_routing():
+        idx = (
+            torch.rand(T, E, device=device, generator=route_gen)
+            .topk(K, dim=-1).indices.to(torch.int64)
+            if args.rand_routing
+            else uniform_topk_idx(T, K, E, rank, device)
+        )
+        return idx, is_token_in_rank_of(idx)
+
+    fixed_routing = None if args.rand_routing else draw_routing()
 
     def log(m):
         if rank == 0:
             print(m, flush=True)
 
+    GiB = 1 << 30
+
+    def meminfo():  # observability only — cheap driver/bookkeeping queries, no sync
+        free_b, total_b = torch.cuda.mem_get_info()
+        return (f"alloc={torch.cuda.memory_allocated() / GiB:.1f} "
+                f"reserved={torch.cuda.memory_reserved() / GiB:.1f} "
+                f"free={free_b / GiB:.1f}/{total_b / GiB:.1f} GB")
+
     log(f"[repro] world={world_size} H={H} I={I} E={E} K={K} T={T} "
         f"num_layers={args.num_layers} num_steps={args.num_steps} E_local={E_local}")
+    log(f"[repro] PYTORCH_CUDA_ALLOC_CONF="
+        f"{os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')} "
+        f"rand_routing={args.rand_routing} activation_checkpoint={args.activation_checkpoint}")
 
     for step in range(args.num_steps):
         if w1.grad is not None:
@@ -115,14 +161,18 @@ def main():
         h = x0.clone().requires_grad_(True)
         for layer in range(args.num_layers):
             log(f"[repro] step {step} fwd layer {layer}")
+            layer_topk_idx, layer_is_token_in_rank = (
+                draw_routing() if args.rand_routing else fixed_routing)
             h = stream_moe_func(
-                buf, h, topk_idx, topk_weights, is_token_in_rank, w1, w2,
-                streams=streams, num_experts=E)
-        log(f"[repro] step {step} backward (runs {args.num_layers} dispatch_grads back-to-back)")
+                buf, h, layer_topk_idx, topk_weights, layer_is_token_in_rank,
+                w1, w2, streams=streams, num_experts=E,
+                activation_checkpoint=args.activation_checkpoint)
+        log(f"[repro] step {step} end-fwd | {meminfo()} | backward starting "
+            f"({args.num_layers} dispatch_grads back-to-back)")
         h.sum().backward()
         torch.cuda.synchronize()
         dist.barrier(device_ids=[torch.cuda.current_device()])
-        log(f"[repro] step {step} COMPLETE")
+        log(f"[repro] step {step} COMPLETE | {meminfo()}")
 
     if rank == 0:
         print(f"PASS: {args.num_steps} steps x {args.num_layers}-layer "
