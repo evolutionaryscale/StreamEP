@@ -23,15 +23,27 @@ struct SourceMeta {
 
     __forceinline__ SourceMeta() = default;
 
-    __device__ __forceinline__ SourceMeta(int rdma_rank, const bool* is_token_in_nvl_ranks) {
+    // [slot genstamp] bits 16..31 of `is_token_in_nvl_rank_bits` carry the low
+    // 16 bits of the slot's CUMULATIVE ring position (prev + iter-local token
+    // idx) — unique per slot occupancy. The RDMA data ring's cumulative tail
+    // counter announces slot ARRIVAL, but data-vs-counter write VISIBILITY at
+    // the target is not guaranteed by the wire (RC orders NIC execution, not
+    // PCIe/NVLink placement). The forwarder accepts a slot only once its tag
+    // matches the position it expects. False-accept horizon: 2^16 positions =
+    // ring_size * (2^16/ring) wraps; credit flow control bounds slot staleness
+    // to <~2 iters, so unreachable. Bits 0..7 remain the NVL mask.
+    __device__ __forceinline__ SourceMeta(int rdma_rank, const bool* is_token_in_nvl_ranks, int ring_pos_tag) {
         src_rdma_rank = rdma_rank;
         is_token_in_nvl_rank_bits = is_token_in_nvl_ranks[0];
         #pragma unroll
         for (int i = 1; i < NUM_MAX_NVL_PEERS; ++i)
             is_token_in_nvl_rank_bits |= is_token_in_nvl_ranks[i] << i;
+        is_token_in_nvl_rank_bits |= (ring_pos_tag & 0xffff) << 16;
     }
 
     __device__ __forceinline__ bool is_token_in_nvl_rank(int nvl_rank) const { return (is_token_in_nvl_rank_bits >> nvl_rank) & 1; }
+
+    __device__ __forceinline__ int seq_tag() const { return (is_token_in_nvl_rank_bits >> 16) & 0xffff; }
 };
 
 EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
@@ -94,23 +106,6 @@ __forceinline__ __device__ void atomicmax_reader_prev_cumulative(uint32_t* prev_
         if (prev == old) break;
         old = prev;
     }
-}
-
-// Round `gbl_ptr` up to a 128-byte boundary in place. Used before allocating
-// the RDMA dispatch meta SymBuffer so each 32-int (=128B) slab aligns to a
-// single H100 L2 cache line — required for sentinel-amo coherence: sender
-// bulk_put → amo_nonfetch_add(slot 30) on the same QP; the
-// amo invalidates the entire 128B line on the receiver, so subsequent reads
-// of slots 0..17 return HBM values rather than stale L2). The 128B base
-// alignment of `rdma_buffer_ptr` (NUM_BUFFER_ALIGNMENT_BYTES) is preserved
-// only at the start of the heap; intermediate SymBuffer advances depend on
-// `num_bytes_per_token * num_max_rdma_chunked_recv_tokens * num_rdma_ranks`
-// which is only int4-aligned. A `get_rdma_buffer_size_hint` slack of
-// NUM_BUFFER_ALIGNMENT_BYTES covers the up-to-127-byte gap this introduces.
-__forceinline__ __device__ void align_meta_base_to_l2_line(void*& gbl_ptr) {
-    constexpr uintptr_t kMask = NUM_BUFFER_ALIGNMENT_BYTES - 1;
-    auto p = reinterpret_cast<uintptr_t>(gbl_ptr);
-    gbl_ptr = reinterpret_cast<void*>((p + kMask) & ~kMask);
 }
 
 template <bool kLowLatencyMode>
@@ -1045,20 +1040,12 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
     auto num_bytes_per_token = get_num_bytes_per_token(shape.hidden_int4, shape.num_topk, shape.num_topk);
     auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
         env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
-    align_meta_base_to_l2_line(env.rdma_buffer_ptr);
-    auto rdma_channel_meta = SymBuffer<int>(env.rdma_buffer_ptr,
-        kRdmaMetaRingDepth * kRdmaMetaSlabInts, kNumRDMARanks, channel_id, num_channels);
+    // [data-ring header] The per-(channel, src_rdma) routing header rides
+    // rdma_channel_data at ring position `baseline`. The SymBuffer chain is
+    // data -> head -> tail, matching `get_dispatch_rdma_region_bytes`; data
+    // ends int4-aligned, so the uint64 head/tail need no extra alignment.
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
-    // [meta backpressure] One slot per (consumer_rdma_rank, dst_nvl). The meta
-    // sender waits until the slowest of dst's NUM_MAX_NVL_PEERS forwarder warps
-    // has advanced its slot to env.dispatch_meta_writes[channel, dst] before it
-    // reuses the slab; each forwarder warp AMO-adds +1 to its own slot right
-    // after its gen-stamp gate passes. Lives on this (sender) rank's symmetric
-    // region, advanced remotely by the consumer (mirrors rdma_channel_head).
-    // Declared identically in fwd dispatch_main + bwd dispatch_grads so both map
-    // to the same symmetric offset and share the counter in call order.
-    auto meta_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks * NUM_MAX_NVL_PEERS, channel_id, num_channels);
 
     // NVL buffer layouts (rs_wr = "read for senders, write for receivers";
     // ws_rr = "write for senders, read for receivers").
@@ -1149,128 +1136,49 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         int token_start_idx, token_end_idx;
         get_channel_task_range(shape.num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-        // Publish per-channel meta to each dst_rdma_rank into this iter's ring
-        // slab: 18 raw data ints in slots 0..17 (NUM_MAX_NVL_PEERS*2
-        // start_sum/end_sum + 2 rdma_channel prefix start/end) + the absolute
-        // gen-stamp (nvl_seq) at slot 30.
-        // Remote dst: bulk_put (slots 0..17) → 2nd put (gen-stamp) on the same
-        // QP; RC ordering places the data put before the gen-stamp put, so a
-        // forwarder that observes the gen-stamp is guaranteed the data landed.
-        // Local dst: direct stores + __threadfence + gen-stamp store — the
-        // forwarder is on the same GPU and observes the data via the L2.
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
-        for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
-            // [meta backpressure] depth-1: do not reuse dst's meta slab until all
-            // NUM_MAX_NVL_PEERS forwarder warps on dst have read the prior
-            // occupant. meta_need = #prior writes to (channel,dst); meta_head[d]
-            // = #reads by dst's forwarder warp d (each AMO-adds +1 every call,
-            // incl. zero-token, so no slot stalls -> no deadlock). Spin until the
-            // slowest reader (min over the 8 slots) has caught up.
-            const int meta_writes_idx = channel_id * kNumRDMARanks + dst_rdma_rank;
-            const uint32_t meta_need = env.dispatch_meta_writes[meta_writes_idx];
-            uint32_t mh = 0;
-            {
-                auto bp_start = clock64();
-                while (true) {
-                    mh = lane_id < NUM_MAX_NVL_PEERS
-                        ? static_cast<uint32_t>(ld_acquire_sys_global(
-                              meta_head.buffer(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id)))
-                        : 0xffffffffu;
-                    #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
-                        mh = min(mh, __shfl_xor_sync(0xffffffffu, mh, off));
-                    // Run-ahead: slab (k % depth)'s prior occupant is write
-                    // k-depth, so we only need forwarders to have consumed write
-                    // (meta_need - (depth-1)), not fully caught up. depth-1
-                    // reduces to the original `mh >= meta_need`.
-                    if (static_cast<int32_t>(mh - meta_need + (kRdmaMetaRingDepth - 1)) >= 0)
-                        break;
-                    if (clock64() - bp_start >= NUM_TIMEOUT_CYCLES) {
-                        if (lane_id == 0)
-                            printf("StreamEP dispatch meta backpressure timeout, phase: %d, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, need: %u, mh: %u\n",
-                                   static_cast<int>(nvl_seq & 1), channel_id, rdma_rank, nvl_rank, dst_rdma_rank, meta_need, mh);
-                        trap();
-                    }
-                }
-            }
-            __syncwarp();
-            // [genstamp ring] rotate through kRdmaMetaRingDepth slabs by
-            // dispatch_seq (= nvl_seq >> 1) so a peer up to depth-1 iters ahead
-            // writes a DIFFERENT slab — its overwrite can't clobber this iter's
-            // meta before the forwarder reads it.
-            const int meta_slab_off =
-                static_cast<int>((nvl_seq >> 1) % kRdmaMetaRingDepth) * kRdmaMetaSlabInts;
-            auto dst_ptr =
-                (dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank))
-                + meta_slab_off;
-            if (lane_id < NUM_MAX_NVL_PEERS) {
-                dst_ptr[lane_id] =
-                    channel_id == 0
-                        ? 0
-                        : inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1];
-            } else if (lane_id < NUM_MAX_NVL_PEERS * 2) {
-                dst_ptr[lane_id] =
-                    inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
-                                                     channel_id];
-            } else if (lane_id == NUM_MAX_NVL_PEERS * 2) {
-                dst_ptr[lane_id] = channel_id == 0 ? 0 : inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
-            } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
-                dst_ptr[lane_id] = inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
-            } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 2 and dst_rdma_rank != rdma_rank) {
-                // [genstamp] stage this iter's nvl_seq into the send buffer's
-                // gen-stamp slot; shipped by the 2nd put below (remote only).
-                dst_ptr[kRdmaMetaGenstampSlot] = static_cast<int>(nvl_seq);
-            }
-            __syncwarp();
-
-            if (dst_rdma_rank != rdma_rank) {
-                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank) + meta_slab_off),
-                                                  reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank) + meta_slab_off),
-                                                  sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
-                                                  translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
-                                                  channel_id, lane_id, 0);
-                // [genstamp] 2nd put on the SAME QP -> RC-ordered after the data
-                // put: the gen-stamp becomes visible only once slots 0..17 land.
-                nvshmemi_ibgda_put_nbi_warp<true>(
-                    reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank) + meta_slab_off + kRdmaMetaGenstampSlot),
-                    reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank) + meta_slab_off + kRdmaMetaGenstampSlot),
-                    sizeof(int),
-                    translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
-                    channel_id, lane_id, 0);
-            } else if (lane_id == 0) {
-                // [genstamp] local dst: fence orders the slot 0..17 stores before
-                // the gen-stamp store; same-GPU coherence covers the forwarder read.
-                __threadfence();
-                dst_ptr[kRdmaMetaGenstampSlot] = static_cast<int>(nvl_seq);
-            }
-            // [meta backpressure] record this write; the next overwrite of dst's
-            // slab waits for these readers (depth-1). Single writer per
-            // (channel,dst) per call; stream-ordered to the next dispatch kernel.
-            if (lane_id == 0)
-                env.dispatch_meta_writes[meta_writes_idx] += 1;
-        }
+        // [data-ring header] The per-(channel, dst_rdma) routing header (18
+        // ints: NUM_MAX_NVL_PEERS*2 start_sum/end_sum + 2 rdma_channel prefix
+        // start/end) no longer travels on a separate meta channel. It rides the
+        // data ring as ring position `baseline` (the iter's first slot), staged
+        // + emitted + tail-bumped by the kRDMASenderCoordinator below, delivered
+        // / validated by the same position-tag spin a token uses. The token
+        // stream therefore starts at `baseline + 1`; every per-iter ring span is
+        // `1 + N` positions, accounted uniformly on head (sender credit), tail
+        // (forwarder arrival), and the forwarder-coordinator credit AMO.
         sync_rdma_sender_smem();
 
         // Iterate over tokens and copy into buffer.
         //
-        // The RDMA head slot accumulates across all iters (peer's forwarder
-        // coordinator publishes deltas via amo_nonfetch_add). The iter-start
-        // baseline is the cumulative head RIGHT NOW: this iter's consumer has
-        // not begun draining yet, so the live counter equals the prior-iters
-        // cumulative and `cached_rdma_channel_head = ld(head) - prev` starts at
-        // exactly 0. Read it live at entry rather than a baseline snapshotted at
-        // the PRIOR kernel's sender-exit: that snapshot was captured too early
-        // (the consumer's forwarder coordinator keeps advancing rdma_channel_head
-        // after the sender exits), so it was too low, the iter-local head started
-        // > 0, the full-ring gate fired late, and the sender overwrote un-drained
-        // ring slots once a (channel,src) token count exceeded the ring depth
-        // (wrap). Reading live is exact and safe: a not-yet-landed remote amo only
-        // lowers it -> over-stall, never over-write.
+        // The iter-start baseline comes from the persistent reader_prev_head
+        // array (EXACT cumulative per-iter sent counts), not a LIVE read of the
+        // head: a live read races in-flight PRIOR-iter credit AMOs that can
+        // inflate the relative head and let the sender overwrite un-drained
+        // slots. With the exact baseline, in-flight stragglers only make the
+        // relative head temporarily NEGATIVE -> over-stall, never over-write.
         int64_t token_idx;
         uint32_t prev_rdma_channel_head_at_entry = lane_id < kNumRDMARanks
-            ? static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)))
+            ? env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
             : 0u;
-        int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
+        // Continuous ring phase: slots advance across iters as (prev + j) %
+        // ring instead of restarting at 0 each iter. With a per-iter phase
+        // restart, the credit gate's W - R < ring criterion under-protects
+        // the previous iter's final partial wrap (by ring - T%ring drains),
+        // letting a run-ahead next-iter sender overwrite undrained slots.
+        const int ring_phase_base = lane_id < kNumRDMARanks
+            ? static_cast<int>(prev_rdma_channel_head_at_entry
+                               % static_cast<uint32_t>(env.num_max_rdma_chunked_recv_tokens))
+            : 0;
+        // Seed the cached credit view from a LIVE read: with the exact
+        // baseline, the iter-entry relative head is the (possibly NEGATIVE)
+        // backlog of undrained prior-iter slots — initializing to 0 would let
+        // this iter's first `ring` tokens bypass the credit gate entirely and
+        // overwrite undrained slots one wrap below (gate checks re-read only
+        // once they spin).
+        int cached_rdma_channel_head = lane_id < kNumRDMARanks
+            ? static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)))
+                               - prev_rdma_channel_head_at_entry)
+            : 0;
+        int global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
             uint64_t is_token_in_rank_uint64 = 0;
@@ -1286,7 +1194,11 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
 
             auto start_time = clock64();
-            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
+            // [data-ring header] token iter-local index `rdma_tail_idx` occupies
+            // ring position `baseline + 1 + rdma_tail_idx` (the header takes
+            // position `baseline`); the credit gate compares that shifted
+            // position against the freed-position credit (also position-domain).
+            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx + 1 - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head =
                     static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))) - prev_rdma_channel_head_at_entry);
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
@@ -1308,12 +1220,22 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             #pragma unroll
             for (int i = 0, slot_idx; i < kNumRDMARanks; ++i)
                 if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
-                    slot_idx = slot_idx % env.num_max_rdma_chunked_recv_tokens;
+                    // [slot genstamp] this dst's cumulative ring-position tag,
+                    // computed BEFORE the phase shift. +1: the header occupies
+                    // ring position `baseline`, so token iter-local index sits
+                    // at `baseline + 1 + idx` (see the data-ring header note).
+                    const int slot_ring_tag = static_cast<int>(
+                        (__shfl_sync(0xffffffff, prev_rdma_channel_head_at_entry, i)
+                         + static_cast<uint32_t>(slot_idx) + 1u) & 0xffffu);
+                    // Continuous ring phase (see ring_phase_base above); +1 for
+                    // the header slot at the front of the stream.
+                    slot_idx = (slot_idx + 1 + __shfl_sync(0xffffffff, ring_phase_base, i))
+                               % env.num_max_rdma_chunked_recv_tokens;
                     topk_ranks[num_topk_ranks] = i;
                     auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
                     auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
                     if (lane_id == num_topk_ranks)
-                        src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
+                        src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values, slot_ring_tag);
                     dst_send_buffers[num_topk_ranks++] =
                         reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_token;
                 }
@@ -1371,18 +1293,18 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             __syncwarp();
         }
 
-        // Writeback observed cumulative head to persistent reader_prev. All
-        // sender warps share the role; each lane atomicMax's its observed
-        // slot value to keep the array monotonic without a CTA-level sync.
-        // Stream-ordered with the next kernel: the writeback is visible
-        // before the next kernel reads it. False-low values cause the next
-        // iter's sender to over-spin on backpressure (no correctness
-        // impact); false-high values can't happen because the slot
-        // accumulates monotonically.
+        // Writeback the EXACT cumulative head baseline (prev_at_entry + this
+        // iter's per-lane sent count) to persistent reader_prev_head. With the
+        // forwarder coordinator's end-of-iter residual flush, cumulative
+        // credits == cumulative sent at every iter boundary, so this is the
+        // head counter's settled value. All sender warps compute the same
+        // value; atomicMax keeps the array monotonic without a CTA-level
+        // sync, stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_head + channel_id * kNumRDMARanks + lane_id,
-                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))));
+                // +1: per-iter ring span is `1 + N` positions (header + N tokens).
+                prev_rdma_channel_head_at_entry + static_cast<uint32_t>(global_rdma_tail_idx) + 1u);
         }
 
         // Reverse-scan `send_rdma_head[channel_token_range, dst_rdma_rank]`
@@ -1419,6 +1341,69 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
 
         sync_rdma_sender_smem();
 
+        // Continuous ring phase (see kRDMASender ring_phase_base); per dst lane.
+        const int coord_phase_base = lane_id < kNumRDMARanks
+            ? static_cast<int>(env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
+                               % static_cast<uint32_t>(env.num_max_rdma_chunked_recv_tokens))
+            : 0;
+
+        // [data-ring header] Emit the per-(channel, dst_rdma) routing header as
+        // ring position `baseline` — the first slot of this iter's stream — for
+        // EVERY dst unconditionally (incl. zero-token, keeping the `1 + N` ring
+        // span in lockstep). 18 routing ints (NUM_MAX_NVL_PEERS*2 start/end_sum
+        // + 2 rdma_channel prefix) land in the slot's [0, hidden_bytes) region;
+        // a generation tag (nvl_seq & 0xffff) rides the SourceMeta word at
+        // `+ hidden_bytes`, the same offset/spin a token's tag uses. The
+        // forwarder gates on the data-ring tail AMO (arrival), then spins on the
+        // tag (data-visibility fence) exactly as the token loop does — no meta
+        // channel / counter / checksum / backpressure. tail += 1 on the same QP
+        // after the put is the token arrival path. Same warp stages then puts
+        // (__syncwarp orders staging → put / local fence).
+        EP_DEVICE_ASSERT(static_cast<size_t>(NUM_MAX_NVL_PEERS * 2 + 2) * sizeof(int) <= hidden_bytes);
+        for (int dst_rdma_rank = 0; dst_rdma_rank < kNumRDMARanks; ++dst_rdma_rank) {
+            const int hdr_slot = __shfl_sync(0xffffffff, coord_phase_base, dst_rdma_rank);
+            auto hdr_ptr = reinterpret_cast<int*>(
+                (dst_rdma_rank == rdma_rank ? rdma_channel_data.recv_buffer(dst_rdma_rank)
+                                            : rdma_channel_data.send_buffer(dst_rdma_rank))
+                + static_cast<size_t>(hdr_slot) * num_bytes_per_token);
+            if (lane_id < NUM_MAX_NVL_PEERS)
+                hdr_ptr[lane_id] = channel_id == 0 ? 0
+                    : inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1];
+            else if (lane_id < NUM_MAX_NVL_PEERS * 2)
+                hdr_ptr[lane_id] =
+                    inputs.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels + channel_id];
+            else if (lane_id == NUM_MAX_NVL_PEERS * 2)
+                hdr_ptr[lane_id] = channel_id == 0 ? 0
+                    : inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
+            else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1)
+                hdr_ptr[lane_id] = inputs.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
+            // [data-ring header] generation tag in bits 48..63 of the SourceMeta
+            // word (a token's tag offset) = nvl_seq & 0xffff. nvl_seq is >= 2
+            // (1-based dispatch seq << 1) so the tag is never 0 — the forwarder's
+            // tag-spin can't false-match zeroed/stale memory before the header
+            // lands.
+            if (lane_id == 0)
+                *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(hdr_ptr) + hidden_bytes) =
+                    static_cast<uint64_t>(nvl_seq & 0xffffu) << 48;
+            __syncwarp();
+            if (dst_rdma_rank != rdma_rank) {
+                nvshmemi_ibgda_put_nbi_warp<true>(
+                    reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + static_cast<size_t>(hdr_slot) * num_bytes_per_token),
+                    reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + static_cast<size_t>(hdr_slot) * num_bytes_per_token),
+                    num_bytes_per_token,
+                    translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                    channel_id, lane_id, 0);
+            } else {
+                memory_fence();
+            }
+            __syncwarp();
+            if (lane_id == dst_rdma_rank)
+                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), 1,
+                                                translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                                                channel_id, dst_rdma_rank == rdma_rank);
+            __syncwarp();
+        }
+
         int num_tokens_to_send = 0;
         if (lane_id < kNumRDMARanks) {
             num_tokens_to_send = inputs.rdma_channel_prefix_matrix[lane_id * num_channels + channel_id];
@@ -1452,8 +1437,17 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
 
                 if (dst_rdma_rank != rdma_rank) {
-                    auto dst_slot_idx = synced_last_issued_tail % env.num_max_rdma_chunked_recv_tokens;
-                    EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= env.num_max_rdma_chunked_recv_tokens);
+                    // Continuous ring phase: never let a chunk straddle the
+                    // ring edge — clamp this issue at the boundary; the
+                    // remainder ships as its own chunk on the next loop pass
+                    // (starting at slot 0). Single contiguous put per issue.
+                    // +1: token positions start at `baseline + 1` (the header
+                    // occupies `baseline`); matches the kRDMASender slot stride.
+                    auto dst_slot_idx = (synced_last_issued_tail + 1
+                                         + __shfl_sync(0xffffffff, coord_phase_base, dst_rdma_rank))
+                                        % env.num_max_rdma_chunked_recv_tokens;
+                    num_tokens_to_issue =
+                        min(num_tokens_to_issue, env.num_max_rdma_chunked_recv_tokens - dst_slot_idx);
                     const size_t num_bytes_per_msg = num_bytes_per_token * num_tokens_to_issue;
                     const auto dst_ptr =
                         reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_token);
@@ -1488,74 +1482,91 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
-        // [genstamp] Eager spin until this slot carries THIS iter's nvl_seq. The
-        // sender publishes nvl_seq into the gen-stamp slot via a 2nd put issued
-        // after the data put on the same RC QP, so a matching gen-stamp proves
-        // slots 0..17 already landed. Absolute identity replaces the old
-        // cumulative `slot30 > prev` gate (which admitted a peer running an
-        // iteration ahead); a lapped/wrong iter is now rejected, never mis-read.
-        // [genstamp ring] read this iter's ring slab (dispatch_seq % depth); a
-        // matching gen-stamp proves it's THIS iter's meta (a peer up to depth-1
-        // iters ahead wrote a different slab, so this one is intact).
-        const int meta_slab_off =
-            static_cast<int>((nvl_seq >> 1) % kRdmaMetaRingDepth) * kRdmaMetaSlabInts;
+
+        // [data-ring header] baseline = this src's cumulative ring position at
+        // iter entry (persistent reader_prev_tail). By send/recv conservation it
+        // equals the sender's reader_prev_head for this link, so the header the
+        // sender staged at ring[baseline] (position tag = baseline & 0xffff) is
+        // found here, and the tokens follow at baseline + 1 + j. Seeded ahead of
+        // the arrival gate (which now reads the header by position); the token
+        // loop reuses prev_rdma_channel_tail_at_entry / ring_phase_base below.
+        int src_rdma_rank = sm_id % kNumRDMARanks;
+        uint32_t prev_rdma_channel_tail_at_entry = lane_id < kNumRDMARanks
+            ? env.reader_prev_tail[channel_id * kNumRDMARanks + lane_id]
+            : 0u;
+        // Continuous ring phase (see kRDMASender ring_phase_base).
+        const int ring_phase_base = lane_id < kNumRDMARanks
+            ? static_cast<int>(prev_rdma_channel_tail_at_entry
+                               % static_cast<uint32_t>(env.num_max_rdma_chunked_recv_tokens))
+            : 0;
+
+        // [data-ring header] Arrival gate + data-visibility fence, mirroring the
+        // token path: spin on the data-ring tail AMO to cover the header
+        // position (>= 1 means it landed), then spin on the slot's generation
+        // tag (== nvl_seq & 0xffff) to fence the put data against the tail AMO,
+        // since the put can lag the AMO. nvl_seq is non-zero so the spin can't
+        // false-match zeroed/stale memory. Tag visible ⇒ slot visible, so the
+        // 18 routing ints can then be read directly.
         if (lane_id < kNumRDMARanks) {
-            auto meta_slab = rdma_channel_meta.recv_buffer(lane_id) + meta_slab_off;
-            while (true) {
-                auto cur_gen = ld_acquire_sys_global(meta_slab + kRdmaMetaGenstampSlot);
-                if (static_cast<int>(cur_gen) == static_cast<int>(nvl_seq)) {
-                    auto meta_0 = ld_acquire_sys_global(meta_slab + dst_nvl_rank);
-                    auto meta_1 = ld_acquire_sys_global(meta_slab + NUM_MAX_NVL_PEERS + dst_nvl_rank);
-                    auto meta_2 = ld_acquire_sys_global(meta_slab + NUM_MAX_NVL_PEERS * 2);
-                    auto meta_3 = ld_acquire_sys_global(meta_slab + NUM_MAX_NVL_PEERS * 2 + 1);
-                    int start_sum = meta_0, end_sum = meta_1;
-                    EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
-                                         nvl_pack(nvl_seq, start_sum));
-                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
-                                         nvl_pack(nvl_seq, end_sum));
-
-                    src_rdma_channel_prefix = meta_2;
-                    auto src_rdma_channel_prefix_1 = meta_3;
-                    num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
-                    per_token_out.recv_rdma_channel_prefix_matrix[lane_id * num_channels + channel_id] = src_rdma_channel_prefix_1;
-                    src_rdma_channel_prefix += lane_id == 0 ? 0 : inputs.recv_rdma_rank_prefix_sum[lane_id - 1];
-                    EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
-                    break;
-                }
-
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("StreamEP dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, cur_gen: %d, want: %d\n",
-                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, static_cast<int>(cur_gen), static_cast<int>(nvl_seq));
+            auto hdr_buf = rdma_channel_data.recv_buffer(lane_id)
+                           + static_cast<size_t>(ring_phase_base) * num_bytes_per_token;
+            auto hdr_ints = reinterpret_cast<int*>(hdr_buf);
+            const int hdr_tag_want = static_cast<int>(nvl_seq & 0xffffu);
+            auto hdr_start = clock64();
+            while (static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)))
+                                    - prev_rdma_channel_tail_at_entry) < 1) {
+                if (clock64() - hdr_start > NUM_TIMEOUT_CYCLES) {
+                    printf("StreamEP dispatch forwarder timeout (header arrival), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, seq: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, static_cast<int>(nvl_seq));
                     trap();
                 }
             }
-            // [meta backpressure] this (src=lane_id, dst_nvl) warp consumed src's
-            // meta this call: advance src's meta_head slot [my rdma_rank, dst_nvl]
-            // by +1. Fires for EVERY src every call (the gen-stamp gate above
-            // passes every call, incl. zero-token), so the sender's min-over-8
-            // wait never stalls. Mirrors the data-head coordinator AMO; local src
-            // (lane_id == rdma_rank) routes to a release.sys atomicAdd.
-            nvshmemi_ibgda_amo_nonfetch_add(
-                meta_head.buffer(rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank),
-                1,
-                translate_dst_rdma_rank<false>(lane_id, nvl_rank),
-                channel_id + num_channels,
-                lane_id == rdma_rank);
+            auto tag_start = clock64();
+            while (true) {
+                uint64_t tag_raw = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(hdr_buf + hidden_bytes));
+                if (static_cast<int>((tag_raw >> 48) & 0xffff) == hdr_tag_want)
+                    break;
+                if (clock64() - tag_start > NUM_TIMEOUT_CYCLES) {
+                    printf("StreamEP dispatch forwarder timeout (header tag), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, got: %d, want: %d, seq: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank,
+                           static_cast<int>((tag_raw >> 48) & 0xffff), hdr_tag_want, static_cast<int>(nvl_seq));
+                    trap();
+                }
+            }
+            int start_sum = static_cast<int>(ld_acquire_sys_global(hdr_ints + dst_nvl_rank));
+            int end_sum   = static_cast<int>(ld_acquire_sys_global(hdr_ints + NUM_MAX_NVL_PEERS + dst_nvl_rank));
+            int meta_2    = static_cast<int>(ld_acquire_sys_global(hdr_ints + NUM_MAX_NVL_PEERS * 2));
+            int meta_3    = static_cast<int>(ld_acquire_sys_global(hdr_ints + NUM_MAX_NVL_PEERS * 2 + 1));
+            EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
+            st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
+                                 nvl_pack(nvl_seq, start_sum));
+            st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
+                                 nvl_pack(nvl_seq, end_sum));
+
+            src_rdma_channel_prefix = meta_2;
+            auto src_rdma_channel_prefix_1 = meta_3;
+            num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
+            per_token_out.recv_rdma_channel_prefix_matrix[lane_id * num_channels + channel_id] = src_rdma_channel_prefix_1;
+            src_rdma_channel_prefix += lane_id == 0 ? 0 : inputs.recv_rdma_rank_prefix_sum[lane_id - 1];
+            EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
         }
         __syncwarp();
 
         int* send_nvl_head_for_lane = per_token_out.send_nvl_head + (src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank);
         sync_forwarder_smem();
 
-        // Seed prev-at-entry from the persistent reader_prev_tail array.
-        // Slot accumulates across iters; cached_rdma_channel_tail tracks
-        // this iter's advance only. See dispatch_main_kernel kRDMASender
-        // for the rationale.
-        int src_rdma_rank = sm_id % kNumRDMARanks;
-        uint32_t prev_rdma_channel_tail_at_entry = lane_id < kNumRDMARanks
-            ? env.reader_prev_tail[channel_id * kNumRDMARanks + lane_id]
-            : 0u;
+        // Authoritative per-lane recv count for this iter (from the header).
+        // Used by the exact reader_prev_tail writeback at exit.
+        const int rdma_recv_count_this_iter = num_tokens_to_recv_from_rdma;
+
+        // [data-ring header] Credit the header slot up front: seed every src
+        // column to 1 so the coordinator advances rdma_channel_head by the
+        // header even for zero-token srcs that never enter the drain loop; the
+        // drain loop raises N>0 columns to src_rdma_tail+1. After the barrier
+        // above, so it never races the coordinator's zero-init.
+        if (lane_id < kNumRDMARanks)
+            forward_channel_head[dst_nvl_rank][lane_id] = 1;
+        __syncwarp();
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
@@ -1580,8 +1591,20 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
-                        cached_rdma_channel_tail =
-                            static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - prev_rdma_channel_tail_at_entry);
+                        // Clamp visible arrivals to this iter's authoritative
+                        // meta count: the cumulative tail counter keeps
+                        // advancing with the NEXT iter's run-ahead sends, and
+                        // an unclamped read lets the drain loop's chunk range
+                        // extend into next-iter slots (consumed as this-iter
+                        // tokens -> misattribution / double-forward). The
+                        // forwarder must never consume past the meta count.
+                        // [data-ring header] -1: positions arrived include this
+                        // src's header slot; the token count is one fewer.
+                        // max(0,..) guards the header-only / nothing-yet window
+                        // (the header is tag-gated above; its tail AMO may lag).
+                        cached_rdma_channel_tail = min(
+                            max(0, static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - prev_rdma_channel_tail_at_entry) - 1),
+                            rdma_recv_count_this_iter);
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
@@ -1599,16 +1622,48 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             // iters that skip the TMA (not-in-dst-nvl-rank) do NOT advance the
             // stage cursor — the next forwarded iter inherits the pending head
             // slot. Pending queue is at most `kNumStages` deep.
-            struct PendingForward { uint8_t* dst_shifted; };
+            struct PendingForward { uint8_t* dst_shifted; int nvl_pos; };
             PendingForward pending[kNumStages] = {};
             int pending_count = 0;
             int issue_stage = 0;
             int drain_stage = 0;
 
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
-                auto rdma_slot_idx = i % env.num_max_rdma_chunked_recv_tokens;
+                // +1: token iter-local index `i` sits at ring position
+                // `baseline + 1 + i` (the header occupies `baseline`); the slot
+                // and the position tag both shift by one. See the data-ring
+                // header note in the arrival gate above.
+                auto rdma_slot_idx = (i + 1 + __shfl_sync(0xffffffff, ring_phase_base, src_rdma_rank))
+                                     % env.num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
-                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
+                // [slot genstamp] Accept the slot only once its SourceMeta
+                // carries this position's tag (see SourceMeta). Lane 0 spins
+                // on an acquire load and broadcasts; the spin is
+                // zero-iteration unless the slot is announced (tail) but its
+                // data is not yet visible (payload writes can lag the counter
+                // on the wire).
+                const int slot_tag_want = static_cast<int>(
+                    (__shfl_sync(0xffffffff, prev_rdma_channel_tail_at_entry, src_rdma_rank)
+                     + static_cast<uint32_t>(i) + 1u) & 0xffffu);
+                uint64_t meta_raw = 0;
+                if (lane_id == 0) {
+                    auto tag_start = clock64();
+                    while (true) {
+                        meta_raw = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(shifted + hidden_bytes));
+                        if (static_cast<int>((meta_raw >> 48) & 0xffff) == slot_tag_want)
+                            break;
+                        if (clock64() - tag_start > NUM_TIMEOUT_CYCLES) {
+                            printf("StreamEP dispatch forwarder timeout (slot tag), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src lane: %d, seq: %d, got: %d, want: %d\n",
+                                   channel_id, rdma_rank, nvl_rank, dst_nvl_rank, src_rdma_rank,
+                                   static_cast<int>(nvl_seq), static_cast<int>((meta_raw >> 48) & 0xffff), slot_tag_want);
+                            trap();
+                        }
+                    }
+                }
+                meta_raw = __shfl_sync(0xffffffff, meta_raw, 0);
+                SourceMeta src_meta;
+                src_meta.src_rdma_rank = static_cast<int>(meta_raw & 0xffffffffu);
+                src_meta.is_token_in_nvl_rank_bits = static_cast<int>(meta_raw >> 32);
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
                 if (lane_id == src_rdma_rank) {
@@ -1619,14 +1674,22 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 if (not is_in_dst_nvl_rank)
                     continue;
 
+                const int nvl_slot_pos = cached_nvl_channel_tail;  // gen-local; tagged at drain
                 int dst_slot_idx = (cached_nvl_channel_tail++) % env.num_max_nvl_chunked_recv_tokens;
                 auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
 
                 // Drain the oldest pending stage if both stages are in flight.
                 if (pending_count == kNumStages) {
                     mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
-                    if (elect_one_sync())
+                    if (elect_one_sync()) {
+                        // [nvl slot tag] Patch the staged SourceMeta's high 16
+                        // bits with this slot's NVL occupancy tag, then fence
+                        // the generic smem write against the async-proxy store.
+                        auto meta_bits = reinterpret_cast<int*>(tma_buffer(drain_stage) + hidden_bytes) + 1;
+                        *meta_bits = (*meta_bits & 0xffff) | (nvl_slot_tag(nvl_seq, pending[drain_stage].nvl_pos) << 16);
+                        tma_store_fence();
                         tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                    }
                     __syncwarp();
                     tma_store_wait<0>();
                     __syncwarp();
@@ -1643,6 +1706,7 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 }
                 __syncwarp();
                 pending[issue_stage].dst_shifted = dst_shifted;
+                pending[issue_stage].nvl_pos = nvl_slot_pos;
                 issue_stage = (issue_stage + 1) % kNumStages;
                 pending_count += 1;
 
@@ -1653,8 +1717,13 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             // Drain remaining in-flight stages in FIFO order.
             while (pending_count > 0) {
                 mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
-                if (elect_one_sync())
+                if (elect_one_sync()) {
+                    // [nvl slot tag] See the in-loop drain above.
+                    auto meta_bits = reinterpret_cast<int*>(tma_buffer(drain_stage) + hidden_bytes) + 1;
+                    *meta_bits = (*meta_bits & 0xffff) | (nvl_slot_tag(nvl_seq, pending[drain_stage].nvl_pos) << 16);
+                    tma_store_fence();
                     tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                }
                 __syncwarp();
                 tma_store_wait<0>();
                 __syncwarp();
@@ -1662,8 +1731,17 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 pending_count -= 1;
             }
 
-            if (lane_id == src_rdma_rank)
-                forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
+            if (lane_id == src_rdma_rank) {
+                cached_rdma_channel_head = src_rdma_tail;
+                // [data-ring header] +1: the header slot at the front of this
+                // src's stream is a freed ring position too. forward_channel_head
+                // was seeded to 1 (header) before the drain loop; raising it to
+                // src_rdma_tail + 1 publishes header + tokens in position-domain,
+                // which is what the sender's credit gate and reader_prev_head
+                // expect. (cached_rdma_channel_head stays token-domain: it pairs
+                // with cached_rdma_channel_tail in the next outer-loop pass.)
+                forward_channel_head[dst_nvl_rank][src_rdma_rank] = src_rdma_tail + 1;
+            }
 
             __syncwarp();
             if (elect_one_sync())
@@ -1675,16 +1753,17 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
         if (elect_one_sync())
             forward_channel_retired[dst_nvl_rank] = true;
 
-        // Writeback observed cumulative tail to the persistent array. (The meta
-        // slot is now absolute gen-stamped — no prev to maintain.) Forwarder
-        // exits only after draining each src_rdma's expected count, so
-        // ld(rdma_channel_tail) at exit >= prev_at_entry + this iter's count;
-        // atomicMax across forwarder warps preserves monotonicity, stream-ordered
-        // with the next kernel's read.
+        // Writeback the EXACT cumulative tail (prev_at_entry + this iter's
+        // authoritative count) to the persistent array. A live
+        // ld(rdma_channel_tail) here races in-flight NEXT-iter tail AMOs and
+        // would misalign the next kernel's drain window. All forwarder warps
+        // compute the same exact value; atomicMax keeps monotonicity,
+        // stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id,
-                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))));
+                // +1: per-iter ring span is `1 + N` positions (header + N tokens).
+                prev_rdma_channel_tail_at_entry + static_cast<uint32_t>(rdma_recv_count_this_iter) + 1u);
         }
 
         // Reverse-scan `send_nvl_head[(channel, dst_rdma) range, NVL peer]`
@@ -1739,8 +1818,26 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
                 if (not forward_channel_retired[i])
                     min_head = min(min_head, forward_channel_head[i][target_rdma]);
-            if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max()))
+            if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max())) {
+                // Flush the end-of-iter residual (< chunk) before exiting, so
+                // cumulative credits == cumulative tokens sent at every iter
+                // boundary. Required by the sender's exact reader_prev_head
+                // baseline: without this flush the unreturned residual
+                // accumulates as phantom ring occupancy. All warps retired
+                // => forward_channel_head[i][r] holds each warp's final
+                // (full per-lane) count, so min over ALL i is exact.
+                int final_head = std::numeric_limits<int>::max();
+                #pragma unroll
+                for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+                    final_head = min(final_head, forward_channel_head[i][target_rdma]);
+                if (lane_id < kNumRDMARanks and final_head > last_head)
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
+                                                    final_head - last_head,
+                                                    translate_dst_rdma_rank<false>(lane_id, nvl_rank),
+                                                    channel_id + num_channels,
+                                                    lane_id == rdma_rank);
                 break;
+            }
 
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + env.num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
@@ -1879,9 +1976,36 @@ dispatch_main_kernel(DispatchPoolOut pool_out,
                 const int s = chunk_idx % kNumStages;
                 const int ns = (chunk_idx + 1) % kNumStages;
 
+                const int nvl_slot_pos = cached_channel_head_idx;  // gen-local
                 int token_idx_in_buffer = (cached_channel_head_idx++) % env.num_max_nvl_chunked_recv_tokens;
                 auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
-                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
+                // [nvl slot tag] Accept the slot only once its tag matches
+                // this (seq, position) — see utils.cuh nvl_slot_tag. Lane 0
+                // spins on an acquire load and broadcasts. Zero-iteration in
+                // a healthy run (the tail release-acquire already ordered the
+                // payload); a spin here means the slot holds ANOTHER
+                // occupancy's token (cross-gen NVL ring reuse) — previously
+                // consumed silently as this token (misattribution).
+                const int nvl_tag_want = nvl_slot_tag(nvl_seq, nvl_slot_pos);
+                uint64_t meta_raw = 0;
+                if (lane_id == 0) {
+                    auto tag_start = clock64();
+                    while (true) {
+                        meta_raw = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(shifted + hidden_bytes));
+                        if (static_cast<int>((meta_raw >> 48) & 0xffff) == nvl_tag_want)
+                            break;
+                        if (clock64() - tag_start > NUM_TIMEOUT_CYCLES) {
+                            printf("StreamEP dispatch NVL receiver timeout (slot tag), channel: %d, RDMA: %d, nvl: %d, src NVL: %d, seq: %d, pos: %d, got: %d, want: %d\n",
+                                   channel_id, rdma_rank, nvl_rank, src_nvl_rank, static_cast<int>(nvl_seq),
+                                   nvl_slot_pos, static_cast<int>((meta_raw >> 48) & 0xffff), nvl_tag_want);
+                            trap();
+                        }
+                    }
+                }
+                meta_raw = __shfl_sync(0xffffffff, meta_raw, 0);
+                SourceMeta meta;
+                meta.src_rdma_rank = static_cast<int>(meta_raw & 0xffffffffu);
+                meta.is_token_in_nvl_rank_bits = static_cast<int>(meta_raw >> 32);
                 int src_rdma_rank = meta.src_rdma_rank;
                 int recv_token_idx = __shfl_sync(0xffffffff, total_offset, src_rdma_rank);
                 (lane_id == src_rdma_rank) ? (total_offset += 1) : 0;
@@ -2299,20 +2423,12 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
     auto num_bytes_per_token = get_num_bytes_per_token(shape.hidden_int4, shape.num_topk, shape.num_topk);
     auto rdma_channel_data = SymBuffer<uint8_t>(env.rdma_buffer_ptr,
         env.num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
-    align_meta_base_to_l2_line(env.rdma_buffer_ptr);
-    auto rdma_channel_meta = SymBuffer<int>(env.rdma_buffer_ptr,
-        kRdmaMetaRingDepth * kRdmaMetaSlabInts, kNumRDMARanks, channel_id, num_channels);
+    // [data-ring header] The per-(channel, src_rdma) routing header rides
+    // rdma_channel_data at ring position `baseline`. The SymBuffer chain is
+    // data -> head -> tail, matching `get_dispatch_rdma_region_bytes`; data
+    // ends int4-aligned, so the uint64 head/tail need no extra alignment.
     auto rdma_channel_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
-    // [meta backpressure] One slot per (consumer_rdma_rank, dst_nvl). The meta
-    // sender waits until the slowest of dst's NUM_MAX_NVL_PEERS forwarder warps
-    // has advanced its slot to env.dispatch_meta_writes[channel, dst] before it
-    // reuses the slab; each forwarder warp AMO-adds +1 to its own slot right
-    // after its gen-stamp gate passes. Lives on this (sender) rank's symmetric
-    // region, advanced remotely by the consumer (mirrors rdma_channel_head).
-    // Declared identically in fwd dispatch_main + bwd dispatch_grads so both map
-    // to the same symmetric offset and share the counter in call order.
-    auto meta_head = SymBuffer<uint64_t, false>(env.rdma_buffer_ptr, 1, kNumRDMARanks * NUM_MAX_NVL_PEERS, channel_id, num_channels);
 
     void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
     int rs_wr_rank = 0, ws_rr_rank = 0;
@@ -2385,112 +2501,45 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         int token_start_idx, token_end_idx;
         get_channel_task_range(shape.num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-        // See dispatch_main_kernel kRDMASender for the gen-stamp ring rationale.
-        // Mirrored here verbatim — fwd dispatch and bwd dispatch_grads share the
-        // meta SymBuffer (both run on streams.dispatch); the phase bit in nvl_seq
-        // keeps their gen-stamps distinct even at the same dispatch_seq.
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
-        for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
-            // [meta backpressure] depth-1: do not reuse dst's meta slab until all
-            // NUM_MAX_NVL_PEERS forwarder warps on dst have read the prior
-            // occupant. meta_need = #prior writes to (channel,dst); meta_head[d]
-            // = #reads by dst's forwarder warp d (each AMO-adds +1 every call,
-            // incl. zero-token, so no slot stalls -> no deadlock). Spin until the
-            // slowest reader (min over the 8 slots) has caught up.
-            const int meta_writes_idx = channel_id * kNumRDMARanks + dst_rdma_rank;
-            const uint32_t meta_need = env.dispatch_meta_writes[meta_writes_idx];
-            uint32_t mh = 0;
-            {
-                auto bp_start = clock64();
-                while (true) {
-                    mh = lane_id < NUM_MAX_NVL_PEERS
-                        ? static_cast<uint32_t>(ld_acquire_sys_global(
-                              meta_head.buffer(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id)))
-                        : 0xffffffffu;
-                    #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
-                        mh = min(mh, __shfl_xor_sync(0xffffffffu, mh, off));
-                    // Run-ahead: slab (k % depth)'s prior occupant is write
-                    // k-depth, so we only need forwarders to have consumed write
-                    // (meta_need - (depth-1)), not fully caught up. depth-1
-                    // reduces to the original `mh >= meta_need`.
-                    if (static_cast<int32_t>(mh - meta_need + (kRdmaMetaRingDepth - 1)) >= 0)
-                        break;
-                    if (clock64() - bp_start >= NUM_TIMEOUT_CYCLES) {
-                        if (lane_id == 0)
-                            printf("StreamEP dispatch meta backpressure timeout, phase: %d, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, need: %u, mh: %u\n",
-                                   static_cast<int>(nvl_seq & 1), channel_id, rdma_rank, nvl_rank, dst_rdma_rank, meta_need, mh);
-                        trap();
-                    }
-                }
-            }
-            __syncwarp();
-            // [genstamp ring] rotate through kRdmaMetaRingDepth slabs by
-            // dispatch_seq (= nvl_seq >> 1) so a peer up to depth-1 iters ahead
-            // writes a DIFFERENT slab — its overwrite can't clobber this iter's
-            // meta before the forwarder reads it.
-            const int meta_slab_off =
-                static_cast<int>((nvl_seq >> 1) % kRdmaMetaRingDepth) * kRdmaMetaSlabInts;
-            auto dst_ptr =
-                (dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank))
-                + meta_slab_off;
-            if (lane_id < NUM_MAX_NVL_PEERS) {
-                dst_ptr[lane_id] =
-                    channel_id == 0
-                        ? 0
-                        : routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1];
-            } else if (lane_id < NUM_MAX_NVL_PEERS * 2) {
-                dst_ptr[lane_id] =
-                    routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels +
-                                                      channel_id];
-            } else if (lane_id == NUM_MAX_NVL_PEERS * 2) {
-                dst_ptr[lane_id] = channel_id == 0 ? 0 : routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
-            } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
-                dst_ptr[lane_id] = routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
-            } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 2 and dst_rdma_rank != rdma_rank) {
-                // [genstamp] stage this iter's nvl_seq into the send buffer's
-                // gen-stamp slot; shipped by the 2nd put below (remote only).
-                dst_ptr[kRdmaMetaGenstampSlot] = static_cast<int>(nvl_seq);
-            }
-            __syncwarp();
-
-            if (dst_rdma_rank != rdma_rank) {
-                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank) + meta_slab_off),
-                                                  reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank) + meta_slab_off),
-                                                  sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
-                                                  translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
-                                                  channel_id, lane_id, 0);
-                // [genstamp] 2nd put on the SAME QP -> RC-ordered after the data
-                // put: the gen-stamp becomes visible only once slots 0..17 land.
-                nvshmemi_ibgda_put_nbi_warp<true>(
-                    reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank) + meta_slab_off + kRdmaMetaGenstampSlot),
-                    reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank) + meta_slab_off + kRdmaMetaGenstampSlot),
-                    sizeof(int),
-                    translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
-                    channel_id, lane_id, 0);
-            } else if (lane_id == 0) {
-                // [genstamp] local dst: fence orders the slot 0..17 stores before
-                // the gen-stamp store; same-GPU coherence covers the forwarder read.
-                __threadfence();
-                dst_ptr[kRdmaMetaGenstampSlot] = static_cast<int>(nvl_seq);
-            }
-            // [meta backpressure] record this write; the next overwrite of dst's
-            // slab waits for these readers (depth-1). Single writer per
-            // (channel,dst) per call; stream-ordered to the next dispatch kernel.
-            if (lane_id == 0)
-                env.dispatch_meta_writes[meta_writes_idx] += 1;
-        }
+        // [data-ring header] Mirror of dispatch_main_kernel: the 18-int routing
+        // header rides the data ring as ring position `baseline`, staged +
+        // emitted + tail-bumped by the kRDMASenderCoordinator below, validated
+        // by the token transport (tail-AMO gate + nvl_seq tag-spin). The token
+        // stream starts at `baseline + 1`; per-iter ring span is `1 + N`,
+        // accounted on head / tail / forwarder-coordinator credit. No meta
+        // channel / counter / checksum / backpressure.
         sync_rdma_sender_smem();
 
         // See dispatch_main_kernel kRDMASender for the prev-at-entry rationale:
-        // read the LIVE cumulative head at entry (=0 iter-local at start), not a
-        // baseline snapshotted at the prior sender-exit (too low -> wrap overwrite
-        // once a (channel,src) count exceeds the RDMA recv ring depth).
+        // the persistent reader_prev_head array accumulates EXACT per-iter sent
+        // counts (with the coordinator's end-of-iter residual flush), so it
+        // equals the head counter's settled value at every iter boundary. A
+        // LIVE read here races in-flight prior-iter credit AMOs (entry read
+        // too low -> mid-iter relative-head inflation -> ring overwrite).
         int64_t token_idx;
         uint32_t prev_rdma_channel_head_at_entry = lane_id < kNumRDMARanks
-            ? static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)))
+            ? env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
             : 0u;
-        int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
+        // Continuous ring phase: slots advance across iters as (prev + j) %
+        // ring instead of restarting at 0 each iter. With a per-iter phase
+        // restart, the credit gate's W - R < ring criterion under-protects
+        // the previous iter's final partial wrap (by ring - T%ring drains),
+        // letting a run-ahead next-iter sender overwrite undrained slots.
+        const int ring_phase_base = lane_id < kNumRDMARanks
+            ? static_cast<int>(prev_rdma_channel_head_at_entry
+                               % static_cast<uint32_t>(env.num_max_rdma_chunked_recv_tokens))
+            : 0;
+        // Seed the cached credit view from a LIVE read: with the exact
+        // baseline, the iter-entry relative head is the (possibly NEGATIVE)
+        // backlog of undrained prior-iter slots — initializing to 0 would let
+        // this iter's first `ring` tokens bypass the credit gate entirely and
+        // overwrite undrained slots one wrap below (gate checks re-read only
+        // once they spin).
+        int cached_rdma_channel_head = lane_id < kNumRDMARanks
+            ? static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)))
+                               - prev_rdma_channel_head_at_entry)
+            : 0;
+        int global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
             uint64_t is_token_in_rank_uint64 = 0;
@@ -2506,7 +2555,10 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
 
             auto start_time = clock64();
-            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
+            // [data-ring header] +1: token `rdma_tail_idx` is at ring position
+            // `baseline + 1 + rdma_tail_idx` (header at `baseline`); gate the
+            // shifted position against the position-domain freed credit.
+            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx + 1 - cached_rdma_channel_head >= env.num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head =
                     static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))) - prev_rdma_channel_head_at_entry);
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
@@ -2524,12 +2576,21 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             #pragma unroll
             for (int i = 0, slot_idx; i < kNumRDMARanks; ++i)
                 if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
-                    slot_idx = slot_idx % env.num_max_rdma_chunked_recv_tokens;
+                    // [slot genstamp] this dst's cumulative ring-position tag,
+                    // computed BEFORE the phase shift. +1: header occupies
+                    // `baseline`, token iter-local index sits at `baseline+1+idx`.
+                    const int slot_ring_tag = static_cast<int>(
+                        (__shfl_sync(0xffffffff, prev_rdma_channel_head_at_entry, i)
+                         + static_cast<uint32_t>(slot_idx) + 1u) & 0xffffu);
+                    // Continuous ring phase (see ring_phase_base above); +1 for
+                    // the header slot at the front of the stream.
+                    slot_idx = (slot_idx + 1 + __shfl_sync(0xffffffff, ring_phase_base, i))
+                               % env.num_max_rdma_chunked_recv_tokens;
                     topk_ranks[num_topk_ranks] = i;
                     auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
                     auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
                     if (lane_id == num_topk_ranks)
-                        src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
+                        src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values, slot_ring_tag);
                     dst_send_buffers[num_topk_ranks++] =
                         reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_token;
                 }
@@ -2575,12 +2636,13 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             __syncwarp();
         }
 
-        // Writeback observed cumulative head; see dispatch_main_kernel
+        // Writeback the EXACT cumulative head baseline; see dispatch_main_kernel
         // kRDMASender for rationale.
         if (lane_id < kNumRDMARanks) {
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_head + channel_id * kNumRDMARanks + lane_id,
-                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id))));
+                // +1: per-iter ring span is `1 + N` positions (header + N tokens).
+                prev_rdma_channel_head_at_entry + static_cast<uint32_t>(global_rdma_tail_idx) + 1u);
         }
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
         // RDMA sender coordinator — same as fwd: issue chunked RDMA puts to
@@ -2597,6 +2659,58 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_window[lane_id] = 0) : 0;
 
         sync_rdma_sender_smem();
+
+        // Continuous ring phase (see kRDMASender ring_phase_base); per dst lane.
+        const int coord_phase_base = lane_id < kNumRDMARanks
+            ? static_cast<int>(env.reader_prev_head[channel_id * kNumRDMARanks + lane_id]
+                               % static_cast<uint32_t>(env.num_max_rdma_chunked_recv_tokens))
+            : 0;
+
+        // [data-ring header] Mirror of dispatch_main_kernel: emit the
+        // per-(channel, dst_rdma) routing header as ring position `baseline`
+        // for EVERY dst unconditionally (incl. zero-token) — 18 routing ints in
+        // [0, hidden_bytes) + a generation tag (nvl_seq & 0xffff) at the
+        // SourceMeta word, a 1-slot put + tail += 1 before the token chunks.
+        // The forwarder gates on the tail AMO then tag-spins. No meta channel.
+        EP_DEVICE_ASSERT(static_cast<size_t>(NUM_MAX_NVL_PEERS * 2 + 2) * sizeof(int) <= hidden_bytes);
+        for (int dst_rdma_rank = 0; dst_rdma_rank < kNumRDMARanks; ++dst_rdma_rank) {
+            const int hdr_slot = __shfl_sync(0xffffffff, coord_phase_base, dst_rdma_rank);
+            auto hdr_ptr = reinterpret_cast<int*>(
+                (dst_rdma_rank == rdma_rank ? rdma_channel_data.recv_buffer(dst_rdma_rank)
+                                            : rdma_channel_data.send_buffer(dst_rdma_rank))
+                + static_cast<size_t>(hdr_slot) * num_bytes_per_token);
+            if (lane_id < NUM_MAX_NVL_PEERS)
+                hdr_ptr[lane_id] = channel_id == 0 ? 0
+                    : routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1];
+            else if (lane_id < NUM_MAX_NVL_PEERS * 2)
+                hdr_ptr[lane_id] =
+                    routing.gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id - NUM_MAX_NVL_PEERS) * num_channels + channel_id];
+            else if (lane_id == NUM_MAX_NVL_PEERS * 2)
+                hdr_ptr[lane_id] = channel_id == 0 ? 0
+                    : routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
+            else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1)
+                hdr_ptr[lane_id] = routing.rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
+            if (lane_id == 0)
+                *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(hdr_ptr) + hidden_bytes) =
+                    static_cast<uint64_t>(nvl_seq & 0xffffu) << 48;
+            __syncwarp();
+            if (dst_rdma_rank != rdma_rank) {
+                nvshmemi_ibgda_put_nbi_warp<true>(
+                    reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + static_cast<size_t>(hdr_slot) * num_bytes_per_token),
+                    reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + static_cast<size_t>(hdr_slot) * num_bytes_per_token),
+                    num_bytes_per_token,
+                    translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                    channel_id, lane_id, 0);
+            } else {
+                memory_fence();
+            }
+            __syncwarp();
+            if (lane_id == dst_rdma_rank)
+                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), 1,
+                                                translate_dst_rdma_rank<false>(dst_rdma_rank, nvl_rank),
+                                                channel_id, dst_rdma_rank == rdma_rank);
+            __syncwarp();
+        }
 
         int num_tokens_to_send = 0;
         if (lane_id < kNumRDMARanks) {
@@ -2634,8 +2748,18 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
                 int num_tokens_in_chunk = min(num_tokens_processed, env.num_max_rdma_chunked_send_tokens);
                 if (dst_rdma_rank != rdma_rank) {
+                    // Continuous ring phase: never let a chunk straddle the
+                    // ring edge — clamp this issue at the boundary; the
+                    // remainder ships as its own chunk on the next loop pass
+                    // (starting at slot 0). Single contiguous put per issue.
+                    // +1: token positions start at `baseline + 1` (the header
+                    // occupies `baseline`); matches the kRDMASender slot stride.
+                    auto src_slot_idx = (synced_last_issued_tail + 1
+                                         + __shfl_sync(0xffffffff, coord_phase_base, dst_rdma_rank))
+                                        % env.num_max_rdma_chunked_recv_tokens;
+                    num_tokens_in_chunk =
+                        min(num_tokens_in_chunk, env.num_max_rdma_chunked_recv_tokens - src_slot_idx);
                     const size_t num_bytes_per_msg = num_tokens_in_chunk * num_bytes_per_token;
-                    auto src_slot_idx = synced_last_issued_tail % env.num_max_rdma_chunked_recv_tokens;
                     const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + src_slot_idx * num_bytes_per_token);
                     const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + src_slot_idx * num_bytes_per_token);
                     nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg,
@@ -2672,66 +2796,82 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
-        // [genstamp] See dispatch_main_kernel forwarder: eager spin until the
-        // gen-stamp slot carries THIS iter's nvl_seq (published by the sender's
-        // 2nd RC-ordered put after the data put). Absolute identity; a peer
-        // running an iteration ahead is rejected, not mis-read.
-        // [genstamp ring] read this iter's ring slab (dispatch_seq % depth); a
-        // matching gen-stamp proves it's THIS iter's meta (a peer up to depth-1
-        // iters ahead wrote a different slab, so this one is intact).
-        const int meta_slab_off =
-            static_cast<int>((nvl_seq >> 1) % kRdmaMetaRingDepth) * kRdmaMetaSlabInts;
-        if (lane_id < kNumRDMARanks) {
-            auto meta_slab = rdma_channel_meta.recv_buffer(lane_id) + meta_slab_off;
-            while (true) {
-                auto cur_gen = ld_acquire_sys_global(meta_slab + kRdmaMetaGenstampSlot);
-                if (static_cast<int>(cur_gen) == static_cast<int>(nvl_seq)) {
-                    auto meta_0 = ld_acquire_sys_global(meta_slab + dst_nvl_rank);
-                    auto meta_1 = ld_acquire_sys_global(meta_slab + NUM_MAX_NVL_PEERS + dst_nvl_rank);
-                    auto meta_2 = ld_acquire_sys_global(meta_slab + NUM_MAX_NVL_PEERS * 2);
-                    auto meta_3 = ld_acquire_sys_global(meta_slab + NUM_MAX_NVL_PEERS * 2 + 1);
-                    int start_sum = meta_0, end_sum = meta_1;
-                    EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-                    st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
-                                         nvl_pack(nvl_seq, start_sum));
-                    st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
-                                         nvl_pack(nvl_seq, end_sum));
 
-                    src_rdma_channel_prefix = meta_2;
-                    auto src_rdma_channel_prefix_1 = meta_3;
-                    num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
-                    src_rdma_channel_prefix += lane_id == 0 ? 0 : routing.recv_rdma_rank_prefix_sum[lane_id - 1];
-                    EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
-                    break;
-                }
-
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("StreamEP dispatch_grads forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, cur_gen: %d, want: %d\n",
-                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, static_cast<int>(cur_gen), static_cast<int>(nvl_seq));
-                    trap();
-                }
-            }
-            // [meta backpressure] this (src=lane_id, dst_nvl) warp consumed src's
-            // meta this call: advance src's meta_head slot [my rdma_rank, dst_nvl]
-            // by +1. Fires for EVERY src every call (the gen-stamp gate above
-            // passes every call, incl. zero-token), so the sender's min-over-8
-            // wait never stalls. Mirrors the data-head coordinator AMO; local src
-            // (lane_id == rdma_rank) routes to a release.sys atomicAdd.
-            nvshmemi_ibgda_amo_nonfetch_add(
-                meta_head.buffer(rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank),
-                1,
-                translate_dst_rdma_rank<false>(lane_id, nvl_rank),
-                channel_id + num_channels,
-                lane_id == rdma_rank);
-        }
-        __syncwarp();
-        sync_forwarder_smem();
-
-        // See dispatch_main_kernel forwarder for the prev-at-entry rationale.
+        // [data-ring header] Mirror of dispatch_main_kernel: baseline seeded
+        // ahead of the arrival gate; by send/recv conservation the header at
+        // ring[baseline] (tag = nvl_seq & 0xffff) is found here, tokens at
+        // baseline + 1 + j.
         int src_rdma_rank = sm_id % kNumRDMARanks;
         uint32_t prev_rdma_channel_tail_at_entry = lane_id < kNumRDMARanks
             ? env.reader_prev_tail[channel_id * kNumRDMARanks + lane_id]
             : 0u;
+        const int ring_phase_base = lane_id < kNumRDMARanks
+            ? static_cast<int>(prev_rdma_channel_tail_at_entry
+                               % static_cast<uint32_t>(env.num_max_rdma_chunked_recv_tokens))
+            : 0;
+
+        // [data-ring header] Arrival gate (tail AMO >= 1) + data-visibility
+        // fence (tag-spin == nvl_seq & 0xffff), identical to
+        // dispatch_main_kernel; then read the 18 routing ints. No meta channel /
+        // counter / checksum. bwd does NOT write recv_rdma_channel_prefix_matrix
+        // (fwd populated it on the StreamingHandle).
+        if (lane_id < kNumRDMARanks) {
+            auto hdr_buf = rdma_channel_data.recv_buffer(lane_id)
+                           + static_cast<size_t>(ring_phase_base) * num_bytes_per_token;
+            auto hdr_ints = reinterpret_cast<int*>(hdr_buf);
+            const int hdr_tag_want = static_cast<int>(nvl_seq & 0xffffu);
+            auto hdr_start = clock64();
+            while (static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)))
+                                    - prev_rdma_channel_tail_at_entry) < 1) {
+                if (clock64() - hdr_start > NUM_TIMEOUT_CYCLES) {
+                    printf("StreamEP dispatch_grads forwarder timeout (header arrival), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, seq: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, static_cast<int>(nvl_seq));
+                    trap();
+                }
+            }
+            auto tag_start = clock64();
+            while (true) {
+                uint64_t tag_raw = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(hdr_buf + hidden_bytes));
+                if (static_cast<int>((tag_raw >> 48) & 0xffff) == hdr_tag_want)
+                    break;
+                if (clock64() - tag_start > NUM_TIMEOUT_CYCLES) {
+                    printf("StreamEP dispatch_grads forwarder timeout (header tag), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, got: %d, want: %d, seq: %d\n",
+                           channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank,
+                           static_cast<int>((tag_raw >> 48) & 0xffff), hdr_tag_want, static_cast<int>(nvl_seq));
+                    trap();
+                }
+            }
+            int start_sum = static_cast<int>(ld_acquire_sys_global(hdr_ints + dst_nvl_rank));
+            int end_sum   = static_cast<int>(ld_acquire_sys_global(hdr_ints + NUM_MAX_NVL_PEERS + dst_nvl_rank));
+            int meta_2    = static_cast<int>(ld_acquire_sys_global(hdr_ints + NUM_MAX_NVL_PEERS * 2));
+            int meta_3    = static_cast<int>(ld_acquire_sys_global(hdr_ints + NUM_MAX_NVL_PEERS * 2 + 1));
+            EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
+            st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id,
+                                 nvl_pack(nvl_seq, start_sum));
+            st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id,
+                                 nvl_pack(nvl_seq, end_sum));
+            src_rdma_channel_prefix = meta_2;
+            auto src_rdma_channel_prefix_1 = meta_3;
+            num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
+            src_rdma_channel_prefix += lane_id == 0 ? 0 : routing.recv_rdma_rank_prefix_sum[lane_id - 1];
+            EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
+        }
+        __syncwarp();
+        sync_forwarder_smem();
+
+        // Authoritative per-lane recv count for this iter (from the meta).
+        // Used by the exact reader_prev_tail writeback at exit.
+        const int rdma_recv_count_this_iter = num_tokens_to_recv_from_rdma;
+
+        // [data-ring header] Credit the header slot up front (seed 1) so a
+        // zero-token src still returns the header's freed position; the drain
+        // loop raises N>0 columns to src_rdma_tail + 1. After the barrier so it
+        // never races the forwarder-coordinator's zero-init. See
+        // dispatch_main_kernel. (src_rdma_rank / prev_rdma_channel_tail_at_entry
+        // / ring_phase_base are declared above the arrival gate.)
+        if (lane_id < kNumRDMARanks)
+            forward_channel_head[dst_nvl_rank][lane_id] = 1;
+        __syncwarp();
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0;
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
@@ -2756,8 +2896,19 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
-                        cached_rdma_channel_tail =
-                            static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - prev_rdma_channel_tail_at_entry);
+                        // Clamp visible arrivals to this iter's authoritative
+                        // meta count: the cumulative tail counter keeps
+                        // advancing with the NEXT iter's run-ahead sends, and
+                        // an unclamped read lets the drain loop's chunk range
+                        // extend into next-iter slots (consumed as this-iter
+                        // tokens -> misattribution / double-forward). The
+                        // forwarder must never consume past the meta count.
+                        // [data-ring header] -1: positions arrived include this
+                        // src's header slot; the token count is one fewer.
+                        // max(0,..) guards the header-only / nothing-yet window.
+                        cached_rdma_channel_tail = min(
+                            max(0, static_cast<int>(static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank))) - prev_rdma_channel_tail_at_entry) - 1),
+                            rdma_recv_count_this_iter);
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
@@ -2771,28 +2922,66 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
 
             // Two-stage prefetch pipeline (mirrors fwd dispatch forwarder).
-            struct PendingForward { uint8_t* dst_shifted; };
+            struct PendingForward { uint8_t* dst_shifted; int nvl_pos; };
             PendingForward pending[kNumStages] = {};
             int pending_count = 0;
             int issue_stage = 0;
             int drain_stage = 0;
 
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
-                auto rdma_slot_idx = i % env.num_max_rdma_chunked_recv_tokens;
+                // +1: token iter-local index `i` is at ring position
+                // `baseline + 1 + i` (header at `baseline`); slot + tag shift one.
+                auto rdma_slot_idx = (i + 1 + __shfl_sync(0xffffffff, ring_phase_base, src_rdma_rank))
+                                     % env.num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
-                auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
+                // [slot genstamp] Accept the slot only once its SourceMeta
+                // carries this position's tag (see SourceMeta). Lane 0 spins
+                // on an acquire load and broadcasts; the spin is
+                // zero-iteration unless the slot is announced (tail) but its
+                // data is not yet visible (payload writes can lag the counter
+                // on the wire).
+                const int slot_tag_want = static_cast<int>(
+                    (__shfl_sync(0xffffffff, prev_rdma_channel_tail_at_entry, src_rdma_rank)
+                     + static_cast<uint32_t>(i) + 1u) & 0xffffu);
+                uint64_t meta_raw = 0;
+                if (lane_id == 0) {
+                    auto tag_start = clock64();
+                    while (true) {
+                        meta_raw = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(shifted + hidden_bytes));
+                        if (static_cast<int>((meta_raw >> 48) & 0xffff) == slot_tag_want)
+                            break;
+                        if (clock64() - tag_start > NUM_TIMEOUT_CYCLES) {
+                            printf("StreamEP dispatch forwarder timeout (slot tag), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src lane: %d, seq: %d, got: %d, want: %d\n",
+                                   channel_id, rdma_rank, nvl_rank, dst_nvl_rank, src_rdma_rank,
+                                   static_cast<int>(nvl_seq), static_cast<int>((meta_raw >> 48) & 0xffff), slot_tag_want);
+                            trap();
+                        }
+                    }
+                }
+                meta_raw = __shfl_sync(0xffffffff, meta_raw, 0);
+                SourceMeta src_meta;
+                src_meta.src_rdma_rank = static_cast<int>(meta_raw & 0xffffffffu);
+                src_meta.is_token_in_nvl_rank_bits = static_cast<int>(meta_raw >> 32);
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
                 if (not is_in_dst_nvl_rank)
                     continue;
 
+                const int nvl_slot_pos = cached_nvl_channel_tail;  // gen-local; tagged at drain
                 int dst_slot_idx = (cached_nvl_channel_tail++) % env.num_max_nvl_chunked_recv_tokens;
                 auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
 
                 if (pending_count == kNumStages) {
                     mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
-                    if (elect_one_sync())
+                    if (elect_one_sync()) {
+                        // [nvl slot tag] Patch the staged SourceMeta's high 16
+                        // bits with this slot's NVL occupancy tag, then fence
+                        // the generic smem write against the async-proxy store.
+                        auto meta_bits = reinterpret_cast<int*>(tma_buffer(drain_stage) + hidden_bytes) + 1;
+                        *meta_bits = (*meta_bits & 0xffff) | (nvl_slot_tag(nvl_seq, pending[drain_stage].nvl_pos) << 16);
+                        tma_store_fence();
                         tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                    }
                     __syncwarp();
                     tma_store_wait<0>();
                     __syncwarp();
@@ -2806,6 +2995,7 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 }
                 __syncwarp();
                 pending[issue_stage].dst_shifted = dst_shifted;
+                pending[issue_stage].nvl_pos = nvl_slot_pos;
                 issue_stage = (issue_stage + 1) % kNumStages;
                 pending_count += 1;
 
@@ -2815,8 +3005,13 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
 
             while (pending_count > 0) {
                 mbarrier_wait(tma_mbarrier(drain_stage), tma_phase[drain_stage]);
-                if (elect_one_sync())
+                if (elect_one_sync()) {
+                    // [nvl slot tag] See the in-loop drain above.
+                    auto meta_bits = reinterpret_cast<int*>(tma_buffer(drain_stage) + hidden_bytes) + 1;
+                    *meta_bits = (*meta_bits & 0xffff) | (nvl_slot_tag(nvl_seq, pending[drain_stage].nvl_pos) << 16);
+                    tma_store_fence();
                     tma_store_1d(tma_buffer(drain_stage), pending[drain_stage].dst_shifted, num_bytes_per_token);
+                }
                 __syncwarp();
                 tma_store_wait<0>();
                 __syncwarp();
@@ -2824,8 +3019,12 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 pending_count -= 1;
             }
 
-            if (lane_id == src_rdma_rank)
-                forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
+            if (lane_id == src_rdma_rank) {
+                cached_rdma_channel_head = src_rdma_tail;
+                // [data-ring header] +1: the header slot is a freed ring
+                // position too (position-domain credit; seeded 1 before drain).
+                forward_channel_head[dst_nvl_rank][src_rdma_rank] = src_rdma_tail + 1;
+            }
 
             __syncwarp();
             if (elect_one_sync())
@@ -2837,16 +3036,17 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
         if (elect_one_sync())
             forward_channel_retired[dst_nvl_rank] = true;
 
-        // Writeback observed cumulative tail to the persistent array. (The meta
-        // slot is now absolute gen-stamped — no prev to maintain.) Forwarder
-        // exits only after draining each src_rdma's expected count, so
-        // ld(rdma_channel_tail) at exit >= prev_at_entry + this iter's count;
-        // atomicMax across forwarder warps preserves monotonicity, stream-ordered
-        // with the next kernel's read.
+        // Writeback the EXACT cumulative tail (prev_at_entry + this iter's
+        // authoritative count) to the persistent array. A live
+        // ld(rdma_channel_tail) here races in-flight NEXT-iter tail AMOs and
+        // would misalign the next kernel's drain window. All forwarder warps
+        // compute the same exact value; atomicMax keeps monotonicity,
+        // stream-ordered with the next kernel's read.
         if (lane_id < kNumRDMARanks) {
             atomicmax_reader_prev_cumulative(
                 env.reader_prev_tail + channel_id * kNumRDMARanks + lane_id,
-                static_cast<uint32_t>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))));
+                // +1: per-iter ring span is `1 + N` positions (header + N tokens).
+                prev_rdma_channel_tail_at_entry + static_cast<uint32_t>(rdma_recv_count_this_iter) + 1u);
         }
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
         if (target_rank > 0)
@@ -2868,8 +3068,26 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
                 if (not forward_channel_retired[i])
                     min_head = min(min_head, forward_channel_head[i][target_rdma]);
-            if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max()))
+            if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max())) {
+                // Flush the end-of-iter residual (< chunk) before exiting, so
+                // cumulative credits == cumulative tokens sent at every iter
+                // boundary. Required by the sender's exact reader_prev_head
+                // baseline: without this flush the unreturned residual
+                // accumulates as phantom ring occupancy. All warps retired
+                // => forward_channel_head[i][r] holds each warp's final
+                // (full per-lane) count, so min over ALL i is exact.
+                int final_head = std::numeric_limits<int>::max();
+                #pragma unroll
+                for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+                    final_head = min(final_head, forward_channel_head[i][target_rdma]);
+                if (lane_id < kNumRDMARanks and final_head > last_head)
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
+                                                    final_head - last_head,
+                                                    translate_dst_rdma_rank<false>(lane_id, nvl_rank),
+                                                    channel_id + num_channels,
+                                                    lane_id == rdma_rank);
                 break;
+            }
 
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + env.num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
@@ -2979,9 +3197,30 @@ dispatch_grads_main_kernel(DispatchGradsIO io,
                 const int s = chunk_idx % kNumStages;
                 const int ns = (chunk_idx + 1) % kNumStages;
 
+                const int nvl_slot_pos = cached_channel_head_idx;  // gen-local
                 int token_idx_in_buffer = (cached_channel_head_idx++) % env.num_max_nvl_chunked_recv_tokens;
                 auto shifted = nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
-                auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes));
+                // [nvl slot tag] See the fwd receiver — same acceptance check.
+                const int nvl_tag_want = nvl_slot_tag(nvl_seq, nvl_slot_pos);
+                uint64_t meta_raw = 0;
+                if (lane_id == 0) {
+                    auto tag_start = clock64();
+                    while (true) {
+                        meta_raw = ld_acquire_sys_global(reinterpret_cast<uint64_t*>(shifted + hidden_bytes));
+                        if (static_cast<int>((meta_raw >> 48) & 0xffff) == nvl_tag_want)
+                            break;
+                        if (clock64() - tag_start > NUM_TIMEOUT_CYCLES) {
+                            printf("StreamEP dispatch_grads NVL receiver timeout (slot tag), channel: %d, RDMA: %d, nvl: %d, src NVL: %d, seq: %d, pos: %d, got: %d, want: %d\n",
+                                   channel_id, rdma_rank, nvl_rank, src_nvl_rank, static_cast<int>(nvl_seq),
+                                   nvl_slot_pos, static_cast<int>((meta_raw >> 48) & 0xffff), nvl_tag_want);
+                            trap();
+                        }
+                    }
+                }
+                meta_raw = __shfl_sync(0xffffffff, meta_raw, 0);
+                SourceMeta meta;
+                meta.src_rdma_rank = static_cast<int>(meta_raw & 0xffffffffu);
+                meta.is_token_in_nvl_rank_bits = static_cast<int>(meta_raw >> 32);
                 int src_rdma_rank = meta.src_rdma_rank;
                 int recv_token_idx = __shfl_sync(0xffffffff, total_offset, src_rdma_rank);
                 (lane_id == src_rdma_rank) ? (total_offset += 1) : 0;

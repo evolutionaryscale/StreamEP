@@ -350,7 +350,6 @@ void Buffer::destroy() {
         if (dispatch_reader_prev_tail)     CUDA_CHECK(cudaFree(dispatch_reader_prev_tail));
         if (combine_reader_prev_head)      CUDA_CHECK(cudaFree(combine_reader_prev_head));
         if (combine_reader_prev_tail)      CUDA_CHECK(cudaFree(combine_reader_prev_tail));
-        if (dispatch_meta_writes)          CUDA_CHECK(cudaFree(dispatch_meta_writes));
         if (enable_shrink) {
             internode::free(mask_buffer_ptr);
             internode::free(sync_buffer_ptr);
@@ -512,12 +511,10 @@ void Buffer::sync(const std::vector<int>& device_ids,
         CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail,    prev_array_bytes_32));
         CUDA_CHECK(cudaMalloc(&combine_reader_prev_head,     prev_array_bytes_32));
         CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail,     prev_array_bytes_32));
-        CUDA_CHECK(cudaMalloc(&dispatch_meta_writes,         prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(dispatch_reader_prev_head,    0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail,    0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(combine_reader_prev_head,     0, prev_array_bytes_32));
         CUDA_CHECK(cudaMemset(combine_reader_prev_tail,     0, prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(dispatch_meta_writes,        0, prev_array_bytes_32));
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -1534,7 +1531,22 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     int64_t streaming_rdma_total =
         2 * static_cast<int64_t>(num_rdma_ranks) * num_channels *
         NUM_MAX_NVL_PEERS * num_local_experts * sizeof(int);
-    EP_HOST_ASSERT(streaming_rdma_offset + streaming_rdma_total <= num_rdma_bytes);
+    // The metadata kernel's count-exchange + streaming-superset payloads live
+    // in a region DISJOINT from the dispatch + combine hot-path SymBuffer
+    // chains: the metadata kernel runs at EVERY call, and under cross-rank
+    // run-ahead its RDMA puts land while a lagging peer's PRIOR iterations
+    // are still draining their rings. Sharing base offset 0 with the dispatch
+    // data ring (channel 0 sits first) let a leading rank's metadata puts
+    // clobber a lagging rank's live channel-0 ring slots.
+    const int64_t metadata_rdma_offset =
+        internode::get_dispatch_rdma_region_bytes(
+            hidden_int4, num_topk, config.num_max_rdma_chunked_recv_tokens,
+            num_channels, num_rdma_ranks) +
+        internode::get_combine_rdma_region_bytes(
+            hidden_int4, num_topk, config.num_max_rdma_chunked_recv_tokens,
+            num_channels, num_rdma_ranks);
+    EP_HOST_ASSERT(metadata_rdma_offset + streaming_rdma_offset + streaming_rdma_total
+                   <= num_rdma_bytes);
 
     internode::streaming_dispatch_metadata(
         topk_idx.data_ptr<topk_idx_t>(),
@@ -1555,7 +1567,8 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         num_tokens, num_topk, num_experts, num_channels,
         hidden_int4, expert_alignment, tile_m,
         streaming_rdma_offset,
-        rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
+        static_cast<void*>(static_cast<uint8_t*>(rdma_buffer_ptr) + metadata_rdma_offset),
+        buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
         rank, num_ranks, stream, num_rdma_bytes, num_nvl_bytes);
 
     // Host-poll all four host-mapped counters before dispatch_main launch
@@ -1648,7 +1661,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
         .reader_prev_head                    = dispatch_reader_prev_head,
         .reader_prev_tail                    = dispatch_reader_prev_tail,
-        .dispatch_meta_writes                = dispatch_meta_writes,
     };
 
     internode::launch_dispatch_main(pool_out, per_token_out, inputs, tile_signal,
@@ -1732,9 +1744,9 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
     // launch the kernel because:
     //   1. Sender side has work — this rank's local layer has dL/dy for
     //      `num_tokens` source tokens that must be shipped to expert ranks.
-    //   2. Receiver / forwarder side must publish empty meta + bump the
-    //      sentinel slot so remote-RDMA-peer forwarders waiting on our
-    //      `rdma_channel_meta` don't time out.
+    //   2. Receiver / forwarder side must still emit the per-link data-ring
+    //      header (N=0) + bump the tail so remote-RDMA-peer forwarders waiting
+    //      on the header's arrival don't time out.
     // tile_m is used inside the NVL-receiver path (slot/tile_m, fire_pool_blocks)
     // which is gated by `num_recv_tokens > 0` and never executes on this
     // rank, so tile_m=0 is safe at the kernel level.
@@ -1795,7 +1807,6 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
         .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
         .reader_prev_head                    = dispatch_reader_prev_head,
         .reader_prev_tail                    = dispatch_reader_prev_tail,
-        .dispatch_meta_writes                = dispatch_meta_writes,
     };
 
     // Recorded before the main kernel launch — bwd orchestrator's compute

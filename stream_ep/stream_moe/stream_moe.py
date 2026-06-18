@@ -751,21 +751,29 @@ class StreamMoEFunc(torch.autograd.Function):
                 preact_a = torch.empty(
                     total_tiles, tile_m, two_I, dtype=dtype, device=device
                 )
-                _postact_recompute_scratch = torch.empty(
-                    total_tiles, tile_m, I, dtype=dtype, device=device
-                )
-                streaming_moe_a(
-                    pool,
-                    w1_local,
-                    _postact_recompute_scratch,
-                    handle.expert_pool_block_offset,
-                    handle.pool_arrival_target,  # count == target ⟹ immediate
-                    handle.pool_arrival_target,
-                    preact_a=preact_a,
-                    tile_m=tile_m,
-                    tile_n=tile_n_a,
-                    cluster_n=2,
-                    num_sms=num_sms_a,
+                # Recompute preact = pool @ w1 with a plain grouped-M GEMM (pool
+                # is fully materialized from the fwd save, so a streaming kernel
+                # would be pure overhead). cu_seqlens_m = the per-expert padded
+                # token offsets (identical to dW's cu_seqlens_k); the per-expert
+                # weight w1[e] is selected by the M-group index. Padding rows are
+                # computed (each M-row is independent) and masked downstream by
+                # kernel_y_bwd's mPaddingMask, exactly as the fwd kernel-A path.
+                # Not bit-identical to fwd's preact (different tiling) but same
+                # math within the bf16 recompute-noise floor checkpointing
+                # tolerates. MUST stay after the wait_event(grads_started) +
+                # wait_dispatch_grads_started gates above so dispatch_grads_main
+                # is co-resident first and this GEMM only fills leftover SMs.
+                gemm(
+                    pool,                              # A (TK_padded, H) k-major
+                    w1_local,                          # B (E_local, 2I, H)=(l,n,k)
+                    preact_a.view(TK_padded, two_I),   # D (TK_padded, 2I) n-major
+                    None,                              # C
+                    None,                              # tile_count_semaphore
+                    tile_M=tile_m,
+                    tile_N=tile_n_a,
+                    cluster_M=1,
+                    cluster_N=1,
+                    cu_seqlens_m=cu_seqlens_k,         # per-expert padded token offsets
                 )
 
         # ── Stage 2 — kernel_y_bwd on streams.compute ──────────────────────
