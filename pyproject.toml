@@ -4,7 +4,7 @@
 # Consumers (evoscale) install with `no-build-isolation = ["stream-ep"]` so the
 # env's already-pinned torch (cu128 ABI) is used directly; the requires line
 # below documents the contract and lets pure-isolation builds find the deps too.
-requires = ["setuptools>=61", "wheel", "torch>=2.8,<2.9"]
+requires = ["setuptools>=61", "wheel", "torch>=2.11,<2.12"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,7 +13,7 @@ version = "0.1.9"
 # Declared explicitly so uv installs torch FIRST (the env's existing pin) and
 # stream-ep's setup.py can import it at metadata-prep time under
 # no-build-isolation. Without this, uv has no dep edge to enforce ordering.
-dependencies = ["torch>=2.8,<2.9"]
+dependencies = ["torch>=2.11,<2.12"]
 
 [tool.yapf]
 based_on_style = "pep8"
