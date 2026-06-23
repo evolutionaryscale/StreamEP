@@ -2,6 +2,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <pybind11/functional.h>
 #include <torch/python.h>
@@ -449,6 +450,10 @@ void Buffer::set_compute_stream_handle(int64_t stream_handle) {
     compute_stream_handle_ = stream_handle;
 }
 
+void Buffer::set_default_stream_handle(int64_t stream_handle) {
+    default_stream_handle_ = stream_handle;
+}
+
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
@@ -581,6 +586,41 @@ inline void record_consumer_stream(const torch::Tensor& t, int64_t consumer_stre
     t.record_stream(at::cuda::getStreamFromExternal(
         reinterpret_cast<cudaStream_t>(consumer_stream_handle),
         t.device().index()));
+}
+
+// Allocate a fresh (uninitialized) caching-allocator tensor for a pool-shaped
+// buffer that lives across the layer (pool, dL_do_pool).
+//
+// When a DEFAULT (caller) stream is registered, allocate on it rather than the
+// current (communicate) stream, so the buffer lands in the default pool and can
+// be reused across layers / absorb the model's freed activations instead of
+// carving a segregated communicate-stream pool. In this case we DELIBERATELY do
+// NOT record_consumer_stream: free-side safety comes from the caller-side
+// layer-end caller.wait_stream(compute/communicate) back-edges — these buffers
+// are held as Python locals / saved tensors and freed at bwd return, AFTER those
+// gates, so any caller-FIFO reuse is ordered after both consumer streams.
+// record_stream would instead defer reclamation behind the lagging side streams
+// and pile up pending-free blocks (measured: ~10 GB on the comm pool).
+// Alloc->first-use is covered by the layer-start communicate.wait_stream(caller)
+// gate preceding the first writer (dispatch_main / dispatch_grads_main).
+//
+// Fallback (no default stream registered — e.g. a direct intranode_dispatch
+// caller that isn't stream_moe_func and has no back-edge contract): keep the
+// original behavior — allocate on the current stream and record the compute
+// consumer so the allocator defers reuse until compute is done.
+inline torch::Tensor empty_on_default(at::IntArrayRef size,
+                                      const torch::TensorOptions& opts,
+                                      int64_t default_stream_handle,
+                                      int64_t consumer_stream_handle) {
+    if (default_stream_handle == 0) {
+        auto t = torch::empty(size, opts);
+        record_consumer_stream(t, consumer_stream_handle);
+        return t;
+    }
+    c10::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal(
+        reinterpret_cast<cudaStream_t>(default_stream_handle),
+        opts.device().index()));
+    return torch::empty(size, opts);
 }
 
 void validate_dispatch_inputs(const torch::Tensor& x,
@@ -1140,8 +1180,12 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     // kernel A's tile-streaming, fwd combine's gather) or uses quack's
     // `lens_k` to bound the K-tile via TMA's OOB-zero-fill (bwd dW1's
     // grouped GEMM). Padding rows are never read.
-    auto pool = torch::empty({TK_padded, hidden}, x.options());
-    record_consumer_stream(pool, compute_stream_handle_);
+    // Allocated on the DEFAULT (caller) stream, NOT this dispatch's communicate
+    // stream — pool is saved across fwd→bwd and freed at bwd return, after the
+    // caller-side layer-end back-edges, so it shares the default pool and reuses
+    // freely without a record_consumer_stream deferral. See empty_on_default.
+    auto pool = empty_on_default({TK_padded, hidden}, x.options(),
+                                 default_stream_handle_, compute_stream_handle_);
 
     auto post = allocate_post_poll_bundle(
         TK_padded, hidden, poll.num_recv_tokens, num_topk,
@@ -1293,8 +1337,13 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     // store), and dW2's grouped GEMM reads dL_do_pool through quack's
     // `lens_k` which bounds the K-tile via TMA's OOB-zero-fill. Padding
     // rows are never functionally read.
-    auto dL_do_pool = torch::empty({TK_padded, hidden}, dL_dy.options());
-    record_consumer_stream(dL_do_pool, compute_stream_handle_);
+    // Allocated on the DEFAULT (caller) stream, NOT communicate — dL_do_pool is
+    // a bwd local freed at bwd return, after the caller-side layer-end
+    // back-edges, so it shares the default pool without a record_consumer_stream
+    // deferral. See empty_on_default. (torch::empty: no init kernel.)
+    auto dL_do_pool = empty_on_default({TK_padded, hidden}, dL_dy.options(),
+                                       default_stream_handle_,
+                                       compute_stream_handle_);
 
     // Per-tile signal arrays. Both zero-init: bwd_dispatch_arrival_count
     // accumulates Pass 2 release-adds; kernel_y_bwd's scheduler spins on
@@ -1596,8 +1645,14 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // predicates on `pool_recv_token >= 0` (kernel A's tile-streaming,
     // combine's gather) or uses quack's `lens_k` for OOB-zero-fill (bwd dW
     // grouped GEMM). Padding rows are never read.
-    auto pool = torch::empty({TK_padded, hidden}, x.options());
-    record_consumer_stream(pool, compute_stream_handle_);
+    // Allocated on the DEFAULT (caller) stream, NOT communicate — saved across
+    // fwd→bwd, freed at bwd return after the caller-side layer-end back-edges, so
+    // it shares the default pool without a record_consumer_stream deferral. See
+    // empty_on_default. (NOTE: the internode dL_do_pool below is torch::zeros and
+    // is intentionally left on communicate — moving a memset to the default
+    // stream would need extra alloc→first-use ordering.)
+    auto pool = empty_on_default({TK_padded, hidden}, x.options(),
+                                 default_stream_handle_, compute_stream_handle_);
 
     auto post = allocate_post_poll_bundle_internode(
         TK_padded, hidden, num_recv_tokens, num_rdma_recv_tokens, num_topk,
@@ -2002,6 +2057,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("kernel_y_started_flag_tensor", &stream_ep::Buffer::kernel_y_started_flag_tensor)
         .def("kernel_a_bwd_started_flag_tensor", &stream_ep::Buffer::kernel_a_bwd_started_flag_tensor)
         .def("set_compute_stream_handle", &stream_ep::Buffer::set_compute_stream_handle)
+        .def("set_default_stream_handle", &stream_ep::Buffer::set_default_stream_handle)
         .def("intranode_dispatch", &stream_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_grads", &stream_ep::Buffer::intranode_dispatch_grads)
         .def("intranode_combine", &stream_ep::Buffer::intranode_combine)

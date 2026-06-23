@@ -283,6 +283,13 @@ private:
     // memset clobbers in-flight values.
     int64_t compute_stream_handle_ = 0;
 
+    // Handle of the DEFAULT (caller) stream the consumer model runs on (set via
+    // `set_default_stream_handle`; zero until set). When set, `pool` / `dL_do_pool`
+    // are allocated on it (see empty_on_default) so they share the default
+    // caching-allocator pool instead of a segregated communicate-stream pool;
+    // free-side safety is the caller-side layer-end back-edges, NOT record_stream.
+    int64_t default_stream_handle_ = 0;
+
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
@@ -371,6 +378,11 @@ public:
     // per (Buffer, StreamHolder) pair by `stream_moe_func`; safe to call
     // multiple times.
     void set_compute_stream_handle(int64_t stream_handle);
+
+    // Register the default (caller) stream so `pool` / `dL_do_pool` are allocated
+    // in the default caching-allocator pool. Called by `stream_moe_func`; safe to
+    // call multiple times.
+    void set_default_stream_handle(int64_t stream_handle);
 
     // Streaming-MoE consolidated dispatch (intranode, pool layout). Two kernels
     // + one host sync per call: a fused metadata kernel (cross-rank count

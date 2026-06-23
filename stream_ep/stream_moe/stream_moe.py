@@ -1019,6 +1019,14 @@ def stream_moe_func(
     # compute are still reading or writing. Cheap; idempotent stores an int
     # handle, so calling per-layer is fine.
     buffer.runtime.set_compute_stream_handle(streams.compute.cuda_stream)
+    # Register the caller (default) stream so the C++ Buffer allocates ``pool`` /
+    # ``dL_do_pool`` in the default caching-allocator pool instead of a segregated
+    # communicate-stream pool. ``stream_moe_func`` runs on the caller stream (the
+    # model's default stream), which is also where StreamMoEFunc captures
+    # ``caller_stream`` and where the fwd/bwd scratch is allocated — so all
+    # StreamMoE memory shares one pool. Free-side safety is the layer-end
+    # caller.wait_stream(compute/communicate) back-edges (NOT record_stream).
+    buffer.runtime.set_default_stream_handle(torch.cuda.current_stream().cuda_stream)
     return StreamMoEFunc.apply(
         streams,
         buffer,
