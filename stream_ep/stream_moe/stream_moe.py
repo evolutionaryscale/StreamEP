@@ -368,39 +368,55 @@ class StreamMoEFunc(torch.autograd.Function):
         # finishes — kernel A's scheduler spin on
         # `pool_arrival_count[tile] == pool_arrival_target[tile]` re-claims
         # those, terminating immediately on every tile.
-        _nvtx_push(f"fwd_compute_{_fid}")
-        with torch.cuda.stream(streams.compute):
-            postact_a = torch.empty(
+        # Allocate kernel A/Y outputs on the CALLER stream (default pool), not the
+        # compute stream, so the default pool can reuse this memory across layers
+        # (and absorb the model's freed activations) instead of carving a separate
+        # compute-stream pool. The kernels below still run on streams.compute.
+        # NO record_stream: free-side safety comes from the layer-end
+        # caller.wait_stream(compute) back-edge (these are locals freed at return,
+        # after that gate, so any reuse is ordered after compute). record_stream
+        # would instead defer reclamation behind the lagging compute stream and
+        # bloat the pool (measured: +9 GB of active_pending_free).
+        postact_a = torch.empty(
+            handle.total_tiles,
+            tile_m,
+            w2_local.shape[2],
+            dtype=x.dtype,
+            device=pool.device,
+        )
+        # preact_a holds the [2I] pre-SwiGLU gate-up accumulator from kernel
+        # A's mD TMA-store path (opt-in via the ``preact_a`` kwarg below).
+        # Kept alive across fwd→bwd via ctx.save_for_backward; bwd consumes
+        # it for SwiGLU bwd in registers and for postact_a recompute. The
+        # cheap thing element-wise-recomputes from preact in bwd, the
+        # expensive thing (preact, would otherwise need a GEMM to recover)
+        # is the one we save.
+        #
+        # Under ``activation_checkpoint`` we DON'T save preact_a: the fwd
+        # ``[2I]`` TMA-store is skipped (preact_a=None below) and bwd
+        # recomputes it from the saved ``pool`` @ ``w1_local`` (one
+        # kernel-A-sized GEMM that overlaps with dispatch_grads' comm tail).
+        # Trades ~2I·2 B/slot of saved activation per layer for that GEMM.
+        preact_a = (
+            None
+            if activation_checkpoint
+            else torch.empty(
                 handle.total_tiles,
                 tile_m,
-                w2_local.shape[2],
+                2 * w2_local.shape[2],
                 dtype=x.dtype,
                 device=pool.device,
             )
-            # preact_a holds the [2I] pre-SwiGLU gate-up accumulator from kernel
-            # A's mD TMA-store path (opt-in via the ``preact_a`` kwarg below).
-            # Kept alive across fwd→bwd via ctx.save_for_backward; bwd consumes
-            # it for SwiGLU bwd in registers and for postact_a recompute. The
-            # cheap thing element-wise-recomputes from preact in bwd, the
-            # expensive thing (preact, would otherwise need a GEMM to recover)
-            # is the one we save.
-            #
-            # Under ``activation_checkpoint`` we DON'T save preact_a: the fwd
-            # ``[2I]`` TMA-store is skipped (preact_a=None below) and bwd
-            # recomputes it from the saved ``pool`` @ ``w1_local`` (one
-            # kernel-A-sized GEMM that overlaps with dispatch_grads' comm tail).
-            # Trades ~2I·2 B/slot of saved activation per layer for that GEMM.
-            preact_a = (
-                None
-                if activation_checkpoint
-                else torch.empty(
-                    handle.total_tiles,
-                    tile_m,
-                    2 * w2_local.shape[2],
-                    dtype=x.dtype,
-                    device=pool.device,
-                )
-            )
+        )
+        # Order compute after caller before its FIRST use of postact_a/preact_a
+        # above (alloc→first-use safety: a recycled caller-pool block's previous
+        # caller-stream kernel must finish before compute touches it). Cheap here:
+        # caller has no GPU work outstanding at this point (dispatch runs on
+        # communicate), so it doesn't serialize the dispatch ↔ kernel-A overlap.
+        streams.compute.wait_stream(caller_stream)
+
+        _nvtx_push(f"fwd_compute_{_fid}")
+        with torch.cuda.stream(streams.compute):
             # Empty-rank guard: when no token is routed to any of this rank's
             # local experts, ``total_tiles == 0`` ⟹ ``T_recv == 0``. Skipping
             # kernel A / kernel Y is required because their CuTeDSL launches
@@ -644,46 +660,49 @@ class StreamMoEFunc(torch.autograd.Function):
         TK_padded = pool.shape[0]
         T_recv = handle.k_local_total.shape[0]
 
-        # Per-stream zero-init / shape-only allocations — runs before the
-        # fan-out gate on caller_stream so it overlaps with the upstream
-        # layer's bwd tail. These do NOT touch fwd-written handle data, so
-        # they don't need the fan-out wait yet.
-        with torch.cuda.stream(streams.compute):
-            dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
-            bwd_k_local_remaining = torch.empty(
-                T_recv, dtype=torch.int32, device=device
-            )
-            bwd_a_done_per_token = torch.zeros(
-                T_recv, dtype=torch.int64, device=device
-            )
-            dL_dswiglu_in = torch.empty(
-                total_tiles, tile_m, two_I, dtype=dtype, device=device
-            )
-            postact_a_for_dW2 = torch.empty(
-                total_tiles, tile_m, I, dtype=dtype, device=device
-            )
-            # dL_dweight: per-pid_n fp32 atomic-add target; MUST zero-init.
-            dL_dweight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
-        # Allocated on ``streams.compute`` (block above) but read by
-        # ``buffer.combine_grads`` on ``streams.communicate`` below. PyTorch's
-        # caching allocator only tracks the allocation stream's events for
-        # reuse — without record_stream the storage can be recycled while
-        # combine_grads is still reading on ``communicate``. Symmetric to the
-        # C++-side ``record_consumer_stream`` plumbing on dispatch slabs (see
-        # ``Buffer.set_compute_stream_handle``).
-        dL_dx_per_r.record_stream(streams.communicate)
-        bwd_a_done_per_token.record_stream(streams.communicate)
-        dL_dweight.record_stream(streams.communicate)
-
-        with torch.cuda.stream(streams.compute):
-            # quack `gemm` with default `add_to_output=False` overwrites D,
-            # so neither dW destination needs zero-init.
-            dW1_local = torch.empty_like(w1_local)
-            dW2_local = torch.empty_like(w2_local)
+        # Allocate the backward scratch on the CALLER stream (default pool), not
+        # streams.compute, so it doesn't carve a segregated compute-stream pool.
+        # Memsets for the zero-init targets run on streams.compute after the
+        # fan-out gate below. Free-side safety is the layer-end back-edges (see
+        # the note below the allocations), so no record_stream here.
+        dL_dx_per_r = torch.empty(T_recv, H, dtype=dtype, device=device)
+        bwd_k_local_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
+        bwd_a_done_per_token = torch.empty(T_recv, dtype=torch.int64, device=device)
+        dL_dswiglu_in = torch.empty(
+            total_tiles, tile_m, two_I, dtype=dtype, device=device
+        )
+        postact_a_for_dW2 = torch.empty(
+            total_tiles, tile_m, I, dtype=dtype, device=device
+        )
+        # dL_dweight: per-pid_n fp32 atomic-add target; MUST zero-init.
+        dL_dweight = torch.empty(TK_padded, dtype=torch.float32, device=device)
+        # quack `gemm` with default `add_to_output=False` overwrites D, so neither
+        # dW destination needs zero-init.
+        dW1_local = torch.empty_like(w1_local)
+        dW2_local = torch.empty_like(w2_local)
+        # NO record_stream on the scratch above. It's caller-allocated and freed
+        # as locals at bwd return — AFTER the layer-end
+        # caller.wait_stream(compute/communicate) back-edges — so any later reuse
+        # (next layer's scratch or the model's activations) is ordered after both
+        # consumer streams finish with it. record_stream would instead defer
+        # reclamation behind the lagging side streams, piling up pending-free
+        # blocks the default pool can't reuse (measured: +9 GB).
 
         # ── Single fan-out gate on caller_stream ───────────────────────────
+        # MUST precede the FIRST side-stream use of the caller-allocated scratch
+        # above: ``torch.empty`` may hand back caller-pool blocks whose previous
+        # caller-stream kernel is still in flight, so compute/communicate must
+        # join caller's completion state before touching them (alloc→first-use).
+        # (Also required before the FWD-written handle reads below.)
         streams.communicate.wait_stream(caller_stream)
         streams.compute.wait_stream(caller_stream)
+
+        # Zero-init targets — AFTER the fan-out gate so the memsets are ordered
+        # after caller's prior use of any recycled block.
+        with torch.cuda.stream(streams.compute):
+            dL_dx_per_r.zero_()
+            bwd_a_done_per_token.zero_()
+            dL_dweight.zero_()
 
         # Reads of FWD-written handle tensors (expert_pool_block_offset,
         # expert_frequency, k_local_total — all on the fwd post-poll bundle,
