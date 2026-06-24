@@ -85,11 +85,14 @@ def rank_zero_only(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-H = 2048
-I = 384
-NUM_EXPERTS = 384
+# Default profile shape = the 82ba5b prod config (82B total / 4.3B active):
+# d_model H=3072, per-expert I=768, E=256 experts, top-K=8, 8192 tokens/rank.
+# Override any of these via --hidden / --intermediate / --num_experts / --topk.
+H = 3072
+I = 768
+NUM_EXPERTS = 256
 SEQ_LEN_PER_RANK = 8192
-TOPK = 13
+TOPK = 8
 DTYPE = torch.bfloat16
 NUM_SMS = 64  # 64 SMs (32 channels): tuned for 4+ node RDMA-dominated runs.
 TILE_M = 128
@@ -155,16 +158,18 @@ def main():
     p.add_argument("--num_sms", type=int, default=None,
                    help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
-    # MoE shape overrides — default to the profile shape; pass 82ba5b's
-    # (H=3072 I=768 E=256 K=8) to measure the recompute cost at the real
-    # GEMM size (2I·H), which is what determines whether the bwd preact_a
-    # recompute hides behind dispatch_grads' comm. Defaults come via globals()
-    # because main() rebinds H/I/NUM_EXPERTS/TOPK as locals below — a bare
-    # `default=H` would be an UnboundLocalError on that soon-to-be-local name.
-    p.add_argument("--hidden", type=int, default=globals()["H"], help="d_model (82ba5b=3072)")
-    p.add_argument("--intermediate", type=int, default=globals()["I"], help="per-expert I (82ba5b=768)")
-    p.add_argument("--num_experts", type=int, default=globals()["NUM_EXPERTS"], help="total experts E (82ba5b=256)")
-    p.add_argument("--topk", type=int, default=globals()["TOPK"], help="top-k K (82ba5b=8)")
+    # MoE shape overrides — default to the 82ba5b prod shape (H=3072 I=768
+    # E=256 K=8), so the profile runs at the real GEMM size (2I·H) that
+    # determines whether the bwd preact_a recompute hides behind
+    # dispatch_grads' comm. Pass flags for a different shape, e.g. the esm4
+    # 18.6B: --hidden 2048 --intermediate 384 --num_experts 384 --topk 13.
+    # Defaults come via globals() because main() rebinds H/I/NUM_EXPERTS/TOPK
+    # as locals below — a bare `default=H` would be an UnboundLocalError on
+    # that soon-to-be-local name.
+    p.add_argument("--hidden", type=int, default=globals()["H"], help="d_model H (default: 82ba5b 3072)")
+    p.add_argument("--intermediate", type=int, default=globals()["I"], help="per-expert I (default: 82ba5b 768)")
+    p.add_argument("--num_experts", type=int, default=globals()["NUM_EXPERTS"], help="total experts E (default: 82ba5b 256)")
+    p.add_argument("--topk", type=int, default=globals()["TOPK"], help="top-k K (default: 82ba5b 8)")
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)
