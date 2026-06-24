@@ -8,6 +8,11 @@ Public surface:
     ``stream_moe.py`` docstring on the compile boundary.
   - ``stream_moe.StreamHolder`` / ``stream_moe.make_streams`` —
     dataclass holding the two caller-owned streams + helper to allocate them.
+  - ``stream_moe.TileConfig`` / ``stream_moe.default_tile_config`` — frozen
+    all-optional overrides struct for every GEMM tuning knob + the bench-tuned
+    picker. Pass ``tile_config=TileConfig(tile_n_a=128, ...)`` to
+    ``stream_moe_func`` to pin specific tile / cluster / swizzle / num_sms
+    knobs; unset (``None``) fields are auto-picked from the weight shape.
   - ``kernel_a.streaming_moe_a`` /
     ``kernel_y.streaming_moe_y`` — host wrappers for kernels A and Y.
   - ``tile_scheduler.StreamingTileScheduler`` /

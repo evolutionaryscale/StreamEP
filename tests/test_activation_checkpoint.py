@@ -49,7 +49,7 @@ def main():
     group = dist.group.WORLD
 
     # Small but kernel-valid shapes (2I % tile_n and I % tile_n hold for the
-    # auto-picked tiles at I=256/H=512; see _pick_tile_config). randn inputs so
+    # auto-picked tiles at I=256/H=512; see default_tile_config). randn inputs so
     # gradients are non-degenerate.
     num_experts = 64
     num_local_experts = num_experts // world_size
