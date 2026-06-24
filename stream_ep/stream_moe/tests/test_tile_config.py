@@ -124,3 +124,45 @@ def test_resolve_unset_fields_stay_autopicked_not_frozen():
 def test_resolve_validates_bad_override():
     with pytest.raises(ValueError, match="tile_n_y"):
         _resolve_tile_config(TileConfig(tile_n_y=7), 1536, 2048)
+
+
+# ── tile_m backward-codegen guard (atom_layout_n=2) ──────────────────────────
+# tile_m 192/320 force quack atom_layout_n=2, which the streaming backward GEMMs
+# can't codegen. 320 always; 192 only when a tile_n > 128. I=H=2048 so 128 and
+# 256 both divide every dim — isolates the tile_m check from divisibility.
+
+def test_validate_rejects_tile_m_320_even_with_small_tile_n():
+    cfg = TileConfig(
+        tile_m=320, tile_n_a=128, tile_n_y=128, tile_n_y_bwd=128,
+        tile_n_a_bwd=128, tile_n_dW1=128, tile_n_dW2=128,
+    )
+    with pytest.raises(ValueError, match="tile_m=320"):
+        cfg.validate(2048, 2048)
+
+
+def test_validate_rejects_tile_m_192_with_large_tile_n():
+    # tile_n_y_bwd=256 divides I=2048 (so divisibility is fine) but >128, which
+    # the tile_m=192 guard must reject and name.
+    cfg = TileConfig(tile_m=192, tile_n_y_bwd=256)
+    with pytest.raises(ValueError, match="tile_m=192.*tile_n_y_bwd=256"):
+        cfg.validate(2048, 2048)
+
+
+def test_validate_accepts_tile_m_192_with_all_tile_n_le_128():
+    # The verified-working config: tile_m=192 + every tile_n <= 128.
+    TileConfig(
+        tile_m=192, tile_n_a=128, tile_n_y=128, tile_n_y_bwd=128,
+        tile_n_a_bwd=128, tile_n_dW1=128, tile_n_dW2=128,
+    ).validate(2048, 2048)
+
+
+def test_validate_accepts_tile_m_256_with_large_tile_n():
+    # 256 keeps atom_layout_n=1, so it is NOT gated on tile_n (unlike 192/320).
+    TileConfig(tile_m=256, tile_n_y_bwd=256).validate(2048, 2048)
+
+
+def test_resolve_rejects_tile_m_192_with_autopicked_tile_n():
+    # Resolved config: tile_m=192 override + auto tile_n (256 at this shape) ->
+    # validate must reject, since auto tile_n exceed 128.
+    with pytest.raises(ValueError, match="tile_m=192"):
+        _resolve_tile_config(TileConfig(tile_m=192), 2048, 2048)

@@ -146,13 +146,19 @@ class TileConfig:
     resolved baseline (where ``None`` retains its kernel-level meaning — defer
     to the quack / backward default).
 
+    ``tile_m`` is STRUCTURAL — the dispatch pool's BLOCK_M padding + per-tile
+    signaling grain, shared by dispatch and all four compute kernels — not a
+    per-kernel knob; changing it re-tiles the pool. :meth:`validate` rejects
+    ``tile_m`` 192/320 (the quack ``atom_layout_n=2`` sizes the streaming
+    backward GEMMs can't codegen): 320 outright, 192 unless every ``tile_n`` <=
+    128. In practice ``tile_m`` 128 is the operating point — 256 keeps
+    ``atom_layout_n=1`` but exceeds the dispatch-pool memory budget at
+    production shapes. See markdowns/reserved_memory_stream_segregation.md.
+
     Constraints NOT checked by :meth:`validate` (quack ``GemmSm90`` raises on
     them directly, see ``quack/gemm_sm90.py``):
       * ``tile_m`` must be one of ``{64, 128, 192, 256, 320}`` (and only
-        ``{64, 128, 192}`` for a dW GEMM that sets ``pingpong``). It is also
-        STRUCTURAL — the dispatch pool's BLOCK_M padding + per-tile signaling
-        grain, shared by dispatch and all four compute kernels — not a
-        per-kernel knob; changing it re-tiles the pool.
+        ``{64, 128, 192}`` for a dW GEMM that sets ``pingpong``).
       * each ``tile_n`` must additionally satisfy quack's CTA-N rule
         (``% 16`` and ≤256, or ``% 32`` and ≤512, tighter when tile_m is
         192/320). The bench-tuned defaults + power-of-2 fallback all comply.
@@ -190,24 +196,64 @@ class TileConfig:
     num_sms_y_bwd: int | None = None
 
     def validate(self, I: int, H: int) -> None:
-        """Raise ``ValueError`` if an output ``tile_n`` violates the grouped-
-        GEMM divisibility contract for weight shapes ``(I, H)``.
+        """Raise ``ValueError`` if a tile knob violates a StreamEP constraint
+        that quack can't catch, for weight shapes ``(I, H)``. Two classes:
 
-        Mirrors the constraints :func:`default_tile_config` satisfies by
-        construction (one CTA per ``(tile_m, tile_n)`` output tile; a
-        non-dividing ``tile_n`` makes the last CTA write out of bounds — the
-        streaming kernels A / Y bypass quack's epilogue predication, so quack
-        can't catch this). :func:`stream_moe_func` calls it on the *resolved*
-        config so a bad caller override fails here, not inside a kernel launch.
+        * Output ``tile_n`` divisibility — one CTA per ``(tile_m, tile_n)``
+          output tile; a non-dividing ``tile_n`` makes the last CTA write out of
+          bounds (the streaming kernels A / Y bypass quack's epilogue
+          predication, so quack can't catch it). Covers the four output
+          ``tile_n`` knobs.
+        * ``tile_m`` backward codegen — ``tile_m`` 192 / 320 make quack split
+          the N dim across two MMA atoms (``atom_layout_n=2``), which the
+          streaming backward GEMMs cannot CuTeDSL-codegen. 320 forces it always;
+          192 only when a ``tile_n`` > 128. So ``tile_m=192`` is rejected unless
+          every ``tile_n`` <= 128, and ``tile_m=320`` is rejected outright.
 
-        Only the four output ``tile_n`` knobs carry static-N divisibility
-        constraints — ``tile_m`` rides the dynamic recv-token (M) dim (the
-        scheduler pads partial tiles), and the dW / cluster / swizzle / num_sms
-        knobs have no divisibility contract. ``None`` fields are skipped (they
-        mean "auto-pick" and are resolved before a real launch); the quack-side
-        constraints in the class docstring are quack's to enforce.
+        :func:`stream_moe_func` calls this on the *resolved* config, so a bad
+        caller override fails here rather than as a deep backward SIGABRT.
+        ``None`` fields are skipped (they mean "auto-pick" and are resolved
+        before a real launch). ``tile_m`` has no divisibility constraint — it
+        rides the dynamic recv-token (M) dim (the scheduler pads partial tiles).
+        Other quack CTA-shape rules (the ``tile_m`` allowlist, the
+        ``tile_n`` %16/%32 bounds) are quack's to enforce; see the class
+        docstring.
         """
         errs = []
+        # tile_m 192/320 are the quack GemmSm90 CTA sizes that split the N
+        # dimension across two MMA atoms (atom_layout_n=2). The streaming
+        # BACKWARD GEMMs (kernel_y_bwd / kernel_a_bwd, plus the dW grouped GEMMs
+        # that inherit tile_m / tile_n_a) cannot CuTeDSL-codegen that split
+        # (verified: SIGABRT deep in backward). 320 forces it unconditionally;
+        # 192 forces it only when a tile_n > 128. So tile_m=192 is allowed iff
+        # every tile_n <= 128 (atom_layout_n=1); 320 is not. tile_m in
+        # {64,128,256} keep atom_layout_n=1 and are unaffected. See
+        # markdowns/reserved_memory_stream_segregation.md.
+        if self.tile_m == 320:
+            errs.append(
+                "tile_m=320 forces quack atom_layout_n=2 unconditionally; the "
+                "streaming backward GEMMs (kernel_y_bwd / kernel_a_bwd) cannot "
+                "codegen the N-split. Use tile_m in {64, 128, 256}."
+            )
+        elif self.tile_m == 192:
+            over = [
+                f"{name}={v}"
+                for name, v in (
+                    ("tile_n_a", self.tile_n_a),
+                    ("tile_n_y", self.tile_n_y),
+                    ("tile_n_y_bwd", self.tile_n_y_bwd),
+                    ("tile_n_a_bwd", self.tile_n_a_bwd),
+                    ("tile_n_dW1", self.tile_n_dW1),
+                    ("tile_n_dW2", self.tile_n_dW2),
+                )
+                if v is not None and v > 128
+            ]
+            if over:
+                errs.append(
+                    "tile_m=192 requires every tile_n <= 128 (else quack "
+                    "atom_layout_n=2, which the streaming backward GEMMs cannot "
+                    "codegen); tile_n > 128: " + ", ".join(over)
+                )
         if self.tile_n_a is not None and (
             (2 * I) % self.tile_n_a != 0 or I % self.tile_n_a != 0
         ):
