@@ -452,6 +452,7 @@ void Buffer::set_compute_stream_handle(int64_t stream_handle) {
 
 void Buffer::set_default_stream_handle(int64_t stream_handle) {
     default_stream_handle_ = stream_handle;
+    default_stream_registered_ = true;
 }
 
 void Buffer::sync(const std::vector<int>& device_ids,
@@ -610,16 +611,25 @@ inline void record_consumer_stream(const torch::Tensor& t, int64_t consumer_stre
 // consumer so the allocator defers reuse until compute is done.
 inline torch::Tensor empty_on_default(at::IntArrayRef size,
                                       const torch::TensorOptions& opts,
+                                      bool default_stream_registered,
                                       int64_t default_stream_handle,
                                       int64_t consumer_stream_handle) {
-    if (default_stream_handle == 0) {
+    if (!default_stream_registered) {
         auto t = torch::empty(size, opts);
         record_consumer_stream(t, consumer_stream_handle);
         return t;
     }
-    c10::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal(
-        reinterpret_cast<cudaStream_t>(default_stream_handle),
-        opts.device().index()));
+    // A default (caller) stream is registered. handle == 0 is the legacy default
+    // CUDA stream (NULL cudaStream_t) — a valid registered value, NOT "unset" —
+    // so map it to the device's canonical default stream; the allocation then
+    // lands in the default caching-allocator pool (stream 0) where the model's
+    // freed activations live. A nonzero handle is an external (side) stream.
+    auto dev = opts.device().index();
+    auto target = (default_stream_handle == 0)
+        ? at::cuda::getDefaultCUDAStream(dev)
+        : at::cuda::getStreamFromExternal(
+              reinterpret_cast<cudaStream_t>(default_stream_handle), dev);
+    c10::cuda::CUDAStreamGuard guard(target);
     return torch::empty(size, opts);
 }
 
@@ -1185,6 +1195,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     // caller-side layer-end back-edges, so it shares the default pool and reuses
     // freely without a record_consumer_stream deferral. See empty_on_default.
     auto pool = empty_on_default({TK_padded, hidden}, x.options(),
+                                 default_stream_registered_,
                                  default_stream_handle_, compute_stream_handle_);
 
     auto post = allocate_post_poll_bundle(
@@ -1342,6 +1353,7 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     // back-edges, so it shares the default pool without a record_consumer_stream
     // deferral. See empty_on_default. (torch::empty: no init kernel.)
     auto dL_do_pool = empty_on_default({TK_padded, hidden}, dL_dy.options(),
+                                       default_stream_registered_,
                                        default_stream_handle_,
                                        compute_stream_handle_);
 
@@ -1652,6 +1664,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // is intentionally left on communicate — moving a memset to the default
     // stream would need extra alloc→first-use ordering.)
     auto pool = empty_on_default({TK_padded, hidden}, x.options(),
+                                 default_stream_registered_,
                                  default_stream_handle_, compute_stream_handle_);
 
     auto post = allocate_post_poll_bundle_internode(
