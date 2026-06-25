@@ -76,6 +76,11 @@ class StreamingHandle:
 
     total_tiles: int
     tile_m: int
+    # Padded pool row count = total_tiles * tile_m == pool.shape[0]. Stored
+    # explicitly so the backward path (and any future `pool`-freeing
+    # checkpoint level) can recover it WITHOUT reading `handle.pool.shape`,
+    # i.e. so `handle.pool` can be dropped after forward.
+    TK_padded: int
     dispatch_seq: int
 
     # ── Internode-only stash. The C++ ``StreamingDispatchOutputs`` struct
@@ -597,6 +602,7 @@ class Buffer:
             k_local_total=out.k_local_total,
             total_tiles=out.total_tiles,
             tile_m=tile_m,
+            TK_padded=out.total_tiles * tile_m,  # == out.pool.shape[0]
             dispatch_seq=seq,
             _dispatch_out=out,
         )
@@ -628,7 +634,7 @@ class Buffer:
         config = self.get_dispatch_config(self.group_size) if config is None else config
         seq = handle.dispatch_seq if dispatch_seq is None else dispatch_seq
 
-        TK_padded = handle.pool.shape[0]
+        TK_padded = handle.TK_padded  # was handle.pool.shape[0]; decoupled so pool can be dropped post-fwd
         num_topk = handle.recv_token_to_slots.shape[1]
         num_local_experts = handle.expert_frequency.shape[0]
         num_experts = num_local_experts * self.group_size
