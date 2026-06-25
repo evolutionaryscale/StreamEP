@@ -66,7 +66,7 @@ def main():
                         "memory toward OOM with --num_layers / --num_tokens; "
                         "no artificial ballast or side-collectives here.")
     p.add_argument("--activation_checkpoint", action="store_true",
-                   help="Pass activation_checkpoint=True to stream_moe_func "
+                   help="Pass activation_checkpoint_level=1 to stream_moe_func "
                         "(matches the bench's model.moe_activation_checkpoint). "
                         "Drops preact_a from fwd retention and RECOMPUTES it in "
                         "bwd — shifts the memory peak from forward into backward "
@@ -166,7 +166,7 @@ def main():
             h = stream_moe_func(
                 buf, h, layer_topk_idx, topk_weights, layer_is_token_in_rank,
                 w1, w2, streams=streams, num_experts=E,
-                activation_checkpoint=args.activation_checkpoint)
+                activation_checkpoint_level=(1 if args.activation_checkpoint else 0))
         log(f"[repro] step {step} end-fwd | {meminfo()} | backward starting "
             f"({args.num_layers} dispatch_grads back-to-back)")
         h.sum().backward()

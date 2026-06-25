@@ -299,7 +299,7 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
-            activation_checkpoint=args.recompute_preact,
+            activation_checkpoint_level=(1 if args.recompute_preact else 0),
         )
         out.sum().backward()
     torch.cuda.synchronize()
@@ -352,7 +352,7 @@ def main():
                     w2_local,
                     streams=streams,
                     num_experts=NUM_EXPERTS,
-                    activation_checkpoint=args.recompute_preact,
+                    activation_checkpoint_level=(1 if args.recompute_preact else 0),
                 )
             fwd_ends[step].record()
             bwd_starts[step].record()

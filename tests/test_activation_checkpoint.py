@@ -1,6 +1,6 @@
-"""Gradient-equivalence test for the ``activation_checkpoint`` flag.
+"""Gradient-equivalence test for ``activation_checkpoint_level`` 0 vs 1.
 
-``stream_moe_func(..., activation_checkpoint=True)`` skips saving ``preact_a``
+``stream_moe_func(..., activation_checkpoint_level=1)`` skips saving ``preact_a``
 in forward and recomputes it from ``pool @ w1_local`` in backward with a plain
 grouped-M GEMM (``quack.gemm`` with ``cu_seqlens_m``). Because that is a
 DIFFERENT kernel than forward's gated kernel A, the reconstructed ``preact_a``
@@ -80,7 +80,7 @@ def main():
 
     streams = make_streams()
 
-    def run(activation_checkpoint: bool):
+    def run(level: int):
         x = x0.clone().requires_grad_(True)
         topk_weights = topk_weights0.clone().requires_grad_(True)
         w1 = w1_local.clone().requires_grad_(True)
@@ -88,7 +88,7 @@ def main():
         out = stream_moe_func(
             buf, x, topk_idx, topk_weights, is_token_in_rank, w1, w2,
             streams=streams, num_experts=num_experts,
-            activation_checkpoint=activation_checkpoint,
+            activation_checkpoint_level=level,
         )
         out.sum().backward()
         torch.cuda.synchronize()
@@ -100,10 +100,10 @@ def main():
             "dw2": w2.grad.float(),
         }
 
-    # Two baseline runs (noise floor) + one recompute run.
-    base_a = run(False)
-    base_b = run(False)
-    recomp = run(True)
+    # Two baseline runs (level 0, noise floor) + one recompute run (level 1).
+    base_a = run(0)
+    base_b = run(0)
+    recomp = run(1)
 
     def max_abs_diff(p, q):
         return (p - q).abs().max().item()
