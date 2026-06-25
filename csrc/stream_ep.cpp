@@ -862,8 +862,12 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // NOTE: `o` is NOT reserved in the slab — it is allocated standalone below
     // so its storage can be freed after fwd combine (forward-only; see below).
 
-    auto bundle = torch::empty({b.total_bytes()}, i8_opts);
-    record_consumer_stream(bundle, consumer_stream_handle);
+    // Default pool (like `pool`): the slab's bwd-needed views (recv_token_to_slots,
+    // pool_topk_weight, ...) pin it until bwd return, AFTER the layer-end
+    // back-edges, so NO record_consumer_stream — back-edge ordering guards reuse.
+    // The memsets below run on `stream` (alloc->first-use via the layer-start gate).
+    auto bundle = empty_on_default_pool({b.total_bytes()}, i8_opts,
+                                        default_stream_registered, default_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
@@ -1066,8 +1070,12 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // NOTE: `o` is NOT reserved in the slab — allocated standalone below
     // (forward-only; freed after fwd combine). See intranode allocator.
 
-    auto bundle = torch::empty({b.total_bytes()}, i8_opts);
-    record_consumer_stream(bundle, consumer_stream_handle);
+    // Default pool (like `pool`): bwd-needed views pin the slab until bwd return,
+    // after the layer-end back-edges, so NO record_consumer_stream — back-edge
+    // ordering guards reuse. Memsets below run on `stream` (alloc->first-use via
+    // the layer-start gate). See intranode allocate_post_poll_bundle.
+    auto bundle = empty_on_default_pool({b.total_bytes()}, i8_opts,
+                                        default_stream_registered, default_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
@@ -1491,12 +1499,16 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
     // Σ_k w_k·y_k is reconstructed from the data reduce alone. C++ returns
     // `c10::nullopt`; Python surfaces it as `None`.
     auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
+    // Combine outputs (recv_x, recv_topk_weights_out) are the layer result /
+    // gradients returned to the caller and freed by it after the layer-end
+    // back-edges — default pool, no record_stream (back-edges + caller-FIFO order
+    // every in-layer consumer before any reuse), like `pool`.
     c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
         ? c10::nullopt
-        : c10::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, f32_opts));
+        : c10::optional<torch::Tensor>(empty_on_default_pool(
+              {num_recv_tokens, num_topk}, f32_opts,
+              default_stream_registered_, default_stream_handle_));
     float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
-    if (recv_topk_weights_out.has_value())
-        record_consumer_stream(*recv_topk_weights_out, compute_stream_handle_);
 
     // Combine data. Combine carves its sub-buffer chain from
     // `buffer_ptrs[i] + dispatch_section_bytes`, physically disjoint from
@@ -1511,8 +1523,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
         num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens,
         hidden_int4_x, num_topk);
     EP_HOST_ASSERT(dispatch_section_bytes + combine_section_bytes <= num_nvl_bytes);
-    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-    record_consumer_stream(recv_x, compute_stream_handle_);
+    auto recv_x = empty_on_default_pool({num_recv_tokens, hidden}, x.options(),
+                                        default_stream_registered_, default_stream_handle_);
     intranode::launch_combine_main(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
@@ -1973,15 +1985,18 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
     // Combine output tensors. Fwd: no per-K weight output (kernel Y already
     // pre-multiplies pool_topk_weight per row); C++ returns `c10::nullopt`
     // and Python surfaces as `None`.
-    auto recv_x = torch::empty({num_combined_tokens, hidden}, x.options());
-    record_consumer_stream(recv_x, compute_stream_handle_);
+    // Combine outputs (layer result / gradients) returned to the caller and freed
+    // by it after the layer-end back-edges — default pool, no record_stream (the
+    // back-edges + caller-FIFO order every in-layer consumer before reuse), like `pool`.
+    auto recv_x = empty_on_default_pool({num_combined_tokens, hidden}, x.options(),
+                                        default_stream_registered_, default_stream_handle_);
     auto f32_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
         ? c10::nullopt
-        : c10::optional<torch::Tensor>(torch::empty({num_combined_tokens, num_topk}, f32_opts));
+        : c10::optional<torch::Tensor>(empty_on_default_pool(
+              {num_combined_tokens, num_topk}, f32_opts,
+              default_stream_registered_, default_stream_handle_));
     float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
-    if (recv_topk_weights_out.has_value())
-        record_consumer_stream(*recv_topk_weights_out, compute_stream_handle_);
 
     // kNVLSender ships recv-side `x` back to source ranks → it needs the
     // *recv*-side per-(src_world, channel) prefix (`recv_gbl_channel_prefix_matrix`),
