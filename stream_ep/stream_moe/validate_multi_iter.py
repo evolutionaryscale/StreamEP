@@ -261,6 +261,16 @@ def main():
         "cleanly or forms a launch partition (peers parked in comm "
         "kernels against the dead/stalled rank).",
     )
+    p.add_argument(
+        "--act_ckpt_level",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="activation_checkpoint_level passed to stream_moe_func: 0 = save "
+        "preact_a + pool, 1 = save pool + recompute preact_a, 2 = compressed "
+        "recv-token checkpoint. Compare peak reserved across --n_layers at "
+        "0/1/2 to measure the saved-activation reduction.",
+    )
     args = p.parse_args()
     assert not (args.vary_routing and not args.no_ref), (
         "--vary_routing requires --no_ref (the eager reference assumes one "
@@ -459,6 +469,7 @@ def main():
                 w2_warm,
                 streams=streams,
                 num_experts=NUM_EXPERTS,
+                activation_checkpoint_level=args.act_ckpt_level,
             )
         torch.autograd.grad(
             h_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out
@@ -493,6 +504,7 @@ def main():
                 w2_iter,
                 streams=streams,
                 num_experts=NUM_EXPERTS,
+                activation_checkpoint_level=args.act_ckpt_level,
             )
             if args.side_ar_mb > 0:
                 h.register_hook(_side_ar_hook)
@@ -525,6 +537,7 @@ def main():
                 f"alloc={torch.cuda.memory_allocated() / (1 << 30):.1f} "
                 f"peak={torch.cuda.max_memory_allocated() / (1 << 30):.1f} "
                 f"reserved={torch.cuda.memory_reserved() / (1 << 30):.1f} "
+                f"peak_resv={torch.cuda.max_memory_reserved() / (1 << 30):.1f} "
                 f"free={free_b / (1 << 30):.1f} of {total_b / (1 << 30):.1f} GB"
             )
             if not all_ok:
