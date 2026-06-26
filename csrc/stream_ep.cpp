@@ -2082,6 +2082,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("y_done_per_token",     &stream_ep::StreamingDispatchOutputs::y_done_per_token)
         .def_readonly("o",                          &stream_ep::StreamingDispatchOutputs::o)
         .def("release_o",                           &stream_ep::StreamingDispatchOutputs::release_o)
+        .def("release_pool",                        &stream_ep::StreamingDispatchOutputs::release_pool)
         .def_readonly("recv_token_to_slots",        &stream_ep::StreamingDispatchOutputs::recv_token_to_slots)
         .def_readonly("k_local_total",                   &stream_ep::StreamingDispatchOutputs::k_local_total)
         .def_readonly("total_tiles",                     &stream_ep::StreamingDispatchOutputs::total_tiles)
