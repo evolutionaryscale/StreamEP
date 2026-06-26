@@ -97,6 +97,10 @@ from stream_ep.stream_moe.kernel_y import (
 from stream_ep.stream_moe.kernel_y_bwd import (
     streaming_moe_y_bwd,
 )
+from stream_ep.stream_moe.recv_pool_compress import (
+    compress_pool_to_recv,
+    reexpand_recv_to_pool,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -260,45 +264,6 @@ def _nvtx_push(name: str) -> None:
 def _nvtx_pop() -> None:
     if _NVTX_ENABLED:
         torch.cuda.nvtx.range_pop()
-
-
-# ── activation_checkpoint_level=2 pool <-> x_recv (markdowns/act_ckpt_level2_plan.md sec 5) ──
-# Both write IN PLACE into a caller-pre-allocated `out` (index_select(out=...),
-# masked_fill_): the big [.,H] buffer is then a pure default-pool tensor the
-# caching allocator can reuse, instead of an advanced-indexing alloc that strands
-# in whatever stream-pool is current. Sync-free (no boolean indexing / nonzero):
-# only index arithmetic + tiny [TK]/[T_recv]-shaped scratch. Identical-duplicate
-# broadcast makes the round-trip reproduce pool bit-for-bit on real rows.
-def _compress_pool_to_recv(
-    pool: torch.Tensor, recv_token_to_slots: torch.Tensor, out: torch.Tensor
-) -> None:
-    """Expanded pool[TK_padded, H] -> unexpanded out[T_recv, H], in place.
-
-    Gather-by-token: out[t] = pool[first valid slot of token t]. Every received
-    token routes to >=1 local expert, so every row of recv_token_to_slots
-    ([T_recv, num_topk], -1 for non-local k) has >=1 non-negative entry.
-    """
-    valid = recv_token_to_slots >= 0                      # [T_recv, K] bool
-    first_k = valid.to(torch.int32).argmax(dim=1)         # [T_recv] first valid k (argmax -> first max)
-    first_slot = recv_token_to_slots.gather(              # [T_recv] its pool slot
-        1, first_k.unsqueeze(1)
-    ).squeeze(1).to(torch.int64)
-    torch.index_select(pool, 0, first_slot, out=out)      # out[T_recv, H], in place
-
-
-def _reexpand_recv_to_pool(
-    x_recv: torch.Tensor, pool_recv_token: torch.Tensor, out: torch.Tensor
-) -> None:
-    """Unexpanded x_recv[T_recv, H] -> expanded out[TK_padded, H], in place.
-
-    Gather-by-slot: out[s] = x_recv[pool_recv_token[s]] (slot -> recv-token id,
-    -1 for padding). Padding slots map to row 0 (garbage) then get zeroed — they
-    are masked / cu_seqlens-excluded by every downstream consumer, so the value
-    is don't-care; zeroing keeps it deterministic.
-    """
-    idx = pool_recv_token.clamp(min=0).to(torch.int64)    # -1 -> 0 (zeroed below)
-    torch.index_select(x_recv, 0, idx, out=out)           # out[TK_padded, H], in place
-    out.masked_fill_((pool_recv_token == -1).unsqueeze(1), 0)
 
 
 class StreamMoEFunc(torch.autograd.Function):
@@ -550,7 +515,7 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle.recv_token_to_slots.shape[0], pool.shape[1],
                 dtype=pool.dtype, device=pool.device,
             )
-            _compress_pool_to_recv(pool, handle.recv_token_to_slots, x_recv)
+            compress_pool_to_recv(pool, handle.pool_recv_token, x_recv)
             # Free pool: drop ALL THREE refs. handle.pool=None + the local are
             # not enough — handle._dispatch_out (the C++ struct) holds the other
             # ref (exactly like `o`/release_o), so without release_pool() pool
@@ -849,7 +814,7 @@ class StreamMoEFunc(torch.autograd.Function):
             # bwd back-edges). NO record_stream.
             pool = torch.empty(TK_padded, H, dtype=dtype, device=device)
             with torch.cuda.stream(streams.compute):
-                _reexpand_recv_to_pool(x_recv, handle.pool_recv_token, pool)
+                reexpand_recv_to_pool(x_recv, handle.pool_recv_token, pool)
 
         # ── Stage 1.5 — recompute preact_a (checkpoint level >= 1 only) ─────
         # Reconstruct the [2I] pre-SwiGLU accumulator that fwd kernel A would
