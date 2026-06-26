@@ -8,7 +8,7 @@ SM internals on one GPU; this gives the multi-rank picture nsys is built for —
 achieved NVLink/DRAM/SM/Tensor throughput over time (gpu-metrics), dispatch ↔
 compute overlap geometry, exposed comm, and per-rank/per-node imbalance. Run
 the FULL pipeline (not isolated kernels) because overlap only exists across the
-4 concurrent streams.
+2 concurrent streams (the communicate stream + the compute stream).
 
 Shape defaults to the 82ba5b prod MoE (inherited from profile_pipeline globals:
 H=3072, I=768, E=256, K=8, T=8192/rank). World size = however many ranks

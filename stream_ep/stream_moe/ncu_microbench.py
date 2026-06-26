@@ -115,7 +115,8 @@ def _shape(args) -> dict:
         tokens_per_expert = SEQ_LEN_PER_RANK * TOPK * args.world // NUM_EXPERTS
         tiles_per_expert = max(1, -(-tokens_per_expert // tile_m))
         total_tiles = tiles_per_expert * E_local
-    return dict(H=H, I=I, E_local=E_local, tile_m=tile_m, total_tiles=total_tiles, cfg=cfg)
+    return dict(H=H, I=I, E_local=E_local, tile_m=tile_m, total_tiles=total_tiles, cfg=cfg,
+                ac_level=args.ac_level)
 
 
 def build(kernel: str, s: dict, device):
@@ -136,16 +137,20 @@ def build(kernel: str, s: dict, device):
 
         pool = (torch.randn(TK, H, dtype=DTYPE, device=device, generator=g) * 0.1).contiguous()
         postact_a = torch.empty(total_tiles, tile_m, I, dtype=DTYPE, device=device)
-        preact_a = torch.empty(total_tiles, tile_m, two_I, dtype=DTYPE, device=device)
+        # ac_level 0 saves preact_a ([2I] mD store); ac_level >=1 (production
+        # 82ba5b default) sets preact_a=None -> store skipped, separate kernel.
+        preact_a = torch.empty(total_tiles, tile_m, two_I, dtype=DTYPE, device=device) if s["ac_level"] == 0 else None
         cnt, tgt = _fired_arrival(total_tiles, device)
 
         def fn():
             streaming_moe_a(
                 pool, W1, postact_a, epbo, cnt, tgt,
                 preact_a=preact_a, tile_m=tile_m, tile_n=cfg.tile_n_a,
+                cluster_n=2,  # match production (stream_moe.py launches fwd A/Y at cluster_n=2)
             )
 
-        return fn, f"kernel_a  GEMM (TK={TK},H={H})@W1(2I={two_I}) tile_m={tile_m} tile_n_a={cfg.tile_n_a}"
+        store = "preact" if s["ac_level"] == 0 else "no-preact"
+        return fn, f"kernel_a  GEMM (TK={TK},H={H})@W1(2I={two_I}) tile_m={tile_m} tile_n_a={cfg.tile_n_a} ac_level={s['ac_level']}({store})"
 
     if kernel == "y":
         from stream_ep.stream_moe.kernel_y import streaming_moe_y
@@ -164,6 +169,7 @@ def build(kernel: str, s: dict, device):
                 postact_a, W2, o, pool_recv_token, pool_topk_weight,
                 k_local_remaining, y_done_per_token, epbo, cnt, tgt,
                 combine_seq=1, tile_m=tile_m, tile_n=cfg.tile_n_y,
+                cluster_n=2,  # match production (a_bwd/y_bwd stay at wrapper default cluster_n=1)
             )
 
         return fn, f"kernel_y  GEMM (TK={TK},I={I})@W2(H={H}) tile_m={tile_m} tile_n_y={cfg.tile_n_y}"
@@ -219,6 +225,9 @@ def main():
     p.add_argument("--tiles", type=int, default=None, help="total padded tiles; default = uniform-routing estimate for --world")
     p.add_argument("--hidden", type=int, default=H_DEFAULT)
     p.add_argument("--intermediate", type=int, default=I_DEFAULT)
+    p.add_argument("--ac_level", type=int, default=0, choices=[0, 1, 2],
+                   help="kernel_a only: 0 = save preact_a (mD [2I] store); >=1 = skip it "
+                        "(production 82ba5b uses moe_ac_level=1). No effect on other kernels.")
     p.add_argument("--tile_m", type=int, default=None)
     p.add_argument("--tile_n_a", type=int, default=None)
     p.add_argument("--tile_n_y", type=int, default=None)
