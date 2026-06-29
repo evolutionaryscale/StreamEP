@@ -308,6 +308,12 @@ def default_tile_config(I: int, H: int) -> TileConfig:
         tile_m=128,
         tile_n_a=tile_n_a,
         tile_n_y=pick(256, H),
+        # y_bwd forces ab_stage=4 (deep W2/A mainloop prefetch — its scoreboard
+        # stall is the long-K mainloop load; see StreamingMoeYBwd._compute_stages).
+        # tile_n_y_bwd must stay small enough to leave SMEM for that 4th AB
+        # stage; 192 fits at the supported shapes (H=3072, I=768). A larger
+        # tile_n_y_bwd raises a descriptive ValueError from _compute_stages
+        # rather than silently overflowing SMEM at launch.
         tile_n_y_bwd=pick(192, I),
         tile_n_a_bwd=pick(256, H),
         tile_m_dW1=None,

@@ -585,10 +585,13 @@ def test_streaming_moe_y_bwd_dense_padding(device):
         streaming_moe_y_bwd,
     )
 
-    # Production-ish shape (matches profile_pipeline.py defaults that the
-    # orchestrator's validate_multi_iter exercises).
-    H, I, E_local = 2048, 2048, 8
-    tile_m, tile_n = 128, 256  # tile_n=256 matches tile_n_a default
+    # Production shape (82ba5b MoE: H=3072, I=768) with the orchestrator's
+    # default y_bwd tile (tile_n_y_bwd=192 from default_tile_config — 768 % 192
+    # == 0). This is the real supported operating point and leaves SMEM room for
+    # y_bwd's forced ab_stage=4; an oversized tile_n here raises a descriptive
+    # ValueError from StreamingMoeYBwd._compute_stages rather than fitting.
+    H, I, E_local = 3072, 768, 8
+    tile_m, tile_n = 128, 192
     tile_to_expert_list = list(range(E_local))  # dense: 1 tile per expert
     total_tiles = len(tile_to_expert_list)
     TK_padded = total_tiles * tile_m
@@ -726,6 +729,59 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     )
 
 
+def test_streaming_moe_y_bwd_oversized_tile_raises(device):
+    """An oversized tile_n_y_bwd must raise a descriptive ValueError from
+    StreamingMoeYBwd._compute_stages — NOT a silent cudaErrorInvalidValue at
+    launch. y_bwd forces ab_stage=4 (deep W2/A mainloop prefetch); a tile so
+    large that ab_stage=4 + epi_c_stage=2 + one epi stage exceed the per-CTA
+    SMEM budget is unsupported and must fail fast at compile time with an
+    actionable message ("shrink tile_n_y_bwd"). The MMA atom caps tile_n at
+    256, so we use the largest valid tile (256) over a large K=H=3072: the
+    A/B mainloop bytes then scale with K, and ab_stage=4 + epi_c_stage=2 no
+    longer fit the per-CTA SMEM budget, tripping the ValueError. (I=1024
+    keeps 256 | I so the kernel's I % tile_n assert passes first.)
+    """
+    from stream_ep.stream_moe.kernel_y_bwd import (
+        streaming_moe_y_bwd,
+    )
+
+    H, I, E_local = 3072, 1024, 1
+    tile_m, tile_n = 128, 256  # max valid tile_n; ab=4 won't fit at K=H=3072
+    total_tiles = 1
+    TK = total_tiles * tile_m
+    dtype = torch.bfloat16
+
+    dL_do_pool = torch.zeros(TK, H, dtype=dtype, device=device)
+    W2 = torch.zeros(E_local, H, I, dtype=dtype, device=device)
+    dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
+    postact_a_for_dW2 = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
+    pool_topk_weight = torch.zeros(TK, dtype=torch.float32, device=device)
+    pool_recv_token = torch.full((TK,), -1, dtype=torch.int32, device=device)
+    preact_a = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
+    dL_dweight = torch.zeros(TK, dtype=torch.float32, device=device)
+    expert_pool_block_offset = torch.tensor(
+        [0, total_tiles], dtype=torch.int32, device=device
+    )
+    cnt, tgt = _make_bwd_arrival(total_tiles, device=device)
+
+    with pytest.raises(ValueError, match="ab_stage=4.*shrink tile_n_y_bwd"):
+        streaming_moe_y_bwd(
+            dL_do_pool,
+            W2,
+            dL_dswiglu_in,
+            postact_a_for_dW2,
+            pool_topk_weight,
+            pool_recv_token,
+            preact_a,
+            dL_dweight,
+            expert_pool_block_offset,
+            cnt,
+            tgt,
+            tile_m=tile_m,
+            tile_n=tile_n,
+        )
+
+
 if __name__ == "__main__":
     dev = torch.device("cuda")
     test_streaming_moe_y_bwd_compiles(dev)
@@ -738,3 +794,5 @@ if __name__ == "__main__":
     print("producer-consumer PASS")
     test_streaming_moe_y_bwd_dense_padding(dev)
     print("dense-padding PASS")
+    test_streaming_moe_y_bwd_oversized_tile_raises(dev)
+    print("oversized-tile-raises PASS")

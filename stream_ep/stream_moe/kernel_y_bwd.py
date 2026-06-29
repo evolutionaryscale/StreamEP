@@ -176,6 +176,109 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     )
     _epi_param_bases = (ParamsBase,)
 
+    # y_bwd is memory-LATENCY-bound — the dominant ncu stall is the L1TEX
+    # global-load scoreboard (warps waiting on global loads), ~66% of CPI at
+    # baseline. A gating sweep (see markdowns/logbook.md) showed the stall is
+    # the long-K (K=H=3072) W2/A *mainloop* load, NOT the per-subtile preact
+    # reload: deepening the mainloop prefetch (ab_stage 3 -> 4, epi_c_stage=2)
+    # drops the scoreboard stall 67% -> 52% and cuts duration ~13% (626 ->
+    # 545 us at the 82ba5b shape), whereas deepening the preact prefetch
+    # (epi_c 2 -> 3) does nothing. So y_bwd forces ab_stage=4.
+    AB_STAGE_TARGET = 4
+    EPI_C_STAGE_TARGET = 2
+
+    @classmethod
+    def _compute_stages(
+        cls,
+        cta_tile_shape_mnk,
+        epi_tile,
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        epilogue_args,
+        smem_capacity,
+        occupancy,
+        warp_shape_mnk=None,
+    ):
+        """Force ab_stage=4 (deep mainloop W2/A prefetch) for y_bwd.
+
+        Replaces the default heuristic (which picks ab_stage=3) — y_bwd's
+        bottleneck is the L1TEX global-load scoreboard on the long-K W2/A
+        mainloop, so a deeper mainloop pipeline is the win (see class
+        comment / markdowns/logbook.md). ``ab_stage`` and ``epi_c_stage``
+        are pinned to ``AB_STAGE_TARGET`` / ``EPI_C_STAGE_TARGET``; the freed
+        ``epi_stage`` is set to the largest value (>= 1) that still fits the
+        per-CTA SMEM budget. The byte accounting mirrors the parent
+        ``GemmSm90._compute_stages`` exactly so this stays a stage-policy
+        override, not a divergent SMEM model.
+
+        Raises ``ValueError`` (fast, descriptive) when even ``epi_stage=1``
+        does not fit — i.e. ab_stage=4 + epi_c_stage=2 alone overflow the
+        budget for the given tile. This replaces the opaque
+        ``cudaErrorInvalidValue`` launch failure with an actionable message
+        ("shrink tile_n_y_bwd"). The tile picker (default_tile_config in
+        stream_moe.py) deliberately leaves room for ab_stage=4 at the
+        supported shapes; a too-large tile override is the error path.
+        """
+        ab_stage = cls.AB_STAGE_TARGET
+        epi_c_stage = cls.EPI_C_STAGE_TARGET
+
+        # --- byte accounting (mirrors GemmSm90._compute_stages) ---
+        epi_smem_bytes = cls.epi_smem_bytes(
+            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
+        )
+        has_tile_load = epi_smem_bytes.c_stage > 0
+        epi_tile_elems = cute.size(cute.shape(epi_tile))
+        d_bytes_per_stage = (
+            epi_tile_elems * d_dtype.width // 8 if d_dtype is not None else 0
+        )
+        epi_bytes_per_stage = d_bytes_per_stage + epi_smem_bytes.d_stage
+
+        # SMEM consumed by everything EXCEPT the epi (D-store) staging:
+        #   unstaged epi + mbar/helper reservation + ab_stage A/B operands
+        #   + epi_c_stage C-load staging.
+        fixed_bytes = epi_smem_bytes.unstaged
+        if c_dtype is not None:
+            fixed_bytes += epi_tile_elems * c_dtype.width // 8 * epi_c_stage
+        if has_tile_load:
+            fixed_bytes += epi_smem_bytes.c_stage * epi_c_stage
+
+        a_shape = cute.slice_(cta_tile_shape_mnk, (None, 0, None))
+        b_shape = cute.slice_(cta_tile_shape_mnk, (0, None, None))
+        ab_bytes_per_stage = (
+            cute.size(a_shape) * a_dtype.width // 8
+            + cute.size(b_shape) * b_dtype.width // 8
+        )
+        mbar_helpers_bytes = 1024
+
+        budget = smem_capacity // occupancy
+        # Bytes left for the epi D-store staging after the pinned ab/epi_c
+        # allocations and the mbar/helper reservation.
+        epi_budget = (
+            budget
+            - mbar_helpers_bytes
+            - fixed_bytes
+            - ab_bytes_per_stage * ab_stage
+        )
+        epi_stage = epi_budget // epi_bytes_per_stage if epi_bytes_per_stage > 0 else 1
+
+        if epi_stage < 1:
+            needed = (
+                mbar_helpers_bytes
+                + fixed_bytes
+                + ab_bytes_per_stage * ab_stage
+                + epi_bytes_per_stage  # one epi stage
+            )
+            tile_m, tile_n = cta_tile_shape_mnk[0], cta_tile_shape_mnk[1]
+            raise ValueError(
+                f"StreamingMoeYBwd requires ab_stage={ab_stage} "
+                f"(epi_c_stage={epi_c_stage}, epi_stage>=1) = {needed // 1024} KB "
+                f"SMEM but the per-CTA budget is {budget // 1024} KB at "
+                f"tile=({tile_m},{tile_n}); shrink tile_n_y_bwd."
+            )
+        return ab_stage, epi_stage, epi_c_stage
+
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mAuxOut: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
