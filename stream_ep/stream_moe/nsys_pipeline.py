@@ -41,7 +41,7 @@ from stream_ep.stream_moe.profile_pipeline import (
     get_world_size,
     init_distributed,
     make_skewed_topk_idx,
-    make_uniform_topk_idx,
+    make_randn_topk_idx,
     make_buffer,
     rank_zero_print,
 )
@@ -54,7 +54,9 @@ def main():
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=5, help="warmup iters OUTSIDE the profiler fence (JIT + caches)")
     p.add_argument("--n_iter", type=int, default=12, help="steady iters INSIDE the profiler fence")
-    p.add_argument("--skew_hot_frac", type=float, default=0.0, help=">0 uses biased routing (heavy-comm regime)")
+    p.add_argument("--skew_hot_frac", type=float, default=0.0,
+                   help="0 = uniform-random routing (randn router logits, production-like "
+                        "~2.72 remote-nodes/tok); >0 = biased/hot-expert routing (heavier comm)")
     p.add_argument("--skew_hot_weight", type=float, default=4.0)
     args = p.parse_args()
 
@@ -67,7 +69,8 @@ def main():
     rank_zero_print(
         f"[nsys_pipeline] world={world_size} num_sms={buffer.num_sms} "
         f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} local_E={local_E} "
-        f"n_warmup={args.n_warmup} n_iter={args.n_iter} skew={args.skew_hot_frac}"
+        f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
+        f"routing={'randn-uniform' if args.skew_hot_frac == 0 else f'skew{args.skew_hot_frac}@{args.skew_hot_weight}'}"
     )
 
     g = torch.Generator(device=device).manual_seed(42)
@@ -85,7 +88,8 @@ def main():
             hot_weight=args.skew_hot_weight, device=device, generator=skew_gen,
         )
     else:
-        topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
+        randn_gen = torch.Generator(device=device).manual_seed(7000 + rank)
+        topk_idx = make_randn_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, device, randn_gen)
     topk_weights = torch.softmax(
         torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
     ).contiguous().requires_grad_(True)
