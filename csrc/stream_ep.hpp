@@ -284,11 +284,19 @@ private:
     int64_t compute_stream_handle_ = 0;
 
     // Handle of the DEFAULT (caller) stream the consumer model runs on (set via
-    // `set_default_stream_handle`; zero until set). When set, `pool` / `dL_do_pool`
-    // are allocated on it (see empty_on_default) so they share the default
-    // caching-allocator pool instead of a segregated communicate-stream pool;
-    // free-side safety is the caller-side layer-end back-edges, NOT record_stream.
+    // `set_default_stream_handle`). When set, `pool` / `dL_do_pool` are allocated
+    // on it (see empty_on_default) so they share the default caching-allocator
+    // pool instead of a segregated communicate-stream pool; free-side safety is
+    // the caller-side layer-end back-edges, NOT record_stream.
+    //
+    // The handle is the raw cudaStream_t as int64. The legacy default CUDA stream
+    // is NULL (handle == 0), so 0 is a VALID registered value — we cannot use it
+    // as the "unset" sentinel. `default_stream_registered_` tracks set-ness
+    // separately; without it the common case (consumer runs MoE on the default
+    // stream) registers handle 0, collides with "unset", and the redirect never
+    // fires — stranding the pool buffers on the communicate pool.
     int64_t default_stream_handle_ = 0;
+    bool default_stream_registered_ = false;
 
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 

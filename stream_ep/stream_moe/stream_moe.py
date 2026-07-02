@@ -487,28 +487,30 @@ class StreamMoEFunc(torch.autograd.Function):
             out, _ = buffer.combine(handle.o, handle)
         _nvtx_pop()  # fwd_combine
 
-        # Release o from the saved state. o is forward-only — kernel Y's
-        # atomic-scatter target, consumed by combine above, never read in bwd —
-        # but ctx.save_for_backward holds the whole handle, so without this it
-        # would be pinned through backward (one ~T_recv×hidden buffer per layer,
-        # never freed until bwd). Combine's kernel has already been launched and
-        # captured o's data_ptr; o is a standalone allocation (csrc
-        # allocate_post_poll_bundle) recorded on the compute stream, so the
-        # caching allocator guards reuse via o's alloc-stream + compute-stream
-        # events. Dropping the Python ref here lets that storage be reclaimed
-        # after fwd combine instead of surviving to the bwd peak. The handle's
-        # _dispatch_out (the C++ StreamingDispatchOutputs, saved for the bwd
-        # internode routing) holds the OTHER reference to o, so handle.o=None
-        # alone wouldn't free it — release_o() drops the struct's ref too. All
-        # other _dispatch_out members are bwd-needed, so only o is released.
-        handle.o = None
-        if handle._dispatch_out is not None:
-            handle._dispatch_out.release_o()
-
         # Layer-end back-edges. caller_stream waits on both streams so the
         # layer-as-barrier invariant holds across layers.
         caller_stream.wait_stream(streams.communicate)
         caller_stream.wait_stream(streams.compute)
+
+        # Release o from the saved state, AFTER the back-edges. o is forward-only
+        # — kernel Y's atomic-scatter target, consumed by combine above, never
+        # read in bwd — but ctx.save_for_backward holds the whole handle, so
+        # without this it would be pinned through backward (one ~T_recv×hidden
+        # buffer per layer). o is allocated in the DEFAULT pool WITHOUT
+        # record_stream (csrc allocate_post_poll_bundle, like `pool`), so its
+        # free-side safety is exactly these back-edges: releasing it here orders
+        # any caller-FIFO reuse of its storage after kernel Y (compute) and
+        # combine (communicate), both of which caller_stream just joined. Doing
+        # this after the back-edges (vs mid-forward) preserves the bwd-peak
+        # benefit — the storage is reclaimable before the bwd peak either way —
+        # while letting o drop record_stream. The handle's _dispatch_out (the C++
+        # StreamingDispatchOutputs, saved for bwd internode routing) holds the
+        # OTHER reference, so handle.o=None alone wouldn't free it — release_o()
+        # drops the struct's ref too. All other _dispatch_out members are
+        # bwd-needed, so only o is released.
+        handle.o = None
+        if handle._dispatch_out is not None:
+            handle._dispatch_out.release_o()
 
         # Save tensors bwd will consume. The contract is "save preact, drop
         # postact" — preact_a is the strictly more useful saved activation:
