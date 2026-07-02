@@ -59,10 +59,14 @@ Public surface
 --------------
 * :class:`StreamHolder` — dataclass holding the two caller-owned streams.
 * :func:`make_streams` — construct a ``StreamHolder`` for a given device.
+* :class:`TileConfig` — frozen all-optional overrides struct for every GEMM
+  tuning knob (``None`` field ⇒ auto-pick).
+* :func:`default_tile_config` — bench-tuned resolved ``TileConfig`` picked from
+  ``(I, H)`` with a power-of-2 divisibility fallback.
 * :class:`StreamMoEFunc` — ``torch.autograd.Function`` running the layer
   forward and backward.
 * :func:`stream_moe_func` — thin wrapper around ``StreamMoEFunc.apply`` with
-  the public keyword-arg API.
+  the public keyword-arg API (incl. optional ``tile_config``).
 
 Compile interaction
 -------------------
@@ -79,7 +83,7 @@ kernel.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 
 import torch
 from quack.gemm import gemm
@@ -104,12 +108,18 @@ from stream_ep.stream_moe.recv_pool_compress import (
 
 
 # ---------------------------------------------------------------------------
-# Internal tile-config picker. All knobs the matched-pair GEMMs accept are
-# bench-tuned defaults; per-call divisibility constraints on the 4 tile_n
-# values are checked here and substituted with the largest power-of-2 ≤ 256
-# that satisfies the constraint when the default doesn't fit. The caller side
-# of ``stream_moe_func`` only sees ``(I, H)`` and gets a fully-resolved
-# config back — there are no public tile / cluster / num_sms kwargs.
+# Public tile-config surface.
+#
+# ``TileConfig`` is an all-optional overrides struct: every field defaults to
+# ``None`` meaning "auto-pick this one". ``stream_moe_func`` resolves a config
+# per call by overlaying the caller's non-``None`` fields onto
+# ``default_tile_config(I, H)`` (the bench-tuned baseline) — so setting one
+# knob never freezes the others at a stale hardcoded default; the rest are
+# still picked for the actual shape. ``default_tile_config`` enforces the
+# per-shape divisibility constraints on the 4 output ``tile_n`` values
+# (largest power-of-2 ≤ 256 fallback when a default doesn't divide), and
+# ``TileConfig.validate(I, H)`` re-checks them on the resolved config so a bad
+# caller override fails with a clear message instead of inside a kernel.
 # ---------------------------------------------------------------------------
 
 
@@ -122,42 +132,157 @@ def _largest_pow2_divisor(x: int, cap: int) -> int:
 
 
 @dataclass(frozen=True)
-class _TileConfig:
-    """Internal: every tuning knob the matched-pair GEMMs accept."""
+class TileConfig:
+    """Every tuning knob the matched-pair GEMMs accept — as overrides.
 
-    tile_m: int
+    Public, frozen, all-optional. Every field defaults to ``None`` meaning
+    "auto-pick this one". Construct with only the knobs you want to pin
+    (``TileConfig(tile_n_a=128, num_sms_a=120)``) and pass to
+    :func:`stream_moe_func` as ``tile_config=...``; the unset (``None``) fields
+    are filled from :func:`default_tile_config` for the actual weight shape, so
+    pinning one knob never freezes the others at a stale hardcoded default. The
+    resolution (overlay + :meth:`validate`) happens in
+    :func:`stream_moe_func`; :func:`default_tile_config` returns the fully
+    resolved baseline (where ``None`` retains its kernel-level meaning — defer
+    to the quack / backward default).
+
+    ``tile_m`` is STRUCTURAL — the dispatch pool's BLOCK_M padding + per-tile
+    signaling grain, shared by dispatch and all four compute kernels — not a
+    per-kernel knob; changing it re-tiles the pool. :meth:`validate` rejects
+    ``tile_m`` 192/320 (the quack ``atom_layout_n=2`` sizes the streaming
+    backward GEMMs can't codegen): 320 outright, 192 unless every ``tile_n`` <=
+    128. In practice ``tile_m`` 128 is the operating point — 256 keeps
+    ``atom_layout_n=1`` but exceeds the dispatch-pool memory budget at
+    production shapes. See markdowns/reserved_memory_stream_segregation.md.
+
+    Constraints NOT checked by :meth:`validate` (quack ``GemmSm90`` raises on
+    them directly, see ``quack/gemm_sm90.py``):
+      * ``tile_m`` must be one of ``{64, 128, 192, 256, 320}`` (and only
+        ``{64, 128, 192}`` for a dW GEMM that sets ``pingpong``).
+      * each ``tile_n`` must additionally satisfy quack's CTA-N rule
+        (``% 16`` and ≤256, or ``% 32`` and ≤512, tighter when tile_m is
+        192/320). The bench-tuned defaults + power-of-2 fallback all comply.
+    """
+
+    tile_m: int | None = None
     # fwd kernel A output N = 2I; must divide both 2I and I.
-    tile_n_a: int
+    tile_n_a: int | None = None
     # fwd kernel Y output N = H; must divide H.
-    tile_n_y: int
+    tile_n_y: int | None = None
     # bwd kernel Y output N = I; must divide I.
-    tile_n_y_bwd: int
+    tile_n_y_bwd: int | None = None
     # bwd kernel A output N = H; must divide H.
-    tile_n_a_bwd: int
+    tile_n_a_bwd: int | None = None
     # dW GEMM tiles; ``None`` falls back to (tile_m, tile_n_a) inside the
     # backward; dW2 also accepts None tile_n meaning "use kernel A default".
-    tile_m_dW1: int | None
-    tile_n_dW1: int | None
-    tile_m_dW2: int | None
-    tile_n_dW2: int | None
+    tile_m_dW1: int | None = None
+    tile_n_dW1: int | None = None
+    tile_m_dW2: int | None = None
+    tile_n_dW2: int | None = None
     # dW grouped-GEMM cluster / pingpong / swizzle (quack epilogue tuning).
-    cluster_m_dW1: int
-    cluster_n_dW1: int
-    cluster_m_dW2: int
-    cluster_n_dW2: int
-    pingpong_dW1: bool
-    pingpong_dW2: bool
-    swizzle_dW1: int
-    swizzle_dW2: int
+    cluster_m_dW1: int | None = None
+    cluster_n_dW1: int | None = None
+    cluster_m_dW2: int | None = None
+    cluster_n_dW2: int | None = None
+    pingpong_dW1: bool | None = None
+    pingpong_dW2: bool | None = None
+    swizzle_dW1: int | None = None
+    swizzle_dW2: int | None = None
     # Persistent-kernel SM counts. ``None`` defers to quack's default for
     # ``streaming_moe_{a,y}{,_bwd}``.
-    num_sms_a: int | None
-    num_sms_y: int | None
-    num_sms_a_bwd: int | None
-    num_sms_y_bwd: int | None
+    num_sms_a: int | None = None
+    num_sms_y: int | None = None
+    num_sms_a_bwd: int | None = None
+    num_sms_y_bwd: int | None = None
+
+    def validate(self, I: int, H: int) -> None:
+        """Raise ``ValueError`` if a tile knob violates a StreamEP constraint
+        that quack can't catch, for weight shapes ``(I, H)``. Two classes:
+
+        * Output ``tile_n`` divisibility — one CTA per ``(tile_m, tile_n)``
+          output tile; a non-dividing ``tile_n`` makes the last CTA write out of
+          bounds (the streaming kernels A / Y bypass quack's epilogue
+          predication, so quack can't catch it). Covers the four output
+          ``tile_n`` knobs.
+        * ``tile_m`` backward codegen — ``tile_m`` 192 / 320 make quack split
+          the N dim across two MMA atoms (``atom_layout_n=2``), which the
+          streaming backward GEMMs cannot CuTeDSL-codegen. 320 forces it always;
+          192 only when a ``tile_n`` > 128. So ``tile_m=192`` is rejected unless
+          every ``tile_n`` <= 128, and ``tile_m=320`` is rejected outright.
+
+        :func:`stream_moe_func` calls this on the *resolved* config, so a bad
+        caller override fails here rather than as a deep backward SIGABRT.
+        ``None`` fields are skipped (they mean "auto-pick" and are resolved
+        before a real launch). ``tile_m`` has no divisibility constraint — it
+        rides the dynamic recv-token (M) dim (the scheduler pads partial tiles).
+        Other quack CTA-shape rules (the ``tile_m`` allowlist, the
+        ``tile_n`` %16/%32 bounds) are quack's to enforce; see the class
+        docstring.
+        """
+        errs = []
+        # tile_m 192/320 are the quack GemmSm90 CTA sizes that split the N
+        # dimension across two MMA atoms (atom_layout_n=2). The streaming
+        # BACKWARD GEMMs (kernel_y_bwd / kernel_a_bwd, plus the dW grouped GEMMs
+        # that inherit tile_m / tile_n_a) cannot CuTeDSL-codegen that split
+        # (verified: SIGABRT deep in backward). 320 forces it unconditionally;
+        # 192 forces it only when a tile_n > 128. So tile_m=192 is allowed iff
+        # every tile_n <= 128 (atom_layout_n=1); 320 is not. tile_m in
+        # {64,128,256} keep atom_layout_n=1 and are unaffected. See
+        # markdowns/reserved_memory_stream_segregation.md.
+        if self.tile_m == 320:
+            errs.append(
+                "tile_m=320 forces quack atom_layout_n=2 unconditionally; the "
+                "streaming backward GEMMs (kernel_y_bwd / kernel_a_bwd) cannot "
+                "codegen the N-split. Use tile_m in {64, 128, 256}."
+            )
+        elif self.tile_m == 192:
+            over = [
+                f"{name}={v}"
+                for name, v in (
+                    ("tile_n_a", self.tile_n_a),
+                    ("tile_n_y", self.tile_n_y),
+                    ("tile_n_y_bwd", self.tile_n_y_bwd),
+                    ("tile_n_a_bwd", self.tile_n_a_bwd),
+                    ("tile_n_dW1", self.tile_n_dW1),
+                    ("tile_n_dW2", self.tile_n_dW2),
+                )
+                if v is not None and v > 128
+            ]
+            if over:
+                errs.append(
+                    "tile_m=192 requires every tile_n <= 128 (else quack "
+                    "atom_layout_n=2, which the streaming backward GEMMs cannot "
+                    "codegen); tile_n > 128: " + ", ".join(over)
+                )
+        if self.tile_n_a is not None and (
+            (2 * I) % self.tile_n_a != 0 or I % self.tile_n_a != 0
+        ):
+            errs.append(
+                f"tile_n_a={self.tile_n_a} must divide both 2*I={2 * I} and "
+                f"I={I} (fwd kernel A out N=2I; kernel_a also asserts "
+                f"I % tile_n_a == 0)"
+            )
+        if self.tile_n_y is not None and H % self.tile_n_y != 0:
+            errs.append(
+                f"tile_n_y={self.tile_n_y} must divide H={H} (fwd kernel Y out N=H)"
+            )
+        if self.tile_n_y_bwd is not None and I % self.tile_n_y_bwd != 0:
+            errs.append(
+                f"tile_n_y_bwd={self.tile_n_y_bwd} must divide I={I} "
+                f"(bwd kernel Y out N=I)"
+            )
+        if self.tile_n_a_bwd is not None and H % self.tile_n_a_bwd != 0:
+            errs.append(
+                f"tile_n_a_bwd={self.tile_n_a_bwd} must divide H={H} "
+                f"(bwd kernel A out N=H)"
+            )
+        if errs:
+            raise ValueError(
+                f"TileConfig invalid for (I={I}, H={H}): " + "; ".join(errs)
+            )
 
 
-def _pick_tile_config(I: int, H: int) -> _TileConfig:
+def default_tile_config(I: int, H: int) -> TileConfig:
     """Pick a tile config from the weight shapes.
 
     Prefers the bench-tuned defaults (tile_n_a=192, tile_n_y=256,
@@ -179,7 +304,7 @@ def _pick_tile_config(I: int, H: int) -> _TileConfig:
     if I % tile_n_a != 0:
         tile_n_a = _largest_pow2_divisor(I, cap=256)
 
-    return _TileConfig(
+    return TileConfig(
         tile_m=128,
         tile_n_a=tile_n_a,
         tile_n_y=pick(256, H),
@@ -202,6 +327,35 @@ def _pick_tile_config(I: int, H: int) -> _TileConfig:
         num_sms_a_bwd=None,
         num_sms_y_bwd=None,
     )
+
+
+def _resolve_tile_config(
+    tile_config: TileConfig | None, I: int, H: int
+) -> TileConfig:
+    """Resolve a caller override against the shape-picked baseline.
+
+    Overlays ``tile_config``'s non-``None`` fields onto
+    ``default_tile_config(I, H)`` and validates the result. ``None`` (the
+    default for every ``TileConfig`` field) means "auto-pick", so a field the
+    caller didn't set takes the baseline's shape-picked value rather than a
+    frozen hardcoded default. ``tile_config=None`` returns the bare baseline.
+
+    Caller ``None`` always resolves to the baseline value — a caller cannot
+    request a field's kernel-level ``None`` fallback (e.g. ``tile_n_dW1`` →
+    "use tile_n_a") through the public surface; that internal default is not
+    something callers need, and the dW GEMMs predicate partial tiles anyway.
+    """
+    cfg = default_tile_config(I, H)
+    if tile_config is not None:
+        overrides = {
+            f.name: getattr(tile_config, f.name)
+            for f in fields(tile_config)
+            if getattr(tile_config, f.name) is not None
+        }
+        if overrides:
+            cfg = replace(cfg, **overrides)
+    cfg.validate(I, H)
+    return cfg
 
 
 @dataclass(frozen=True)
@@ -293,27 +447,7 @@ class StreamMoEFunc(torch.autograd.Function):
         w1_local: torch.Tensor,
         w2_local: torch.Tensor,
         num_experts: int,
-        tile_m: int,
-        tile_n_a: int,
-        tile_n_y: int,
-        tile_n_y_bwd: int,
-        tile_n_a_bwd: int,
-        tile_m_dW1: int | None,
-        tile_n_dW1: int | None,
-        tile_m_dW2: int | None,
-        tile_n_dW2: int | None,
-        cluster_m_dW1: int,
-        cluster_n_dW1: int,
-        cluster_m_dW2: int,
-        cluster_n_dW2: int,
-        pingpong_dW1: bool,
-        pingpong_dW2: bool,
-        swizzle_dW1: int,
-        swizzle_dW2: int,
-        num_sms_a: int | None,
-        num_sms_y: int | None,
-        num_sms_a_bwd: int | None,
-        num_sms_y_bwd: int | None,
+        cfg: TileConfig,
         activation_checkpoint_level: int = 0,
     ) -> torch.Tensor:
         # activation_checkpoint_level: 0 = save preact_a + pool (no ckpt);
@@ -326,6 +460,14 @@ class StreamMoEFunc(torch.autograd.Function):
         _NVTX_FWD_COUNT += 1
         _fid = _NVTX_FWD_COUNT
         _nvtx_push(f"moe_fwd_{_fid}")
+
+        # Forward reads only these knobs directly; the rest of ``cfg`` rides on
+        # ctx for backward (see the ctx store below).
+        tile_m = cfg.tile_m
+        tile_n_a = cfg.tile_n_a
+        tile_n_y = cfg.tile_n_y
+        num_sms_a = cfg.num_sms_a
+        num_sms_y = cfg.num_sms_y
 
         caller_stream = torch.cuda.current_stream()
 
@@ -570,27 +712,11 @@ class StreamMoEFunc(torch.autograd.Function):
         ctx.streams = streams
         ctx.buffer = buffer
         ctx.handle = handle
-        ctx.tile_m = tile_m
-        ctx.tile_n_a = tile_n_a
-        ctx.tile_n_y = tile_n_y
-        ctx.tile_n_y_bwd = tile_n_y_bwd
-        ctx.tile_n_a_bwd = tile_n_a_bwd
-        ctx.tile_m_dW1 = tile_m_dW1
-        ctx.tile_n_dW1 = tile_n_dW1
-        ctx.tile_m_dW2 = tile_m_dW2
-        ctx.tile_n_dW2 = tile_n_dW2
-        ctx.cluster_m_dW1 = cluster_m_dW1
-        ctx.cluster_n_dW1 = cluster_n_dW1
-        ctx.cluster_m_dW2 = cluster_m_dW2
-        ctx.cluster_n_dW2 = cluster_n_dW2
-        ctx.pingpong_dW1 = pingpong_dW1
-        ctx.pingpong_dW2 = pingpong_dW2
-        ctx.swizzle_dW1 = swizzle_dW1
-        ctx.swizzle_dW2 = swizzle_dW2
-        ctx.num_sms_a = num_sms_a
-        ctx.num_sms_y = num_sms_y
-        ctx.num_sms_a_bwd = num_sms_a_bwd if num_sms_a_bwd is not None else num_sms_a
-        ctx.num_sms_y_bwd = num_sms_y_bwd if num_sms_y_bwd is not None else num_sms_y
+        # The full tuning config rides on ctx for backward — a small frozen
+        # dataclass of ints/bools, no tensors, so (unlike streams/buffer/handle)
+        # it needs no eager release. The num_sms_*_bwd "fall back to the fwd
+        # count when None" derivation happens in backward, off ``cfg``.
+        ctx.cfg = cfg
         _nvtx_pop()  # moe_fwd
         return out
 
@@ -673,25 +799,31 @@ class StreamMoEFunc(torch.autograd.Function):
         # them so handle's tensors (pool_arrival_count et al.) can be freed
         # at this layer's bwd return rather than at the end of the iter.
         del ctx.streams, ctx.buffer, ctx.handle
-        tile_m: int = ctx.tile_m
-        tile_n_a: int = ctx.tile_n_a
-        tile_n_y_bwd: int = ctx.tile_n_y_bwd
-        tile_n_a_bwd: int = ctx.tile_n_a_bwd
-        tile_m_dW1: int = ctx.tile_m_dW1 if ctx.tile_m_dW1 is not None else tile_m
-        tile_n_dW1: int = ctx.tile_n_dW1 if ctx.tile_n_dW1 is not None else tile_n_a
-        tile_m_dW2: int = ctx.tile_m_dW2 if ctx.tile_m_dW2 is not None else tile_m
-        tile_n_dW2: int = ctx.tile_n_dW2 if ctx.tile_n_dW2 is not None else tile_n_a
-        cluster_m_dW1: int = ctx.cluster_m_dW1
-        cluster_n_dW1: int = ctx.cluster_n_dW1
-        cluster_m_dW2: int = ctx.cluster_m_dW2
-        cluster_n_dW2: int = ctx.cluster_n_dW2
-        pingpong_dW1: bool = ctx.pingpong_dW1
-        pingpong_dW2: bool = ctx.pingpong_dW2
-        swizzle_dW1: int = ctx.swizzle_dW1
-        swizzle_dW2: int = ctx.swizzle_dW2
-        num_sms_a: int | None = ctx.num_sms_a
-        num_sms_a_bwd: int | None = ctx.num_sms_a_bwd
-        num_sms_y_bwd: int | None = ctx.num_sms_y_bwd
+        cfg: TileConfig = ctx.cfg
+        tile_m: int = cfg.tile_m
+        tile_n_a: int = cfg.tile_n_a
+        tile_n_y_bwd: int = cfg.tile_n_y_bwd
+        tile_n_a_bwd: int = cfg.tile_n_a_bwd
+        tile_m_dW1: int = cfg.tile_m_dW1 if cfg.tile_m_dW1 is not None else tile_m
+        tile_n_dW1: int = cfg.tile_n_dW1 if cfg.tile_n_dW1 is not None else tile_n_a
+        tile_m_dW2: int = cfg.tile_m_dW2 if cfg.tile_m_dW2 is not None else tile_m
+        tile_n_dW2: int = cfg.tile_n_dW2 if cfg.tile_n_dW2 is not None else tile_n_a
+        cluster_m_dW1: int = cfg.cluster_m_dW1
+        cluster_n_dW1: int = cfg.cluster_n_dW1
+        cluster_m_dW2: int = cfg.cluster_m_dW2
+        cluster_n_dW2: int = cfg.cluster_n_dW2
+        pingpong_dW1: bool = cfg.pingpong_dW1
+        pingpong_dW2: bool = cfg.pingpong_dW2
+        swizzle_dW1: int = cfg.swizzle_dW1
+        swizzle_dW2: int = cfg.swizzle_dW2
+        # bwd kernels take the *_bwd SM counts (falling back to the fwd count
+        # when unset); the fwd-only num_sms_a / num_sms_y aren't used here.
+        num_sms_a_bwd: int | None = (
+            cfg.num_sms_a_bwd if cfg.num_sms_a_bwd is not None else cfg.num_sms_a
+        )
+        num_sms_y_bwd: int | None = (
+            cfg.num_sms_y_bwd if cfg.num_sms_y_bwd is not None else cfg.num_sms_y
+        )
 
         # Upstream may pass a non-contiguous grad (e.g. `out.sum().backward()`
         # produces a stride-(0,0) broadcast view); `dispatch_grads` asserts
@@ -1029,27 +1161,7 @@ class StreamMoEFunc(torch.autograd.Function):
             dW1_local,  # w1_local
             dW2_local,  # w2_local
             None,  # num_experts
-            None,  # tile_m
-            None,  # tile_n_a
-            None,  # tile_n_y
-            None,  # tile_n_y_bwd
-            None,  # tile_n_a_bwd
-            None,  # tile_m_dW1
-            None,  # tile_n_dW1
-            None,  # tile_m_dW2
-            None,  # tile_n_dW2
-            None,  # cluster_m_dW1
-            None,  # cluster_n_dW1
-            None,  # cluster_m_dW2
-            None,  # cluster_n_dW2
-            None,  # pingpong_dW1
-            None,  # pingpong_dW2
-            None,  # swizzle_dW1
-            None,  # swizzle_dW2
-            None,  # num_sms_a
-            None,  # num_sms_y
-            None,  # num_sms_a_bwd
-            None,  # num_sms_y_bwd
+            None,  # cfg (TileConfig)
             None,  # activation_checkpoint_level
         )
 
@@ -1065,16 +1177,20 @@ def stream_moe_func(
     *,
     streams: StreamHolder,
     num_experts: int,
+    tile_config: TileConfig | None = None,
     activation_checkpoint_level: int = 0,
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
-    Tile / cluster / swizzle / persistent-kernel-SM tuning is picked
-    internally from ``w1_local``'s shape via :func:`_pick_tile_config` —
-    bench-tuned defaults with a power-of-2 fallback per kernel's tile_n
-    divisibility constraint. There are no public tuning kwargs; callers that
-    need to sweep specific shapes go through the kernel-level wrappers
-    (``streaming_moe_a``, ``streaming_moe_y``, ...) directly.
+    Tile / cluster / swizzle / persistent-kernel-SM tuning comes from
+    ``tile_config``, an all-optional :class:`TileConfig` of overrides. Every
+    unset (``None``) field — which is all of them when ``tile_config`` is
+    ``None`` (the default) — is auto-picked from ``w1_local``'s shape via
+    :func:`default_tile_config` (bench-tuned defaults with a power-of-2
+    fallback per kernel's tile_n divisibility constraint). To pin specific
+    knobs, pass e.g. ``tile_config=TileConfig(tile_n_a=128, num_sms_a=120)``;
+    the rest stay shape-picked, and the resolved config is validated against
+    ``w1_local``'s shape before launch (:meth:`TileConfig.validate`).
 
     Returns the cross-rank-reduced output of shape ``[num_tokens, hidden]``
     produced by the combine receiver — the standard MoE forward output for
@@ -1098,10 +1214,12 @@ def stream_moe_func(
     ``@torch.compiler.disable`` at the consumer boundary; see this module's
     docstring for the underlying constraint.
     """
-    # w1_local shape is [E_local, 2*I, H]; derive I and H to pick tiles.
+    # w1_local shape is [E_local, 2*I, H]; derive I and H to pick / validate tiles.
     _, two_I, H = w1_local.shape
     I = two_I // 2
-    cfg = _pick_tile_config(I, H)
+    # Overlay the caller's non-None overrides onto the shape-picked baseline,
+    # then validate; unset knobs are auto-picked for this shape.
+    cfg = _resolve_tile_config(tile_config, I, H)
 
     # Register the compute stream so the C++ Buffer's per-dispatch slabs
     # (``torch::empty``'d on the communicate stream) are record_stream'd onto
@@ -1128,26 +1246,6 @@ def stream_moe_func(
         w1_local,
         w2_local,
         num_experts,
-        cfg.tile_m,
-        cfg.tile_n_a,
-        cfg.tile_n_y,
-        cfg.tile_n_y_bwd,
-        cfg.tile_n_a_bwd,
-        cfg.tile_m_dW1,
-        cfg.tile_n_dW1,
-        cfg.tile_m_dW2,
-        cfg.tile_n_dW2,
-        cfg.cluster_m_dW1,
-        cfg.cluster_n_dW1,
-        cfg.cluster_m_dW2,
-        cfg.cluster_n_dW2,
-        cfg.pingpong_dW1,
-        cfg.pingpong_dW2,
-        cfg.swizzle_dW1,
-        cfg.swizzle_dW2,
-        cfg.num_sms_a,
-        cfg.num_sms_y,
-        cfg.num_sms_a_bwd,
-        cfg.num_sms_y_bwd,
+        cfg,
         activation_checkpoint_level,
     )

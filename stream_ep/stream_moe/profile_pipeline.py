@@ -41,6 +41,8 @@ import torch.profiler
 from stream_ep import Buffer as StreamEPBuffer
 
 from stream_ep.stream_moe.stream_moe import (
+    TileConfig,
+    _resolve_tile_config,
     make_streams,
     stream_moe_func,
 )
@@ -85,16 +87,16 @@ def rank_zero_only(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-H = 2048
-I = 384
-NUM_EXPERTS = 384
+# Default profile shape = the 82ba5b prod config (82B total / 4.3B active):
+# d_model H=3072, per-expert I=768, E=256 experts, top-K=8, 8192 tokens/rank.
+# Override any of these via --hidden / --intermediate / --num_experts / --topk.
+H = 3072
+I = 768
+NUM_EXPERTS = 256
 SEQ_LEN_PER_RANK = 8192
-TOPK = 13
+TOPK = 8
 DTYPE = torch.bfloat16
 NUM_SMS = 64  # 64 SMs (32 channels): tuned for 4+ node RDMA-dominated runs.
-TILE_M = 128
-TILE_N_A = 192
-TILE_N_Y = 256
 
 
 def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
@@ -142,6 +144,37 @@ def make_buffer(group, num_sms=None, hidden=H):
     return StreamEPBuffer(group, nvl_bytes, rdma_bytes)
 
 
+def _tile_config_from_args(args) -> TileConfig:
+    """Build the TileConfig override struct from the tile / cluster / swizzle /
+    pingpong / num_sms flags. Each is None unless the caller passed it, so
+    stream_moe_func auto-picks the unset knobs from the weight shape — only
+    flags actually passed override the bench-tuned baseline.
+    """
+    return TileConfig(
+        tile_m=args.tile_m,
+        tile_n_a=args.tile_n_a,
+        tile_n_y=args.tile_n_y,
+        tile_n_y_bwd=args.tile_n_y_bwd,
+        tile_n_a_bwd=args.tile_n_a_bwd,
+        tile_m_dW1=args.tile_m_dW1,
+        tile_n_dW1=args.tile_n_dW1,
+        tile_m_dW2=args.tile_m_dW2,
+        tile_n_dW2=args.tile_n_dW2,
+        cluster_m_dW1=args.cluster_m_dW1,
+        cluster_n_dW1=args.cluster_n_dW1,
+        cluster_m_dW2=args.cluster_m_dW2,
+        cluster_n_dW2=args.cluster_n_dW2,
+        pingpong_dW1=args.pingpong_dW1,
+        pingpong_dW2=args.pingpong_dW2,
+        swizzle_dW1=args.swizzle_dW1,
+        swizzle_dW2=args.swizzle_dW2,
+        num_sms_a=args.num_sms_a,
+        num_sms_y=args.num_sms_y,
+        num_sms_a_bwd=args.num_sms_a_bwd,
+        num_sms_y_bwd=args.num_sms_y_bwd,
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -155,16 +188,18 @@ def main():
     p.add_argument("--num_sms", type=int, default=None,
                    help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
-    # MoE shape overrides — default to the profile shape; pass 82ba5b's
-    # (H=3072 I=768 E=256 K=8) to measure the recompute cost at the real
-    # GEMM size (2I·H), which is what determines whether the bwd preact_a
-    # recompute hides behind dispatch_grads' comm. Defaults come via globals()
-    # because main() rebinds H/I/NUM_EXPERTS/TOPK as locals below — a bare
-    # `default=H` would be an UnboundLocalError on that soon-to-be-local name.
-    p.add_argument("--hidden", type=int, default=globals()["H"], help="d_model (82ba5b=3072)")
-    p.add_argument("--intermediate", type=int, default=globals()["I"], help="per-expert I (82ba5b=768)")
-    p.add_argument("--num_experts", type=int, default=globals()["NUM_EXPERTS"], help="total experts E (82ba5b=256)")
-    p.add_argument("--topk", type=int, default=globals()["TOPK"], help="top-k K (82ba5b=8)")
+    # MoE shape overrides — default to the 82ba5b prod shape (H=3072 I=768
+    # E=256 K=8), so the profile runs at the real GEMM size (2I·H) that
+    # determines whether the bwd preact_a recompute hides behind
+    # dispatch_grads' comm. Pass flags for a different shape, e.g. the esm4
+    # 18.6B: --hidden 2048 --intermediate 384 --num_experts 384 --topk 13.
+    # Defaults come via globals() because main() rebinds H/I/NUM_EXPERTS/TOPK
+    # as locals below — a bare `default=H` would be an UnboundLocalError on
+    # that soon-to-be-local name.
+    p.add_argument("--hidden", type=int, default=globals()["H"], help="d_model H (default: 82ba5b 3072)")
+    p.add_argument("--intermediate", type=int, default=globals()["I"], help="per-expert I (default: 82ba5b 768)")
+    p.add_argument("--num_experts", type=int, default=globals()["NUM_EXPERTS"], help="total experts E (default: 82ba5b 256)")
+    p.add_argument("--topk", type=int, default=globals()["TOPK"], help="top-k K (default: 82ba5b 8)")
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)
@@ -188,25 +223,28 @@ def main():
         "recv-token checkpoint (compact pool -> x_recv after kernel Y on the "
         "caller stream, re-expand in bwd). Overrides --recompute_preact.",
     )
-    p.add_argument("--tile_m", type=int, default=TILE_M)
-    p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
-    p.add_argument("--tile_n_y", type=int, default=TILE_N_Y)
-    p.add_argument("--tile_n_a_bwd", type=int, default=256)
-    p.add_argument("--tile_n_y_bwd", type=int, default=128)
-    # dW grouped-GEMM tile knobs. None → fall back to (tile_m, tile_n_a) at the
-    # bwd call site, matching pre-decouple behaviour.
+    # Tile / cluster / swizzle / pingpong / num_sms overrides. Every default is
+    # None = "auto-pick": unset flags are filled by default_tile_config(I, H)
+    # for the actual shape (so the default run matches the bench baseline and a
+    # frozen value never breaks a non-default --hidden/--intermediate). A flag
+    # the caller passes overrides just that one knob; see _tile_config_from_args.
+    p.add_argument("--tile_m", type=int, default=None)
+    p.add_argument("--tile_n_a", type=int, default=None)
+    p.add_argument("--tile_n_y", type=int, default=None)
+    p.add_argument("--tile_n_a_bwd", type=int, default=None)
+    p.add_argument("--tile_n_y_bwd", type=int, default=None)
     p.add_argument("--tile_m_dW1", type=int, default=None)
-    p.add_argument("--tile_n_dW1", type=int, default=256)
+    p.add_argument("--tile_n_dW1", type=int, default=None)
     p.add_argument("--tile_m_dW2", type=int, default=None)
     p.add_argument("--tile_n_dW2", type=int, default=None)
-    p.add_argument("--cluster_m_dW1", type=int, default=2)
-    p.add_argument("--cluster_n_dW1", type=int, default=2)
-    p.add_argument("--cluster_m_dW2", type=int, default=1)
-    p.add_argument("--cluster_n_dW2", type=int, default=1)
-    p.add_argument("--pingpong_dW1", action="store_true")
-    p.add_argument("--pingpong_dW2", action="store_true")
-    p.add_argument("--swizzle_dW1", type=int, default=8)
-    p.add_argument("--swizzle_dW2", type=int, default=8)
+    p.add_argument("--cluster_m_dW1", type=int, default=None)
+    p.add_argument("--cluster_n_dW1", type=int, default=None)
+    p.add_argument("--cluster_m_dW2", type=int, default=None)
+    p.add_argument("--cluster_n_dW2", type=int, default=None)
+    p.add_argument("--pingpong_dW1", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--pingpong_dW2", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--swizzle_dW1", type=int, default=None)
+    p.add_argument("--swizzle_dW2", type=int, default=None)
     p.add_argument(
         "--skew_hot_frac",
         type=float,
@@ -228,6 +266,12 @@ def main():
     I = args.intermediate
     NUM_EXPERTS = args.num_experts
     TOPK = args.topk
+
+    # Tile overrides from flags (unset = None = auto-pick). tile_cfg is what we
+    # pass to stream_moe_func; resolved_cfg is the same overlaid onto the
+    # shape-picked baseline + validated, used to report the actual tiles.
+    tile_cfg = _tile_config_from_args(args)
+    resolved_cfg = _resolve_tile_config(tile_cfg, I, H)
 
     device = init_distributed()
     rank, world_size = get_global_rank(), get_world_size()
@@ -298,7 +342,10 @@ def main():
         print(
             f"config: world={world_size} num_sms={StreamEPBuffer.num_sms} "
             f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
-            f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y} "
+            f"tile_m={resolved_cfg.tile_m} tile_n_a={resolved_cfg.tile_n_a} "
+            f"tile_n_y={resolved_cfg.tile_n_y} tile_n_y_bwd={resolved_cfg.tile_n_y_bwd} "
+            f"tile_n_a_bwd={resolved_cfg.tile_n_a_bwd} "
+            f"num_sms_a={resolved_cfg.num_sms_a} num_sms_y={resolved_cfg.num_sms_y} "
             f"act_ckpt_level={act_ckpt_level}",
             flush=True,
         )
@@ -316,6 +363,7 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
+            tile_config=tile_cfg,
             activation_checkpoint_level=act_ckpt_level,
         )
         out.sum().backward()
@@ -369,6 +417,7 @@ def main():
                     w2_local,
                     streams=streams,
                     num_experts=NUM_EXPERTS,
+                    tile_config=tile_cfg,
                     activation_checkpoint_level=act_ckpt_level,
                 )
             fwd_ends[step].record()
