@@ -139,6 +139,15 @@ struct StreamingDispatchOutputs {
     // this struct (handle._dispatch_out) holds the other reference. All other
     // members are bwd-needed (routing / slab views), so only o is released.
     void release_o() { o = torch::Tensor(); }
+
+    // Release the `pool` reference held by this struct. activation_checkpoint_
+    // level=2 saves a compressed recv-token tensor instead of `pool` and frees
+    // pool after the forward compaction; like `o`, `handle.pool=None` alone is
+    // insufficient because this struct (handle._dispatch_out) holds the other
+    // reference. The backward re-expands pool from the saved tensor, and neither
+    // intranode nor internode bwd reads this struct's `pool`, so dropping it is
+    // safe at level 2. (Levels 0/1 keep pool and do NOT call this.)
+    void release_pool() { pool = torch::Tensor(); }
 };
 
 struct Buffer {

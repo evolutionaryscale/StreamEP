@@ -175,7 +175,18 @@ def main():
         action="store_true",
         help="Activation-checkpoint preact_a: skip the fwd [2I] save and "
         "recompute it from pool @ W1 in bwd. Measures the recompute's e2e "
-        "cost and peak-memory saving vs the default (save preact_a).",
+        "cost and peak-memory saving vs the default (save preact_a). Alias for "
+        "--act_ckpt_level 1; --act_ckpt_level takes precedence if given.",
+    )
+    p.add_argument(
+        "--act_ckpt_level",
+        type=int,
+        default=None,
+        choices=[0, 1, 2],
+        help="activation_checkpoint_level: 0 = save preact_a + pool, 1 = save "
+        "pool + recompute preact_a (= --recompute_preact), 2 = compressed "
+        "recv-token checkpoint (compact pool -> x_recv after kernel Y on the "
+        "caller stream, re-expand in bwd). Overrides --recompute_preact.",
     )
     p.add_argument("--tile_m", type=int, default=TILE_M)
     p.add_argument("--tile_n_a", type=int, default=TILE_N_A)
@@ -205,6 +216,12 @@ def main():
     )
     p.add_argument("--skew_hot_weight", type=float, default=4.0)
     args = p.parse_args()
+
+    # --act_ckpt_level overrides --recompute_preact (the bool 0/1 alias).
+    act_ckpt_level = (
+        args.act_ckpt_level if args.act_ckpt_level is not None
+        else (1 if args.recompute_preact else 0)
+    )
 
     # MoE shape from args (defaults = the module-level profile shape).
     H = args.hidden
@@ -282,7 +299,7 @@ def main():
             f"config: world={world_size} num_sms={StreamEPBuffer.num_sms} "
             f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
             f"tile_m={args.tile_m} tile_n_a={args.tile_n_a} tile_n_y={args.tile_n_y} "
-            f"recompute_preact={args.recompute_preact}",
+            f"act_ckpt_level={act_ckpt_level}",
             flush=True,
         )
 
@@ -299,7 +316,7 @@ def main():
             w2_local,
             streams=streams,
             num_experts=NUM_EXPERTS,
-            activation_checkpoint=args.recompute_preact,
+            activation_checkpoint_level=act_ckpt_level,
         )
         out.sum().backward()
     torch.cuda.synchronize()
@@ -352,7 +369,7 @@ def main():
                     w2_local,
                     streams=streams,
                     num_experts=NUM_EXPERTS,
-                    activation_checkpoint=args.recompute_preact,
+                    activation_checkpoint_level=act_ckpt_level,
                 )
             fwd_ends[step].record()
             bwd_starts[step].record()

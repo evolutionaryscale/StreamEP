@@ -97,6 +97,10 @@ from stream_ep.stream_moe.kernel_y import (
 from stream_ep.stream_moe.kernel_y_bwd import (
     streaming_moe_y_bwd,
 )
+from stream_ep.stream_moe.recv_pool_compress import (
+    compress_pool_to_recv,
+    reexpand_recv_to_pool,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +314,14 @@ class StreamMoEFunc(torch.autograd.Function):
         num_sms_y: int | None,
         num_sms_a_bwd: int | None,
         num_sms_y_bwd: int | None,
-        activation_checkpoint: bool = False,
+        activation_checkpoint_level: int = 0,
     ) -> torch.Tensor:
+        # activation_checkpoint_level: 0 = save preact_a + pool (no ckpt);
+        # 1 = save pool, recompute preact_a in bwd; 2 = save compressed
+        # recv-token x_recv, re-expand pool + recompute preact_a in bwd
+        # (markdowns/act_ckpt_level2_plan.md).
+        if activation_checkpoint_level not in (0, 1, 2):
+            raise ValueError(f"activation_checkpoint_level must be 0/1/2, got {activation_checkpoint_level}")
         global _NVTX_FWD_COUNT
         _NVTX_FWD_COUNT += 1
         _fid = _NVTX_FWD_COUNT
@@ -392,14 +402,14 @@ class StreamMoEFunc(torch.autograd.Function):
         # expensive thing (preact, would otherwise need a GEMM to recover)
         # is the one we save.
         #
-        # Under ``activation_checkpoint`` we DON'T save preact_a: the fwd
+        # At ``activation_checkpoint_level >= 1`` we DON'T save preact_a: the fwd
         # ``[2I]`` TMA-store is skipped (preact_a=None below) and bwd
         # recomputes it from the saved ``pool`` @ ``w1_local`` (one
         # kernel-A-sized GEMM that overlaps with dispatch_grads' comm tail).
         # Trades ~2I·2 B/slot of saved activation per layer for that GEMM.
         preact_a = (
             None
-            if activation_checkpoint
+            if activation_checkpoint_level >= 1
             else torch.empty(
                 handle.total_tiles,
                 tile_m,
@@ -487,6 +497,35 @@ class StreamMoEFunc(torch.autograd.Function):
             out, _ = buffer.combine(handle.o, handle)
         _nvtx_pop()  # fwd_combine
 
+        # ── Level 2: compress pool -> x_recv on the CALLER stream, overlapping
+        # combine. caller.wait_stream(compute) syncs the caller past kernel Y
+        # (hence past kernel A's gated pool reads), so pool is fully materialized
+        # and readable here; x_recv is then allocated AND written on the caller
+        # stream -> a pure default-pool tensor (no record_stream, no cross-stream
+        # bracketing). pool is freed right after (its last reader, this
+        # compaction, is done) with no extra wait — combine reads `o`, never
+        # pool. The saved x_recv (T_recv rows) replaces the expanded, 128-padded
+        # pool (TK_padded rows); bwd re-expands it. markdowns/act_ckpt_level2_plan.md sec 4.
+        x_recv = None
+        if activation_checkpoint_level == 2:
+            caller_stream.wait_stream(streams.compute)
+            # Allocate x_recv on the CALLER stream (current here) -> default pool,
+            # then fill in place. A pure default-pool tensor: no record_stream.
+            x_recv = torch.empty(
+                handle.recv_token_to_slots.shape[0], pool.shape[1],
+                dtype=pool.dtype, device=pool.device,
+            )
+            compress_pool_to_recv(pool, handle.pool_recv_token, x_recv)
+            # Free pool: drop ALL THREE refs. handle.pool=None + the local are
+            # not enough — handle._dispatch_out (the C++ struct) holds the other
+            # ref (exactly like `o`/release_o), so without release_pool() pool
+            # stays pinned through bwd and L2 saves NOTHING. dispatch_grads reads
+            # handle.TK_padded now (not pool.shape); bwd re-expands from x_recv.
+            handle.pool = None
+            if handle._dispatch_out is not None:
+                handle._dispatch_out.release_pool()
+            pool = None
+
         # Layer-end back-edges. caller_stream waits on both streams so the
         # layer-as-barrier invariant holds across layers.
         caller_stream.wait_stream(streams.communicate)
@@ -518,11 +557,13 @@ class StreamMoEFunc(torch.autograd.Function):
         # orchestrator element-wise-recomputes postact_a from it (silu(gate)
         # * up) into a transient buffer just before dW2's grouped GEMM.
         #
-        # Under activation_checkpoint, preact_a was never materialized (None);
-        # bwd recomputes it from the saved pool @ w1_local. Save only the
-        # GEMM inputs so save_for_backward stays a homogeneous tensor tuple.
-        ctx.activation_checkpoint = activation_checkpoint
-        if activation_checkpoint:
+        # At level >= 1, preact_a was never materialized (None); bwd recomputes
+        # it from the saved pool @ w1_local. Save only the GEMM inputs so
+        # save_for_backward stays a homogeneous tensor tuple.
+        ctx.activation_checkpoint_level = activation_checkpoint_level
+        if activation_checkpoint_level == 2:
+            ctx.save_for_backward(x_recv, w1_local, w2_local)
+        elif activation_checkpoint_level == 1:
             ctx.save_for_backward(pool, w1_local, w2_local)
         else:
             ctx.save_for_backward(preact_a, pool, w1_local, w2_local)
@@ -607,10 +648,15 @@ class StreamMoEFunc(torch.autograd.Function):
         _bid = _NVTX_BWD_COUNT
         _nvtx_push(f"moe_bwd_{_bid}")
 
-        # Under activation_checkpoint the fwd saved only the recompute inputs
-        # (pool, w1, w2); preact_a is reconstructed below from pool @ w1_local
-        # before kernel_y_bwd reads it. Otherwise preact_a was saved directly.
-        if ctx.activation_checkpoint:
+        # At level >= 1 the fwd saved only the recompute inputs; preact_a is
+        # reconstructed below from pool @ w1_local before kernel_y_bwd reads it.
+        # Level 2 saved the compressed x_recv (not pool) — pool is re-expanded
+        # from it after the dispatch_grads gate (sec 6). Level 0 saved preact_a.
+        if ctx.activation_checkpoint_level == 2:
+            x_recv, w1_local, w2_local = ctx.saved_tensors
+            pool = None      # re-expanded below (only when total_tiles > 0)
+            preact_a = None
+        elif ctx.activation_checkpoint_level == 1:
             pool, w1_local, w2_local = ctx.saved_tensors
             preact_a = None  # recomputed after the dispatch_grads gate
         else:
@@ -653,13 +699,15 @@ class StreamMoEFunc(torch.autograd.Function):
         dL_dy = dL_dy.contiguous()
 
         caller_stream = torch.cuda.current_stream()
-        device = pool.device
-        dtype = pool.dtype
+        # device/dtype from dL_dy (always present, same activation dtype as pool)
+        # so this works at level 2 where pool is None until re-expanded.
+        device = dL_dy.device
+        dtype = dL_dy.dtype
 
         E_local, two_I, H = w1_local.shape
         I = two_I // 2
         total_tiles = handle.total_tiles
-        TK_padded = pool.shape[0]
+        TK_padded = handle.TK_padded  # was pool.shape[0]; pool may be None at level 2
         T_recv = handle.k_local_total.shape[0]
 
         # Allocate the backward scratch on the CALLER stream (default pool), not
@@ -751,7 +799,24 @@ class StreamMoEFunc(torch.autograd.Function):
         # above; same rationale.
         buffer.wait_dispatch_grads_started(streams.compute)
 
-        # ── Stage 1.5 — recompute preact_a (activation_checkpoint only) ─────
+        # ── Level 2: re-expand x_recv -> pool on the compute stream, overlapping
+        # dispatch_grads's comm tail (the same window Stage 1.5 uses). FIFO-before
+        # Stage 1.5 (preact recompute) and Stage 5 (dW1) — pool's only bwd
+        # consumers. Transient: a bwd local on the compute pool, freed at bwd
+        # return; one layer live at a time, so it never touches the fwd-end peak.
+        # markdowns/act_ckpt_level2_plan.md sec 6.
+        if ctx.activation_checkpoint_level == 2 and total_tiles > 0:
+            # Allocate the transient pool on the CALLER stream -> default pool
+            # (so it reuses freed x_recv space as bwd drains them, instead of
+            # stranding in the compute pool); fill it in place on the compute
+            # stream. Same caller-alloc / compute-write pattern as the bwd scratch
+            # (alloc->first-use via the fan-out gate above; free-side via the
+            # bwd back-edges). NO record_stream.
+            pool = torch.empty(TK_padded, H, dtype=dtype, device=device)
+            with torch.cuda.stream(streams.compute):
+                reexpand_recv_to_pool(x_recv, handle.pool_recv_token, pool)
+
+        # ── Stage 1.5 — recompute preact_a (checkpoint level >= 1 only) ─────
         # Reconstruct the [2I] pre-SwiGLU accumulator that fwd kernel A would
         # have TMA-stored, by re-running the same kernel-A GEMM on the saved
         # pool @ w1_local. Same kernel + same inputs ⟹ preact_a is bit-
@@ -767,7 +832,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # couple to dispatch_grads' per-tile fill of bwd_dispatch_arrival_count.
         # postact (silu(gate)*up) is a throwaway here; kernel_y_bwd recomputes
         # its own pool_topk_weight-scaled postact_a_for_dW2 from preact_a.
-        if ctx.activation_checkpoint and total_tiles > 0:
+        if ctx.activation_checkpoint_level >= 1 and total_tiles > 0:
             with torch.cuda.stream(streams.compute):
                 preact_a = torch.empty(
                     total_tiles, tile_m, two_I, dtype=dtype, device=device
@@ -985,7 +1050,7 @@ class StreamMoEFunc(torch.autograd.Function):
             None,  # num_sms_y
             None,  # num_sms_a_bwd
             None,  # num_sms_y_bwd
-            None,  # activation_checkpoint
+            None,  # activation_checkpoint_level
         )
 
 
@@ -1000,7 +1065,7 @@ def stream_moe_func(
     *,
     streams: StreamHolder,
     num_experts: int,
-    activation_checkpoint: bool = False,
+    activation_checkpoint_level: int = 0,
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
@@ -1015,13 +1080,18 @@ def stream_moe_func(
     produced by the combine receiver — the standard MoE forward output for
     this rank's source tokens.
 
-    ``activation_checkpoint`` (default False): when True, the ``[2I]``
-    pre-SwiGLU accumulator ``preact_a`` is NOT saved for backward (saving
-    ~2I·dtype_size bytes/recv-slot/layer); backward instead recomputes it
-    from the saved ``pool @ w1_local`` (one kernel-A-sized GEMM that overlaps
-    with ``dispatch_grads``' comm tail). Trades that activation memory for
-    bwd compute — use when a layer's saved-activation footprint OOMs (e.g.
-    the 82B shape on 80 GB H100 vs 141 GB H200).
+    ``activation_checkpoint_level`` (default 0):
+      * 0 — save both ``preact_a`` and ``pool`` (no recompute).
+      * 1 — DON'T save the ``[2I]`` pre-SwiGLU accumulator ``preact_a``
+        (saving ~2I·dtype_size bytes/recv-slot/layer); backward recomputes it
+        from the saved ``pool @ w1_local`` (one kernel-A-sized GEMM that
+        overlaps with ``dispatch_grads``' comm tail). Trades that activation
+        memory for bwd compute — use when a layer's saved-activation footprint
+        OOMs (e.g. the 82B shape on 80 GB H100 vs 141 GB H200).
+      * 2 — additionally save only the *unexpanded* recv tokens
+        ``x_recv [T_recv, H]`` instead of the expanded, 128-padded ``pool``,
+        re-expanding ``pool`` in backward. NOT YET IMPLEMENTED (raises);
+        see ``markdowns/act_ckpt_level2_plan.md``.
 
     Compile interaction: this entry point is eager-only. Callers that want
     ``torch.compile`` around the outer model must apply
@@ -1079,5 +1149,5 @@ def stream_moe_func(
         cfg.num_sms_y,
         cfg.num_sms_a_bwd,
         cfg.num_sms_y_bwd,
-        activation_checkpoint,
+        activation_checkpoint_level,
     )

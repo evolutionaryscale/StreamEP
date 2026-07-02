@@ -53,11 +53,9 @@ struct Config {
         // Below are some assumptions
         // TODO: add assertions
         constexpr int kNumMaxTopK = 128;
-        constexpr int kNumMaxScales = 128;
         EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
         EP_HOST_ASSERT(num_ranks <= NUM_MAX_NVL_PEERS or num_sms % 2 == 0);
         const auto num_rdma_ranks = std::max(num_ranks / NUM_MAX_NVL_PEERS, 1);
-        const auto num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
         const int num_channels = num_sms / 2;
         const int hidden_int4 = static_cast<int>(hidden_bytes / sizeof(int4));
 
@@ -77,11 +75,13 @@ struct Config {
         num_bytes += internode::get_combine_nvl_region_bytes(
             hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
             num_channels, num_rdma_ranks);
-        // Scales: unused in stream_ep but kept in the upper bound so the
-        // allocation stays compatible with upstream DeepEP slot layouts that
-        // include per-token quant scales.
-        num_bytes += static_cast<size_t>(num_channels) * num_nvl_ranks
-                   * num_max_nvl_chunked_recv_tokens * kNumMaxScales * sizeof(float);
+        // NOTE: upstream DeepEP appends a per-slot fp8-scales block here
+        // (num_channels * num_nvl_ranks * recv_tokens * kNumMaxScales floats).
+        // stream_ep never quantizes dispatched tokens, so no kernel indexes it
+        // (see get_dispatch/combine_nvl_region_bytes in api.cuh -- the per-slot
+        // layout has no scales sub-buffer, and the block sat past
+        // dispatch_region + combine_region where neither kernel reads). Dropped
+        // to reclaim the dead padding; do NOT re-add for "upstream compat".
         num_bytes = ((num_bytes + 127) / 128) * 128;
         return num_bytes;
     }
@@ -95,7 +95,6 @@ struct Config {
         // Below are some assumptions
         // TODO: add assertions
         constexpr int kNumMaxTopK = 128;
-        constexpr int kNumMaxScales = 128;
         EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
         EP_HOST_ASSERT(num_sms % 2 == 0);
         const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
@@ -119,11 +118,11 @@ struct Config {
         num_bytes += internode::get_combine_rdma_region_bytes(
             hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens,
             num_channels, num_rdma_ranks);
-        // Scales: unused in stream_ep but kept in the upper bound so the
-        // allocation stays compatible with upstream DeepEP slot layouts that
-        // include per-token quant scales. Mirrors the NVL hint above.
-        num_bytes += static_cast<size_t>(num_channels) * num_rdma_ranks
-                   * num_max_rdma_chunked_recv_tokens * kNumMaxScales * sizeof(float) * 2;
+        // NOTE: dropped the unused per-slot fp8-scales padding block here; see
+        // the matching note in get_nvl_buffer_size_hint above. stream_ep never
+        // quantizes dispatched tokens, and the combine SymBuffer offsets past
+        // dispatch_region + combine_region (rdma_buffer_ptr_combine =
+        // rdma_buffer_ptr + num_rdma_bytes), so no kernel indexed the padding.
         num_bytes = ((num_bytes + 127) / 128) * 128;
         return num_bytes;
 #else

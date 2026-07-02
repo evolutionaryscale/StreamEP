@@ -1,6 +1,6 @@
-"""Gradient-equivalence test for the ``activation_checkpoint`` flag.
+"""Gradient-equivalence test for ``activation_checkpoint_level`` 0 vs 1.
 
-``stream_moe_func(..., activation_checkpoint=True)`` skips saving ``preact_a``
+``stream_moe_func(..., activation_checkpoint_level=1)`` skips saving ``preact_a``
 in forward and recomputes it from ``pool @ w1_local`` in backward with a plain
 grouped-M GEMM (``quack.gemm`` with ``cu_seqlens_m``). Because that is a
 DIFFERENT kernel than forward's gated kernel A, the reconstructed ``preact_a``
@@ -80,7 +80,7 @@ def main():
 
     streams = make_streams()
 
-    def run(activation_checkpoint: bool):
+    def run(level: int):
         x = x0.clone().requires_grad_(True)
         topk_weights = topk_weights0.clone().requires_grad_(True)
         w1 = w1_local.clone().requires_grad_(True)
@@ -88,7 +88,7 @@ def main():
         out = stream_moe_func(
             buf, x, topk_idx, topk_weights, is_token_in_rank, w1, w2,
             streams=streams, num_experts=num_experts,
-            activation_checkpoint=activation_checkpoint,
+            activation_checkpoint_level=level,
         )
         out.sum().backward()
         torch.cuda.synchronize()
@@ -100,24 +100,15 @@ def main():
             "dw2": w2.grad.float(),
         }
 
-    # Two baseline runs (noise floor) + one recompute run.
-    base_a = run(False)
-    base_b = run(False)
-    recomp = run(True)
+    # Two baseline runs (level 0, noise floor) + recompute runs at level 1
+    # (recompute preact_a) and level 2 (compressed recv-token ckpt: re-expand
+    # pool, then recompute preact_a). Both must match level 0 within tolerance.
+    base_a = run(0)
+    base_b = run(0)
+    recomps = {1: run(1), 2: run(2)}
 
     def max_abs_diff(p, q):
         return (p - q).abs().max().item()
-
-    # Sanity: no NaN/Inf anywhere.
-    for name, t in recomp.items():
-        assert torch.isfinite(t).all(), f"recompute produced non-finite {name} (rank={rank})"
-
-    # Shapes must match the non-checkpointed path exactly.
-    for k in recomp:
-        assert recomp[k].shape == base_a[k].shape, (
-            f"{k} shape changed under activation_checkpoint: "
-            f"{base_a[k].shape} vs {recomp[k].shape}"
-        )
 
     # Per-tensor: off-vs-ON diff must be within max(atomic-noise floor,
     # bf16-GEMM tolerance). ``slack`` lets the recompute sit at a different
@@ -125,34 +116,45 @@ def main():
     # covers the bf16 accumulation-order difference of the recompute's separate
     # grouped-M GEMM kernel — which scales with tensor magnitude, so a fixed
     # atol alone would get tight at production shapes. A real bug (wrong
-    # preact_a) blows past both by orders of magnitude / O(1) relative.
+    # preact_a, or a wrong pool re-expansion at level 2) blows past both by
+    # orders of magnitude / O(1) relative.
     slack = 4.0
     atol = 1e-3   # absolute floor for tensors whose values + noise are ~0
     rtol = 2e-2   # bf16 GEMM-accumulation tolerance (separate recompute kernel)
     failures = []
     report = []
-    for k in ("out", "dx", "dtopk", "dw1", "dw2"):
-        noise = max_abs_diff(base_a[k], base_b[k])
-        test = max_abs_diff(base_a[k], recomp[k])
-        scale = base_a[k].abs().max().item()
-        bound = max(slack * noise, atol, rtol * scale)
-        report.append(
-            f"{k}: off-vs-on={test:.3e}  off-vs-off(noise)={noise:.3e}  "
-            f"rtol*scale={rtol * scale:.3e}  bound={bound:.3e}"
-        )
-        if test > bound:
-            failures.append(
-                f"{k}: off-vs-on diff {test:.4e} exceeds bound {bound:.4e} "
-                f"(noise {noise:.4e}, rtol*scale {rtol * scale:.4e}) "
-                f"— recompute is NOT equivalent"
+    for level, recomp in recomps.items():
+        # Sanity: no NaN/Inf anywhere.
+        for name, t in recomp.items():
+            assert torch.isfinite(t).all(), (
+                f"level {level} produced non-finite {name} (rank={rank})")
+        # Shapes must match the non-checkpointed path exactly.
+        for k in recomp:
+            assert recomp[k].shape == base_a[k].shape, (
+                f"level {level}: {k} shape changed: "
+                f"{base_a[k].shape} vs {recomp[k].shape}")
+        for k in ("out", "dx", "dtopk", "dw1", "dw2"):
+            noise = max_abs_diff(base_a[k], base_b[k])
+            test = max_abs_diff(base_a[k], recomp[k])
+            scale = base_a[k].abs().max().item()
+            bound = max(slack * noise, atol, rtol * scale)
+            report.append(
+                f"L{level} {k}: off-vs-on={test:.3e}  off-vs-off(noise)={noise:.3e}  "
+                f"rtol*scale={rtol * scale:.3e}  bound={bound:.3e}"
             )
+            if test > bound:
+                failures.append(
+                    f"level {level} {k}: off-vs-on diff {test:.4e} exceeds bound "
+                    f"{bound:.4e} (noise {noise:.4e}, rtol*scale {rtol * scale:.4e}) "
+                    f"— recompute is NOT equivalent"
+                )
 
     if rank == 0:
-        print(f"[rank0 world={world_size}] activation_checkpoint grad-equivalence:")
+        print(f"[rank0 world={world_size}] activation_checkpoint_level grad-equivalence:")
         for line in report:
             print("  " + line)
 
-    assert not failures, "activation_checkpoint mismatch:\n" + "\n".join(failures)
+    assert not failures, "activation_checkpoint_level mismatch:\n" + "\n".join(failures)
 
     if rank == 0:
         print(f"PASS: activation_checkpoint grads within atomic-noise floor "
