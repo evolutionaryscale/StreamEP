@@ -459,8 +459,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* base_pool,
                                  int* seen_per_substream,
                                  int* rank_prefix_matrix,
-                                 int* tile_id_to_expert,
-                                 int* pool_arrival_target,
                                  int* total_tiles_device,
                                  // Shape
                                  int num_tokens,
