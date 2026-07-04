@@ -167,8 +167,6 @@ __global__ void streaming_dispatch_metadata_phase_a_kernel(
         int* base_pool,
         int* seen_per_substream,
         int* rank_prefix_matrix,
-        int* tile_id_to_expert,
-        int* pool_arrival_target,
         int* total_tiles_device,
         // Shape
         int num_tokens,
@@ -572,8 +570,6 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
         int* base_pool,
         int* seen_per_substream,
         int* rank_prefix_matrix,
-        int* tile_id_to_expert,
-        int* pool_arrival_target,
         int* total_tiles_device,
         // Shape
         int num_experts,
@@ -798,26 +794,9 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
         __syncthreads();
     }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // PHASE B5: tile_id_to_expert + pool_arrival_target — grid-stride, one
-    // thread per tile_id. Linear search over E_local experts to find owner.
-    // ──────────────────────────────────────────────────────────────────────
-    int total_tiles_inter = *total_tiles_device;
-    for (int tile_id = grid_tid; tile_id < total_tiles_inter; tile_id += grid_threads) {
-        int e_found = 0;
-        for (int e = 0; e < E_local; ++e) {
-            if (tile_id < expert_pool_block_offset[e + 1]) {
-                e_found = e;
-                break;
-            }
-        }
-        int e_start = expert_pool_block_offset[e_found];
-        int n_tiles_e = expert_pool_block_offset[e_found + 1] - e_start;
-        int n_e = expert_frequency[e_found];
-        int t = tile_id - e_start;
-        tile_id_to_expert[tile_id] = e_found;
-        pool_arrival_target[tile_id] = (t == n_tiles_e - 1) ? (n_e - t * tile_m) : tile_m;
-    }
+    // (Phase B5 -- tile_id_to_expert + pool_arrival_target fill -- moved to the
+    //  post-poll intranode::fill_tile_metadata_kernel (topology-agnostic), sized
+    //  from the host-polled total_tiles. See stream_ep.cpp internode_dispatch.)
 }
 
 void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
@@ -834,8 +813,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* base_pool,
                                  int* seen_per_substream,
                                  int* rank_prefix_matrix,
-                                 int* tile_id_to_expert,
-                                 int* pool_arrival_target,
                                  int* total_tiles_device,
                                  int num_tokens,
                                  int num_topk,
@@ -889,7 +866,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,                           \
                       expert_frequency, expert_pool_block_offset, base_pool,                        \
                       seen_per_substream, rank_prefix_matrix,                                        \
-                      tile_id_to_expert, pool_arrival_target, total_tiles_device,                    \
+                      total_tiles_device,                    \
                       num_tokens, num_topk, num_experts, num_channels,                               \
                       expert_alignment, tile_m, streaming_rdma_offset,                               \
                       rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,                       \
@@ -932,7 +909,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       recv_gbl_rank_prefix_sum,                                                      \
                       expert_frequency, expert_pool_block_offset, base_pool,                        \
                       seen_per_substream, rank_prefix_matrix,                                        \
-                      tile_id_to_expert, pool_arrival_target, total_tiles_device,                    \
+                      total_tiles_device,                    \
                       num_experts, num_channels, expert_alignment, tile_m,                           \
                       buffer_ptrs, rank);                                                            \
     }                                                                                                \

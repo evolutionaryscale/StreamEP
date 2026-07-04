@@ -50,8 +50,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* base_pool,
                                  int* seen_per_substream,
                                  int* rank_prefix_matrix,
-                                 int* tile_id_to_expert,
-                                 int* pool_arrival_target,
                                  int* total_tiles_out,
                                  int* num_recv_mapped,
                                  int* num_recv_per_expert_mapped,
@@ -68,6 +66,18 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int tile_m,
                                  int expert_alignment,
                                  cudaStream_t stream);
+
+// Post-poll tile-metadata fill (was Phase 9 of streaming_dispatch_metadata's
+// phase_b). Sizes tile_id_to_expert / pool_arrival_target from the host-polled
+// total_tiles. See intranode.cu. No-ops when total_tiles == 0.
+void launch_fill_tile_metadata(const int* expert_pool_block_offset,
+                               const int* expert_frequency,
+                               int* tile_id_to_expert,
+                               int* pool_arrival_target,
+                               int total_tiles,
+                               int num_experts_per_rank,
+                               int tile_m,
+                               cudaStream_t stream);
 
 // Argument groupings for the streaming dispatch main kernel. Each struct
 // captures one logical concern; passing all six instead of 31 loose args makes
@@ -449,8 +459,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* base_pool,
                                  int* seen_per_substream,
                                  int* rank_prefix_matrix,
-                                 int* tile_id_to_expert,
-                                 int* pool_arrival_target,
                                  int* total_tiles_device,
                                  // Shape
                                  int num_tokens,

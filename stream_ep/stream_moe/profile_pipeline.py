@@ -501,7 +501,11 @@ def main():
         # catch-all (which then collects only the dW1 / dW2 quack.gemm calls).
         target_kernels = [
             # Collective ops — this script is their timing home.
-            "streaming_dispatch_metadata_kernel",
+            # Metadata is 3 kernels post-reorg: phase_a (IPC exchange) + phase_b
+            # (compute) + fill_tile_metadata (post-poll tile-array fill).
+            "streaming_dispatch_metadata_phase_a_kernel",
+            "streaming_dispatch_metadata_phase_b_kernel",
+            "fill_tile_metadata_kernel",
             "dispatch_main_kernel",
             "dispatch_grads_main_kernel",
             "combine_main_kernel",
@@ -517,7 +521,9 @@ def main():
         def _classify(ev_key: str) -> str | None:
             # C++ kernels: direct substring match on the natural name.
             for key in (
-                "streaming_dispatch_metadata_kernel",
+                "streaming_dispatch_metadata_phase_a_kernel",
+                "streaming_dispatch_metadata_phase_b_kernel",
+                "fill_tile_metadata_kernel",
                 "dispatch_grads_main_kernel",
                 "dispatch_main_kernel",
                 "combine_main_kernel",
@@ -561,7 +567,12 @@ def main():
         # twice per training iter (once for fwd combine, once for bwd
         # combine_grads) but the per-call avg is the same, so we use it for
         # both serial sums.
-        dispatch_meta_us = per_call("streaming_dispatch_metadata_kernel")
+        dispatch_meta_a_us = per_call("streaming_dispatch_metadata_phase_a_kernel")
+        dispatch_meta_b_us = per_call("streaming_dispatch_metadata_phase_b_kernel")
+        dispatch_fill_us = per_call("fill_tile_metadata_kernel")
+        # Per-dispatch metadata time = sum of the three per-call averages (each
+        # kernel fires once per dispatch, so per_call == per-dispatch for each).
+        dispatch_meta_us = dispatch_meta_a_us + dispatch_meta_b_us + dispatch_fill_us
         dispatch_us = per_call("dispatch_main_kernel")
         dispatch_grads_us = per_call("dispatch_grads_main_kernel")
         combine_kernel_us = per_call("combine_main_kernel")
@@ -614,7 +625,8 @@ def main():
             "=== end-to-end pipeline analysis (from profiler key_averages + CUDA events) ==="
         )
         print(f"  buffer.dispatch (metadata + main):       {dispatch_meta_us + dispatch_us:7.1f} μs")
-        print(f"    streaming_dispatch_metadata_kernel:    {dispatch_meta_us:7.1f} μs")
+        print(f"    streaming_dispatch_metadata (a+b+fill):{dispatch_meta_us:7.1f} μs")
+        print(f"      phase_a / phase_b / fill:             {dispatch_meta_a_us:5.1f} / {dispatch_meta_b_us:5.1f} / {dispatch_fill_us:5.1f} μs")
         print(f"    dispatch_main_kernel:                  {dispatch_us:7.1f} μs")
         print(f"  streaming_moe_a:                         {streaming_a_us:7.1f} μs")
         print(f"  streaming_moe_y:                         {streaming_y_us:7.1f} μs")

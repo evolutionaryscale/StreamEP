@@ -676,15 +676,12 @@ void validate_dispatch_inputs(const torch::Tensor& x,
 // Per-tensor init requirements (audit):
 //   rank_prefix_matrix       atomicAdd target in metadata phase 4–5 → MUST be 0.
 //   {channel,base,...}_*     written by metadata kernel; init value irrelevant.
-//   tile_id_to_expert        written by phase 8 at indices < total_tiles; tail unused.
-//   pool_arrival_target      written by phase 8 at indices < total_tiles; tail unused.
 // Single bundle-wide memset(0) is correctness-preserving and simplest.
 //
-// `total_tiles_max` is the upper-bound tile count (every (token, k) at every
-// sender contributes at most one slot, plus up to E_local extra tiles from
-// per-expert ceil-padding). Production: 8192×4×8/128 + 8 = 2056 ints (~8 KB
-// per array). Caller narrows the per-tile views to the polled `total_tiles`
-// after the host poll.
+// tile_id_to_expert / pool_arrival_target are NOT in this bundle -- they are
+// sized from the host-polled total_tiles and filled post-poll by
+// fill_tile_metadata_kernel (see intranode_dispatch), so no pre-poll
+// upper-bound tile count is computed here.
 struct PrePollBundle {
     torch::Tensor channel_prefix_matrix;     // [R, num_channels]
     torch::Tensor expert_frequency;          // [E_local]
@@ -693,12 +690,9 @@ struct PrePollBundle {
     torch::Tensor seen_per_substream;        // [num_channels, R, E_local] — bwd Pass 2 input
     torch::Tensor rank_prefix_matrix;        // [R, R]
     torch::Tensor total_tiles_device;        // [1]
-    torch::Tensor tile_id_to_expert;         // [total_tiles_max] (caller narrows)
-    torch::Tensor pool_arrival_target;       // [total_tiles_max] (caller narrows)
 };
 
-PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
-                                       int num_ranks,
+PrePollBundle allocate_pre_poll_bundle(int num_ranks,
                                        int num_channels,
                                        int num_local_experts,
                                        at::cuda::CUDAStream stream,
@@ -714,8 +708,6 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
     int64_t off_seen_per_substream       = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
     int64_t off_rank_prefix_matrix       = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
     int64_t off_total_tiles_device       = b.reserve<int>(1);
-    int64_t off_tile_id_to_expert        = b.reserve<int>(total_tiles_max);
-    int64_t off_pool_arrival_target      = b.reserve<int>(total_tiles_max);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     record_consumer_stream(bundle, consumer_stream_handle);
@@ -736,8 +728,6 @@ PrePollBundle allocate_pre_poll_bundle(int64_t total_tiles_max,
         .seen_per_substream       = at::from_blob(base + off_seen_per_substream,       {num_channels, num_ranks, num_local_experts},         keep, i32_opts),
         .rank_prefix_matrix       = at::from_blob(base + off_rank_prefix_matrix,       {num_ranks, num_ranks},                               keep, i32_opts),
         .total_tiles_device       = at::from_blob(base + off_total_tiles_device,       {1},                                                  keep, i32_opts),
-        .tile_id_to_expert        = at::from_blob(base + off_tile_id_to_expert,        {total_tiles_max},                                    keep, i32_opts),
-        .pool_arrival_target      = at::from_blob(base + off_pool_arrival_target,      {total_tiles_max},                                    keep, i32_opts),
     };
 }
 
@@ -938,13 +928,10 @@ struct PrePollBundleInternode {
     torch::Tensor base_pool;                   // [num_channels, num_ranks, num_local_experts]
     torch::Tensor seen_per_substream;          // [num_channels, num_ranks, num_local_experts]
     torch::Tensor rank_prefix_matrix;          // [num_ranks, num_ranks]
-    torch::Tensor tile_id_to_expert;           // [total_tiles_max] (caller narrows)
-    torch::Tensor pool_arrival_target;         // [total_tiles_max] (caller narrows)
     torch::Tensor total_tiles_device;          // [1]
 };
 
-PrePollBundleInternode allocate_pre_poll_bundle_internode(int64_t total_tiles_max,
-                                                          int num_ranks,
+PrePollBundleInternode allocate_pre_poll_bundle_internode(int num_ranks,
                                                           int num_rdma_ranks,
                                                           int num_channels,
                                                           int num_local_experts,
@@ -963,8 +950,6 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int64_t total_tiles_ma
     int64_t off_base_pool           = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
     int64_t off_seen_per_substream  = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
     int64_t off_rank_prefix_matrix  = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
-    int64_t off_tile_id_to_expert   = b.reserve<int>(total_tiles_max);
-    int64_t off_pool_arrival_target = b.reserve<int>(total_tiles_max);
     int64_t off_total_tiles_device  = b.reserve<int>(1);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
@@ -984,8 +969,6 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int64_t total_tiles_ma
         .base_pool                  = at::from_blob(base + off_base_pool,           {num_channels, num_ranks, num_local_experts}, keep, i32_opts),
         .seen_per_substream         = at::from_blob(base + off_seen_per_substream,  {num_channels, num_ranks, num_local_experts}, keep, i32_opts),
         .rank_prefix_matrix         = at::from_blob(base + off_rank_prefix_matrix,  {num_ranks, num_ranks},                       keep, i32_opts),
-        .tile_id_to_expert          = at::from_blob(base + off_tile_id_to_expert,   {total_tiles_max},                            keep, i32_opts),
-        .pool_arrival_target        = at::from_blob(base + off_pool_arrival_target, {total_tiles_max},                            keep, i32_opts),
         .total_tiles_device         = at::from_blob(base + off_total_tiles_device,  {1},                                          keep, i32_opts),
     };
 }
@@ -1161,8 +1144,7 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     *streaming_total_tiles = -1;
 
     // Pre-host-poll bundle: metadata kernel outputs + sender's prefix matrix.
-    int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
-    auto pre = allocate_pre_poll_bundle(total_tiles_max, num_ranks, num_channels, num_local_experts, stream, compute_stream_handle_);
+    auto pre = allocate_pre_poll_bundle(num_ranks, num_channels, num_local_experts, stream, compute_stream_handle_);
 
     intranode::streaming_dispatch_metadata(topk_idx.data_ptr<topk_idx_t>(),
                                            pre.expert_frequency.data_ptr<int>(),
@@ -1170,8 +1152,6 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
                                            pre.base_pool.data_ptr<int>(),
                                            pre.seen_per_substream.data_ptr<int>(),
                                            pre.rank_prefix_matrix.data_ptr<int>(),
-                                           pre.tile_id_to_expert.data_ptr<int>(),
-                                           pre.pool_arrival_target.data_ptr<int>(),
                                            pre.total_tiles_device.data_ptr<int>(),
                                            moe_recv_counter_mapped,
                                            moe_recv_expert_counter_mapped,
@@ -1223,19 +1203,32 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
                                  default_stream_registered_,
                                  default_stream_handle_, compute_stream_handle_);
 
+    // Per-tile metadata arrays sized from the host-polled total_tiles (exact) --
+    // not a pre-poll upper bound -- so uneven per-rank token counts can't overflow.
+    // Default pool like `pool` (bwd-pinned: pool_arrival_target sources bwd's
+    // total_tiles; freed after the layer-end back-edges) -> empty_on_default, no
+    // record_consumer_stream. Fill BEFORE the post-poll bundle so metadata_done_event
+    // (recorded there) captures it for kernel A's arrival spin.
+    auto tile_i32 = x.options().dtype(torch::kInt32);
+    auto tile_id_to_expert = empty_on_default({poll.total_tiles}, tile_i32,
+                                              default_stream_registered_,
+                                              default_stream_handle_, compute_stream_handle_);
+    auto pool_arrival_target = empty_on_default({poll.total_tiles}, tile_i32,
+                                                default_stream_registered_,
+                                                default_stream_handle_, compute_stream_handle_);
+    intranode::launch_fill_tile_metadata(
+        pre.expert_pool_block_offset.data_ptr<int>(),
+        pre.expert_frequency.data_ptr<int>(),
+        tile_id_to_expert.data_ptr<int>(),
+        pool_arrival_target.data_ptr<int>(),
+        poll.total_tiles, num_local_experts, tile_m, stream);
+
     auto post = allocate_post_poll_bundle(
         TK_padded, hidden, poll.num_recv_tokens, num_topk,
         num_ranks, num_channels, num_tokens, poll.total_tiles,
         x.options(), stream, compute_stream_handle_,
         default_stream_registered_, default_stream_handle_);
 
-    // Narrow the per-tile arrays from total_tiles_max → total_tiles for the
-    // returned views. `narrow` on a from_blob'd tensor returns a view sharing
-    // the same storage; the bundle stays alive via the from_blob deleter
-    // lambda. Visible size is only known post-poll, so we can't size the
-    // arrays correctly at allocate_pre_poll_bundle time.
-    auto tile_id_to_expert   = pre.tile_id_to_expert.narrow(0, 0, poll.total_tiles);
-    auto pool_arrival_target = pre.pool_arrival_target.narrow(0, 0, poll.total_tiles);
 
     EP_HOST_ASSERT(
         num_ranks * num_ranks * sizeof(int) +
@@ -1607,8 +1600,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // shapes: base_pool / seen_per_substream / rank_prefix_matrix span
     // num_world_ranks (= num_ranks for the streaming path on internode);
     // channel prefix matrices come in two tiers (rdma + gbl).
-    int64_t total_tiles_max = static_cast<int64_t>(num_tokens) * num_topk * num_ranks / tile_m + num_local_experts + 1;
-    auto pre = allocate_pre_poll_bundle_internode(total_tiles_max, num_ranks, num_rdma_ranks,
+    auto pre = allocate_pre_poll_bundle_internode(num_ranks, num_rdma_ranks,
                                                   num_channels, num_local_experts, stream,
                                                   compute_stream_handle_);
 
@@ -1652,8 +1644,6 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         pre.base_pool.data_ptr<int>(),
         pre.seen_per_substream.data_ptr<int>(),
         pre.rank_prefix_matrix.data_ptr<int>(),
-        pre.tile_id_to_expert.data_ptr<int>(),
-        pre.pool_arrival_target.data_ptr<int>(),
         pre.total_tiles_device.data_ptr<int>(),
         num_tokens, num_topk, num_experts, num_channels,
         hidden_int4, expert_alignment, tile_m,
@@ -1696,14 +1686,33 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
                                  default_stream_registered_,
                                  default_stream_handle_, compute_stream_handle_);
 
+    // Per-tile metadata arrays sized from the host-polled total_tiles (exact) --
+    // not a pre-poll upper bound -- so uneven per-rank token counts can't overflow.
+    // Default pool like `pool` (bwd-pinned: internode_dispatch_grads reads both via
+    // the handle; freed after the layer-end back-edges) -> empty_on_default, no
+    // record_consumer_stream. Fill (topology-agnostic; E_local == num_experts_per_rank)
+    // BEFORE the post-poll bundle so its metadata_done_event captures it for kernel A;
+    // it ran in fwd, so the bwd tile_id_to_expert read is satisfied.
+    auto tile_i32 = x.options().dtype(torch::kInt32);
+    auto tile_id_to_expert_n = empty_on_default({total_tiles}, tile_i32,
+                                                default_stream_registered_,
+                                                default_stream_handle_, compute_stream_handle_);
+    auto pool_arrival_target_n = empty_on_default({total_tiles}, tile_i32,
+                                                  default_stream_registered_,
+                                                  default_stream_handle_, compute_stream_handle_);
+    intranode::launch_fill_tile_metadata(
+        pre.expert_pool_block_offset.data_ptr<int>(),
+        pre.expert_frequency.data_ptr<int>(),
+        tile_id_to_expert_n.data_ptr<int>(),
+        pool_arrival_target_n.data_ptr<int>(),
+        total_tiles, num_local_experts, tile_m, stream);
+
     auto post = allocate_post_poll_bundle_internode(
         TK_padded, hidden, num_recv_tokens, num_rdma_recv_tokens, num_topk,
         num_ranks, num_rdma_ranks, num_channels, num_tokens, total_tiles,
         internode::get_source_meta_bytes(), x.options(), stream,
         compute_stream_handle_, default_stream_registered_, default_stream_handle_);
 
-    auto tile_id_to_expert_n   = pre.tile_id_to_expert.narrow(0, 0, total_tiles);
-    auto pool_arrival_target_n = pre.pool_arrival_target.narrow(0, 0, total_tiles);
 
     internode::DispatchPoolOut pool_out{
         .pool             = reinterpret_cast<int4*>(pool.data_ptr()),

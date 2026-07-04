@@ -102,9 +102,9 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 //      over (c, src) lex order. Per expert: SMEM-staged scan with cooperative
 //      threads. E ≤ num_blocks at production, so all experts run in
 //      parallel in one grid wave.
-//   GRID SYNC.
-//   9 (all blocks, grid-stride): tile_id_to_expert + pool_arrival_target —
-//      one thread per tile.
+//   (Phase 9 -- tile_id_to_expert + pool_arrival_target fill -- moved out to the
+//    standalone post-poll kernel fill_tile_metadata_kernel, sized from the
+//    host-polled total_tiles. See stream_ep.cpp intranode_dispatch.)
 //
 // Pool layout: each expert's region in `pool` starts at
 // `expert_pool_block_offset[e] * BLOCK_M` (BLOCK_M = tile_m) and is padded up to
@@ -113,7 +113,7 @@ __device__ __forceinline__ void sender_wait_for_queue_space(int cached_tail_idx,
 // Phase A (cross-rank IPC exchange): single block, 60 KB SMEM, NOT cooperative.
 // Builds local SMEM histogram by scanning topk_idx, bracketed by two
 // barrier_block calls so peer writes are observable on the post-barrier read.
-// This kernel runs Phases 1-5 only; Phases 6-9 live in `_phase_b_kernel`
+// This kernel runs Phases 1-5 only; Phases 6-8 live in `_phase_b_kernel`
 // below, launched FIFO-after on the same stream. The split lets phase B
 // run with much smaller per-block SMEM (~1.5 KB vs 60 KB), which:
 //   (a) avoids the cooperative-launch occupancy ceiling (1 block/SM at 60 KB
@@ -129,8 +129,6 @@ __global__ void streaming_dispatch_metadata_phase_a_kernel(
         int* base_pool,
         int* seen_per_substream,
         int* rank_prefix_matrix,
-        int* tile_id_to_expert,
-        int* pool_arrival_target,
         int* total_tiles_out,
         int* num_recv_mapped,
         int* num_recv_per_expert_mapped,
@@ -239,8 +237,6 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
         int* base_pool,
         int* seen_per_substream,
         int* rank_prefix_matrix,
-        int* tile_id_to_expert,
-        int* pool_arrival_target,
         int* total_tiles_out,
         int* num_recv_mapped,
         int* num_recv_per_expert_mapped,
@@ -438,32 +434,9 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
         __syncthreads();
     }
 
-    // Phase 9 reads expert_pool_block_offset (already synced in barrier #3)
-    // and expert_frequency (synced in barrier #2). Phase 8 writes base_pool
-    // and Phase 9 writes tile_id_to_expert + pool_arrival_target — disjoint
-    // outputs, so no sync needed between Phase 8 and Phase 9.
-
-    // ──────────────────────────────────────────────────────────────────────
-    // PHASE 9: tile_id_to_expert + pool_arrival_target — grid-stride.
-    // One thread per tile. Linear search over E to find owning expert (E ≤ 64,
-    // cheap; could be binary search if E grows).
-    // ──────────────────────────────────────────────────────────────────────
-    int total_tiles = *total_tiles_out;
-    for (int tile_id = grid_tid; tile_id < total_tiles; tile_id += grid_threads) {
-        int e_found = 0;
-        for (int e = 0; e < E; ++e) {
-            if (tile_id < expert_pool_block_offset[e + 1]) {
-                e_found = e;
-                break;
-            }
-        }
-        int e_start = expert_pool_block_offset[e_found];
-        int n_tiles_e = expert_pool_block_offset[e_found + 1] - e_start;
-        int n_e = expert_frequency[e_found];
-        int t = tile_id - e_start;
-        tile_id_to_expert[tile_id] = e_found;
-        pool_arrival_target[tile_id] = (t == n_tiles_e - 1) ? (n_e - t * tile_m) : tile_m;
-    }
+    // (Phase 9 -- tile_id_to_expert + pool_arrival_target fill -- moved to a
+    // standalone post-poll kernel, fill_tile_metadata_kernel, sized from the
+    // host-polled total_tiles. See stream_ep.cpp intranode_dispatch.)
 }
 
 void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
@@ -472,8 +445,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int* base_pool,
                                  int* seen_per_substream,
                                  int* rank_prefix_matrix,
-                                 int* tile_id_to_expert,
-                                 int* pool_arrival_target,
                                  int* total_tiles_out,
                                  int* num_recv_mapped,
                                  int* num_recv_per_expert_mapped,
@@ -513,7 +484,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       topk_idx,                                                              \
                       expert_frequency, expert_pool_block_offset, base_pool,                 \
                       seen_per_substream, rank_prefix_matrix,                                \
-                      tile_id_to_expert, pool_arrival_target,                                \
                       total_tiles_out, num_recv_mapped,                                      \
                       num_recv_per_expert_mapped, total_tiles_mapped,                        \
                       num_tokens, num_topk, num_experts_per_rank, num_channels,              \
@@ -557,7 +527,6 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       streaming_dispatch_metadata_phase_b_kernel<ranks>,                     \
                       expert_frequency, expert_pool_block_offset, base_pool,                 \
                       seen_per_substream, rank_prefix_matrix,                                \
-                      tile_id_to_expert, pool_arrival_target,                                \
                       total_tiles_out, num_recv_mapped,                                      \
                       num_recv_per_expert_mapped, total_tiles_mapped,                        \
                       num_experts_per_rank, num_channels,                                    \
@@ -569,6 +538,64 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
     SWITCH_RANKS(STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH);
 
 #undef STREAMING_DISPATCH_METADATA_PHASE_B_LAUNCH
+}
+
+// Post-poll tile-metadata fill (was Phase 9 of the phase_b metadata kernel).
+// Split out so `tile_id_to_expert` / `pool_arrival_target` are sized from the
+// host-polled `total_tiles` (exact) instead of a pre-poll upper bound — fixes the
+// uneven-tokens-per-rank overflow. Plain grid-stride, non-cooperative, non-templated.
+// Reads expert_pool_block_offset / expert_frequency (metadata kernel outputs, still
+// alive in the pre-poll bundle); writes every element of the two [total_tiles] arrays
+// (no zero-init needed). Launched on the dispatch stream before the post-poll bundle,
+// so metadata_done_event (recorded there) captures it for kernel A's arrival spin.
+__global__ void fill_tile_metadata_kernel(
+        const int* expert_pool_block_offset,  // [E+1]
+        const int* expert_frequency,          // [E]
+        int* tile_id_to_expert,               // [total_tiles]
+        int* pool_arrival_target,             // [total_tiles]
+        int total_tiles,
+        int num_experts_per_rank,
+        int tile_m) {
+    const int E = num_experts_per_rank;
+    const int grid_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int grid_threads = gridDim.x * blockDim.x;
+    for (int tile_id = grid_tid; tile_id < total_tiles; tile_id += grid_threads) {
+        int e_found = 0;
+        for (int e = 0; e < E; ++e) {
+            if (tile_id < expert_pool_block_offset[e + 1]) {
+                e_found = e;
+                break;
+            }
+        }
+        int e_start = expert_pool_block_offset[e_found];
+        int n_tiles_e = expert_pool_block_offset[e_found + 1] - e_start;
+        int n_e = expert_frequency[e_found];
+        int t = tile_id - e_start;
+        tile_id_to_expert[tile_id] = e_found;
+        pool_arrival_target[tile_id] = (t == n_tiles_e - 1) ? (n_e - t * tile_m) : tile_m;
+    }
+}
+
+void launch_fill_tile_metadata(const int* expert_pool_block_offset,
+                               const int* expert_frequency,
+                               int* tile_id_to_expert,
+                               int* pool_arrival_target,
+                               int total_tiles,
+                               int num_experts_per_rank,
+                               int tile_m,
+                               cudaStream_t stream) {
+    // Empty-recv rank: 0 tiles → skip (a 0-block grid is cudaErrorInvalidConfiguration).
+    if (total_tiles == 0) return;
+    constexpr int kNumThreads = 256;
+    int num_blocks = (total_tiles + kNumThreads - 1) / kNumThreads;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(num_blocks);
+    cfg.blockDim = dim3(kNumThreads);
+    cfg.stream = stream;
+    LAUNCH_KERNEL(&cfg, fill_tile_metadata_kernel,
+                  expert_pool_block_offset, expert_frequency,
+                  tile_id_to_expert, pool_arrival_target,
+                  total_tiles, num_experts_per_rank, tile_m);
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
