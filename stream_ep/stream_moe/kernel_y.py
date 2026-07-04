@@ -57,11 +57,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import quack.copy_utils as copy_utils
-import quack.sm90_utils as quack_sm90_utils
 import quack.utils as utils
 import torch
 from cutlass import Int32, Int64, const_expr
-from cutlass.utils import LayoutEnum
 from quack.cache_utils import COMPILE_ONLY, jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
@@ -81,7 +79,6 @@ from quack.varlen_utils import VarlenArguments
 
 from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.ptx_helpers import (
-    pack_bf16x2,
     red_add_bf16x2_v4_pred,
     st_release_gpu_global,
     threadfence_gpu,
@@ -125,8 +122,11 @@ class AtomicScatterStore(EpiOp):
 
     Allocates two SMEM regions in one struct field `s_<name>`:
       - `staging`: bf16 tensor of shape `(epi_tile_M, epi_tile_N, epi_stage)`,
-        swizzled per `make_smem_layout_epi` (the same layout `TileStore` uses for
-        TMA-stored postact).
+        a PLAIN row-major layout with the N stride padded to `SMEM_N_PAD`
+        bf16/row (NOT the WGMMA/TMA `Swizzle<2,4,3>` atom). The staging has no
+        TMA/WGMMA consumer (`mD=None`), so the swizzle was dead weight that
+        only induced a 3.6-way shared-LOAD bank conflict on the scatter read;
+        the un-swizzled + N-padded layout de-conflicts it. See `SMEM_N_PAD`.
       - `recv_token`: int32 tensor of shape `(tile_M,)` — pool_recv_token slice
         for this tile. Loaded once per tile in `begin()` from gmem.
 
@@ -135,6 +135,27 @@ class AtomicScatterStore(EpiOp):
     per-tile recv_token load, and the per-tile end bookkeeping.
     """
 
+    # Per-row N padding (in bf16 elements) for the un-swizzled staging tile.
+    # The dominant cost of the scatter epilogue was a 3.6-way shared-LOAD bank
+    # conflict on the staging SMEM. Root cause: the staging carried the
+    # WGMMA/TMA ``Swizzle<2,4,3>`` 64-byte swizzle, but the scatter read is a
+    # manual scalar/v4 bf16 gather the swizzle was never designed to
+    # de-conflict — and the staging has NO TMA/WGMMA consumer (``mD=None``), so
+    # the swizzle is dead weight. We replace it with a plain row-major layout
+    # whose N stride is padded from 32 to 34 bf16/row.
+    #
+    # Why 34 (and not 33): the bank-conflict fix only needs the row stride's
+    # 4-byte-WORD count to be coprime with the 16 shared-memory banks (so
+    # consecutive rows rotate onto different bank sets instead of aliasing).
+    # 34 bf16 = 68 bytes = 17 4-byte words, and gcd(17, 16) = 1 → rows rotate.
+    # 34 (even) ALSO keeps every row's base 4-byte aligned, which a 33 (odd)
+    # pad does not: the R2S store and the bf16x2-pair `recast_tensor(row,
+    # Int32)` read both require 32-bit alignment, and odd-`m` rows under a 33
+    # pad land at a 2-byte-only-aligned offset (`m*66` bytes). 34 satisfies
+    # both the de-conflict and the alignment constraint. The pad costs
+    # +512 bytes/stage; total epilogue SMEM stays within the 1-block/SM budget.
+    SMEM_N_PAD = 34
+
     def __init__(self, name: str = "scatter"):
         super().__init__(name)
 
@@ -142,17 +163,27 @@ class AtomicScatterStore(EpiOp):
     def _layout_key(self):
         return f"{self.name}_smem_layout_staged"
 
+    def _make_staging_layout(self, gemm):
+        """Plain (un-swizzled) row-major staging layout
+        ``(epi_tile_M, epi_tile_N, epi_stage)`` with the N stride padded to
+        ``SMEM_N_PAD`` bf16/row. Replaces the dead ``Swizzle<2,4,3>`` atom —
+        see ``SMEM_N_PAD`` for why padding (not swizzle) de-conflicts the
+        scalar scatter read."""
+        epi_tile_M = gemm.epi_tile[0]
+        epi_tile_N = gemm.epi_tile[1]
+        epi_stage = gemm.epi_stage
+        pad = self.SMEM_N_PAD
+        return cute.make_layout(
+            (epi_tile_M, epi_tile_N, epi_stage),
+            stride=(pad, 1, epi_tile_M * pad),
+        )
+
     def param_fields(self):
         return [(self.name, object, MISSING), (self._layout_key(), object, MISSING)]
 
     def to_params(self, gemm, args):
         scatter = getattr(args, self.name)
-        smem_layout_staged = quack_sm90_utils.make_smem_layout_epi(
-            scatter.mO.element_type,
-            LayoutEnum.from_tensor(scatter.mO),
-            gemm.epi_tile,
-            gemm.epi_stage,
-        )
+        smem_layout_staged = self._make_staging_layout(gemm)
         return {self.name: scatter, self._layout_key(): smem_layout_staged}
 
     # --- SMEM allocation ----------------------------------------------------
@@ -164,7 +195,14 @@ class AtomicScatterStore(EpiOp):
         # the two so the framework can multiply d_stage by `epi_stage` at
         # allocation time. v0.3.11 we conservatively allocated for 4 stages
         # in one int return; the new structure expresses it directly.
-        bf16_bytes_per_stage = cute.size(cute.shape(epi_tile)) * 2
+        #
+        # The staging is the un-swizzled, N-padded layout (see SMEM_N_PAD), so
+        # the per-stage byte count uses the PADDED row stride (epi_tile_M rows ×
+        # SMEM_N_PAD bf16/row), not the dense epi_tile element count. Reporting
+        # the padded size keeps `_compute_stages`'s SMEM budget accounting in
+        # sync with the actual `cute.cosize(staging_layout)` allocation.
+        epi_tile_M = epi_tile[0]
+        bf16_bytes_per_stage = epi_tile_M * self.SMEM_N_PAD * 2
         return EpiSmemBytes(
             d_stage=bf16_bytes_per_stage,
             unstaged=cta_tile_shape_mnk[0] * 4 + 16,
@@ -197,9 +235,10 @@ class AtomicScatterStore(EpiOp):
     def get_smem_tensor(self, gemm, params, storage_epi):
         smem_layout_staged = getattr(params, self._layout_key())
         s_struct = getattr(storage_epi, f"s_{self.name}")
-        staging_t = s_struct.staging.get_tensor(
-            smem_layout_staged.outer, swizzle=smem_layout_staged.inner
-        )
+        # Un-swizzled plain layout (see SMEM_N_PAD): no `swizzle=` arg — the
+        # staging is a flat row-major padded MemRange, so the layout's strides
+        # alone resolve every (m, n, stage) address.
+        staging_t = s_struct.staging.get_tensor(smem_layout_staged)
         recv_token_t = s_struct.recv_token.get_tensor(
             cute.make_layout(gemm.cta_tile_shape_mnk[0])
         )
@@ -382,6 +421,26 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         self.rounding_mode = RoundingMode.RN
         return self.EpilogueParams(**self._epi_ops_to_params_dict(args))
 
+    def _scatter_plain_r2s_copy(self, dtype):
+        """Build a PLAIN (non-StMatrix) register→SMEM tiled copy for the
+        atomic-scatter staging.
+
+        Reuses the MMA-derived `tiled_copy_C_atom` (so the thread→(M,N)
+        coordinate map matches the framework's `tRS_rD` register tensor
+        exactly) but swaps the StMatrix value atom for a `CopyUniversalOp`
+        (`num_bits_per_copy=32` → 2 bf16/store along the contiguous N axis).
+        StMatrix can't be used here: its hardware-fixed transposed lane→address
+        pattern assumes the WGMMA/TMA swizzle, which the un-swizzled padded
+        staging (see `AtomicScatterStore.SMEM_N_PAD`) no longer carries.
+
+        Constexpr — folded at trace time, no runtime cost.
+        """
+        tiled_copy_C_atom = self.epilog_smem_copy_atom(self.tiled_mma)
+        plain_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=32
+        )
+        return cute.make_tiled_copy_S(plain_atom, tiled_copy_C_atom)
+
     @cute.jit
     def epi_setup_aux_out(
         self,
@@ -454,12 +513,30 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
             epi_store_pipeline.producer_acquire()
         epilogue_barrier.arrive_and_wait()
 
-        # 2. R2S: cvt_copy register acc → staging SMEM (per-stage slot).
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+        # 2. R2S: register acc → staging SMEM (per-stage slot).
+        #
+        # The framework's `tiled_copy_r2s` is an StMatrix atom
+        # (`sm90_get_smem_store_op` → `StMatrix8x8x16bOp`) whose hardware-fixed
+        # transposed 8x8 lane→address pattern is matched to the WGMMA/TMA
+        # swizzle. Our staging is now an un-swizzled, N-padded plain layout
+        # (see `AtomicScatterStore.SMEM_N_PAD`), so StMatrix would scatter the
+        # registers to the wrong physical addresses. Build a PLAIN R2S tiled
+        # copy with the SAME thread→(M,N) coordinate map (the MMA-derived
+        # `tiled_copy_C_atom`) but a `CopyUniversalOp` value atom: `partition_D`
+        # over the plain staging then resolves each register to its correct
+        # row-major padded address via the layout strides alone. The plain
+        # copy's per-thread value layout is element-for-element identical to
+        # the StMatrix `tRS_rD` layout (same 8 (M,N) coords in the same order),
+        # so `retile=True` re-tiles `tRS_rD` losslessly.
+        plain_r2s = self._scatter_plain_r2s_copy(staging_t.element_type)
+        thr_copy_r2s = plain_r2s.get_slice(tidx)
         tRS_sScatter = thr_copy_r2s.partition_D(staging_t)
         epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
         copy_utils.cvt_copy(
-            tiled_copy_r2s, tRS_rD, tRS_sScatter[None, None, None, epi_buffer]
+            plain_r2s,
+            tRS_rD,
+            tRS_sScatter[None, None, None, epi_buffer],
+            retile=True,
         )
 
         # 3. Sync to make staging visible to all warps.
@@ -506,10 +583,14 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         # divide evenly into 32-lane groups).
         # Computed below after rows_per_warp is known.
 
-        # Per-stage staging view. We read individual bf16 from SMEM (which
-        # honors swizzle correctly) and pack into bf16x2 manually — see
-        # `pack_bf16x2` in ptx_helpers.py for why `cute.recast_tensor` on
-        # swizzled SMEM does NOT preserve bf16x2 pair-adjacency.
+        # Per-stage staging view. The staging is now an un-swizzled, N-padded
+        # plain row-major layout (see `AtomicScatterStore.SMEM_N_PAD`), so within
+        # a row the N axis is stride-1 contiguous and bf16x2 pairs ARE adjacent.
+        # We can therefore recast a single row to Int32 and read whole bf16x2
+        # pairs directly — no per-element scalar loads + `pack_bf16x2`. Each v4
+        # chunk = 8 bf16 = 4 int32, so the read is 4 shared-load requests
+        # instead of 8 (and the recast is now valid, unlike on the old swizzled
+        # staging where it would NOT preserve pair-adjacency).
         stage_view = staging_t[None, None, epi_buffer]  # (epi_tile_M, epi_tile_N)
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -528,6 +609,12 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
             # Decompose: row offset within warp's slab and v4-chunk within row.
             # constexpr divisor folds to shift+and at compile time when
             # v4_chunks_per_row is a power of 2.
+            # NOTE: this lane→(row,chunk) mapping is load-bearing for GLOBAL-WRITE
+            # coalescing (4 lanes write one recv-token row's contiguous chunks).
+            # Reassigning lanes to spread across rows (tried) does NOT reduce the
+            # shared-load bank conflict — that's inherent to the staging swizzle,
+            # not the decomposition — and it hurts global-write coalescing. Fix
+            # the bank conflict in the staging LAYOUT (un-swizzle/pad), not here.
             m_off = work_safe // Int32(v4_chunks_per_row)
             v4_chunk = work_safe % Int32(v4_chunks_per_row)
             m_in_subtile = Int32(warp_idx) * Int32(rows_per_warp) + m_off
@@ -543,20 +630,17 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
             atomic_pred = (r_raw >= Int32(0)) & (r_raw < T_recv) & row_in_range
             r_safe = r_raw if atomic_pred else Int32(0)
 
-            # 8 adjacent bf16 starting at bf16-idx (v4_chunk * 8).
+            # 8 adjacent bf16 starting at bf16-idx (v4_chunk * 8) = 4 int32.
+            # Recast THIS ROW (stride-1 contiguous in N on the un-swizzled
+            # padded staging) to Int32: bf16 pair [2k, 2k+1] → int32 k. The v4
+            # chunk's 8 bf16 = int32 [4*v4_chunk .. 4*v4_chunk+3].
             bf16_base = v4_chunk * Int32(8)
-            b0 = stage_view[m_safe, bf16_base + Int32(0)]
-            b1 = stage_view[m_safe, bf16_base + Int32(1)]
-            b2 = stage_view[m_safe, bf16_base + Int32(2)]
-            b3 = stage_view[m_safe, bf16_base + Int32(3)]
-            b4 = stage_view[m_safe, bf16_base + Int32(4)]
-            b5 = stage_view[m_safe, bf16_base + Int32(5)]
-            b6 = stage_view[m_safe, bf16_base + Int32(6)]
-            b7 = stage_view[m_safe, bf16_base + Int32(7)]
-            p0 = pack_bf16x2(b0, b1)
-            p1 = pack_bf16x2(b2, b3)
-            p2 = pack_bf16x2(b4, b5)
-            p3 = pack_bf16x2(b6, b7)
+            stage_row_i32 = cute.recast_tensor(stage_view[m_safe, None], Int32)
+            i32_base = v4_chunk * Int32(4)
+            p0 = stage_row_i32[i32_base + Int32(0)]
+            p1 = stage_row_i32[i32_base + Int32(1)]
+            p2 = stage_row_i32[i32_base + Int32(2)]
+            p3 = stage_row_i32[i32_base + Int32(3)]
             # v4 needs 16-byte alignment (8 bf16). bf16_base is multiple
             # of 8 by construction; n_origin is multiple of epi_tile_N
             # (≥ 8 by config); together address is 16-byte aligned.

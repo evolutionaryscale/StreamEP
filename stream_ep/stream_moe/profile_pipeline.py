@@ -126,6 +126,19 @@ def make_skewed_topk_idx(
     )
 
 
+def make_randn_topk_idx(n_tokens, topk, num_experts, device, generator=None):
+    """Production-like routing: top-k of random Gaussian router logits. Each
+    token's ``topk`` experts are distinct draws spread ~uniformly over all
+    ``num_experts`` (like a real softmax router), so at world=32 / 4-node a
+    token touches ~2.72 distinct remote nodes — vs ``make_uniform_topk_idx``
+    which deterministically collapses all ``topk`` onto a single rank (0.75
+    remote nodes/tok, 3.6× too little off-node traffic). This is the
+    representative regime for internode comm profiling.
+    """
+    logits = torch.randn(n_tokens, num_experts, device=device, generator=generator)
+    return logits.topk(topk, dim=-1).indices.to(torch.int64)
+
+
 def make_buffer(group, num_sms=None, hidden=H):
     if num_sms is not None:
         StreamEPBuffer.set_num_sms(num_sms)

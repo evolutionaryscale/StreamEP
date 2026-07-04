@@ -294,10 +294,10 @@ def default_tile_config(I: int, H: int) -> TileConfig:
     """
     two_I = 2 * I
 
-    def pick(default: int, constraint: int) -> int:
+    def pick(default: int, constraint: int, cap: int = 256) -> int:
         if constraint % default == 0:
             return default
-        return _largest_pow2_divisor(constraint, cap=256)
+        return _largest_pow2_divisor(constraint, cap=cap)
 
     tile_n_a = pick(192, two_I)
     # kernel_a also asserts I % tile_n_a == 0 (kernel_a.py:485).
@@ -308,7 +308,16 @@ def default_tile_config(I: int, H: int) -> TileConfig:
         tile_m=128,
         tile_n_a=tile_n_a,
         tile_n_y=pick(256, H),
-        tile_n_y_bwd=pick(192, I),
+        # y_bwd forces ab_stage=4 (deep W2/A mainloop prefetch — its scoreboard
+        # stall is the long-K mainloop load; see StreamingMoeYBwd._compute_stages).
+        # tile_n_y_bwd must stay small enough to leave SMEM for that 4th AB
+        # stage: 192 fits (H100 per-CTA budget) and is used when it divides I;
+        # 256 overflows (250 KB > 227 KB). When 192 does not divide I (e.g.
+        # I=256) the pow2 fallback is capped at 128 — the largest pow2 <= the
+        # SMEM-safe bound — so it never lands on an over-budget 256 and trips
+        # _compute_stages' ValueError. (Only tile_n_y_bwd needs this: y_bwd is
+        # the sole kernel that pins ab_stage; the others adapt ab_stage to fit.)
+        tile_n_y_bwd=pick(192, I, cap=128),
         tile_n_a_bwd=pick(256, H),
         tile_m_dW1=None,
         tile_n_dW1=256,
