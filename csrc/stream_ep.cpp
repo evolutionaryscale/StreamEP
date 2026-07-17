@@ -719,15 +719,17 @@ PrePollBundle allocate_pre_poll_bundle(int num_ranks,
     // (incrementing the bundle's refcount); on tensor free, the storage
     // deleter destructs the lambda, releasing the refcount.
     auto keep = [bundle](void*) {};
+    // Pass bundle's concrete device to every from_blob (see allocate_post_poll_bundle).
+    const at::Device blob_dev = bundle.device();
 
     return PrePollBundle{
-        .channel_prefix_matrix    = at::from_blob(base + off_channel_prefix_matrix,    {num_ranks, num_channels},                            keep, i32_opts),
-        .expert_frequency         = at::from_blob(base + off_expert_frequency,         {num_local_experts},                                  keep, i32_opts),
-        .expert_pool_block_offset = at::from_blob(base + off_expert_pool_block_offset, {num_local_experts + 1},                              keep, i32_opts),
-        .base_pool                = at::from_blob(base + off_base_pool,                {num_channels, num_ranks, num_local_experts},         keep, i32_opts),
-        .seen_per_substream       = at::from_blob(base + off_seen_per_substream,       {num_channels, num_ranks, num_local_experts},         keep, i32_opts),
-        .rank_prefix_matrix       = at::from_blob(base + off_rank_prefix_matrix,       {num_ranks, num_ranks},                               keep, i32_opts),
-        .total_tiles_device       = at::from_blob(base + off_total_tiles_device,       {1},                                                  keep, i32_opts),
+        .channel_prefix_matrix    = at::from_blob(base + off_channel_prefix_matrix,    {num_ranks, num_channels},                            keep, i32_opts, blob_dev),
+        .expert_frequency         = at::from_blob(base + off_expert_frequency,         {num_local_experts},                                  keep, i32_opts, blob_dev),
+        .expert_pool_block_offset = at::from_blob(base + off_expert_pool_block_offset, {num_local_experts + 1},                              keep, i32_opts, blob_dev),
+        .base_pool                = at::from_blob(base + off_base_pool,                {num_channels, num_ranks, num_local_experts},         keep, i32_opts, blob_dev),
+        .seen_per_substream       = at::from_blob(base + off_seen_per_substream,       {num_channels, num_ranks, num_local_experts},         keep, i32_opts, blob_dev),
+        .rank_prefix_matrix       = at::from_blob(base + off_rank_prefix_matrix,       {num_ranks, num_ranks},                               keep, i32_opts, blob_dev),
+        .total_tiles_device       = at::from_blob(base + off_total_tiles_device,       {1},                                                  keep, i32_opts, blob_dev),
     };
 }
 
@@ -865,13 +867,21 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     CUDA_CHECK(cudaMemsetAsync(base + z_pre_bytes,  0xFF, n_end - z_pre_bytes, stream));
 
     auto keep = [bundle](void*) {};
+    // Pass bundle's concrete device to every from_blob so TensorMaker never
+    // infers the device from base+off via getDeviceFromPtr. When a rank receives
+    // zero tokens (num_recv_tokens == 0), the trailing views below are zero-size
+    // with off == total_bytes (one-past-the-end of the slab); device inference on
+    // that pointer TORCH_CHECKs ("resides on host memory") whenever the slab
+    // happens to end on a CUDA allocator granule boundary. bundle is a real
+    // tensor, so bundle.device() carries a concrete index.
+    const at::Device blob_dev = bundle.device();
 
-    out.pool_topk_weight           = at::from_blob(base + off_pool_topk_weight,    {TK_padded},                          keep, f32_opts);
-    out.recv_channel_prefix_matrix = at::from_blob(base + off_recv_channel_prefix, {num_ranks, num_channels},            keep, i32_opts);
-    out.send_head                  = at::from_blob(base + off_send_head,           {num_tokens, num_ranks},              keep, i32_opts);
-    out.pool_arrival_count         = at::from_blob(base + off_pool_arrival_count,  {total_tiles},                        keep, i32_opts);
-    out.pool_recv_token            = at::from_blob(base + off_pool_recv_token,     {TK_padded},                          keep, i32_opts);
-    out.pool_k_slot                = at::from_blob(base + off_pool_k_slot,         {TK_padded},                          keep, i32_opts);
+    out.pool_topk_weight           = at::from_blob(base + off_pool_topk_weight,    {TK_padded},                          keep, f32_opts, blob_dev);
+    out.recv_channel_prefix_matrix = at::from_blob(base + off_recv_channel_prefix, {num_ranks, num_channels},            keep, i32_opts, blob_dev);
+    out.send_head                  = at::from_blob(base + off_send_head,           {num_tokens, num_ranks},              keep, i32_opts, blob_dev);
+    out.pool_arrival_count         = at::from_blob(base + off_pool_arrival_count,  {total_tiles},                        keep, i32_opts, blob_dev);
+    out.pool_recv_token            = at::from_blob(base + off_pool_recv_token,     {TK_padded},                          keep, i32_opts, blob_dev);
+    out.pool_k_slot                = at::from_blob(base + off_pool_k_slot,         {TK_padded},                          keep, i32_opts, blob_dev);
 
     // Z_post memset must precede metadata_done event so that consumer kernels
     // gated on the event (potentially on separate HW queues under CDMC>1)
@@ -902,10 +912,10 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
 
     out.metadata_done_event = EventHandle(stream);
 
-    out.k_local_remaining    = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                        keep, i32_opts);
-    out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                        keep, i64_opts);
-    out.recv_token_to_slots    = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},              keep, i32_opts);
-    out.k_local_total          = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                        keep, i32_opts);
+    out.k_local_remaining    = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                        keep, i32_opts, blob_dev);
+    out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                        keep, i64_opts, blob_dev);
+    out.recv_token_to_slots    = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},              keep, i32_opts, blob_dev);
+    out.k_local_total          = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                        keep, i32_opts, blob_dev);
 
     return out;
 }
@@ -958,18 +968,20 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int num_ranks,
     CUDA_CHECK(cudaMemsetAsync(base, 0, b.total_bytes(), stream));
 
     auto keep = [bundle](void*) {};
+    // Pass bundle's concrete device to every from_blob (see allocate_post_poll_bundle).
+    const at::Device blob_dev = bundle.device();
 
     return PrePollBundleInternode{
-        .rdma_channel_prefix_matrix = at::from_blob(base + off_rdma_chprefix,       {num_rdma_ranks, num_channels},               keep, i32_opts),
-        .recv_rdma_rank_prefix_sum  = at::from_blob(base + off_recv_rdma_prefix,    {num_rdma_ranks},                             keep, i32_opts),
-        .gbl_channel_prefix_matrix  = at::from_blob(base + off_gbl_chprefix,        {num_ranks, num_channels},                    keep, i32_opts),
-        .recv_gbl_rank_prefix_sum   = at::from_blob(base + off_recv_gbl_prefix,     {num_ranks},                                  keep, i32_opts),
-        .expert_frequency           = at::from_blob(base + off_expert_frequency,    {num_local_experts},                          keep, i32_opts),
-        .expert_pool_block_offset   = at::from_blob(base + off_expert_pool_offset,  {num_local_experts + 1},                      keep, i32_opts),
-        .base_pool                  = at::from_blob(base + off_base_pool,           {num_channels, num_ranks, num_local_experts}, keep, i32_opts),
-        .seen_per_substream         = at::from_blob(base + off_seen_per_substream,  {num_channels, num_ranks, num_local_experts}, keep, i32_opts),
-        .rank_prefix_matrix         = at::from_blob(base + off_rank_prefix_matrix,  {num_ranks, num_ranks},                       keep, i32_opts),
-        .total_tiles_device         = at::from_blob(base + off_total_tiles_device,  {1},                                          keep, i32_opts),
+        .rdma_channel_prefix_matrix = at::from_blob(base + off_rdma_chprefix,       {num_rdma_ranks, num_channels},               keep, i32_opts, blob_dev),
+        .recv_rdma_rank_prefix_sum  = at::from_blob(base + off_recv_rdma_prefix,    {num_rdma_ranks},                             keep, i32_opts, blob_dev),
+        .gbl_channel_prefix_matrix  = at::from_blob(base + off_gbl_chprefix,        {num_ranks, num_channels},                    keep, i32_opts, blob_dev),
+        .recv_gbl_rank_prefix_sum   = at::from_blob(base + off_recv_gbl_prefix,     {num_ranks},                                  keep, i32_opts, blob_dev),
+        .expert_frequency           = at::from_blob(base + off_expert_frequency,    {num_local_experts},                          keep, i32_opts, blob_dev),
+        .expert_pool_block_offset   = at::from_blob(base + off_expert_pool_offset,  {num_local_experts + 1},                      keep, i32_opts, blob_dev),
+        .base_pool                  = at::from_blob(base + off_base_pool,           {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
+        .seen_per_substream         = at::from_blob(base + off_seen_per_substream,  {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
+        .rank_prefix_matrix         = at::from_blob(base + off_rank_prefix_matrix,  {num_ranks, num_ranks},                       keep, i32_opts, blob_dev),
+        .total_tiles_device         = at::from_blob(base + off_total_tiles_device,  {1},                                          keep, i32_opts, blob_dev),
     };
 }
 
@@ -1066,18 +1078,20 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     CUDA_CHECK(cudaMemsetAsync(base + z_pre_bytes,  0xFF, n_end - z_pre_bytes, stream));
 
     auto keep = [bundle](void*) {};
+    // Pass bundle's concrete device to every from_blob (see allocate_post_poll_bundle).
+    const at::Device blob_dev = bundle.device();
 
     PostPollBundleInternode out;
-    out.pool_topk_weight                = at::from_blob(base + off_pool_topk_weight,       {TK_padded},                                  keep, f32_opts);
-    out.pool_arrival_count              = at::from_blob(base + off_pool_arrival_count,     {total_tiles},                                keep, i32_opts);
-    out.recv_rdma_channel_prefix_matrix = at::from_blob(base + off_recv_rdma_chprefix,     {num_rdma_ranks, num_channels},               keep, i32_opts);
-    out.recv_gbl_channel_prefix_matrix  = at::from_blob(base + off_recv_gbl_chprefix,      {num_ranks, num_channels},                    keep, i32_opts);
-    out.send_rdma_head                  = at::from_blob(base + off_send_rdma_head,         {num_tokens, num_rdma_ranks},                 keep, i32_opts);
-    out.send_nvl_head                   = at::from_blob(base + off_send_nvl_head,          {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS},    keep, i32_opts);
-    out.recv_src_meta                   = at::from_blob(base + off_recv_src_meta,          {num_recv_tokens, source_meta_bytes},         keep, u8_opts);
-    out.pool_recv_token                 = at::from_blob(base + off_pool_recv_token,        {TK_padded},                                  keep, i32_opts);
-    out.pool_k_slot                     = at::from_blob(base + off_pool_k_slot,            {TK_padded},                                  keep, i32_opts);
-    out.recv_token_to_slots             = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},                  keep, i32_opts);
+    out.pool_topk_weight                = at::from_blob(base + off_pool_topk_weight,       {TK_padded},                                  keep, f32_opts, blob_dev);
+    out.pool_arrival_count              = at::from_blob(base + off_pool_arrival_count,     {total_tiles},                                keep, i32_opts, blob_dev);
+    out.recv_rdma_channel_prefix_matrix = at::from_blob(base + off_recv_rdma_chprefix,     {num_rdma_ranks, num_channels},               keep, i32_opts, blob_dev);
+    out.recv_gbl_channel_prefix_matrix  = at::from_blob(base + off_recv_gbl_chprefix,      {num_ranks, num_channels},                    keep, i32_opts, blob_dev);
+    out.send_rdma_head                  = at::from_blob(base + off_send_rdma_head,         {num_tokens, num_rdma_ranks},                 keep, i32_opts, blob_dev);
+    out.send_nvl_head                   = at::from_blob(base + off_send_nvl_head,          {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS},    keep, i32_opts, blob_dev);
+    out.recv_src_meta                   = at::from_blob(base + off_recv_src_meta,          {num_recv_tokens, source_meta_bytes},         keep, u8_opts, blob_dev);
+    out.pool_recv_token                 = at::from_blob(base + off_pool_recv_token,        {TK_padded},                                  keep, i32_opts, blob_dev);
+    out.pool_k_slot                     = at::from_blob(base + off_pool_k_slot,            {TK_padded},                                  keep, i32_opts, blob_dev);
+    out.recv_token_to_slots             = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},                  keep, i32_opts, blob_dev);
 
     // Z_post memset must precede metadata_done event (see intranode dispatch
     // for rationale: consumers gated on the event may run on a separate HW
@@ -1097,9 +1111,9 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
 
     out.metadata_done_event = EventHandle(stream);
 
-    out.k_local_remaining             = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                            keep, i32_opts);
-    out.y_done_per_token          = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                            keep, i64_opts);
-    out.k_local_total                   = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                            keep, i32_opts);
+    out.k_local_remaining             = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                            keep, i32_opts, blob_dev);
+    out.y_done_per_token          = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                            keep, i64_opts, blob_dev);
+    out.k_local_total                   = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                            keep, i32_opts, blob_dev);
 
     return out;
 }
