@@ -17,12 +17,15 @@ is FIFO-ordered after A: by the time Y issues its first instruction, A has
 fully retired and its TMA stores are drained. No per-tile A→Y release/acquire
 signal is needed.
 
-Inherits the GEMM mainloop, SwiGLU epilogue, scheduler-warp + pipeline-state
-machinery from `quack.gemm_act.GemmGatedSm90`. Streaming-specific behavior is
-isolated to two overrides:
-  (1) get_scheduler_class — return StreamingTileScheduler.
-  (2) get_scheduler_arguments — build StreamingTileSchedulerArguments from
-      pool-shape metadata.
+Inherits the GEMM mainloop, pipeline-state machinery, and the default linear
+epilogue from `StreamingGemmBase` (= quack `GemmDefaultSm90` + the shared
+streaming scheduler hooks). Streaming/gated-specific behavior is isolated to:
+  (1) StreamingGemmBase.get_scheduler_class — return StreamingTileScheduler.
+  (2) StreamingGemmBase.get_scheduler_arguments — build
+      StreamingTileSchedulerArguments from pool-shape metadata.
+  (3) StreamingMoeA.epi_visit_subtile — the gated SwiGLU activation
+      (`act_fn(gate, up)`) writing the I-wide postact to mAuxOut's gated
+      TileStore.
 
 The streaming scheduler uses the upstream 4-int sched payload
 (pid_m, pid_n, batch_idx, is_valid) — no streaming-specific SMEM extension.
@@ -50,71 +53,61 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.gemm_act import GemmGatedMixin
-from quack.gemm_sm90 import GemmSm90
+from quack.epilogue.ops import TileStore
+from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.rounding import RoundingMode
-from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
 from stream_ep.stream_moe.ptx_helpers import threadfence_system
-from stream_ep.stream_moe.tile_scheduler import (
-    StreamingTileScheduler,
-    StreamingTileSchedulerArguments,
+from stream_ep.stream_moe.streaming_gemm_base import (
+    StreamingGemmBase,
+    StreamingTileSchedulerOptions,
 )
-
-
-# ---------------------------------------------------------------------------
-# Host-facing scheduler-options NamedTuple. Mirrors TileSchedulerOptions but
-# carries the streaming-specific tensors/pointers that the scheduler needs.
-# ---------------------------------------------------------------------------
-@mlir_namedtuple
-class StreamingTileSchedulerOptions(NamedTuple):
-    max_active_clusters: Int32
-    consumer_head: cute.Tensor  # [1] int32 — global linear claim counter
-    # Per-tile ready spin source for kernel A's dispatch handoff. The
-    # scheduler does `count[tile] == target[tile]` (count-vs-target). Dispatch's
-    # metadata kernel fills `pool_arrival_target` with the per-tile firing
-    # target; dispatch's Pass 2 release-adds into `pool_arrival_count`.
-    pool_arrival_count: cute.Tensor   # [total_tiles] int32 — release-add destination
-    pool_arrival_target: cute.Tensor  # [total_tiles] int32 — per-tile firing target
-    expert_pool_block_offset: (
-        cute.Tensor
-    )  # [E_local + 1] int32 — pool-block prefix-sum. Source for the
-    # warp-cooperative ballot lookup that retired per-claim `tile_id_to_expert`.
-    total_tiles: Int32  # passed as scalar so get_grid_shape doesn't deref device tensor
-    # Optional cross-stream launch-gate "started" flag (single int32 in
-    # device memory). When supplied, the CTA that wins ``linear_idx == 0``
-    # in ``_fetch_next_work_idx`` atomicAdd's this flag once. The host on
-    # the consumer stream (typically communicate) issues
-    # ``cuStreamBatchMemOp wait_value_geq`` against this flag before
-    # launching combine_main / combine_grads_main, so combine's 80-CTA
-    # sender grid can't grab SMs ahead of kernel_y / kernel_a_bwd's
-    # 132-CTA grid. Pass ``None`` to disable (kernel_a / kernel_y_bwd
-    # don't bump anything — only kernel_y / kernel_a_bwd own a flag).
-    started_flag: Optional[cute.Tensor] = None  # [1] int32 device flag
 
 
 # ---------------------------------------------------------------------------
 # Streaming kernel A class.
 # ---------------------------------------------------------------------------
-class StreamingMoeA(GemmGatedMixin, GemmSm90):
-    """Streaming-MoE kernel A: standard strided varlen_m GEMM + SwiGLU with
-    queue-pull scheduler. Pool layout means kernel A uses the base GEMM
-    mainloop's varlen_m path verbatim — no per-tile gather indirection.
+class StreamingMoeA(StreamingGemmBase):
+    """Streaming-MoE kernel A: standard strided varlen_m GEMM + gated SwiGLU
+    with the queue-pull streaming scheduler. Pool layout means kernel A uses
+    the base GEMM mainloop's varlen_m path verbatim — no per-tile gather
+    indirection.
+
+    Epilogue: the full-2I pre-activation accumulator is the main D output
+    (mD → preact_a, written when store_preact=True); the I-wide
+    post-activation half rides mAuxOut's gated ``TileStore``. The gated
+    activation ``act_fn(gate, up)`` is applied over adjacent-N accumulator
+    lanes in ``epi_visit_subtile``; the half-N aux tile + the SM90 STSM
+    register permute are owned by ``TileStore(gated=True)`` (in its
+    ``store_convert``), so no ``epi_convert_aux_out`` override is needed. The
+    streaming scheduler hooks + the ``__call__`` type-shim come from
+    ``StreamingGemmBase``.
+
+    ``act_fn`` (the compile-time gated activation, e.g. swiglu) is baked onto
+    the instance via a ``post_init`` hook (``self.act_fn``) — the same
+    plumbing kernel_y_bwd uses for ``implicit_dtype`` — so the class inherits
+    ``GemmDefaultEpiMixin``'s ``epi_to_underlying_arguments`` unchanged.
 
     Kernel Y runs on the SAME compute stream and is FIFO-ordered after A
     fully retires — same-stream FIFO covers cross-stage visibility, no
     per-tile release/acquire is needed.
+
+    postact destination: the inherited ``TileStore("mAuxOut")`` path shifts
+    by ``cu_seqlens_m[batch_idx]`` then ``local_tile((pid_m, pid_n))``. The
+    combined row offset ``cu_seqlens_m[batch_idx] + pid_m * tile_m =
+    expert_pool_block_offset[e] * tile_m + (tile_id - expert_pool_block_offset[e])
+    * tile_m = tile_id * tile_m`` lands postact_a's per-tile slab — no
+    streaming-specific override needed.
     """
 
-    _epi_ops = GemmGatedMixin._epi_ops
+    _epi_ops = GemmDefaultEpiMixin._epi_ops + (TileStore("mAuxOut", gated=True),)
     _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mAuxOut: cute.Tensor
-        act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -126,75 +119,25 @@ class StreamingMoeA(GemmGatedMixin, GemmSm90):
     # ComposableEpiMixin.__init_subclass__.
 
     @cute.jit
-    def __call__(
-        self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
-        epilogue_args: tuple,
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: Optional[VarlenArguments],
-        stream: cuda.CUstream,
-        trace_ptr: Optional[Int64] = None,
-    ):
-        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
-        as the scheduler_args type (base annotation is TileSchedulerOptions).
-        Body delegates to GemmSm90.__call__ unchanged.
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        """Gated SwiGLU forward: ``aux[i] = act_fn(acc[2i], acc[2i+1])`` over
+        adjacent-N accumulator lanes.
+
+        The linear part (alpha*acc + beta*C + rowvec + colvec) is folded into
+        ``tRS_rD`` in place first — every term is None for the MoE forward, so
+        it is a no-op, kept for parity with the default epilogue contract.
+        ``tRS_rD`` (full 2I) is then the main D output (preact); the returned
+        half-N ``tRS_rAuxOut`` rides mAuxOut's gated TileStore (SM90-only; the
+        STSM permute + half-N tile live in ``TileStore.store_convert``).
         """
-        from quack.gemm_sm90 import GemmSm90 as _GemmSm90Base
-
-        _GemmSm90Base.__call__(
-            self,
-            mA,
-            mB,
-            mD,
-            mC,
-            epilogue_args,
-            scheduler_args,
-            varlen_args,
-            stream,
-            trace_ptr,
+        GemmDefaultEpiMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
         )
-
-    # -- scheduler hooks -----------------------------------------------------
-
-    def get_scheduler_class(self, varlen_m: bool = False):
-        return StreamingTileScheduler
-
-    def get_scheduler_arguments(
-        self,
-        mA: cute.Tensor,  # pool: (TK_padded, H)
-        mB: cute.Tensor,  # W1: (2I, H, E_local)
-        mD: Optional[cute.Tensor],  # None (no D for streaming kernel A)
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: VarlenArguments,
-        epilogue_args,
-    ):
-        # mB shape is (n=2I, k=H, l=E_local); n-dim tile count = ceil(2I / tile_N).
-        num_pid_n = cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1])
-        E_local = cute.size(mB, mode=[2])
-        return StreamingTileSchedulerArguments(
-            problem_shape_ntile_mnl=(None, num_pid_n, E_local),
-            consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.pool_arrival_count,
-            arrival_target=scheduler_args.pool_arrival_target,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
-            total_tiles=scheduler_args.total_tiles,
-            tile_shape_mn=self.cta_tile_shape_mnk[:2],
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            scheduler_warp_id=self.ab_load_warp_id,
-            persistence_mode=PersistenceMode.DYNAMIC,
-            started_flag=scheduler_args.started_flag,
-        )
-
-    # postact destination: inherited GemmGatedSm90.epi_setup_postact uses
-    # `varlen_manager.offset_batch_epi(mAuxOut, batch_idx)` (shift by
-    # cu_seqlens_m[batch_idx]) + `local_tile((pid_m, pid_n))`. The combined
-    # row offset is `cu_seqlens_m[batch_idx] + pid_m * tile_m =
-    # expert_pool_block_offset[e] * tile_m + (tile_id - expert_pool_block_offset[e])
-    # * tile_m = tile_id * tile_m`, which lands postact_a's per-tile slab — no
-    # streaming-specific override needed.
+        tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+        tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
+        for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+            tRS_rAuxOut[i] = self.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
+        return (tRS_rAuxOut,)
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +174,9 @@ def _compile_streaming_moe_a(
     # B: W1 (2I, H, E_local), k-major per expert (H contiguous), batch dim = E_local.
     mB = fake_tensor(b_dtype, (I2_sym, H_sym, E_sym), leading_dim=1, divisibility=8)
     # mD: optional pre-SwiGLU output. When `store_preact=True`, kernel A's
-    # standard mD TMA-store path (inherited from GemmDefaultEpiMixin via
-    # GemmGatedMixin) writes the [2I] accumulator (post-alpha/beta/RowVec/
-    # ColVec, pre-act-fn) to gmem alongside the postact_a [I] write.
+    # standard mD TMA-store path (inherited from GemmDefaultEpiMixin) writes
+    # the [2I] accumulator (post-alpha/beta/RowVec/ColVec, pre-act-fn) to gmem
+    # alongside the postact_a [I] write.
     # Bwd consumes preact via `kernel_a_bwd`'s SwiGLU-bwd in registers
     # (skipping the otherwise-required `pool @ W1.T` recompute GEMM); fwd
     # paths that don't need bwd activations leave it None.
@@ -275,11 +218,17 @@ def _compile_streaming_moe_a(
 
     epi_args = StreamingMoeA.EpilogueArguments(
         mAuxOut=mAuxOut,
-        act_fn=gate_fn_map[activation],
         rounding_mode=RoundingMode.RN,
     )
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
+
+    def _set_act_fn(gemm_obj):
+        # Bake the gated activation (compile is keyed on `activation`) as a
+        # constexpr on the instance; epi_visit_subtile reads it as
+        # self.act_fn — same post_init plumbing kernel_y_bwd uses for
+        # implicit_dtype.
+        gemm_obj.act_fn = gate_fn_map[activation]
 
     return compile_gemm_kernel(
         StreamingMoeA,
@@ -298,6 +247,7 @@ def _compile_streaming_moe_a(
         epi_args=epi_args,
         scheduler_args=scheduler_args,
         varlen_args=varlen_args,
+        post_init=_set_act_fn,
     )
 
 
@@ -444,8 +394,8 @@ def streaming_moe_a(
 
     Optional ``preact_a`` ``(total_tiles, tile_M, 2*I) bf16`` is the pre-SwiGLU
     accumulator destination for bwd. When passed, kernel A's standard mD
-    TMA-store path (inherited from ``GemmGatedMixin → GemmDefaultEpiMixin``)
-    writes the [2I] gate-up values to gmem alongside the postact_a [I] write.
+    TMA-store path (inherited from ``GemmDefaultEpiMixin``) writes the [2I]
+    gate-up values to gmem alongside the postact_a [I] write.
     Saving preact lets ``kernel_a_bwd`` apply SwiGLU bwd in registers without
     a recompute GEMM (~370 µs/layer perf win at production); fwd-only paths
     leave ``preact_a=None`` to skip the extra TMA-store traffic. The two
@@ -560,7 +510,6 @@ def streaming_moe_a(
 
     epi_args = StreamingMoeA.EpilogueArguments(
         mAuxOut=postact_flat,
-        act_fn=None,  # Constexpr; pass None at call time
         rounding_mode=None,  # Constexpr; pass None at call time
     )
     scheduler_args = StreamingTileSchedulerOptions(
