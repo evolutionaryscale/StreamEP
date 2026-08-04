@@ -97,7 +97,7 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import ColVecLoad, colvec_reduce_accumulate
+from quack.epilogue.ops import ColVecLoad, colvec_reduce_accumulate
 from quack.gemm_act import GemmActMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
