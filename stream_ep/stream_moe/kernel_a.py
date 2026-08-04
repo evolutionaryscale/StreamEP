@@ -530,6 +530,10 @@ def streaming_moe_a(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
     )
 
+    # Trailing (None, None) are mSFA / mSFB — the unified SM90/100/120 TMA
+    # scale-factor slots main's compiled arg spec always requires (None for a
+    # plain bf16 GEMM). Note main takes no host `stream` arg (it binds the
+    # TVM-FFI env stream), so these two slots follow varlen_args directly.
     compiled_fn(
-        pool, W1, preact_flat, None, epi_args, scheduler_args, varlen_args, None
+        pool, W1, preact_flat, None, epi_args, scheduler_args, varlen_args, None, None
     )

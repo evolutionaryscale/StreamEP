@@ -855,6 +855,8 @@ def streaming_moe_y_bwd(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
     )
 
+    # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
+    # slots, always None for plain bf16); main takes no host stream arg.
     compiled_fn(
         dL_do_pool,
         W2,
@@ -863,5 +865,6 @@ def streaming_moe_y_bwd(
         epi_args,
         scheduler_args,
         varlen_args,
+        None,
         None,
     )

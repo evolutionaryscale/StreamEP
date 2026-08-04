@@ -984,8 +984,10 @@ def streaming_moe_y(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
     )
 
+    # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
+    # slots, always None for plain bf16); main takes no host stream arg.
     compiled_fn(
-        postact_flat, W2, None, None, epi_args, scheduler_args, varlen_args, None
+        postact_flat, W2, None, None, epi_args, scheduler_args, varlen_args, None, None
     )
 
 
