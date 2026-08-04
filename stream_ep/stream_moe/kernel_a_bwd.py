@@ -224,11 +224,15 @@ def _compile_streaming_moe_a_bwd(
     # contiguous in storage). Same pool-major flattening fwd kernel A applies
     # to pool.
     mA = fake_tensor(a_dtype, (TK_padded_sym, I2_sym), leading_dim=1, divisibility=8)
-    # B: W1 permuted to (H, 2I, E_local), n-major (H contiguous along the
-    # leading axis after `W1.permute(2, 1, 0)` on the host). With this layout
-    # the kernel's contraction `Σ_k B[n, k]` evaluates `W1[k, n] = W1[2I_idx,
-    # h]`, i.e. the NN GEMM `dL_dswiglu_in @ W1` we want.
-    mB = fake_tensor(b_dtype, (H_sym, I2_sym, E_sym), leading_dim=0, divisibility=8)
+    # B: W1 in its NATURAL batch-first storage (E_local, 2I, H), H-contiguous.
+    # quack main takes batched operands batch-first (l, ...) and rotates them
+    # to kernel order at trace time, so we pass W1 as-is (no host permute).
+    # This GEMM wants n-major B (n=H, k=2I), so we set b_transposed=True (the
+    # b_kn path): B crosses as (l, k, n)=(E, 2I, H) and the kernel transposes
+    # it to n-major kernel order (n, k, l)=(H, 2I, E). The contraction
+    # `Σ_k B[n, k]` then evaluates `W1[2I_idx, h]` — the NN GEMM
+    # `dL_dswiglu_in @ W1` we want. leading_dim=2 = H (natural contiguous axis).
+    mB = fake_tensor(b_dtype, (E_sym, I2_sym, H_sym), leading_dim=2, divisibility=8)
     # No D / C — streaming kernel A bwd outputs via predicated atomic-scatter
     # into `dL_dx_per_r[T_recv, H]` (no trash row).
     mD = None
@@ -305,6 +309,9 @@ def _compile_streaming_moe_a_bwd(
         gather_A=False,
         is_dynamic_persistent=False,
         device_capacity=device_capacity,
+        # W1 crosses batch-first as (l, k, n) = (E, 2I, H); the kernel
+        # transposes it to n-major kernel order (n, k, l) = (H, 2I, E).
+        b_transposed=True,
         mA=mA,
         mB=mB,
         mD=mD,
@@ -408,16 +415,16 @@ def streaming_moe_a_bwd(
 
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
     # slab has H contiguous along the last axis — same layout fwd kernel A
-    # consumes). For the bwd's NN GEMM we need the kernel-side tensor to be
-    # (n=H, k=2I, l=E_local) with H contiguous (n-major), so the mainloop's
-    # `Σ_k B[n, k]` evaluates `W1[2I_idx, h]`. `permute(2, 1, 0)` gives this
-    # layout WITHOUT a copy: strides go (2I*H, H, 1) → (1, H, 2I*H).
-    W1_p = W1.permute(2, 1, 0)
-    assert W1_p.stride(0) == 1, (
-        "W1.permute(2,1,0) must have H (axis 0) contiguous (n-major B); caller "
-        "must pass W1 as (E_local, 2*I, H) k-major"
+    # consumes). quack main takes batched B batch-first, so we pass W1 as-is —
+    # no host permute. The compile sets b_transposed=True so the kernel reads
+    # it as (l, k, n) = (E, 2I, H) and transposes to n-major kernel order
+    # (n=H, k=2I, l=E); the mainloop's `Σ_k B[n, k]` then evaluates
+    # `W1[2I_idx, h]`.
+    assert W1.stride(-1) == 1, (
+        "W1[e] must have H (last axis) contiguous (k-major weights); caller "
+        "must pass W1 as (E_local, 2*I, H)"
     )
-    assert W1_p.shape == (H, two_I, E_local)
+    assert W1.shape == (E_local, two_I, H)
 
     # Flatten dL_dswiglu_in's leading two dims to (total_tiles * tile_m, 2I)
     # so the kernel sees a single varlen_m M dimension.
@@ -498,7 +505,7 @@ def streaming_moe_a_bwd(
 
     compiled_fn(
         dL_dswiglu_in_flat,
-        W1_p,
+        W1,
         None,
         None,
         epi_args,

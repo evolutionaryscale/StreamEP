@@ -171,8 +171,14 @@ def _compile_streaming_moe_a(
 
     # A: pool (TK_padded, H), k-major (H is contiguous).
     mA = fake_tensor(a_dtype, (TK_padded_sym, H_sym), leading_dim=1, divisibility=8)
-    # B: W1 (2I, H, E_local), k-major per expert (H contiguous), batch dim = E_local.
-    mB = fake_tensor(b_dtype, (I2_sym, H_sym, E_sym), leading_dim=1, divisibility=8)
+    # B: W1 in its NATURAL batch-first storage (E_local, 2I, H), H-contiguous.
+    # quack main takes batched operands batch-first (l, ...) and rotates them
+    # to kernel order at trace time (GemmBase.rotate_batch_last), so we pass W1
+    # as-is with no host permute. This forward GEMM wants k-major B (n=2I,
+    # k=H); the natural storage is already (l, n, k)=(E, 2I, H), so the default
+    # rotate (l,n,k)→(n,k,l)=(2I,H,E) lands H-contiguous k-major B — no
+    # b_transposed. leading_dim=2 = H (the natural contiguous axis).
+    mB = fake_tensor(b_dtype, (E_sym, I2_sym, H_sym), leading_dim=2, divisibility=8)
     # mD: optional pre-SwiGLU output. When `store_preact=True`, kernel A's
     # standard mD TMA-store path (inherited from GemmDefaultEpiMixin) writes
     # the [2I] accumulator (post-alpha/beta/RowVec/ColVec, pre-act-fn) to gmem
@@ -447,14 +453,14 @@ def streaming_moe_a(
             f"{postact_a.dtype}"
         )
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
-    # slab has H contiguous). We need the kernel to see shape (2I, H, E_local)
-    # with leading_dim=1 (H is contiguous along K). torch.permute(1, 2, 0)
-    # gives this layout WITHOUT a copy.
-    W1_p = W1.permute(1, 2, 0)
+    # slab has H contiguous). quack main takes batched B batch-first, so we
+    # pass W1 as-is — no host permute. The natural storage is already
+    # (l, n, k) = (E, 2I, H), so the kernel's default rotate gives k-major
+    # kernel-order B (2I, H, E) — no b_transposed needed.
     assert (
-        W1_p.stride(1) == 1
-    ), "W1[:,e,:] must be H-contiguous (caller passes k-major weights)"
-    assert W1_p.shape == (two_I, H, E_local)
+        W1.stride(-1) == 1
+    ), "W1[e] must be H-contiguous (caller passes (E_local, 2I, H) k-major weights)"
+    assert W1.shape == (E_local, two_I, H)
 
     # Flatten postact_a's leading two dims to (total_tiles * tile_m, I).
     postact_flat = postact_a.view(total_tiles * tile_m, I)
@@ -525,5 +531,5 @@ def streaming_moe_a(
     )
 
     compiled_fn(
-        pool, W1_p, preact_flat, None, epi_args, scheduler_args, varlen_args, None
+        pool, W1, preact_flat, None, epi_args, scheduler_args, varlen_args, None
     )

@@ -465,11 +465,15 @@ def _compile_streaming_moe_y_bwd(
     # A: dL_do_pool (TK_padded, H), k-major (H is contiguous; same layout fwd
     # kernel A uses on pool).
     mA = fake_tensor(a_dtype, (TK_padded_sym, H_sym), leading_dim=1, divisibility=8)
-    # B: W2 permuted to (I, H, E_local), n-major (I is contiguous along the
-    # leading axis after `W2.permute(2, 1, 0)` on the host). With this layout
-    # the kernel's contraction Σ_k B[n, k] yields W2[k, n] = W2[h, i], i.e. the
-    # NN GEMM dL_do_pool @ W2 we want.
-    mB = fake_tensor(b_dtype, (I_sym, H_sym, E_sym), leading_dim=0, divisibility=8)
+    # B: W2 in its NATURAL batch-first storage (E_local, H, I), I-contiguous.
+    # quack main takes batched operands batch-first (l, ...) and rotates them
+    # to kernel order at trace time (GemmBase.rotate_batch_last), so we pass W2
+    # as-is with no host permute. This GEMM wants n-major B (n=I, k=H), so we
+    # set b_transposed=True (the b_kn path): B crosses as (l, k, n)=(E, H, I)
+    # and the kernel transposes it to kernel order (n, k, l)=(I, H, E). The
+    # contraction Σ_k B[n, k] then yields W2[h, i] — the NN GEMM
+    # dL_do_pool @ W2 we want. leading_dim=2 = I (the natural contiguous axis).
+    mB = fake_tensor(b_dtype, (E_sym, H_sym, I_sym), leading_dim=2, divisibility=8)
     # D: dL_dswiglu_in flat. Storage on host is bf16 (Mflat, 2*I); we view as
     # fp32 (Mflat, I) before launch — each fp32 element packs (dgate_n, dup_n)
     # as bf16x2. d_dtype is fp32 (32-bit storage), implicit_dtype is bf16 (the
@@ -559,6 +563,9 @@ def _compile_streaming_moe_y_bwd(
         gather_A=False,
         is_dynamic_persistent=False,
         device_capacity=device_capacity,
+        # W2 crosses batch-first as (l, k, n) = (E, H, I); the kernel
+        # transposes it to n-major kernel order (n, k, l) = (I, H, E).
+        b_transposed=True,
         mA=mA,
         mB=mB,
         mD=mD,
@@ -744,16 +751,16 @@ def streaming_moe_y_bwd(
     assert dL_dweight.is_contiguous()
 
     # Caller passes W2 as (E_local, H, I) k-major (I contiguous; same layout
-    # used by fwd kernel Y). For the bwd's NN GEMM we need the kernel-side
-    # tensor to be (n=I, k=H, l=E_local) with I contiguous (n-major), so the
-    # mainloop's `Σ_k B[n, k]` evaluates `W2[h, i]`. `permute(2, 1, 0)` gives
-    # this layout WITHOUT a copy: strides go (H*I, I, 1) → (1, I, H*I).
-    W2_p = W2.permute(2, 1, 0)
-    assert W2_p.stride(0) == 1, (
-        "W2.permute(2,1,0) must have I (axis 0) contiguous (n-major B); caller "
-        "must pass W2 as (E_local, H, I) k-major"
+    # used by fwd kernel Y). quack main takes batched B batch-first, so we
+    # pass W2 as-is — no host permute. The compile sets b_transposed=True so
+    # the kernel reads it as (l, k, n) = (E, H, I) and transposes to n-major
+    # kernel order (n=I, k=H, l=E); the mainloop's `Σ_k B[n, k]` then
+    # evaluates `W2[h, i]`.
+    assert W2.stride(-1) == 1, (
+        "W2 must have I (last axis) contiguous (k-major weights); caller "
+        "must pass W2 as (E_local, H, I)"
     )
-    assert W2_p.shape == (I, H, E_local)
+    assert W2.shape == (E_local, H, I)
 
     # Capture preact's bf16 dtype BEFORE the f32 view (compile-key + post_init).
     # Same `implicit_dtype` is used for both mC (preact in) and mD (dL_dswiglu_in
@@ -850,7 +857,7 @@ def streaming_moe_y_bwd(
 
     compiled_fn(
         dL_do_pool,
-        W2_p,
+        W2,
         dL_dswiglu_in_flat,
         preact_flat,
         epi_args,

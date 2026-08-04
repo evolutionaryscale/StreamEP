@@ -744,8 +744,13 @@ def _compile_streaming_moe_y(
 
     # A: postact_a flat (TK_padded, I), k-major (I contiguous).
     mA = fake_tensor(a_dtype, (TK_padded_sym, I_sym), leading_dim=1, divisibility=8)
-    # B: W2 (H, I, E_local), k-major per expert (I contiguous), batch dim = E_local.
-    mB = fake_tensor(b_dtype, (H_sym, I_sym, E_sym), leading_dim=1, divisibility=8)
+    # B: W2 in its NATURAL batch-first storage (E_local, H, I), I-contiguous.
+    # quack main takes batched operands batch-first (l, ...) and rotates them
+    # to kernel order at trace time, so we pass W2 as-is (no host permute).
+    # This forward GEMM wants k-major B (n=H, k=I); the natural storage is
+    # already (l, n, k)=(E, H, I), so the default rotate (l,n,k)→(n,k,l)=(H,I,E)
+    # lands I-contiguous k-major B — no b_transposed. leading_dim=2 = I.
+    mB = fake_tensor(b_dtype, (E_sym, H_sym, I_sym), leading_dim=2, divisibility=8)
     # No D / C — streaming kernel Y outputs via predicated atomic-scatter
     # into o[T_recv, H] (no trash row).
     mD = None
@@ -919,12 +924,12 @@ def streaming_moe_y(
     assert pool_arrival_target.shape == (total_tiles,)
     assert pool_arrival_target.dtype == torch.int32
 
-    # Caller passes W2 as (E_local, H, I) k-major contiguous. We need the
-    # kernel to see shape (H, I, E_local) with leading_dim=1 (I contiguous
-    # along K). torch.permute(1, 2, 0) gives this layout WITHOUT a copy.
-    W2_p = W2.permute(1, 2, 0)
-    assert W2_p.stride(1) == 1, "W2[:, e, :] must be I-contiguous (k-major weights)"
-    assert W2_p.shape == (H, I, E_local)
+    # Caller passes W2 as (E_local, H, I) k-major contiguous. quack main takes
+    # batched B batch-first, so we pass W2 as-is — no host permute. The
+    # natural storage is already (l, n, k) = (E, H, I), so the kernel's default
+    # rotate gives k-major kernel-order B (H, I, E) — no b_transposed.
+    assert W2.stride(-1) == 1, "W2[e] must be I-contiguous (caller passes (E_local, H, I) k-major)"
+    assert W2.shape == (E_local, H, I)
 
     # Flatten postact_a's leading two dims.
     postact_flat = postact_a.view(total_tiles * tile_m, I)
@@ -1004,7 +1009,7 @@ def streaming_moe_y(
     )
 
     compiled_fn(
-        postact_flat, W2_p, None, None, epi_args, scheduler_args, varlen_args, None
+        postact_flat, W2, None, None, epi_args, scheduler_args, varlen_args, None
     )
 
 
