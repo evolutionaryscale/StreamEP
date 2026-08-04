@@ -70,23 +70,19 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epilogue.mixin import ComposableEpiMixin
 from quack.epilogue.ops import ColVecLoad, EpiOp, EpiSmemBytes
 from quack.rounding import RoundingMode
-from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
-from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.ptx_helpers import (
     red_add_bf16x2_v4_pred,
     st_release_gpu_global,
     threadfence_gpu,
 )
-from stream_ep.stream_moe.tile_scheduler import (
-    StreamingTileScheduler,
-    StreamingTileSchedulerArguments,
+from stream_ep.stream_moe.streaming_gemm_base import (
+    StreamingGemmBase,
+    StreamingTileSchedulerOptions,
 )
 
 
@@ -338,7 +334,7 @@ class AtomicScatterStore(EpiOp):
         # tail).
         if is_thread0:
             stripes_ptr = utils.elem_pointer(param.tile_n_stripes_done, (tile_id,))
-            prev_stripes = utils.atomic_add_i32(Int32(1), stripes_ptr)
+            prev_stripes = cute.arch.atomic_add(stripes_ptr, Int32(1))
             is_last_stripe = prev_stripes == (param.num_pid_n - Int32(1))
             if is_last_stripe:
                 # Make all atomic-scatters from all N-stripes visible at GPU
@@ -362,7 +358,7 @@ class AtomicScatterStore(EpiOp):
             r = recv_token_t[tidx]
             if r >= Int32(0) and r < T_recv:
                 rem_ptr = utils.elem_pointer(param.k_local_remaining, (r,))
-                prev = utils.atomic_add_i32(Int32(-1), rem_ptr)
+                prev = cute.arch.atomic_add(rem_ptr, Int32(-1))
                 if prev == Int32(1):
                     done_ptr = utils.elem_pointer(param.y_done_per_token, (r,))
                     # ``.gpu`` scope is sufficient: kernel_y (compute stream)
@@ -380,37 +376,39 @@ class AtomicScatterStore(EpiOp):
 
 
 # ---------------------------------------------------------------------------
-# Streaming kernel Y class. Subclass GemmSm90 directly (not GemmDefaultEpiMixin
-# or GemmActMixin) so we control which EpiOps participate.
+# Shared streaming atomic-scatter base for the Y-family kernels (fwd kernel Y
+# and kernel A bwd). Holds the scatter store seam + aux no-ops + RN pin; leaves
+# add only their own _epi_ops / EpilogueArguments / epi_visit_subtile.
 # ---------------------------------------------------------------------------
-class StreamingMoeY(ComposableEpiMixin, GemmSm90):
-    """Streaming-MoE kernel Y: streaming GEMM with fused atomic-scatter epilogue.
+class StreamingScatterBase(StreamingGemmBase):
+    """Shared epilogue machinery for the streaming atomic-scatter kernels.
 
-    Composition:
-      - ColVecLoad("mColVecBroadcast"): per-row weight broadcast along N.
-        Caller passes pool_topk_weight as args.mColVecBroadcast; varlen_m mode
-        with cu_seqlens_m = expert_pool_block_offset * tile_m offsets correctly
-        to pool_start = expert_pool_block_offset[batch_idx] * tile_m + pid_m * tile_m.
-      - AtomicScatterStore("scatter"): owns the bf16 staging SMEM and the
-        per-tile pool_recv_token SMEM area. End-of-tile bookkeeping fires
-        y_done_per_token[r] on hit-zero.
+    The Y-family writes its output via an all-epi-warps coalesced
+    ``red.global.add.v4.bf16x2`` atomic-scatter into a per-recv-token gmem
+    tensor, not the default single-TMA-warp staged store. That replaces the
+    whole per-subtile store, so it overrides ``main``'s ``epi_subtile_store``
+    seam (extracted upstream in gemm_base) rather than an aux-output
+    ``TileStore`` path — which is issued by the single TMA warp and cannot
+    express a multi-warp scatter.
 
-    Overrides:
-      - epi_visit_subtile: in-register weight multiply (replaces the additive
-        bias path of GemmDefaultEpiMixin).
-      - epi_subtile_store: R2S into AtomicScatterStore's staging; per-warp
-        coalesced atomic-scatter from staging into mO[r, n_origin:].
+    Holds the parts common to both leaves:
+      - ``epi_to_underlying_arguments`` — pins ``rounding_mode = RN`` (the
+        scatter store bypasses the framework's SR store path) and builds params
+        from the leaf's ``_epi_ops``.
+      - ``epi_setup_aux_out`` → ``()`` / ``epi_convert_aux_out`` → passthrough —
+        no framework aux output; the scatter goes straight to gmem.
+      - ``_scatter_plain_r2s_copy`` — the plain (non-StMatrix) R2S copy for the
+        un-swizzled padded staging.
+      - ``epi_subtile_store`` — R2S into the AtomicScatterStore staging, then
+        the per-warp coalesced predicated v4 atomic-scatter.
+
+    Leaves (``StreamingMoeY``, ``StreamingMoeABwd``) supply ``_epi_ops`` (with
+    the shared ``AtomicScatterStore``), their ``EpilogueArguments``, and
+    ``epi_visit_subtile``. Scheduler hooks + the ``__call__`` shim come from
+    ``StreamingGemmBase``.
     """
 
-    _epi_ops = (ColVecLoad("mColVecBroadcast"), AtomicScatterStore("scatter"))
     _epi_param_bases = (ParamsBase,)
-
-    @mlir_namedtuple
-    class EpilogueArguments(NamedTuple):
-        scatter: ScatterParams
-        mColVecBroadcast: Optional[cute.Tensor] = None
-
-    # EpilogueParams auto-generated by ComposableEpiMixin.
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         # v0.4.1 GemmBase.epilogue reads `self.rounding_mode` to decide
@@ -453,32 +451,20 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         varlen_manager,
         tidx,
     ):
-        # Kernel Y has no aux-output (atomic-scatter goes directly into
-        # `mO` via AtomicScatterStore). Return None so GemmBase's epilogue
-        # dispatcher knows there's nothing to set up. kernel_a_bwd inherits
-        # this no-op via StreamingMoeABwd(StreamingMoeY).
-        return None
+        # No framework aux-output (the atomic-scatter goes directly into `mO`
+        # via AtomicScatterStore). Return an empty tuple: main's epilogue()
+        # does `len(aux_out_ctxs)` / iterates it, so it must be iterable, not
+        # None.
+        return ()
 
     @cute.jit
     def epi_convert_aux_out(
-        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        self, output_idx, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
+        # Dead for the scatter path (epi_setup_aux_out returns (), so the
+        # framework never calls this); kept signature-compatible with main's
+        # (leading output_idx added) in case a subclass adds an aux output.
         return tRS_rAuxOut
-
-    @cute.jit
-    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
-        """In-register weight multiply on the MMA accumulator subtile.
-
-        ColVecLoad's begin_loop has already populated `mColVecBroadcast` as a
-        register tensor with the same per-thread layout as `tRS_rD`, with the
-        per-row weight broadcast along N. So `tRS_rD[i] *= weight[i]` works
-        element-wise.
-        """
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
-        if const_expr(tDrColVec is not None):
-            for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
-                tRS_rD[i] *= tDrColVec[i]
-        return None
 
     @cute.jit
     def epi_subtile_store(
@@ -487,10 +473,10 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         epi_loop_tensors,
         tRS_rD,
         tRS_sD,
-        tRS_rAuxOut_out,
+        tRS_rAuxOuts_out,
         tiled_copy_r2s,
         copy_D,
-        aux_out_ctx,
+        aux_out_ctxs,
         epi_store_pipeline,
         epilogue_barrier,
         tile_coord_mnkl,
@@ -501,6 +487,11 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         is_tma_warp,
     ):
         """Per-subtile R2S → bf16 SMEM → per-warp coalesced atomic-scatter into o.
+
+        Overrides main's ``epi_subtile_store`` seam. ``tRS_rAuxOuts_out`` /
+        ``aux_out_ctxs`` / ``copy_D`` / ``tiled_copy_r2s`` are the default
+        staged-store inputs and are ignored here — the scatter builds its own
+        plain R2S copy and writes straight to gmem.
 
         Pipeline state hygiene: producer_acquire/commit on epi_store_pipeline
         are kept balanced even though we never call copy_D (gotcha #6 from
@@ -657,65 +648,50 @@ class StreamingMoeY(ComposableEpiMixin, GemmSm90):
         if is_tma_warp:
             epi_store_pipeline.producer_commit()
 
-    # -- scheduler hooks -----------------------------------------------------
 
-    def get_scheduler_class(self, varlen_m: bool = False):
-        return StreamingTileScheduler
+# ---------------------------------------------------------------------------
+# Streaming kernel Y leaf: the gated GEMM's activated output scattered per recv
+# token, with a per-recv-token weight multiply. Adds the weight to the shared
+# scatter base.
+# ---------------------------------------------------------------------------
+class StreamingMoeY(StreamingScatterBase):
+    """Streaming-MoE kernel Y: streaming GEMM + fused atomic-scatter epilogue,
+    with a per-row (per-recv-token) weight multiply on the accumulator.
 
-    def get_scheduler_arguments(
-        self,
-        mA,
-        mB,
-        mD,
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: VarlenArguments,
-        epilogue_args,
-    ):
-        # mB shape: (n=H, k=I, l=E_local).
-        num_pid_n = cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1])
-        E_local = cute.size(mB, mode=[2])
-        return StreamingTileSchedulerArguments(
-            problem_shape_ntile_mnl=(None, num_pid_n, E_local),
-            consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.pool_arrival_count,
-            arrival_target=scheduler_args.pool_arrival_target,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
-            total_tiles=scheduler_args.total_tiles,
-            tile_shape_mn=self.cta_tile_shape_mnk[:2],
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            scheduler_warp_id=self.ab_load_warp_id,
-            persistence_mode=PersistenceMode.DYNAMIC,
-            started_flag=scheduler_args.started_flag,
-        )
+    _epi_ops:
+      - ColVecLoad("mColVecBroadcast"): per-row weight broadcast along N.
+        Caller passes pool_topk_weight as args.mColVecBroadcast; varlen_m mode
+        with cu_seqlens_m = expert_pool_block_offset * tile_m offsets correctly
+        to pool_start = expert_pool_block_offset[batch_idx] * tile_m + pid_m * tile_m.
+      - AtomicScatterStore("scatter"): the shared scatter store op (bf16 staging
+        SMEM + per-tile pool_recv_token area; end-of-tile bookkeeping fires
+        y_done_per_token[r] on hit-zero).
+
+    Everything else — the scatter store seam, aux no-ops, RN pin, scheduler
+    hooks, __call__ — comes from StreamingScatterBase / StreamingGemmBase.
+    """
+
+    _epi_ops = (ColVecLoad("mColVecBroadcast"), AtomicScatterStore("scatter"))
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        scatter: ScatterParams
+        mColVecBroadcast: Optional[cute.Tensor] = None
 
     @cute.jit
-    def __call__(
-        self,
-        mA,
-        mB,
-        mD,
-        mC,
-        epilogue_args,
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args,
-        stream,
-        trace_ptr=None,
-    ):
-        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
-        as the scheduler_args type. Body delegates to GemmSm90.__call__.
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        """In-register per-row weight multiply on the MMA accumulator subtile.
+
+        ColVecLoad's begin_loop has already populated `mColVecBroadcast` as a
+        register tensor with the same per-thread layout as `tRS_rD`, with the
+        per-row weight broadcast along N. So `tRS_rD[i] *= weight[i]` works
+        element-wise. (Replaces the additive bias path of GemmDefaultEpiMixin.)
         """
-        GemmSm90.__call__(
-            self,
-            mA,
-            mB,
-            mD,
-            mC,
-            epilogue_args,
-            scheduler_args,
-            varlen_args,
-            stream,
-            trace_ptr,
-        )
+        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        if const_expr(tDrColVec is not None):
+            for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+                tRS_rD[i] *= tDrColVec[i]
+        return None
 
 
 # ---------------------------------------------------------------------------

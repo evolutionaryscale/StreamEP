@@ -53,7 +53,6 @@ Shares streaming machinery with fwd kernels:
 
 from typing import NamedTuple, Optional, Type
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -67,49 +66,45 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
-from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.kernel_y import (
     AtomicScatterStore,
     ScatterParams,
-    StreamingMoeY,
+    StreamingScatterBase,
 )
-from stream_ep.stream_moe.tile_scheduler import (
-    StreamingTileScheduler,
-    StreamingTileSchedulerArguments,
-)
+from stream_ep.stream_moe.streaming_gemm_base import StreamingTileSchedulerOptions
 
 
 # ---------------------------------------------------------------------------
 # Streaming kernel A bwd class.
 # ---------------------------------------------------------------------------
-class StreamingMoeABwd(StreamingMoeY):
+class StreamingMoeABwd(StreamingScatterBase):
     """Streaming-MoE kernel A bwd: NN GEMM `dL/dswiglu_in @ W1` with fused
     atomic-scatter epilogue into `dL_dx_per_r`.
 
-    Strict subset of fwd kernel_y — no per-slot weight multiply, otherwise
-    structurally identical. Inherits the AtomicScatterStore EpiOp,
-    `epi_subtile_store` (per-warp coalesced predicated v4 bf16x2 atomic-add),
-    `epi_setup_postact`, and `epi_convert_postact` unchanged.
+    Sibling of fwd kernel Y under StreamingScatterBase — no per-slot weight
+    multiply, otherwise structurally identical. Inherits the whole scatter
+    store machinery (AtomicScatterStore EpiOp, `epi_subtile_store`, the
+    `epi_setup_aux_out`/`epi_convert_aux_out` no-ops, the RN pin) from
+    StreamingScatterBase, and the scheduler hooks + `__call__` from
+    StreamingGemmBase.
 
-    Overrides:
-      - `_epi_ops`: drop ColVecLoad — bwd has no per-slot weighting (the
-        forward pool_topk_weight was absorbed into dL/dswiglu_in upstream
+    Supplies only:
+      - `_epi_ops`: just AtomicScatterStore — bwd has no per-slot weighting
+        (the forward pool_topk_weight was absorbed into dL/dswiglu_in upstream
         by kernel_y_bwd's `dswiglu` + post-multiply on (dgate, dup);
-        chain-rule linearity in dpostact bakes the weight into the
-        dgate/dup pair we read here).
-      - `EpilogueArguments`: drop `mColVecBroadcast`.
+        chain-rule linearity in dpostact bakes the weight into the dgate/dup
+        pair we read here).
+      - `EpilogueArguments`: scatter only (no `mColVecBroadcast`).
       - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
         analogue here.
-      - `__call__` + `get_scheduler_arguments`: reuse the shared
-        ``StreamingTileSchedulerOptions``; caller plumbs
-        ``bwd_dispatch_arrival_count`` / ``pool_arrival_target`` (the same
-        pair Y_bwd waited on; at-target by the time A_bwd runs because
-        Y_bwd and A_bwd share a compute stream).
+
+    The caller plumbs ``bwd_dispatch_arrival_count`` / ``pool_arrival_target``
+    (the same pair Y_bwd waited on; at-target by the time A_bwd runs because
+    Y_bwd and A_bwd share a compute stream) into the shared
+    ``StreamingTileSchedulerOptions``.
     """
 
     _epi_ops = (AtomicScatterStore("scatter"),)
@@ -135,65 +130,9 @@ class StreamingMoeABwd(StreamingMoeY):
         """
         return None
 
-    # -- scheduler hooks -----------------------------------------------------
-
-    def get_scheduler_class(self, varlen_m: bool = False):
-        return StreamingTileScheduler
-
-    def get_scheduler_arguments(
-        self,
-        mA: cute.Tensor,  # dL_dswiglu_in: (TK_padded, 2I), k-major
-        mB: cute.Tensor,  # W1 permuted: (H, 2I, E_local), n-major
-        mD: Optional[cute.Tensor],  # None — output via atomic-scatter
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: VarlenArguments,
-        epilogue_args,
-    ):
-        # mB shape is (n=H, k=2I, l=E_local); n-dim tile count = ceil(H / tile_N).
-        num_pid_n = cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1])
-        E_local = cute.size(mB, mode=[2])
-        return StreamingTileSchedulerArguments(
-            problem_shape_ntile_mnl=(None, num_pid_n, E_local),
-            consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.pool_arrival_count,
-            arrival_target=scheduler_args.pool_arrival_target,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
-            total_tiles=scheduler_args.total_tiles,
-            tile_shape_mn=self.cta_tile_shape_mnk[:2],
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            scheduler_warp_id=self.ab_load_warp_id,
-            persistence_mode=PersistenceMode.DYNAMIC,
-            started_flag=scheduler_args.started_flag,
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
-        epilogue_args,
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: Optional[VarlenArguments],
-        stream: cuda.CUstream,
-        trace_ptr: Optional[Int64] = None,
-    ):
-        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
-        as the scheduler_args type. Body delegates to GemmSm90.__call__.
-        """
-        GemmSm90.__call__(
-            self,
-            mA,
-            mB,
-            mD,
-            mC,
-            epilogue_args,
-            scheduler_args,
-            varlen_args,
-            stream,
-            trace_ptr,
-        )
+    # Scheduler hooks (get_scheduler_class / get_scheduler_arguments) and the
+    # __call__ type-shim are inherited from StreamingScatterBase /
+    # StreamingGemmBase.
 
 
 # ---------------------------------------------------------------------------
