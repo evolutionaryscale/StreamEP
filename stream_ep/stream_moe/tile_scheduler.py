@@ -59,7 +59,7 @@ import quack.utils as utils
 from cutlass import Boolean, Int32, const_expr
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
-from quack.tile_scheduler import PersistenceMode, TileScheduler
+from quack.tile_scheduler import PersistenceMode, TileScheduler, WorkTileInfo
 from quack.utils import store_shared_remote_x4
 
 from stream_ep.stream_moe.ptx_helpers import ld_acquire_gpu_global_i32
@@ -122,6 +122,11 @@ class StreamingTileSchedulerArguments:
     # parameter that the caller used to pass into `setup_initial_work_tile`.
     scheduler_warp_id: cutlass.Constexpr[Int32]
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.DYNAMIC
+    # Split-K is unused by the streaming pipeline; a constexpr 1 makes the base
+    # TileScheduler's inherited split-K methods (get_split_k_tile_range,
+    # get_combined_batch_idx, and the framework's per-tile call at
+    # gemm_sm90.get_split_k_tile_range) compile to their no-split path.
+    num_split_k: cutlass.Constexpr[int] = 1
     # Optional [1] int32 device flag. When supplied, the CTA that wins
     # `linear_idx == 0` atomicAdd's this flag once at the top of
     # `_fetch_next_work_idx`. Used by kernel_y / kernel_a_bwd to signal
@@ -176,6 +181,7 @@ class StreamingTileScheduler(TileScheduler):
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         scheduler_warp_id: cutlass.Constexpr[Int32]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
+        num_split_k: cutlass.Constexpr[int] = 1
         started_flag: Optional[cute.Tensor] = None
 
         @staticmethod
@@ -198,6 +204,7 @@ class StreamingTileScheduler(TileScheduler):
                 cluster_shape_mnk=args.cluster_shape_mnk,
                 scheduler_warp_id=args.scheduler_warp_id,
                 persistence_mode=args.persistence_mode,
+                num_split_k=args.num_split_k,
                 started_flag=args.started_flag,
             )
 
@@ -338,7 +345,7 @@ class StreamingTileScheduler(TileScheduler):
         linear_idx = Int32(-1)
         if cute.arch.lane_idx() == 0:
             head_ptr = utils.elem_pointer(params.consumer_head, (Int32(0),))
-            linear_idx = utils.atomic_add_i32(1, head_ptr)
+            linear_idx = cute.arch.atomic_add(head_ptr, Int32(1))
         linear_idx = cute.arch.shuffle_sync(linear_idx, 0)
 
         # Cross-stream launch-gate bump. The CTA that wins `linear_idx == 0`
@@ -353,7 +360,7 @@ class StreamingTileScheduler(TileScheduler):
         if const_expr(params.started_flag is not None):
             if linear_idx == Int32(0) and cute.arch.lane_idx() == 0:
                 flag_ptr = utils.elem_pointer(params.started_flag, (Int32(0),))
-                utils.atomic_add_i32(1, flag_ptr)
+                cute.arch.atomic_add(flag_ptr, Int32(1))
 
         is_valid_i32 = Int32(linear_idx < total_work)
         pid_n = Int32(0)
@@ -456,7 +463,7 @@ class StreamingTileScheduler(TileScheduler):
         block_zero_only: bool = False,
         loc=None,
         ip=None,
-    ) -> cutlass.utils.WorkTileInfo:
+    ) -> WorkTileInfo:
         # _fetch_next_work_idx stashed the per-tile claim result onto self.
         if const_expr(is_valid is None):
             is_valid = work_idx != Int32(0)
@@ -473,11 +480,11 @@ class StreamingTileScheduler(TileScheduler):
             None,
             self._current_expert,
         )
-        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+        return WorkTileInfo(tile_coord_mnkl, is_valid)
 
     @cute.jit
     def write_work_tile_to_smem(
-        self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
+        self, work_tile_info: WorkTileInfo, *, loc=None, ip=None
     ):
         """Write 4 ints to _sched_smem: (pid_m, pid_n, batch_idx=expert_id, is_valid).
 
@@ -550,7 +557,7 @@ class StreamingTileScheduler(TileScheduler):
                     )
 
     @cute.jit
-    def initial_work_tile_info(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
         """Streaming variant of the base `initial_work_tile_info`.
 
         The first work tile must come from the producer's atomic-claim +
@@ -578,7 +585,7 @@ class StreamingTileScheduler(TileScheduler):
         return self.get_current_work(loc=loc, ip=ip)
 
     @cute.jit
-    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         """Read the upstream 4-int payload from sched_smem
         (pid_m, pid_n, batch_idx=expert_id, is_valid) and produce a
         WorkTileInfo with tile_idx ``(pid_m, pid_n, None, batch_idx)``.
@@ -595,7 +602,7 @@ class StreamingTileScheduler(TileScheduler):
             self._scheduler_pipeline.consumer_release(self._pipeline_state)
         self._pipeline_state.advance()
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
-        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid_i32))
+        return WorkTileInfo(tile_coord_mnkl, Boolean(is_valid_i32))
 
     @cute.jit
     def advance_to_next_work(
