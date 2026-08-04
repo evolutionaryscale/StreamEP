@@ -60,7 +60,8 @@ import quack.copy_utils as copy_utils
 import quack.utils as utils
 import torch
 from cutlass import Int32, Int64, const_expr
-from quack.cache_utils import COMPILE_ONLY, jit_cache
+from quack.cache import jit_cache
+from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -951,7 +952,7 @@ def streaming_moe_y(
         device_capacity=device_capacity,
     )
 
-    if COMPILE_ONLY:
+    if compile_config.COMPILE_ONLY:
         return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)

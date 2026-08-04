@@ -140,7 +140,7 @@ def test_streaming_moe_a_bwd_compiles(device):
         total_tiles, device=device
     )
 
-    import quack.cache_utils as cu
+    import stream_ep.stream_moe.compile_config as cu
 
     orig = cu.COMPILE_ONLY
     cu.COMPILE_ONLY = True
