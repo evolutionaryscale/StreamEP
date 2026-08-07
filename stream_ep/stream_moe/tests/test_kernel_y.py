@@ -132,7 +132,7 @@ def test_streaming_moe_y_compiles(device):
     )
     pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
-    import quack.cache_utils as cu
+    import stream_ep.stream_moe.compile_config as cu
 
     orig = cu.COMPILE_ONLY
     cu.COMPILE_ONLY = True

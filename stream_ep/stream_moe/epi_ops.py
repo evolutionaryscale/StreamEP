@@ -33,7 +33,7 @@ import cutlass
 import cutlass.cute as cute
 import quack.layout_utils as layout_utils
 from cutlass import Float32, const_expr
-from quack.epi_ops import ColVecReduce, _get_lane_warp_layouts
+from quack.epilogue.ops import ColVecReduce, _get_lane_warp_layouts
 from quack.sm90_utils import partition_for_epilogue
 from quack.utils import elem_pointer
 

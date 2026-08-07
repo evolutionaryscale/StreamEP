@@ -87,7 +87,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, const_expr
 from quack.activation import dswiglu
-from quack.cache_utils import COMPILE_ONLY, jit_cache
+from quack.cache import jit_cache
+from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -96,33 +97,30 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import ColVecLoad, colvec_reduce_accumulate
-from quack.gemm_act import GemmActMixin
-from quack.gemm_sm90 import GemmSm90
+from quack.epilogue.ops import ColVecLoad, TileStore, colvec_reduce_accumulate
+from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.rounding import RoundingMode
-from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
 from stream_ep.stream_moe.epi_ops import (
     ColVecReduceAtomic,
 )
-from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
-from stream_ep.stream_moe.tile_scheduler import (
-    StreamingTileScheduler,
-    StreamingTileSchedulerArguments,
+from stream_ep.stream_moe.streaming_gemm_base import (
+    StreamingGemmBase,
+    StreamingTileSchedulerOptions,
 )
 
 
 # ---------------------------------------------------------------------------
 # Streaming kernel Y bwd class.
 # ---------------------------------------------------------------------------
-class StreamingMoeYBwd(GemmActMixin, GemmSm90):
+class StreamingMoeYBwd(StreamingGemmBase):
     """Streaming-MoE kernel Y bwd: NN GEMM + SwiGLU bwd in epilogue +
     in-kernel dL/dweight atomic-add + postact_a_for_dW2 TMA-store.
 
     Inherits the standard mD TMA-store path from GemmDefaultEpiMixin (via
-    GemmActMixin), plus a SECOND TMA-store path via ``TileStore("mAuxOut")``
+    StreamingGemmBase), plus a SECOND TMA-store path via ``TileStore("mAuxOut")``
     that we repurpose for ``postact_a_for_dW2`` (host shape bf16 (M, I), no
     f32-recast — plain bf16 store, same layout fwd kernel A's mAuxOut uses).
     Both mC (preact) and mD (dL/dswiglu_in) still use the f32-recast trick —
@@ -153,16 +151,20 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     actually hold) is set via a `post_init` hook passed to
     `compile_gemm_kernel` — same plumbing quack's `gemm_dgated` uses.
 
-    GemmActMixin's ``act_fn`` field is unused — we override
+    No ``act_fn`` param: unlike fwd kernel A, this class overrides
     ``epi_visit_subtile`` to compute the weighted-postact register tensor
-    directly and return it (the framework's standard ``epi_convert_postact``
-    path then casts fp32 → bf16 for the ``mAuxOut`` TMA store). Pass
-    ``act_fn=None`` in EpilogueArguments.
+    directly (via ``dswiglu``) and returns it as the single aux output (the
+    framework's standard ``epi_convert_aux_out`` → ``TileStore.store_convert``
+    path then casts fp32 → bf16 for the ``mAuxOut`` TMA store).
     """
 
-    _epi_ops = (
-        *GemmActMixin._epi_ops,
-        # Second ColVecLoad alongside the inherited "mColVecBroadcast" (used
+    _epi_ops = GemmDefaultEpiMixin._epi_ops + (
+        # mAuxOut = postact_a_for_dW2, a plain (non-gated) bf16 (M, I) TMA
+        # store — full GEMM-N (=I), not the halved gated aux fwd kernel A
+        # uses. Formerly supplied by GemmActMixin._epi_ops; now explicit since
+        # we subclass the default epilogue directly.
+        TileStore("mAuxOut"),
+        # Second ColVecLoad alongside the default "mColVecBroadcast" (used
         # for `pool_topk_weight`). Carries `pool_recv_token` (int32, cast to
         # fp32 by ColVecLoad's begin_loop) so `epi_visit_subtile` can detect
         # padding rows (recv_token < 0) and conditionally zero (dgate, dup,
@@ -200,6 +202,8 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         smem_capacity,
         occupancy,
         warp_shape_mnk=None,
+        a_bytes_per_stage_override=None,
+        ab_extra_bytes_per_stage=0,
     ):
         """Force ab_stage=4 (deep mainloop W2/A prefetch) for y_bwd.
 
@@ -237,27 +241,51 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
 
         # SMEM consumed by everything EXCEPT the epi (D-store) staging:
         #   unstaged epi + mbar/helper reservation + ab_stage A/B operands
-        #   + epi_c_stage C-load staging.
+        #   + epi_c_stage C-load staging + the SharedStorage alignment pads.
         fixed_bytes = epi_smem_bytes.unstaged
         if c_dtype is not None:
             fixed_bytes += epi_tile_elems * c_dtype.width // 8 * epi_c_stage
         if has_tile_load:
             fixed_bytes += epi_smem_bytes.c_stage * epi_c_stage
 
-        a_shape = cute.slice_(cta_tile_shape_mnk, (None, 0, None))
+        # a_bytes_per_stage_override / ab_extra_bytes_per_stage carry the
+        # layout-owning transform_a and aux-A (scale strip / blockscale SF)
+        # smem the parent now threads in; both are None/0 for y_bwd's plain
+        # bf16 GEMM, but we fold them in verbatim to stay a faithful mirror.
+        a_bytes = (
+            cute.size(cute.slice_(cta_tile_shape_mnk, (None, 0, None)))
+            * a_dtype.width
+            // 8
+            if a_bytes_per_stage_override is None
+            else a_bytes_per_stage_override
+        )
         b_shape = cute.slice_(cta_tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8
+            a_bytes
             + cute.size(b_shape) * b_dtype.width // 8
+            + ab_extra_bytes_per_stage
         )
         mbar_helpers_bytes = 1024
+        # SharedStorage packs [sD|sC|epi op smem][sA|sB][sAuxA]; the parent
+        # reserves one 1024 alignment quantum when there is any epi op smem,
+        # and another when ab_extra is not 1024-aligned. y_bwd has epi op smem
+        # (TileStore + ColVec ops), so the first pad applies — without it a
+        # pinned-ab_stage epi_stage pick can overflow the real struct at
+        # launch (the exact case the parent comment warns about).
+        op_smem_bytes = (
+            epi_smem_bytes.unstaged + epi_smem_bytes.d_stage + epi_smem_bytes.c_stage
+        )
+        align_pad_bytes = (1024 if op_smem_bytes else 0) + (
+            1024 if ab_extra_bytes_per_stage % 1024 else 0
+        )
 
         budget = smem_capacity // occupancy
         # Bytes left for the epi D-store staging after the pinned ab/epi_c
-        # allocations and the mbar/helper reservation.
+        # allocations, the mbar/helper reservation, and the alignment pads.
         epi_budget = (
             budget
             - mbar_helpers_bytes
+            - align_pad_bytes
             - fixed_bytes
             - ab_bytes_per_stage * ab_stage
         )
@@ -266,6 +294,7 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         if epi_stage < 1:
             needed = (
                 mbar_helpers_bytes
+                + align_pad_bytes
                 + fixed_bytes
                 + ab_bytes_per_stage * ab_stage
                 + epi_bytes_per_stage  # one epi stage
@@ -282,8 +311,6 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mAuxOut: cute.Tensor  # postact_a_for_dW2 — bf16 (M, I)
-        # Unused: overridden `epi_visit_subtile` bypasses `act_fn`. See class docstring.
-        act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -400,70 +427,14 @@ class StreamingMoeYBwd(GemmActMixin, GemmSm90):
         tRS_rdXY_b16 = cute.make_rmem_tensor(tRS_rdXY_f32.layout, implicit_dtype)
         tRS_rdXY_b16.store(tRS_rdXY_f32.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_b16, Float32).load())
-        # Return weighted postact for the framework's mAuxOut TMA-store path.
-        # epi_convert_postact (inherited) handles fp32 → bf16 (postact_dtype).
-        return tRS_rPostAct
+        # Return weighted postact (single aux output) for the framework's
+        # mAuxOut TMA-store path — main's epi_visit_subtile contract returns a
+        # tuple, one entry per aux TileStore. epi_convert_aux_out (inherited)
+        # handles fp32 → bf16 (postact_dtype).
+        return (tRS_rPostAct,)
 
-    # -- scheduler hooks -----------------------------------------------------
-
-    def get_scheduler_class(self, varlen_m: bool = False):
-        return StreamingTileScheduler
-
-    def get_scheduler_arguments(
-        self,
-        mA: cute.Tensor,  # dL_do_pool: (TK_padded, H)
-        mB: cute.Tensor,  # W2 permuted: (I, H, E_local), n-major
-        mD: Optional[cute.Tensor],  # dL_dswiglu_in flat: (Mflat, I) fp32-view
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: VarlenArguments,
-        epilogue_args,
-    ):
-        # mB shape is (n=I, k=H, l=E_local); n-dim tile count = ceil(I / tile_N).
-        num_pid_n = cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1])
-        E_local = cute.size(mB, mode=[2])
-        return StreamingTileSchedulerArguments(
-            problem_shape_ntile_mnl=(None, num_pid_n, E_local),
-            consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.pool_arrival_count,
-            arrival_target=scheduler_args.pool_arrival_target,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
-            total_tiles=scheduler_args.total_tiles,
-            tile_shape_mn=self.cta_tile_shape_mnk[:2],
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            scheduler_warp_id=self.ab_load_warp_id,
-            persistence_mode=PersistenceMode.DYNAMIC,
-            started_flag=scheduler_args.started_flag,
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
-        epilogue_args: tuple,
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: Optional[VarlenArguments],
-        stream: cuda.CUstream,
-        trace_ptr: Optional[Int64] = None,
-    ):
-        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
-        as the scheduler_args type (base annotation is TileSchedulerOptions).
-        Body delegates to GemmSm90.__call__ unchanged.
-        """
-        GemmSm90.__call__(
-            self,
-            mA,
-            mB,
-            mD,
-            mC,
-            epilogue_args,
-            scheduler_args,
-            varlen_args,
-            stream,
-            trace_ptr,
-        )
+    # Scheduler hooks (get_scheduler_class / get_scheduler_arguments) and the
+    # __call__ type-shim are inherited from StreamingGemmBase.
 
 
 # ---------------------------------------------------------------------------
@@ -494,11 +465,15 @@ def _compile_streaming_moe_y_bwd(
     # A: dL_do_pool (TK_padded, H), k-major (H is contiguous; same layout fwd
     # kernel A uses on pool).
     mA = fake_tensor(a_dtype, (TK_padded_sym, H_sym), leading_dim=1, divisibility=8)
-    # B: W2 permuted to (I, H, E_local), n-major (I is contiguous along the
-    # leading axis after `W2.permute(2, 1, 0)` on the host). With this layout
-    # the kernel's contraction Σ_k B[n, k] yields W2[k, n] = W2[h, i], i.e. the
-    # NN GEMM dL_do_pool @ W2 we want.
-    mB = fake_tensor(b_dtype, (I_sym, H_sym, E_sym), leading_dim=0, divisibility=8)
+    # B: W2 in its NATURAL batch-first storage (E_local, H, I), I-contiguous.
+    # quack main takes batched operands batch-first (l, ...) and rotates them
+    # to kernel order at trace time (GemmBase.rotate_batch_last), so we pass W2
+    # as-is with no host permute. This GEMM wants n-major B (n=I, k=H), so we
+    # set b_transposed=True (the b_kn path): B crosses as (l, k, n)=(E, H, I)
+    # and the kernel transposes it to kernel order (n, k, l)=(I, H, E). The
+    # contraction Σ_k B[n, k] then yields W2[h, i] — the NN GEMM
+    # dL_do_pool @ W2 we want. leading_dim=2 = I (the natural contiguous axis).
+    mB = fake_tensor(b_dtype, (E_sym, H_sym, I_sym), leading_dim=2, divisibility=8)
     # D: dL_dswiglu_in flat. Storage on host is bf16 (Mflat, 2*I); we view as
     # fp32 (Mflat, I) before launch — each fp32 element packs (dgate_n, dup_n)
     # as bf16x2. d_dtype is fp32 (32-bit storage), implicit_dtype is bf16 (the
@@ -564,7 +539,6 @@ def _compile_streaming_moe_y_bwd(
 
     epi_args = StreamingMoeYBwd.EpilogueArguments(
         mAuxOut=mAuxOut,
-        act_fn=None,
         mColVecBroadcast=pool_topk_weight,
         mPaddingMask=pool_recv_token,
         mColVecReduce=mColVecReduce,
@@ -589,6 +563,9 @@ def _compile_streaming_moe_y_bwd(
         gather_A=False,
         is_dynamic_persistent=False,
         device_capacity=device_capacity,
+        # W2 crosses batch-first as (l, k, n) = (E, H, I); the kernel
+        # transposes it to n-major kernel order (n, k, l) = (I, H, E).
+        b_transposed=True,
         mA=mA,
         mB=mB,
         mD=mD,
@@ -774,16 +751,16 @@ def streaming_moe_y_bwd(
     assert dL_dweight.is_contiguous()
 
     # Caller passes W2 as (E_local, H, I) k-major (I contiguous; same layout
-    # used by fwd kernel Y). For the bwd's NN GEMM we need the kernel-side
-    # tensor to be (n=I, k=H, l=E_local) with I contiguous (n-major), so the
-    # mainloop's `Σ_k B[n, k]` evaluates `W2[h, i]`. `permute(2, 1, 0)` gives
-    # this layout WITHOUT a copy: strides go (H*I, I, 1) → (1, I, H*I).
-    W2_p = W2.permute(2, 1, 0)
-    assert W2_p.stride(0) == 1, (
-        "W2.permute(2,1,0) must have I (axis 0) contiguous (n-major B); caller "
-        "must pass W2 as (E_local, H, I) k-major"
+    # used by fwd kernel Y). quack main takes batched B batch-first, so we
+    # pass W2 as-is — no host permute. The compile sets b_transposed=True so
+    # the kernel reads it as (l, k, n) = (E, H, I) and transposes to n-major
+    # kernel order (n=I, k=H, l=E); the mainloop's `Σ_k B[n, k]` then
+    # evaluates `W2[h, i]`.
+    assert W2.stride(-1) == 1, (
+        "W2 must have I (last axis) contiguous (k-major weights); caller "
+        "must pass W2 as (E_local, H, I)"
     )
-    assert W2_p.shape == (I, H, E_local)
+    assert W2.shape == (E_local, H, I)
 
     # Capture preact's bf16 dtype BEFORE the f32 view (compile-key + post_init).
     # Same `implicit_dtype` is used for both mC (preact in) and mD (dL_dswiglu_in
@@ -838,7 +815,7 @@ def streaming_moe_y_bwd(
         device_capacity=device_capacity,
     )
 
-    if COMPILE_ONLY:
+    if compile_config.COMPILE_ONLY:
         return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
@@ -861,7 +838,6 @@ def streaming_moe_y_bwd(
 
     epi_args = StreamingMoeYBwd.EpilogueArguments(
         mAuxOut=postact_a_for_dW2_flat,
-        act_fn=None,  # weighted-postact computed inline in epi_visit_subtile
         mColVecBroadcast=pool_topk_weight,
         mPaddingMask=pool_recv_token,
         mColVecReduce=dL_dweight,
@@ -879,13 +855,16 @@ def streaming_moe_y_bwd(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
     )
 
+    # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
+    # slots, always None for plain bf16); main takes no host stream arg.
     compiled_fn(
         dL_do_pool,
-        W2_p,
+        W2,
         dL_dswiglu_in_flat,
         preact_flat,
         epi_args,
         scheduler_args,
         varlen_args,
+        None,
         None,
     )

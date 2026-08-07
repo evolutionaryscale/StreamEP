@@ -909,7 +909,7 @@ class StreamMoEFunc(torch.autograd.Function):
             cu_seqlens_k = (
                 handle.expert_pool_block_offset.to(torch.int32) * tile_m
             ).contiguous()
-            lens_k_dW = handle.expert_frequency.to(torch.int32)
+            seqused_k_dW = handle.expert_frequency.to(torch.int32)
             bwd_k_local_remaining.copy_(handle.k_local_total, non_blocking=True)
 
         # ── Stage 1 — dispatch_grads on streams.communicate ────────────────
@@ -1100,7 +1100,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # Empty-rank guard: skip the dW1/dW2 grouped GEMMs and zero the
         # destinations. With ``total_tiles == 0`` the per-expert K-lens are
         # all zero — the GEMMs would have zero work, but quack's grouped-GEMM
-        # path isn't guaranteed to handle all-zero ``cu_seqlens_k`` / ``lens_k``
+        # path isn't guaranteed to handle all-zero ``cu_seqlens_k`` / ``seqused_k``
         # gracefully. dW1_local / dW2_local were allocated as
         # ``torch.empty_like`` so they hold uninitialized garbage; the genuine
         # gradient is zero, so explicit ``.zero_()`` is correct.
@@ -1121,7 +1121,7 @@ class StreamMoEFunc(torch.autograd.Function):
                     pingpong=pingpong_dW2,
                     max_swizzle_size=swizzle_dW2,
                     cu_seqlens_k=cu_seqlens_k,
-                    lens_k=lens_k_dW,
+                    seqused_k=seqused_k_dW,
                 )
                 # dW1[e] = (dL_dswiglu_in[slot_range_e]).T @ pool[slot_range_e]
                 dL_dswiglu_in_flat = dL_dswiglu_in.view(TK_padded, two_I)
@@ -1138,7 +1138,7 @@ class StreamMoEFunc(torch.autograd.Function):
                     pingpong=pingpong_dW1,
                     max_swizzle_size=swizzle_dW1,
                     cu_seqlens_k=cu_seqlens_k,
-                    lens_k=lens_k_dW,
+                    seqused_k=seqused_k_dW,
                 )
         else:
             with torch.cuda.stream(streams.compute):

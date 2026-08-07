@@ -53,12 +53,12 @@ Shares streaming machinery with fwd kernels:
 
 from typing import NamedTuple, Optional, Type
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
-from quack.cache_utils import COMPILE_ONLY, jit_cache
+from quack.cache import jit_cache
+from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     get_device_capacity,
@@ -66,49 +66,45 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.gemm_sm90 import GemmSm90
 from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
-from quack.tile_scheduler import PersistenceMode
 from quack.varlen_utils import VarlenArguments
 
-from stream_ep.stream_moe.kernel_a import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.kernel_y import (
     AtomicScatterStore,
     ScatterParams,
-    StreamingMoeY,
+    StreamingScatterBase,
 )
-from stream_ep.stream_moe.tile_scheduler import (
-    StreamingTileScheduler,
-    StreamingTileSchedulerArguments,
-)
+from stream_ep.stream_moe.streaming_gemm_base import StreamingTileSchedulerOptions
 
 
 # ---------------------------------------------------------------------------
 # Streaming kernel A bwd class.
 # ---------------------------------------------------------------------------
-class StreamingMoeABwd(StreamingMoeY):
+class StreamingMoeABwd(StreamingScatterBase):
     """Streaming-MoE kernel A bwd: NN GEMM `dL/dswiglu_in @ W1` with fused
     atomic-scatter epilogue into `dL_dx_per_r`.
 
-    Strict subset of fwd kernel_y — no per-slot weight multiply, otherwise
-    structurally identical. Inherits the AtomicScatterStore EpiOp,
-    `epi_subtile_store` (per-warp coalesced predicated v4 bf16x2 atomic-add),
-    `epi_setup_postact`, and `epi_convert_postact` unchanged.
+    Sibling of fwd kernel Y under StreamingScatterBase — no per-slot weight
+    multiply, otherwise structurally identical. Inherits the whole scatter
+    store machinery (AtomicScatterStore EpiOp, `epi_subtile_store`, the
+    `epi_setup_aux_out`/`epi_convert_aux_out` no-ops, the RN pin) from
+    StreamingScatterBase, and the scheduler hooks + `__call__` from
+    StreamingGemmBase.
 
-    Overrides:
-      - `_epi_ops`: drop ColVecLoad — bwd has no per-slot weighting (the
-        forward pool_topk_weight was absorbed into dL/dswiglu_in upstream
+    Supplies only:
+      - `_epi_ops`: just AtomicScatterStore — bwd has no per-slot weighting
+        (the forward pool_topk_weight was absorbed into dL/dswiglu_in upstream
         by kernel_y_bwd's `dswiglu` + post-multiply on (dgate, dup);
-        chain-rule linearity in dpostact bakes the weight into the
-        dgate/dup pair we read here).
-      - `EpilogueArguments`: drop `mColVecBroadcast`.
+        chain-rule linearity in dpostact bakes the weight into the dgate/dup
+        pair we read here).
+      - `EpilogueArguments`: scatter only (no `mColVecBroadcast`).
       - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
         analogue here.
-      - `__call__` + `get_scheduler_arguments`: reuse the shared
-        ``StreamingTileSchedulerOptions``; caller plumbs
-        ``bwd_dispatch_arrival_count`` / ``pool_arrival_target`` (the same
-        pair Y_bwd waited on; at-target by the time A_bwd runs because
-        Y_bwd and A_bwd share a compute stream).
+
+    The caller plumbs ``bwd_dispatch_arrival_count`` / ``pool_arrival_target``
+    (the same pair Y_bwd waited on; at-target by the time A_bwd runs because
+    Y_bwd and A_bwd share a compute stream) into the shared
+    ``StreamingTileSchedulerOptions``.
     """
 
     _epi_ops = (AtomicScatterStore("scatter"),)
@@ -134,65 +130,9 @@ class StreamingMoeABwd(StreamingMoeY):
         """
         return None
 
-    # -- scheduler hooks -----------------------------------------------------
-
-    def get_scheduler_class(self, varlen_m: bool = False):
-        return StreamingTileScheduler
-
-    def get_scheduler_arguments(
-        self,
-        mA: cute.Tensor,  # dL_dswiglu_in: (TK_padded, 2I), k-major
-        mB: cute.Tensor,  # W1 permuted: (H, 2I, E_local), n-major
-        mD: Optional[cute.Tensor],  # None — output via atomic-scatter
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: VarlenArguments,
-        epilogue_args,
-    ):
-        # mB shape is (n=H, k=2I, l=E_local); n-dim tile count = ceil(H / tile_N).
-        num_pid_n = cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1])
-        E_local = cute.size(mB, mode=[2])
-        return StreamingTileSchedulerArguments(
-            problem_shape_ntile_mnl=(None, num_pid_n, E_local),
-            consumer_head=scheduler_args.consumer_head,
-            arrival_count=scheduler_args.pool_arrival_count,
-            arrival_target=scheduler_args.pool_arrival_target,
-            expert_pool_block_offset=scheduler_args.expert_pool_block_offset,
-            total_tiles=scheduler_args.total_tiles,
-            tile_shape_mn=self.cta_tile_shape_mnk[:2],
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            scheduler_warp_id=self.ab_load_warp_id,
-            persistence_mode=PersistenceMode.DYNAMIC,
-            started_flag=scheduler_args.started_flag,
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
-        epilogue_args,
-        scheduler_args: StreamingTileSchedulerOptions,
-        varlen_args: Optional[VarlenArguments],
-        stream: cuda.CUstream,
-        trace_ptr: Optional[Int64] = None,
-    ):
-        """Type-shim override so CuTeDSL accepts StreamingTileSchedulerOptions
-        as the scheduler_args type. Body delegates to GemmSm90.__call__.
-        """
-        GemmSm90.__call__(
-            self,
-            mA,
-            mB,
-            mD,
-            mC,
-            epilogue_args,
-            scheduler_args,
-            varlen_args,
-            stream,
-            trace_ptr,
-        )
+    # Scheduler hooks (get_scheduler_class / get_scheduler_arguments) and the
+    # __call__ type-shim are inherited from StreamingScatterBase /
+    # StreamingGemmBase.
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +163,15 @@ def _compile_streaming_moe_a_bwd(
     # contiguous in storage). Same pool-major flattening fwd kernel A applies
     # to pool.
     mA = fake_tensor(a_dtype, (TK_padded_sym, I2_sym), leading_dim=1, divisibility=8)
-    # B: W1 permuted to (H, 2I, E_local), n-major (H contiguous along the
-    # leading axis after `W1.permute(2, 1, 0)` on the host). With this layout
-    # the kernel's contraction `Σ_k B[n, k]` evaluates `W1[k, n] = W1[2I_idx,
-    # h]`, i.e. the NN GEMM `dL_dswiglu_in @ W1` we want.
-    mB = fake_tensor(b_dtype, (H_sym, I2_sym, E_sym), leading_dim=0, divisibility=8)
+    # B: W1 in its NATURAL batch-first storage (E_local, 2I, H), H-contiguous.
+    # quack main takes batched operands batch-first (l, ...) and rotates them
+    # to kernel order at trace time, so we pass W1 as-is (no host permute).
+    # This GEMM wants n-major B (n=H, k=2I), so we set b_transposed=True (the
+    # b_kn path): B crosses as (l, k, n)=(E, 2I, H) and the kernel transposes
+    # it to n-major kernel order (n, k, l)=(H, 2I, E). The contraction
+    # `Σ_k B[n, k]` then evaluates `W1[2I_idx, h]` — the NN GEMM
+    # `dL_dswiglu_in @ W1` we want. leading_dim=2 = H (natural contiguous axis).
+    mB = fake_tensor(b_dtype, (E_sym, I2_sym, H_sym), leading_dim=2, divisibility=8)
     # No D / C — streaming kernel A bwd outputs via predicated atomic-scatter
     # into `dL_dx_per_r[T_recv, H]` (no trash row).
     mD = None
@@ -304,6 +248,9 @@ def _compile_streaming_moe_a_bwd(
         gather_A=False,
         is_dynamic_persistent=False,
         device_capacity=device_capacity,
+        # W1 crosses batch-first as (l, k, n) = (E, 2I, H); the kernel
+        # transposes it to n-major kernel order (n, k, l) = (H, 2I, E).
+        b_transposed=True,
         mA=mA,
         mB=mB,
         mD=mD,
@@ -407,16 +354,16 @@ def streaming_moe_a_bwd(
 
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
     # slab has H contiguous along the last axis — same layout fwd kernel A
-    # consumes). For the bwd's NN GEMM we need the kernel-side tensor to be
-    # (n=H, k=2I, l=E_local) with H contiguous (n-major), so the mainloop's
-    # `Σ_k B[n, k]` evaluates `W1[2I_idx, h]`. `permute(2, 1, 0)` gives this
-    # layout WITHOUT a copy: strides go (2I*H, H, 1) → (1, H, 2I*H).
-    W1_p = W1.permute(2, 1, 0)
-    assert W1_p.stride(0) == 1, (
-        "W1.permute(2,1,0) must have H (axis 0) contiguous (n-major B); caller "
-        "must pass W1 as (E_local, 2*I, H) k-major"
+    # consumes). quack main takes batched B batch-first, so we pass W1 as-is —
+    # no host permute. The compile sets b_transposed=True so the kernel reads
+    # it as (l, k, n) = (E, 2I, H) and transposes to n-major kernel order
+    # (n=H, k=2I, l=E); the mainloop's `Σ_k B[n, k]` then evaluates
+    # `W1[2I_idx, h]`.
+    assert W1.stride(-1) == 1, (
+        "W1[e] must have H (last axis) contiguous (k-major weights); caller "
+        "must pass W1 as (E_local, 2*I, H)"
     )
-    assert W1_p.shape == (H, two_I, E_local)
+    assert W1.shape == (E_local, two_I, H)
 
     # Flatten dL_dswiglu_in's leading two dims to (total_tiles * tile_m, 2I)
     # so the kernel sees a single varlen_m M dimension.
@@ -445,7 +392,7 @@ def streaming_moe_a_bwd(
         device_capacity=device_capacity,
     )
 
-    if COMPILE_ONLY:
+    if compile_config.COMPILE_ONLY:
         return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
@@ -495,13 +442,16 @@ def streaming_moe_a_bwd(
         mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
     )
 
+    # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
+    # slots, always None for plain bf16); main takes no host stream arg.
     compiled_fn(
         dL_dswiglu_in_flat,
-        W1_p,
+        W1,
         None,
         None,
         epi_args,
         scheduler_args,
         varlen_args,
+        None,
         None,
     )
