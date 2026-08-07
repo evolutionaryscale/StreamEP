@@ -8,7 +8,7 @@ import torch
 # this, quack only hashes its own sources and stale .o files would mask
 # stream_ep behavioural changes. Must run before any `jit_cache`-decorated
 # function is called.
-import quack.cache as _quack_cache_utils  # quack main: cache_utils -> cache package (EXTRA_SOURCE_DIRS lives here)
+import quack.cache as _quack_cache_utils
 
 _STREAM_EP_PKG_ROOT = Path(__file__).resolve().parent
 if _STREAM_EP_PKG_ROOT not in _quack_cache_utils.EXTRA_SOURCE_DIRS:
