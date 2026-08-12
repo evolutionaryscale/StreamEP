@@ -127,9 +127,9 @@ class AtomicScatterStore(EpiOp):
       - `recv_token`: int32 tensor of shape `(tile_M,)` — pool_recv_token slice
         for this tile. Loaded once per tile in `begin()` from gmem.
 
-    The actual scatter logic lives in `StreamingMoeY.epi_subtile_store`
-    (the override of GemmSm90's hook). This op handles SMEM allocation,
-    per-tile recv_token load, and the per-tile end bookkeeping.
+    The actual scatter logic lives in `StreamingScatterBase._scatter_store`
+    (called from each leaf's `epi_visit_subtile`). This op handles SMEM
+    allocation, per-tile recv_token load, and the per-tile end bookkeeping.
     """
 
     # Per-row N padding (in bf16 elements) for the un-swizzled staging tile.
@@ -270,11 +270,21 @@ class AtomicScatterStore(EpiOp):
         # if `needs_async_fence()` is True. We do a synchronous load above, so we
         # rely on the surrounding epilogue_barrier (called by the consumer side)
         # to make the load visible.
-        return (staging_t, recv_token_t, is_last_t, pool_start)
+        #
+        # Thread `tidx` and `tile_coord_mnkl` into the per-tile state: the
+        # scatter runs in the leaf `epi_visit_subtile` (the only per-subtile hook
+        # with the `tRS_rD` register fragment), which does NOT receive them as
+        # args. `tidx` slices the R2S copy; `tile_coord_mnkl[1]` gives the N
+        # origin. `end()` receives both as its own args, so it just ignores the
+        # two trailing state fields.
+        return (staging_t, recv_token_t, is_last_t, pool_start, ctx.tidx, ctx.tile_coord_mnkl)
 
     def begin_loop(self, gemm, state, epi_coord):
-        # epi_subtile_store reads the staging + recv_token directly from `state`.
-        return state
+        # Thread `epi_coord` to the leaf's `epi_visit_subtile` (via
+        # `epi_loop_tensors["scatter"]`): the scatter needs it for the per-subtile
+        # (m, n) origins. The staging uses a single SMEM buffer (see
+        # `StreamingScatterBase._scatter_store`), so no rotating slot is computed.
+        return (*state, epi_coord)
 
     def needs_async_fence(self):
         return False
@@ -305,7 +315,9 @@ class AtomicScatterStore(EpiOp):
         """
         if const_expr(param is None):
             return
-        staging_t, recv_token_t, is_last_t, pool_start = state
+        # `begin()` threaded tidx + tile_coord_mnkl for the leaf scatter; `end()`
+        # gets both as its own args, so ignore the two trailing state fields.
+        staging_t, recv_token_t, is_last_t, pool_start, _tidx, _tile_coord_mnkl = state
 
         # Reconstruct tile_id from batch_idx + pid_m.
         # tile_id = expert_pool_block_offset[batch_idx] + pid_m.
@@ -385,22 +397,27 @@ class StreamingScatterBase(StreamingGemmBase):
 
     The Y-family writes its output via an all-epi-warps coalesced
     ``red.global.add.v4.bf16x2`` atomic-scatter into a per-recv-token gmem
-    tensor, not the default single-TMA-warp staged store. That replaces the
-    whole per-subtile store, so it overrides ``main``'s ``epi_subtile_store``
-    seam (extracted upstream in gemm_base) rather than an aux-output
-    ``TileStore`` path — which is issued by the single TMA warp and cannot
-    express a multi-warp scatter.
+    tensor, not the default single-TMA-warp staged store. A native aux-output
+    ``TileStore`` can't express a multi-warp scatter, so the store is done in
+    the leaf ``epi_visit_subtile`` (the only per-subtile hook with the
+    ``tRS_rD`` register fragment) via the shared ``_scatter_store`` helper. With
+    ``mD=None`` the op registers no tile-store, so quack's driver store block
+    runs empty and balances the TMA store pipeline itself — the Y-family never
+    touches the pipeline.
 
     Holds the parts common to both leaves:
       - ``epi_to_underlying_arguments`` — pins ``rounding_mode = RN`` (the
         scatter store bypasses the framework's SR store path) and builds params
         from the leaf's ``_epi_ops``.
-      - ``epi_setup_aux_out`` → ``()`` / ``epi_convert_aux_out`` → passthrough —
-        no framework aux output; the scatter goes straight to gmem.
       - ``_scatter_plain_r2s_copy`` — the plain (non-StMatrix) R2S copy for the
         un-swizzled padded staging.
-      - ``epi_subtile_store`` — R2S into the AtomicScatterStore staging, then
-        the per-warp coalesced predicated v4 atomic-scatter.
+      - ``_scatter_store`` — R2S into the AtomicScatterStore staging, then the
+        all-epi-warps coalesced predicated v4 atomic-scatter. Called from each
+        leaf's ``epi_visit_subtile``.
+
+    ``epi_setup_aux_out`` / ``epi_convert_aux_out`` are inherited (no override):
+    ``AtomicScatterStore.is_tile_store()`` is False, so the mixin yields an
+    empty ``store_ctxs`` and never runs an aux store/convert.
 
     Leaves (``StreamingMoeY``, ``StreamingMoeABwd``) supply ``_epi_ops`` (with
     the shared ``AtomicScatterStore``), their ``EpilogueArguments``, and
@@ -440,72 +457,39 @@ class StreamingScatterBase(StreamingGemmBase):
         )
         return cute.make_tiled_copy_S(plain_atom, tiled_copy_C_atom)
 
-    @cute.jit
-    def epi_setup_aux_out(
-        self,
-        params,
-        epi_smem_tensors,
-        tiled_copy_r2s,
-        tiled_copy_t2r,
-        tile_coord_mnkl,
-        varlen_manager,
-        tidx,
-    ):
-        # No framework aux-output (the atomic-scatter goes directly into `mO`
-        # via AtomicScatterStore). Return an empty tuple: main's epilogue()
-        # does `len(aux_out_ctxs)` / iterates it, so it must be iterable, not
-        # None.
-        return ()
+    # `epi_setup_aux_out` / `epi_convert_aux_out` are no longer overridden:
+    # `AtomicScatterStore.is_tile_store()` is False (inherited), so the mixin's
+    # default `epi_setup_aux_out` yields no store_ctxs and never calls a convert.
+    # The scatter goes straight to gmem from `_scatter_store` below; with
+    # `mD=None` the driver's store block runs empty and balances the TMA store
+    # pipeline itself (its own producer_acquire/commit over `len(store_ctxs)=0`).
 
     @cute.jit
-    def epi_convert_aux_out(
-        self, output_idx, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
-    ):
-        # Dead for the scatter path (epi_setup_aux_out returns (), so the
-        # framework never calls this); kept signature-compatible with main's
-        # (leading output_idx added) in case a subclass adds an aux output.
-        return tRS_rAuxOut
-
-    @cute.jit
-    def epi_subtile_store(
-        self,
-        params,
-        epi_loop_tensors,
-        tRS_rD,
-        tRS_sD,
-        tRS_rAuxOuts_out,
-        tiled_copy_r2s,
-        copy_D,
-        aux_out_ctxs,
-        epi_store_pipeline,
-        epilogue_barrier,
-        tile_coord_mnkl,
-        epi_coord,
-        num_prev_subtiles,
-        epi_idx,
-        tidx,
-        is_tma_warp,
-    ):
+    def _scatter_store(self, params, epi_loop_tensors, tRS_rD):
         """Per-subtile R2S → bf16 SMEM → per-warp coalesced atomic-scatter into o.
 
-        Overrides main's ``epi_subtile_store`` seam. ``tRS_rAuxOuts_out`` /
-        ``aux_out_ctxs`` / ``copy_D`` / ``tiled_copy_r2s`` are the default
-        staged-store inputs and are ignored here — the scatter builds its own
-        plain R2S copy and writes straight to gmem.
+        Called from the leaf ``epi_visit_subtile`` (the only per-subtile hook
+        with the ``tRS_rD`` register fragment). The (optionally weight-scaled)
+        accumulator is R2S'd into the ``AtomicScatterStore`` staging, then
+        scattered by all epi warps straight into ``mO[recv_token, :]``.
 
-        Pipeline state hygiene: producer_acquire/commit on epi_store_pipeline
-        are kept balanced even though we never call copy_D (gotcha #6 from
-        logbook 2026-04-30).
+        Unlike the old ``epi_subtile_store`` fork hook, this does NOT touch the
+        TMA store pipeline: with ``mD=None`` the driver's store block runs with
+        an empty ``store_ctxs`` and does the ``producer_acquire``/``commit``
+        balance itself, so the manual "gotcha #6" balancing is gone.
         """
         scatter = params.scatter
-        staging_t, recv_token_t, _is_last_t, pool_start = epi_loop_tensors["scatter"]
+        (
+            staging_t,
+            recv_token_t,
+            _is_last_t,
+            _pool_start,
+            tidx,
+            tile_coord_mnkl,
+            epi_coord,
+        ) = epi_loop_tensors["scatter"]
 
-        # 1. Producer-acquire (balance pipeline state across the persistent loop).
-        if is_tma_warp:
-            epi_store_pipeline.producer_acquire()
-        epilogue_barrier.arrive_and_wait()
-
-        # 2. R2S: register acc → staging SMEM (per-stage slot).
+        # 2. R2S: register acc → staging SMEM.
         #
         # The framework's `tiled_copy_r2s` is an StMatrix atom
         # (`sm90_get_smem_store_op` → `StMatrix8x8x16bOp`) whose hardware-fixed
@@ -523,7 +507,14 @@ class StreamingScatterBase(StreamingGemmBase):
         plain_r2s = self._scatter_plain_r2s_copy(staging_t.element_type)
         thr_copy_r2s = plain_r2s.get_slice(tidx)
         tRS_sScatter = thr_copy_r2s.partition_D(staging_t)
-        epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+        # Single staging buffer. The R2S and the scatter for a subtile are
+        # serialized by the barrier below, and consecutive subtiles are
+        # separated by the driver store block's barriers, so buffer 0 is
+        # WAR-safe every subtile. (The old `(num_prev_subtiles + epi_idx) %
+        # epi_stage` rotation gave no cross-subtile overlap here — the barrier
+        # already serialized R2S→scatter — and `epi_idx`/`num_prev_subtiles`
+        # are not visible to this hook. Revisit only if the perf pass wants it.)
+        epi_buffer = 0
         copy_utils.cvt_copy(
             plain_r2s,
             tRS_rD,
@@ -533,7 +524,7 @@ class StreamingScatterBase(StreamingGemmBase):
 
         # 3. Sync to make staging visible to all warps.
         cute.arch.fence_view_async_shared()
-        epilogue_barrier.arrive_and_wait()
+        self.epilogue_barrier.arrive_and_wait()
 
         # 4. Per-warp coalesced atomic-scatter from staging.
         # staging_t shape: (epi_tile_M, epi_tile_N, epi_stage), n_major.
@@ -642,11 +633,11 @@ class StreamingScatterBase(StreamingGemmBase):
             target_ptr = utils.elem_pointer(o_row_as_i32, (n_global // Int32(2),))
             red_add_bf16x2_v4_pred(target_ptr, p0, p1, p2, p3, Int32(atomic_pred))
 
-        # 5. Producer-commit (balance pipeline state).
+        # 5. WAR barrier: order all warps' scatter READS of the staging before
+        # the next subtile's R2S overwrites buffer 0. (No producer_commit — the
+        # driver store block owns the TMA pipeline balance now that mD=None.)
         cute.arch.fence_view_async_shared()
-        epilogue_barrier.arrive_and_wait()
-        if is_tma_warp:
-            epi_store_pipeline.producer_commit()
+        self.epilogue_barrier.arrive_and_wait()
 
 
 # ---------------------------------------------------------------------------
@@ -686,12 +677,17 @@ class StreamingMoeY(StreamingScatterBase):
         register tensor with the same per-thread layout as `tRS_rD`, with the
         per-row weight broadcast along N. So `tRS_rD[i] *= weight[i]` works
         element-wise. (Replaces the additive bias path of GemmDefaultEpiMixin.)
+
+        Then the shared scatter store consumes the weighted `tRS_rD` (this is
+        the only per-subtile hook with the register fragment). Returns `()`:
+        the driver does `store_frags = (...) + <this>`, which must be a tuple.
         """
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         if const_expr(tDrColVec is not None):
             for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
                 tRS_rD[i] *= tDrColVec[i]
-        return None
+        self._scatter_store(params, epi_loop_tensors, tRS_rD)
+        return ()
 
 
 # ---------------------------------------------------------------------------

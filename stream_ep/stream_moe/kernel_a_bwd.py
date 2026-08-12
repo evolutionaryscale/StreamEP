@@ -86,9 +86,8 @@ class StreamingMoeABwd(StreamingScatterBase):
 
     Sibling of fwd kernel Y under StreamingScatterBase — no per-slot weight
     multiply, otherwise structurally identical. Inherits the whole scatter
-    store machinery (AtomicScatterStore EpiOp, `epi_subtile_store`, the
-    `epi_setup_aux_out`/`epi_convert_aux_out` no-ops, the RN pin) from
-    StreamingScatterBase, and the scheduler hooks + `__call__` from
+    store machinery (AtomicScatterStore EpiOp, the `_scatter_store` helper, the
+    RN pin) from StreamingScatterBase, and the scheduler hooks + `__call__` from
     StreamingGemmBase.
 
     Supplies only:
@@ -98,8 +97,8 @@ class StreamingMoeABwd(StreamingScatterBase):
         chain-rule linearity in dpostact bakes the weight into the dgate/dup
         pair we read here).
       - `EpilogueArguments`: scatter only (no `mColVecBroadcast`).
-      - `epi_visit_subtile`: no-op — kernel_y's weight multiply has no
-        analogue here.
+      - `epi_visit_subtile`: no weight multiply (kernel_y's has no analogue
+        here) — just calls `_scatter_store` and returns `()`.
 
     The caller plumbs ``bwd_dispatch_arrival_count`` / ``pool_arrival_target``
     (the same pair Y_bwd waited on; at-target by the time A_bwd runs because
@@ -127,8 +126,11 @@ class StreamingMoeABwd(StreamingScatterBase):
         By the time we run this kernel, the data-grad GEMM result
         `dL/dpool = dL/dswiglu_in @ W1` lands ALREADY-weighted in
         `tRS_rD`, so the atomic-scatter into `dL_dx_per_r` is a plain sum.
+
+        Returns `()` (the driver concatenates it into `store_frags`).
         """
-        return None
+        self._scatter_store(params, epi_loop_tensors, tRS_rD)
+        return ()
 
     # Scheduler hooks (get_scheduler_class / get_scheduler_arguments) and the
     # __call__ type-shim are inherited from StreamingScatterBase /
