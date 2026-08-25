@@ -1,9 +1,9 @@
 """Custom epilogue ops for the streaming-MoE pipeline.
 
 Currently houses ``ColVecReduceAtomic`` — a variant of quack's
-``ColVecReduce`` whose ``end()`` atomic-adds the cross-warp-reduced row sums
-into a flat per-row fp32 buffer instead of writing to a per-pid_n column of
-a (M, num_pid_n) staging tensor.
+``ColVecReduce`` whose ``end_loop_finish`` atomic-adds the cross-warp-reduced
+row sums into a flat per-row fp32 buffer instead of writing to a per-pid_n
+column of a (M, num_pid_n) staging tensor.
 
 Why a custom op: kernel_y_bwd's epilogue produces the dL/dtopk_weight
 contribution per slot via ``Σ_n postact[m,n] * g[m,n]``. Each pid_n CTA
@@ -26,159 +26,127 @@ unit absorbs scatter patterns at near-DRAM-bandwidth rates and these are
 sparse (one fp32 per slot per stripe), not bandwidth-bound.
 """
 
-import operator
-from functools import partial
-
 import cutlass
 import cutlass.cute as cute
-import quack.layout_utils as layout_utils
-from cutlass import Float32, const_expr
-from quack.epilogue.ops import ColVecReduce, _get_lane_warp_layouts
-from quack.sm90_utils import partition_for_epilogue
+from cutlass import const_expr
+from quack.epilogue.ops import ColVecReduce
 from quack.utils import elem_pointer
 
 from stream_ep.stream_moe.ptx_helpers import red_add_f32
 
 
 class ColVecReduceAtomic(ColVecReduce):
-    """``ColVecReduce`` variant that atomic-adds the per-row reduced sum
-    into a flat (M,) fp32 buffer instead of writing to ``param[m, pid_n]``.
+    """``ColVecReduce`` variant that atomic-adds each row's reduced sum into
+    a flat ``(M,)`` fp32 buffer instead of writing to a per-pid_n column of
+    an ``(M, num_pid_n)`` staging tensor.
 
-    The epilogue ``param`` is a 1D ``(M,)`` fp32 tensor (no per-pid_n
-    column dim, no per-batch dim — varlen_m is handled via the same
-    ``cu_seqlens_m`` domain offset ``ColVecReduce`` uses, just on a 1D
-    target). All pid_n CTAs for a given tile race-free atomic-add to the
-    same (M,) location; the shuffle + cross-warp reduction inside the CTA
-    still runs identically to the parent class.
+    The epilogue ``param`` is a 1D ``(M,)`` fp32 tensor (no per-pid_n column
+    dim, no per-batch dim — varlen_m is handled via the same ``cu_seqlens_m``
+    domain offset ``ColVecReduce`` uses, just on a 1D target). All pid_n CTAs
+    for a given tile race-free atomic-add to the same ``(slot,)`` location;
+    the intra-warp shuffle + cross-warp merge inside the CTA run identically
+    to the parent class.
 
-    Inherits ``begin``, ``begin_loop``, ``param_fields``, ``to_params``,
-    ``smem_bytes``, ``smem_struct_field``, ``get_smem_tensor`` from
-    ``ColVecReduce`` unchanged — the only behavioural change is in the
-    end-of-loop flush.
+    **Only ``end_loop_finish`` (the post-barrier gmem write) is overridden.**
+    ``end_loop_stage`` — the last-N-subtile gate, intra-warp reduce, and
+    per-warp smem staging — is inherited from ``ColVecReduce`` unchanged: it
+    never touches ``param``, so it is agnostic to the flat-vs-column layout,
+    and the driver's single shared barrier (fired via the ``needs_barrier``
+    it returns) orders the staging writes before our merge. ``begin``,
+    ``begin_loop``, ``param_fields``, ``to_params``, ``smem_bytes``,
+    ``smem_struct_field``, and ``get_smem_tensor`` are likewise inherited
+    unchanged.
 
-    v0.4.1 framework calls the per-subtile method ``end_loop`` (with the
-    last-N-subtile gate moved inside the method). v0.3.11 called a single
-    post-loop ``end()`` after the per-subtile fold. We override
-    ``end_loop`` and gate on ``epi_coord[1] == epi_tile_shape[1] - 1`` to
-    fire exactly once per CTA tile, matching the v0.3.11 post-loop
-    invocation point.
+    Parent ``end_loop_finish`` writes ``gColVec[row_idx] = finalize(...)`` into
+    ``param[.., pid_n]`` (requiring a rank-2/3 partial buffer, cf.
+    ``sink_alloc_shape``). We keep its inter-warp merge verbatim, then replace
+    the write with a flat ``red.global.add.f32`` into ``param[slot]`` —
+    dropping the per-pid_n column index and its ``limit_n_tiles`` bound.
+    kernel_y_bwd asserts ``I % tile_n == 0`` so every pid_n stripe is a real
+    partial (no padding stripe to exclude from the sum).
+
+    History: pre-``60d8808`` quack exposed a single per-subtile ``end_loop``
+    hook and this class overrode that. Upstream split it into
+    ``end_loop_stage`` → shared barrier → ``end_loop_finish``; overriding only
+    the finish half (and inheriting the stage) is both smaller and keeps the
+    intra-/inter-warp reduction in lockstep with upstream.
     """
 
     @cute.jit
-    def end_loop(
-        self,
-        gemm,
-        param,
-        state,
-        epi_coord,
-        epi_tile,
-        tiled_copy_t2r,
-        tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
-        tidx,
-    ):
-        """Intra-warp shuffle + optional inter-warp reduction → row sum →
-        ``red.global.add.f32`` into ``param[slot]``.
-
-        ``param`` shape contract: 1D ``(M,)`` fp32 in varlen_m mode (the
-        only mode kernel_y_bwd uses). The varlen_m batch offset is
-        applied via ``cute.domain_offset`` over ``cu_seqlens_m`` exactly
-        as in the parent class, just against a 1D target.
-        """
-        if const_expr(param is None):
-            return
-        # Last-N-subtile gate (v0.4.1 calls end_loop per subtile).
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
-        if const_expr(epi_coord[1] != epi_tile_shape[1] - 1):
-            return
-        tDrReduce, sDrReduce = state[0], state[1]
-        tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
-        reference_src = tiled_copy_t2r is None
-
-        # ── Derive lane/warp layouts (same as parent) ──
-        lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(
-            tiled_copy, reference_src
+    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+        """Inter-warp merge from smem (verbatim from ``ColVecReduce``) then a
+        flat ``red.global.add.f32`` into ``param[slot]`` instead of the
+        parent's column-indexed store. varlen_m only (the only mode
+        kernel_y_bwd uses)."""
+        vals_m, tDcD_m, sExch = staged[0], staged[1], staged[2]
+        warps_in_N, warp_n_idx, is_lane_n_leader = staged[3], staged[4], staged[5]
+        use_swap_shuffle, num_slices, slice_elems, lane_g = (
+            staged[6],
+            staged[7],
+            staged[8],
+            staged[9],
         )
-        lanes_in_N = cute.size(lane_layout_MN, mode=[1])
-        is_lane_n_leader = cute.arch.lane_idx() % lanes_in_N == 0
+        num_vals = const_expr(len(vals_m))
 
-        # ── Intra-warp shuffle reduction across N lanes (same as parent) ──
-        if const_expr(lanes_in_N > 1):
-            assert lane_layout_MN.stride[1] == 1
-            tDrReduce_flt = cute.filter_zeros(tDrReduce)
-            for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
-                tDrReduce_flt[i] = cute.arch.warp_reduction(
-                    tDrReduce_flt[i], operator.add, threads_in_group=lanes_in_N
-                )
+        # ── Inter-warp merge from smem (verbatim from ColVecReduce.end_loop_finish) ──
+        if const_expr(warps_in_N > 1):
+            if const_expr(use_swap_shuffle):
+                if warp_n_idx == 0 and lane_g < num_slices:
+                    for j in cutlass.range_constexpr(slice_elems):
+                        row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                        for warp_n in cutlass.range_constexpr(1, warps_in_N):
+                            others = tuple(sExch[row_idx, warp_n - 1, k] for k in range(num_vals))
+                            merged = self._merge(tuple(v[j] for v in vals_m), others)
+                            for k in cutlass.range_constexpr(num_vals):
+                                vals_m[k][j] = merged[k]
+            else:
+                if warp_n_idx == 0 and is_lane_n_leader:
+                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                        row_idx = tDcD_m[m][0]
+                        for warp_n in cutlass.range_constexpr(1, warps_in_N):
+                            others = tuple(sExch[row_idx, warp_n - 1, k] for k in range(num_vals))
+                            merged = self._merge(tuple(v[m] for v in vals_m), others)
+                            for k in cutlass.range_constexpr(num_vals):
+                                vals_m[k][m] = merged[k]
 
-        warp_N = warp_layout_MN[1]
-        warps_in_N = const_expr(cute.size(warp_N))
-        # The v0.3.11 `max_warps_in_n` safety check is gone: v0.4.1's
-        # ColVecReduce.smem_struct_field sizes the staging area from
-        # `warp_shape_mnk` (passed to smem_bytes), which is by construction
-        # >= warps_in_N at runtime. The parent class handles the bound.
-
-        partition_for_epilogue_fn = partial(
-            partition_for_epilogue,
-            epi_tile=epi_tile,
-            tiled_copy=tiled_copy,
-            tidx=tidx,
-            reference_src=tiled_copy_t2r is None,
-        )
-        tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
-        epilogue_barrier = gemm.epilogue_barrier
-        batch_idx = tile_coord_mnkl[3]
-
-        # ── Param indexing for 1D (M,) target with varlen_m batch offset ──
-        # All pid_n CTAs for this tile_id atomic-add to the same (slot,)
-        # locations; race-free via red.global.add.f32.
+        # ── Flat atomic-add write (replaces parent's column-indexed store) ──
+        # varlen_m only: no per-batch dim, no per-pid_n column, no limit_n_tiles
+        # gate — every launched pid_n stripe is a real partial (I % tile_n == 0),
+        # and all pid_n CTAs race-free atomic-add into the same (slot,) location.
         assert varlen_manager.varlen_m, (
             "ColVecReduceAtomic only supports varlen_m mode (the only mode "
             "kernel_y_bwd uses)"
+        )
+        tile_M = gemm.cta_tile_shape_mnk[0]
+        batch_idx = tile_coord_mnkl[3]
+        limit_m = min(
+            varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M
         )
         mColVec = cute.domain_offset(
             (varlen_manager.params.cu_seqlens_m[batch_idx],), param
         )
         gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
-        limit_m = min(
-            varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M
-        )
-
-        tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-        tDrReduce_m = layout_utils.convert_layout_zero_stride(
-            tDrReduce, tDrReduce.layout
-        )[None, 0]
-        tDcD_m = layout_utils.convert_layout_zero_stride(tDcD, tDrReduce.layout)[
-            None, 0
-        ]
-
-        if const_expr(warps_in_N == 1):
-            # Single warp covers the full tile_N — every is_lane_n_leader
-            # owns one row's final sum, atomic-add directly.
-            if is_lane_n_leader:
-                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                    row_idx = tDcD_m[m][0]
+        if const_expr(use_swap_shuffle):
+            in_warp0 = True if const_expr(warps_in_N == 1) else warp_n_idx == 0
+            if in_warp0 and lane_g < num_slices:
+                for j in cutlass.range_constexpr(slice_elems):
+                    row_idx = tDcD_m[lane_g * slice_elems + j][0]
                     if row_idx < limit_m:
-                        red_add_f32(elem_pointer(gColVec, (row_idx,)), tDrReduce_m[m])
+                        red_add_f32(
+                            elem_pointer(gColVec, (row_idx,)),
+                            self._finalize(tuple(v[j] for v in vals_m)),
+                        )
         else:
-            # Multi-warp tile — stage per-warp partials in SMEM, single
-            # warp_n_idx==0 reduces across warps and atomic-adds.
-            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-            warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
-            if is_lane_n_leader:
+            should_write_gmem = (
+                is_lane_n_leader
+                if const_expr(warps_in_N == 1)
+                else warp_n_idx == 0 and is_lane_n_leader
+            )
+            if should_write_gmem:
                 for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                     row_idx = tDcD_m[m][0]
                     if row_idx < limit_m:
-                        sDrReduce[row_idx, warp_n_idx] = tDrReduce_m[m]
-            epilogue_barrier.arrive_and_wait()
-            if warp_n_idx == 0 and is_lane_n_leader:
-                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                    row_idx = tDcD_m[m][0]
-                    if row_idx < limit_m:
-                        row_sum = Float32(0.0)
-                        for warp_n in cutlass.range_constexpr(warps_in_N):
-                            row_sum += sDrReduce[row_idx, warp_n]
-                        red_add_f32(elem_pointer(gColVec, (row_idx,)), row_sum)
+                        red_add_f32(
+                            elem_pointer(gColVec, (row_idx,)),
+                            self._finalize(tuple(v[m] for v in vals_m)),
+                        )
