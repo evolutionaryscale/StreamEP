@@ -548,6 +548,9 @@ __global__ void streaming_dispatch_metadata_phase_a_kernel(
         }
     }
     __syncthreads();
+    // Prevent a later dispatch from reusing the streaming slab before remote readers finish.
+    if (thread_id == 32)
+        nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
     barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
 
     }  // end if (sm_id == 0) — Phase A1-A5 + Phase B0 completed by block 0.
@@ -578,6 +581,7 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
         int tile_m,
         // Env
         void** buffer_ptrs,
+        int** barrier_signal_ptrs,
         int rank) {
     namespace cg = cooperative_groups;
     auto grid = cg::this_grid();
@@ -663,6 +667,11 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
 
     // Grid-wide barrier #2: seen_per_substream + expert_frequency fully
     // populated before Phase B3 prefix and Phase B4 scan read them.
+    grid.sync();
+
+    // Do not reuse the NVL inbox until every local peer finishes reading it.
+    if (sm_id == 0)
+        barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
     grid.sync();
 
     // ──────────────────────────────────────────────────────────────────────
@@ -911,7 +920,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       seen_per_substream, rank_prefix_matrix,                                        \
                       total_tiles_device,                    \
                       num_experts, num_channels, expert_alignment, tile_m,                           \
-                      buffer_ptrs, rank);                                                            \
+                      buffer_ptrs, barrier_signal_ptrs, rank);                                      \
     }                                                                                                \
     break
 
