@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <functional>
 #include <optional>
 
@@ -177,6 +178,10 @@ __global__ void streaming_dispatch_metadata_phase_a_kernel(
         int tile_m,
         // Streaming SymBuffer offset within rdma_buffer_ptr (post the leading count-exchange payload)
         int64_t streaming_rdma_offset,
+        // Byte offset of the metadata NVL slabs within each buffer_ptrs[i]
+        // (= dispatch + combine NVL region bytes, keeping the slabs disjoint
+        // from both data rings — see get_metadata_nvl_region_bytes, api.cuh).
+        int64_t nvl_metadata_offset,
         // Env
         void* rdma_buffer_ptr,
         void** buffer_ptrs,
@@ -422,8 +427,11 @@ __global__ void streaming_dispatch_metadata_phase_a_kernel(
     __syncthreads();
 
     // ── Phase A5: NVL aggregation of count payload.
-    auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr;
-    auto nvl_recv_buffer = buffer_ptrs[nvl_rank];
+    void* nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS
+        ? static_cast<void*>(static_cast<uint8_t*>(buffer_ptrs[thread_id]) + nvl_metadata_offset)
+        : nullptr;
+    void* nvl_recv_buffer =
+        static_cast<void*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + nvl_metadata_offset);
     auto nvl_reduced_num_tokens_per_expert = Buffer<int>(nvl_recv_buffer, num_rdma_experts).advance_also(nvl_send_buffer);
     auto nvl_send_num_tokens_per_rank = AsymBuffer<int>(nvl_send_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
     auto nvl_send_num_tokens_per_expert = AsymBuffer<int>(nvl_send_buffer, E_local, NUM_MAX_NVL_PEERS);
@@ -576,11 +584,32 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
         int num_channels,
         int expert_alignment,
         int tile_m,
+        // Metadata NVL slab offset (see phase_a kernel).
+        int64_t nvl_metadata_offset,
+        // Test timing hook (default 0 = off, zero overhead): spin this many
+        // microseconds at kernel entry before reading the NVL streaming
+        // inbox. Emulates a legal scheduling delay of this cooperative
+        // kernel (e.g. SM contention from a concurrent GEMM stream). Driven
+        // by STREAMEP_DEBUG_PB_DELAY_US/_RANK; the NVL-aliasing regression
+        // test (tests/test_metadata_nvl_aliasing.py) depends on it — keep.
+        int debug_delay_us,
         // Env
         void** buffer_ptrs,
         int rank) {
     namespace cg = cooperative_groups;
     auto grid = cg::this_grid();
+
+    // ── Test timing hook: every thread spins on %globaltimer (ns) so the
+    // whole grid stalls before Phase B1's inbox reads. Compiled in but inert
+    // (single predicated branch) unless STREAMEP_DEBUG_PB_DELAY_US is set.
+    if (debug_delay_us > 0) {
+        long long t_start, t_now;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_start));
+        const long long t_end = t_start + static_cast<long long>(debug_delay_us) * 1000;
+        do {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_now));
+        } while (t_now < t_end);
+    }
 
     auto sm_id = static_cast<int>(blockIdx.x);
     const int num_blocks = static_cast<int>(gridDim.x);
@@ -604,7 +633,8 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
     // READS from these slabs. Layout mirrors the v1 block-0 derivation
     // — same advance sequence (Buffer<int> + 4 × AsymBuffer<int>) so the
     // streaming_recv slot lands at exactly the same offset Phase A wrote to.
-    auto* nvl_recv_buffer_all = buffer_ptrs[nvl_rank];
+    void* nvl_recv_buffer_all =
+        static_cast<void*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + nvl_metadata_offset);
     const int kNvlSlotInts_all = kNumRDMARanks * num_channels * E_local;
     // Skip past Phase A5 slabs:
     // - Buffer<int>(num_rdma_experts):                advances by num_rdma_experts × 4 bytes
@@ -822,6 +852,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  int expert_alignment,
                                  int tile_m,
                                  int64_t streaming_rdma_offset,
+                                 int64_t nvl_metadata_offset,
                                  void* rdma_buffer_ptr,
                                  void** buffer_ptrs,
                                  int** barrier_signal_ptrs,
@@ -834,6 +865,28 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     const int E_local = num_experts / num_ranks;
     const int kStreamSlabInts = num_channels * NUM_MAX_NVL_PEERS * E_local;
+
+    // ── Test timing hook (supported, default-off, zero overhead when
+    // unset): optional Phase-B entry delay (µs) on selected ranks. Emulates
+    // the legal scheduling delay that opens the NVL metadata/dispatch-ring
+    // race window on pre-fix layouts; tests/test_metadata_nvl_aliasing.py
+    // relies on it — keep. Env is read once per process (static init).
+    // STREAMEP_DEBUG_PB_DELAY_US: microseconds to spin (0/unset = off).
+    // STREAMEP_DEBUG_PB_DELAY_RANK: global rank to delay; -1 (default) =
+    // delay all ranks with nvl_rank == 7 (one per node).
+    static const int kDbgDelayUs = [] {
+        const char* v = getenv("STREAMEP_DEBUG_PB_DELAY_US");
+        return v ? atoi(v) : 0;
+    }();
+    static const int kDbgDelayRank = [] {
+        const char* v = getenv("STREAMEP_DEBUG_PB_DELAY_RANK");
+        return v ? atoi(v) : -1;
+    }();
+    const int debug_delay_us =
+        (kDbgDelayUs > 0 &&
+         ((kDbgDelayRank >= 0 && rank == kDbgDelayRank) ||
+          (kDbgDelayRank < 0 && rank % NUM_MAX_NVL_PEERS == 7)))
+            ? kDbgDelayUs : 0;
 
     // SMEM = streaming_hist + per_rank + per_rdma + per_expert.
     int smem_bytes =
@@ -869,6 +922,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       total_tiles_device,                    \
                       num_tokens, num_topk, num_experts, num_channels,                               \
                       expert_alignment, tile_m, streaming_rdma_offset,                               \
+                      nvl_metadata_offset,                                                           \
                       rdma_buffer_ptr, buffer_ptrs, barrier_signal_ptrs, rank,                       \
                       cpu_rdma_team);                                                                \
     }                                                                                                \
@@ -911,6 +965,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                       seen_per_substream, rank_prefix_matrix,                                        \
                       total_tiles_device,                    \
                       num_experts, num_channels, expert_alignment, tile_m,                           \
+                      nvl_metadata_offset, debug_delay_us,                                           \
                       buffer_ptrs, rank);                                                            \
     }                                                                                                \
     break

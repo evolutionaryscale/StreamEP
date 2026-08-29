@@ -1645,6 +1645,32 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     EP_HOST_ASSERT(metadata_rdma_offset + streaming_rdma_offset + streaming_rdma_total
                    <= num_rdma_bytes);
 
+    // The metadata kernel's NVL slabs (count slabs + streaming inbox) live in
+    // a region DISJOINT from the dispatch + combine NVL sub-buffer chains,
+    // exactly mirroring metadata_rdma_offset above. At offset 0 the metadata
+    // NVL slabs would alias dispatch's (channel 0, writer nvl_rank 0)
+    // nvl_channel_x ring slice: a leading NVL peer's SAME-iteration
+    // dispatch_main forwarder writes ring slots 0..~60 into this rank's
+    // buffer while this rank's (unsynchronized, purely local) metadata
+    // Phase B kernel is still reading the streaming inbox — clobbering
+    // expert_frequency/total_tiles (production signature: sane recv
+    // counters, garbage total_tiles → CPU-poll timeout or multi-TiB pool
+    // alloc). Disjointness is load-bearing; do NOT move this back to 0.
+    const int64_t nvl_metadata_offset =
+        internode::get_dispatch_nvl_region_bytes(
+            hidden_int4, num_topk, config.num_max_nvl_chunked_recv_tokens,
+            num_channels, num_rdma_ranks) +
+        internode::get_combine_nvl_region_bytes(
+            hidden_int4, num_topk, config.num_max_nvl_chunked_recv_tokens,
+            num_channels, num_rdma_ranks);
+    // Backstop: Config::get_nvl_buffer_size_hint reserves this region with
+    // worst-case bounds (kNumMaxTopK / NUM_MAX_LOCAL_EXPERTS); re-check the
+    // actual carve against the actual allocation.
+    EP_HOST_ASSERT(nvl_metadata_offset
+                       + internode::get_metadata_nvl_region_bytes(
+                             num_local_experts, num_channels, num_rdma_ranks)
+                   <= num_nvl_bytes);
+
     internode::streaming_dispatch_metadata(
         topk_idx.data_ptr<topk_idx_t>(),
         moe_recv_counter_mapped, moe_recv_rdma_counter_mapped,
@@ -1662,6 +1688,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         num_tokens, num_topk, num_experts, num_channels,
         hidden_int4, expert_alignment, tile_m,
         streaming_rdma_offset,
+        nvl_metadata_offset,
         static_cast<void*>(static_cast<uint8_t*>(rdma_buffer_ptr) + metadata_rdma_offset),
         buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
         rank, num_ranks, stream, num_rdma_bytes, num_nvl_bytes);
@@ -1675,14 +1702,38 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         num_recv_tokens      = static_cast<int>(*moe_recv_counter);
         num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
         total_tiles          = static_cast<int>(*streaming_total_tiles);
-        bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0) and (total_tiles >= 0);
+        // -1 is the host-reset sentinel; the kernel publishes the final value
+        // once. Accept any total_tiles != -1 (garbage-negative included) so a
+        // corrupt counter hits the fail-fast below instead of spinning to
+        // timeout.
+        bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0) and (total_tiles != -1);
         for (int i = 0; i < num_local_experts and ready; ++i)
             ready &= moe_recv_expert_counter[i] >= 0;
         if (ready) break;
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - t0).count() > NUM_CPU_TIMEOUT_SECS)
-            throw std::runtime_error("StreamEP error: internode_dispatch CPU timeout");
+            throw std::runtime_error("StreamEP error: internode_dispatch CPU timeout"
+                " (rank=" + std::to_string(rank) +
+                ", recv_tokens=" + std::to_string(num_recv_tokens) +
+                ", rdma_recv_tokens=" + std::to_string(num_rdma_recv_tokens) +
+                ", total_tiles=" + std::to_string(total_tiles) + ")");
     }
+    // Always-on fail-fast: a sane total_tiles is bounded by
+    // num_ranks * num_tokens * num_topk / tile_m + num_local_experts (a few
+    // thousand at production shapes) — far below kMaxSaneTotalTiles. Anything
+    // outside [0, kMaxSaneTotalTiles] means the metadata path produced
+    // garbage; throw immediately with the diagnostics instead of spinning to
+    // timeout (garbage-negative) or letting the multi-TiB `pool` allocation
+    // OOM (garbage-positive). tests/test_metadata_nvl_aliasing.py matches on
+    // the "StreamEP-CORRUPT" prefix — keep it stable.
+    constexpr int kMaxSaneTotalTiles = 1 << 20;
+    if (total_tiles < 0 or total_tiles > kMaxSaneTotalTiles)
+        throw std::runtime_error("StreamEP-CORRUPT(host): corrupt streaming_total_tiles"
+            " rank=" + std::to_string(rank) +
+            " total_tiles=" + std::to_string(total_tiles) +
+            " (sane: 0.." + std::to_string(kMaxSaneTotalTiles) + ")" +
+            " recv_tokens=" + std::to_string(num_recv_tokens) +
+            " rdma_recv_tokens=" + std::to_string(num_rdma_recv_tokens));
     int64_t TK_padded = static_cast<int64_t>(total_tiles) * tile_m;
 
     // pool[TK_padded, hidden] (~290 MB at production) lives outside the

@@ -356,6 +356,37 @@ __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
     return total_x + 2 * total_ht;
 }
 
+// Total bytes occupied by the streaming-metadata kernels' NVL slabs on
+// `buffer_ptrs[i]`, carved at `nvl_metadata_offset` = dispatch region +
+// combine region — DISJOINT from both data regions (see
+// `Buffer::internode_dispatch`; an offset-0 carve would alias dispatch's
+// (channel 0, writer nvl_rank 0) `nvl_channel_x` ring slice, letting a
+// leading peer's same-iteration dispatch clobber a lagging peer's metadata
+// Phase-B streaming-inbox reads). The carve is the Phase-A5 count slabs
+// (reduced per-expert Buffer + per-rank/per-expert AsymBuffers) followed by
+// the Phase-B streaming inbox (NUM_MAX_NVL_PEERS writer slots of
+// [num_rdma_ranks][num_channels][num_local_experts] int32). Send- and
+// recv-side views are the SAME bytes in different ranks' mirror-allocated
+// IPC buffers, so each slab is counted once. Must match the advance
+// sequence in `streaming_dispatch_metadata_phase_a/b_kernel`
+// (internode.cu). Used by `Config::get_nvl_buffer_size_hint` (with the
+// NUM_MAX_LOCAL_EXPERTS upper bound) AND by the runtime fit check in
+// `Buffer::internode_dispatch`.
+__host__ __device__ inline int64_t get_metadata_nvl_region_bytes(
+    int num_local_experts, int num_channels, int num_rdma_ranks) {
+    const int64_t nvl_peers = NUM_MAX_NVL_PEERS;
+    // Internode requires num_ranks == num_rdma_ranks * NUM_MAX_NVL_PEERS, so
+    // num_rdma_experts (= num_experts / num_rdma_ranks) == E_local * nvl_peers.
+    const int64_t num_rdma_experts = static_cast<int64_t>(num_local_experts) * nvl_peers;
+    const int64_t count_ints =
+        num_rdma_experts                                        // nvl_reduced_num_tokens_per_expert
+        + static_cast<int64_t>(num_rdma_ranks) * nvl_peers      // nvl_{send,recv}_num_tokens_per_rank
+        + static_cast<int64_t>(num_local_experts) * nvl_peers;  // nvl_{send,recv}_num_tokens_per_expert
+    const int64_t streaming_ints =                              // nvl_streaming_{send,recv}
+        static_cast<int64_t>(num_rdma_ranks) * num_channels * num_local_experts * nvl_peers;
+    return (count_ints + streaming_ints) * static_cast<int64_t>(sizeof(int));
+}
+
 // Total bytes occupied by dispatch's RDMA SymBuffer chain on
 // `env.rdma_buffer_ptr`: `rdma_channel_data` (decoupled, send+recv) +
 // `rdma_channel_head` + `rdma_channel_tail` (non-decoupled). Routing header
@@ -471,6 +502,13 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
                                  // Streaming SymBuffer offset within rdma_buffer_ptr
                                  // (placed AFTER the leading count-exchange payload).
                                  int64_t streaming_rdma_offset,
+                                 // Byte offset applied to every buffer_ptrs[i] before
+                                 // carving the metadata NVL slabs (count slabs +
+                                 // streaming inbox): dispatch + combine NVL region
+                                 // bytes, keeping the slabs DISJOINT from both data
+                                 // rings (mirrors metadata_rdma_offset; see
+                                 // get_metadata_nvl_region_bytes above).
+                                 int64_t nvl_metadata_offset,
                                  // Env
                                  void* rdma_buffer_ptr,
                                  void** buffer_ptrs,

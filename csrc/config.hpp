@@ -75,6 +75,22 @@ struct Config {
         num_bytes += internode::get_combine_nvl_region_bytes(
             hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
             num_channels, num_rdma_ranks);
+        // Internode only: the streaming-metadata kernels carve their NVL
+        // slabs (Phase-A5 count slabs + the Phase-B streaming-superset
+        // inbox) at nvl_metadata_offset = dispatch region + combine region,
+        // DISJOINT from both data regions above — at offset 0 they would
+        // alias dispatch's (channel 0, writer nvl_rank 0) nvl_channel_x
+        // ring slice, and a leading peer's same-iteration dispatch could
+        // clobber a lagging peer's metadata Phase-B inbox reads (see
+        // Buffer::internode_dispatch). Reserve room for those slabs past
+        // the two data regions. num_experts is unknown at sizing time, so
+        // the expert axis is upper-bounded by NUM_MAX_LOCAL_EXPERTS (the
+        // cap asserted in validate_dispatch_inputs), mirroring the
+        // kNumMaxTopK bound above; internode_dispatch re-asserts that the
+        // actual carve fits the actual allocation.
+        if (num_ranks > NUM_MAX_NVL_PEERS)
+            num_bytes += internode::get_metadata_nvl_region_bytes(
+                NUM_MAX_LOCAL_EXPERTS, num_channels, num_rdma_ranks);
         // NOTE: upstream DeepEP appends a per-slot fp8-scales block here
         // (num_channels * num_nvl_ranks * recv_tokens * kNumMaxScales floats).
         // stream_ep never quantizes dispatched tokens, so no kernel indexes it

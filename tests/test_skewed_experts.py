@@ -21,8 +21,8 @@ internode — the bug catcher). The scenarios are parameterized only by
 Scenarios (deterministic per ``(world_size, rank)``):
 
   ``uniform_rotating``     — every (token, k) picks distinct experts so the
-                             total load is exactly balanced. Control;
-                             expected to pass even when the others fail.
+                             total load is exactly balanced. The balanced-load
+                             control.
   ``all_to_first_K``       — every token picks experts ``[0..K-1]``.
                              Maximal expert-dim skew toward the first K
                              experts; ranks owning those experts get all
@@ -190,20 +190,14 @@ def scenario_power_law(T: int, K: int, E: int, world_size: int, rank: int,
 
 # Order: control → milder skews → realistic skew → extreme degenerate. Bail
 # on first failure (a CUDA-side trap poisons the context — subsequent
-# scenarios in the same process can't get clean signal). The first failing
-# scenario is the meaningful data point; the extreme degenerate scenarios
-# at the tail of the list are known to fail at small world sizes (most
-# ranks have no work, barrier_block times out) and are kept for diagnostic
-# completeness, not as expected-pass tests.
+# scenarios in the same process can't get clean signal). All scenarios,
+# including the degenerate all_to_first_K, are expected to pass.
 SCENARIOS = [
     ("uniform_rotating",   scenario_uniform_rotating),   # CONTROL — must pass
     ("half_empty_experts", scenario_half_empty_experts), # cold-substream
     ("per_rank_imbalance", scenario_per_rank_imbalance), # NVL imbalance
     ("power_law",          scenario_power_law),          # realistic skew (Bug B at 4-node)
-    ("all_to_first_K",     scenario_all_to_first_K),     # extreme; may
-                                                          # legitimately crash
-                                                          # at small world
-                                                          # sizes
+    ("all_to_first_K",     scenario_all_to_first_K),     # extreme expert-dim skew
 ]
 
 
