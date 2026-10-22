@@ -89,6 +89,7 @@ import torch
 from quack.gemm import gemm
 from stream_ep import Buffer as StreamEPBuffer
 
+from stream_ep.stream_moe.expert_dropout import draw_seed
 from stream_ep.stream_moe.kernel_a import (
     streaming_moe_a,
 )
@@ -458,6 +459,8 @@ class StreamMoEFunc(torch.autograd.Function):
         num_experts: int,
         cfg: TileConfig,
         activation_checkpoint_level: int = 0,
+        expert_dropout: float = 0.0,
+        dropout_seed: int = 0,
     ) -> torch.Tensor:
         # activation_checkpoint_level: 0 = save preact_a + pool (no ckpt);
         # 1 = save pool, recompute preact_a in bwd; 2 = save compressed
@@ -602,6 +605,8 @@ class StreamMoEFunc(torch.autograd.Function):
                     tile_n=tile_n_a,
                     cluster_n=2,
                     num_sms=num_sms_a,
+                    dropout_p=expert_dropout,
+                    dropout_seed=dropout_seed,
                 )
 
                 # ── Kernel Y on the same compute stream ──────────────────────
@@ -726,6 +731,9 @@ class StreamMoEFunc(torch.autograd.Function):
         # it needs no eager release. The num_sms_*_bwd "fall back to the fwd
         # count when None" derivation happens in backward, off ``cfg``.
         ctx.cfg = cfg
+        # kernel_y_bwd regenerates the dropout mask from the same seed.
+        ctx.expert_dropout = expert_dropout
+        ctx.dropout_seed = dropout_seed
         _nvtx_pop()  # moe_fwd
         return out
 
@@ -1029,6 +1037,8 @@ class StreamMoEFunc(torch.autograd.Function):
                     tile_m=tile_m,
                     tile_n=tile_n_y_bwd,
                     num_sms=num_sms_y_bwd,
+                    dropout_p=ctx.expert_dropout,
+                    dropout_seed=ctx.dropout_seed,
                 )
 
                 # ── Stage 3 — kernel_a_bwd on the SAME compute stream ──────
@@ -1172,6 +1182,8 @@ class StreamMoEFunc(torch.autograd.Function):
             None,  # num_experts
             None,  # cfg (TileConfig)
             None,  # activation_checkpoint_level
+            None,  # expert_dropout
+            None,  # dropout_seed
         )
 
 
@@ -1188,6 +1200,8 @@ def stream_moe_func(
     num_experts: int,
     tile_config: TileConfig | None = None,
     activation_checkpoint_level: int = 0,
+    expert_dropout: float = 0.0,
+    dropout_seed: int | None = None,
 ) -> torch.Tensor:
     """One MoE forward layer: dispatch + kernel A + kernel Y + combine.
 
@@ -1218,6 +1232,12 @@ def stream_moe_func(
         re-expanding ``pool`` in backward. NOT YET IMPLEMENTED (raises);
         see ``markdowns/act_ckpt_level2_plan.md``.
 
+    ``expert_dropout`` (default 0): inverted dropout rate on the expert hidden
+    activation (SwiGLU postact, between W1 and W2). The caller gates it on
+    training mode. ``dropout_seed`` defaults to :func:`expert_dropout.draw_seed`
+    (torch CPU RNG, so checkpoint recompute replays it). 0 runs the unchanged
+    kernels.
+
     Compile interaction: this entry point is eager-only. Callers that want
     ``torch.compile`` around the outer model must apply
     ``@torch.compiler.disable`` at the consumer boundary; see this module's
@@ -1229,6 +1249,8 @@ def stream_moe_func(
     # Overlay the caller's non-None overrides onto the shape-picked baseline,
     # then validate; unset knobs are auto-picked for this shape.
     cfg = _resolve_tile_config(tile_config, I, H)
+    if expert_dropout > 0 and dropout_seed is None:
+        dropout_seed = draw_seed()
 
     # Register the compute stream so the C++ Buffer's per-dispatch slabs
     # (``torch::empty``'d on the communicate stream) are record_stream'd onto
@@ -1257,4 +1279,6 @@ def stream_moe_func(
         num_experts,
         cfg,
         activation_checkpoint_level,
+        expert_dropout,
+        dropout_seed if expert_dropout > 0 else 0,
     )

@@ -106,6 +106,11 @@ from quack.varlen_utils import VarlenArguments
 from stream_ep.stream_moe.epi_ops import (
     ColVecReduceAtomic,
 )
+from stream_ep.stream_moe.expert_dropout import (
+    DropoutSeed,
+    keep_scale,
+    keep_threshold,
+)
 from stream_ep.stream_moe.streaming_gemm_base import (
     StreamingGemmBase,
     StreamingTileSchedulerOptions,
@@ -175,6 +180,8 @@ class StreamingMoeYBwd(StreamingGemmBase):
         # `dL_do_pool` / `dL_dswiglu_in` / `postact_a_for_dW2`.
         ColVecLoad("mPaddingMask"),
         ColVecReduceAtomic("mColVecReduce"),
+        # Expert dropout mask (same hash as kernel A); inactive when None.
+        DropoutSeed(),
     )
     _epi_param_bases = (ParamsBase,)
 
@@ -319,6 +326,7 @@ class StreamingMoeYBwd(StreamingGemmBase):
         mColVecReduce: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
+        dropout_seed: Optional[Int32 | cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops + _extra_param_fields by
     # ComposableEpiMixin.__init_subclass__.
@@ -379,10 +387,28 @@ class StreamingMoeYBwd(StreamingGemmBase):
         # (same layout as tRS_rXY_b16 since both are (M, 2I)).
         tRS_rdXY_f32 = cute.make_rmem_tensor(tRS_rXY_b16.layout, Float32)
         tRS_rPostAct = cute.make_rmem_tensor_like(tRS_rD, Float32)
-        for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-            tRS_rdXY_f32[2 * i], tRS_rdXY_f32[2 * i + 1], tRS_rPostAct[i] = dswiglu(
-                tRS_rXY_f32[2 * i], tRS_rXY_f32[2 * i + 1], tRS_rD[i]
-            )
+        dropout = epi_loop_tensors.get("dropout_seed")
+        if const_expr(dropout is None):
+            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+                tRS_rdXY_f32[2 * i], tRS_rdXY_f32[2 * i + 1], tRS_rPostAct[i] = dswiglu(
+                    tRS_rXY_f32[2 * i], tRS_rXY_f32[2 * i + 1], tRS_rD[i]
+                )
+        else:
+            # Expert dropout, mask d (scale or 0): fwd consumed d*postact, so
+            # dswiglu sees d*g and postact becomes d*postact. tRS_rD keeps the
+            # unmasked g, so the step-3 reduce Sum(g * d*postact) and the
+            # step-4 dW2 operand w*d*postact both see the masked postact.
+            seed, tDcD, row0, col0 = dropout
+            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+                crd = tDcD[i]
+                d = keep_scale(
+                    seed, row0 + crd[0], col0 + crd[1],
+                    self.dropout_threshold, self.dropout_scale,
+                )
+                tRS_rdXY_f32[2 * i], tRS_rdXY_f32[2 * i + 1], tRS_rPostAct[i] = dswiglu(
+                    tRS_rXY_f32[2 * i], tRS_rXY_f32[2 * i + 1], tRS_rD[i] * d
+                )
+                tRS_rPostAct[i] *= d
 
         # (2.5) Padding-row predicate. `tDrPadMask` broadcasts pool_recv_token
         # (int32 → fp32) along N, so all elements at the same row m share the
@@ -451,6 +477,7 @@ def _compile_streaming_moe_y_bwd(
     cluster_m: int,
     cluster_n: int,
     device_capacity,
+    dropout_p: float = 0.0,
 ):
     assert device_capacity[0] == 9, "Streaming MoE kernel Y bwd is SM90-only for now"
 
@@ -543,6 +570,7 @@ def _compile_streaming_moe_y_bwd(
         mPaddingMask=pool_recv_token,
         mColVecReduce=mColVecReduce,
         rounding_mode=RoundingMode.RN,
+        dropout_seed=Int32(0) if dropout_p > 0 else None,
     )
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
@@ -552,6 +580,8 @@ def _compile_streaming_moe_y_bwd(
         # implicit_dtype (bf16) elements as bf16x2. Same plumbing
         # quack's gemm_dgated uses on its PreAct input.
         gemm_obj.implicit_dtype = implicit_dtype
+        gemm_obj.dropout_threshold = keep_threshold(dropout_p)
+        gemm_obj.dropout_scale = 1.0 / (1.0 - dropout_p)
 
     return compile_gemm_kernel(
         StreamingMoeYBwd,
@@ -598,8 +628,14 @@ def streaming_moe_y_bwd(
     cluster_m: int = 1,
     cluster_n: int = 1,
     num_sms: int | None = None,
+    dropout_p: float = 0.0,
+    dropout_seed: int | None = None,
 ) -> None:
     """Launch streaming-MoE kernel Y bwd on the caller's current CUDA stream.
+
+    ``dropout_p`` / ``dropout_seed`` must match the forward kernel A call: the
+    epilogue regenerates the expert dropout mask d and computes the gradients
+    of ``(d * postact) @ W2.T`` (see ``expert_dropout``).
 
     Computes Y-side gradients in one tile-streamed pass:
       g[slot, :]                = dL_do_pool[slot] @ W2[e]               (unweighted)
@@ -813,6 +849,7 @@ def streaming_moe_y_bwd(
         cluster_m=cluster_m,
         cluster_n=cluster_n,
         device_capacity=device_capacity,
+        dropout_p=dropout_p,
     )
 
     if compile_config.COMPILE_ONLY:
@@ -836,12 +873,15 @@ def streaming_moe_y_bwd(
         f"{tuple(postact_a_for_dW2_flat.shape)}, expected {(total_tiles * tile_m, I)}"
     )
 
+    if dropout_p > 0:
+        assert dropout_seed is not None, "dropout_p > 0 needs a dropout_seed"
     epi_args = StreamingMoeYBwd.EpilogueArguments(
         mAuxOut=postact_a_for_dW2_flat,
         mColVecBroadcast=pool_topk_weight,
         mPaddingMask=pool_recv_token,
         mColVecReduce=dL_dweight,
         rounding_mode=None,  # Constexpr; pass None at call time
+        dropout_seed=Int32(dropout_seed) if dropout_p > 0 else None,
     )
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
