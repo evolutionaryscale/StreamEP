@@ -41,7 +41,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, const_expr
 from quack.activation import gate_fn_map
 from quack.cache import jit_cache
 from stream_ep.stream_moe import compile_config
@@ -59,6 +59,11 @@ from quack.gemm_tvm_ffi_utils import compile_gemm_kernel
 from quack.rounding import RoundingMode
 from quack.varlen_utils import VarlenArguments
 
+from stream_ep.stream_moe.expert_dropout import (
+    DropoutSeed,
+    keep_scale,
+    keep_threshold,
+)
 from stream_ep.stream_moe.ptx_helpers import threadfence_system
 from stream_ep.stream_moe.streaming_gemm_base import (
     StreamingGemmBase,
@@ -102,7 +107,11 @@ class StreamingMoeA(StreamingGemmBase):
     streaming-specific override needed.
     """
 
-    _epi_ops = GemmDefaultEpiMixin._epi_ops + (TileStore("mAuxOut", gated=True),)
+    _epi_ops = GemmDefaultEpiMixin._epi_ops + (
+        TileStore("mAuxOut", gated=True),
+        # Expert dropout on postact; inactive (compiled out) when the seed is None.
+        DropoutSeed(),
+    )
     _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
@@ -114,6 +123,7 @@ class StreamingMoeA(StreamingGemmBase):
         mColVecBroadcast: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
+        dropout_seed: Optional[Int32 | cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops + _extra_param_fields by
     # ComposableEpiMixin.__init_subclass__.
@@ -137,6 +147,16 @@ class StreamingMoeA(StreamingGemmBase):
         tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
         for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
             tRS_rAuxOut[i] = self.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
+        dropout = epi_loop_tensors.get("dropout_seed")
+        if const_expr(dropout is not None):
+            # Only postact is masked; the saved preact (mD) stays unmasked for bwd.
+            seed, tDcD, row0, col0 = dropout
+            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                crd = tDcD[2 * i]
+                tRS_rAuxOut[i] *= keep_scale(
+                    seed, row0 + crd[0], (col0 + crd[1]) >> 1,
+                    self.dropout_threshold, self.dropout_scale,
+                )
         return (tRS_rAuxOut,)
 
 
@@ -156,6 +176,7 @@ def _compile_streaming_moe_a(
     device_capacity,
     *,
     store_preact: bool = False,
+    dropout_p: float = 0.0,
 ):
     assert device_capacity[0] == 9, "Streaming MoE kernel A is SM90-only for now"
     assert activation in gate_fn_map, f"Need a gated activation; got {activation}"
@@ -225,6 +246,7 @@ def _compile_streaming_moe_a(
     epi_args = StreamingMoeA.EpilogueArguments(
         mAuxOut=mAuxOut,
         rounding_mode=RoundingMode.RN,
+        dropout_seed=Int32(0) if dropout_p > 0 else None,
     )
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
@@ -233,8 +255,10 @@ def _compile_streaming_moe_a(
         # Bake the gated activation (compile is keyed on `activation`) as a
         # constexpr on the instance; epi_visit_subtile reads it as
         # self.act_fn — same post_init plumbing kernel_y_bwd uses for
-        # implicit_dtype.
+        # implicit_dtype. Dropout p is baked the same way.
         gemm_obj.act_fn = gate_fn_map[activation]
+        gemm_obj.dropout_threshold = keep_threshold(dropout_p)
+        gemm_obj.dropout_scale = 1.0 / (1.0 - dropout_p)
 
     return compile_gemm_kernel(
         StreamingMoeA,
@@ -374,8 +398,14 @@ def streaming_moe_a(
     cluster_n: int = 1,
     activation: str = "swiglu",
     num_sms: int | None = None,
+    dropout_p: float = 0.0,
+    dropout_seed: int | None = None,
 ) -> None:
     """Launch streaming-MoE kernel A on the caller's current CUDA stream (pool layout).
+
+    ``dropout_p > 0`` applies expert dropout to ``postact_a`` with the mask
+    keyed on ``dropout_seed`` (see ``expert_dropout``); ``preact_a`` is
+    unmasked. ``dropout_p == 0`` compiles the unchanged kernel.
 
     ``num_sms`` caps the persistent-grid CTA count to the given value. When
     ``None`` (default) the kernel fills the GPU via ``get_max_active_clusters``.
@@ -496,6 +526,7 @@ def streaming_moe_a(
         activation=activation,
         device_capacity=device_capacity,
         store_preact=preact_a is not None,
+        dropout_p=dropout_p,
     )
 
     if compile_config.COMPILE_ONLY:
@@ -514,9 +545,12 @@ def streaming_moe_a(
     # values from a recycled allocator slot, causing CTAs to early-exit.
     consumer_head = torch.zeros(1, dtype=torch.int32, device=pool.device)
 
+    if dropout_p > 0:
+        assert dropout_seed is not None, "dropout_p > 0 needs a dropout_seed"
     epi_args = StreamingMoeA.EpilogueArguments(
         mAuxOut=postact_flat,
         rounding_mode=None,  # Constexpr; pass None at call time
+        dropout_seed=Int32(dropout_seed) if dropout_p > 0 else None,
     )
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
