@@ -81,11 +81,14 @@ def rank_zero_print(*args, **kwargs) -> None:
 
 def rank_zero_only(fn):
     """Decorator: only rank 0 actually executes; other ranks return None."""
+
     def wrapper(*args, **kwargs):
         if torch_dist.is_initialized() and torch_dist.get_rank() != 0:
             return None
         return fn(*args, **kwargs)
+
     return wrapper
+
 
 # Default profile shape = the 82ba5b prod config (82B total / 4.3B active):
 # d_model H=3072, per-expert I=768, E=256 experts, top-K=8, 8192 tokens/rank.
@@ -105,9 +108,7 @@ def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
     return ((base.unsqueeze(1) + offsets) % num_experts).to(torch.int64)
 
 
-def make_skewed_topk_idx(
-    n_tokens, topk, num_experts, hot_frac, hot_weight, device, generator
-):
+def make_skewed_topk_idx(n_tokens, topk, num_experts, hot_frac, hot_weight, device, generator):
     """Biased multinomial routing: the first ``hot_frac`` of experts get
     ``hot_weight`` × the per-token sampling weight of the rest, sampled without
     replacement so each token still gets ``topk`` distinct experts. Used to
@@ -121,9 +122,7 @@ def make_skewed_topk_idx(
     weights = torch.ones(num_experts, device=device)
     weights[:n_hot] *= hot_weight
     probs = weights.expand(n_tokens, -1).contiguous()
-    return torch.multinomial(probs, topk, replacement=False, generator=generator).to(
-        torch.int64
-    )
+    return torch.multinomial(probs, topk, replacement=False, generator=generator).to(torch.int64)
 
 
 def make_randn_topk_idx(n_tokens, topk, num_experts, device, generator=None):
@@ -148,12 +147,8 @@ def make_buffer(group, num_sms=None, hidden=H):
         StreamEPBuffer.get_dispatch_config(group.size()),
         StreamEPBuffer.get_combine_config(group.size()),
     ):
-        nvl_bytes = max(
-            cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes
-        )
-        rdma_bytes = max(
-            cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes
-        )
+        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes)
+        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes)
     return StreamEPBuffer(group, nvl_bytes, rdma_bytes)
 
 
@@ -198,8 +193,7 @@ def main():
         "Default: /tmp/stream_moe_profile_<YYYYmmdd_HHMMSS>/ (rank-0 picked, "
         "broadcast to peers so all ranks write to the same directory).",
     )
-    p.add_argument("--num_sms", type=int, default=None,
-                   help="StreamEP num_sms override; default = Buffer auto-pick.")
+    p.add_argument("--num_sms", type=int, default=None, help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     # MoE shape overrides — default to the 82ba5b prod shape (H=3072 I=768
     # E=256 K=8), so the profile runs at the real GEMM size (2I·H) that
@@ -269,10 +263,7 @@ def main():
     args = p.parse_args()
 
     # --act_ckpt_level overrides --recompute_preact (the bool 0/1 alias).
-    act_ckpt_level = (
-        args.act_ckpt_level if args.act_ckpt_level is not None
-        else (1 if args.recompute_preact else 0)
-    )
+    act_ckpt_level = args.act_ckpt_level if args.act_ckpt_level is not None else (1 if args.recompute_preact else 0)
 
     # MoE shape from args (defaults = the module-level profile shape).
     H = args.hidden
@@ -307,13 +298,8 @@ def main():
 
     # Replicated W1 / W2 across ranks (each rank slices its E_local share).
     g = torch.Generator(device=device).manual_seed(42)
-    w1_full = (
-        torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g)
-        * 0.02
-    ).contiguous()
-    w2_full = (
-        torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02
-    ).contiguous()
+    w1_full = (torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
+    w2_full = (torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w1_local.requires_grad_(True)
@@ -335,15 +321,11 @@ def main():
         )
     else:
         topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
-    topk_weights = torch.softmax(
-        torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
-    ).contiguous()
+    topk_weights = torch.softmax(torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1).contiguous()
     topk_weights.requires_grad_(True)
 
     rank_idx = topk_idx // local_E
-    is_token_in_rank = torch.zeros(
-        (args.seq_len, world_size), dtype=torch.bool, device=device
-    )
+    is_token_in_rank = torch.zeros((args.seq_len, world_size), dtype=torch.bool, device=device)
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
@@ -393,9 +375,7 @@ def main():
 
     n_wait, n_warmup, n_active = 1, 2, 5
     n_steps = n_wait + n_warmup + n_active
-    schedule = torch.profiler.schedule(
-        wait=n_wait, warmup=n_warmup, active=n_active, repeat=1
-    )
+    schedule = torch.profiler.schedule(wait=n_wait, warmup=n_warmup, active=n_active, repeat=1)
     # Wall-time CUDA events around fwd and bwd for every step. We use the
     # active-region medians as the e2e numbers. cuda_time_total from the
     # profiler is summed-across-streams (would double-count overlap), so
@@ -445,12 +425,8 @@ def main():
     # Active-region medians for the fwd / bwd wall-time numbers. Profiler
     # wait+warmup steps are excluded — those caches and seqs are noisy.
     active_range = range(n_wait + n_warmup, n_steps)
-    fwd_times_us = sorted(
-        fwd_starts[i].elapsed_time(fwd_ends[i]) * 1e3 for i in active_range
-    )
-    bwd_times_us = sorted(
-        bwd_starts[i].elapsed_time(bwd_ends[i]) * 1e3 for i in active_range
-    )
+    fwd_times_us = sorted(fwd_starts[i].elapsed_time(fwd_ends[i]) * 1e3 for i in active_range)
+    bwd_times_us = sorted(bwd_starts[i].elapsed_time(bwd_ends[i]) * 1e3 for i in active_range)
     fwd_e2e_us = fwd_times_us[len(fwd_times_us) // 2]
     bwd_e2e_us = bwd_times_us[len(bwd_times_us) // 2]
     # Step-time spread (jumpiness): per-step fwd+bwd total, min/median/max over
@@ -458,17 +434,14 @@ def main():
     # without it is the signature of the recompute stalling the streaming
     # irregularly (variable overlap with dispatch_grads per step).
     bwd_min_us, bwd_max_us = bwd_times_us[0], bwd_times_us[-1]
-    total_times_us = sorted(
-        (fwd_starts[i].elapsed_time(fwd_ends[i]) + bwd_starts[i].elapsed_time(bwd_ends[i]))
-        * 1e3
-        for i in active_range
-    )
+    total_times_us = sorted((fwd_starts[i].elapsed_time(fwd_ends[i]) + bwd_starts[i].elapsed_time(bwd_ends[i])) * 1e3 for i in active_range)
     total_min_us = total_times_us[0]
     total_med_us = total_times_us[len(total_times_us) // 2]
     total_max_us = total_times_us[-1]
 
     if rank == 0:
         events = prof.key_averages()
+
         # Torch renamed `cuda_time_total` → `device_time_total` on
         # FunctionEventAvg (device-agnostic); old name still works as a
         # `table(sort_by=...)` key alias but no longer exists as an attribute.
@@ -596,20 +569,8 @@ def main():
         fwd_combine_us = combine_kernel_us
         bwd_combine_grads_us = combine_kernel_us
 
-        fwd_serial_us = (
-            dispatch_meta_us
-            + dispatch_us
-            + streaming_a_us
-            + streaming_y_us
-            + fwd_combine_us
-        )
-        bwd_serial_us = (
-            dispatch_grads_us
-            + streaming_y_bwd_us
-            + streaming_a_bwd_us
-            + bwd_combine_grads_us
-            + 2 * gemm_per_call_us
-        )
+        fwd_serial_us = dispatch_meta_us + dispatch_us + streaming_a_us + streaming_y_us + fwd_combine_us
+        bwd_serial_us = dispatch_grads_us + streaming_y_bwd_us + streaming_a_bwd_us + bwd_combine_grads_us + 2 * gemm_per_call_us
         total_serial_us = fwd_serial_us + bwd_serial_us
         total_e2e_us = fwd_e2e_us + bwd_e2e_us
 
@@ -620,12 +581,12 @@ def main():
             return f"{saved:+7.1f} μs ({100 * saved / serial:+5.1f}% of serial)"
 
         print()
-        print(
-            "=== end-to-end pipeline analysis (from profiler key_averages + CUDA events) ==="
-        )
+        print("=== end-to-end pipeline analysis (from profiler key_averages + CUDA events) ===")
         print(f"  buffer.dispatch (metadata + main):       {dispatch_meta_us + dispatch_us:7.1f} μs")
         print(f"    streaming_dispatch_metadata (a+b+fill):{dispatch_meta_us:7.1f} μs")
-        print(f"      phase_a / phase_b / fill:             {dispatch_meta_a_us:5.1f} / {dispatch_meta_b_us:5.1f} / {dispatch_fill_us:5.1f} μs")
+        print(
+            f"      phase_a / phase_b / fill:             {dispatch_meta_a_us:5.1f} / {dispatch_meta_b_us:5.1f} / {dispatch_fill_us:5.1f} μs"
+        )
         print(f"    dispatch_main_kernel:                  {dispatch_us:7.1f} μs")
         print(f"  streaming_moe_a:                         {streaming_a_us:7.1f} μs")
         print(f"  streaming_moe_y:                         {streaming_y_us:7.1f} μs")
@@ -638,31 +599,26 @@ def main():
         print(f"  buffer.dispatch_grads:                   {dispatch_grads_us:7.1f} μs")
         print(f"  streaming_moe_y_bwd:                     {streaming_y_bwd_us:7.1f} μs")
         print(f"  streaming_moe_a_bwd:                     {streaming_a_bwd_us:7.1f} μs")
-        print(
-            f"  buffer.combine_grads:                    {bwd_combine_grads_us:7.1f} μs"
-        )
-        print(
-            f"  gemm_grouped dW1 + dW2 ({gemm_count_per_iter:.0f}× quack.gemm/iter): {2 * gemm_per_call_us:7.1f} μs"
-        )
+        print(f"  buffer.combine_grads:                    {bwd_combine_grads_us:7.1f} μs")
+        print(f"  gemm_grouped dW1 + dW2 ({gemm_count_per_iter:.0f}× quack.gemm/iter): {2 * gemm_per_call_us:7.1f} μs")
         print(f"  bwd serial sum of stages:                {bwd_serial_us:7.1f} μs")
         print(f"  bwd e2e (real overlap):                  {bwd_e2e_us:7.1f} μs")
         print(f"  bwd overlap saved:                       {pct_saved(bwd_serial_us, bwd_e2e_us)}")
         print()
         print(f"  total serial sum (fwd + bwd):            {total_serial_us:7.1f} μs")
-        print(
-            f"  total e2e per training iter (fwd + bwd): {total_e2e_us:7.1f} μs"
-        )
+        print(f"  total e2e per training iter (fwd + bwd): {total_e2e_us:7.1f} μs")
         print(f"  total overlap saved:                     {pct_saved(total_serial_us, total_e2e_us)}")
-        print(
-            "  (fwd and bwd don't overlap with each other by construction — "
-            "autograd boundary at out.sum().backward())"
-        )
+        print("  (fwd and bwd don't overlap with each other by construction — autograd boundary at out.sum().backward())")
         print()
         print("=== step-time spread (jumpiness check) ===")
-        print(f"  bwd   min / median / max:  {bwd_min_us:7.1f} / {bwd_e2e_us:7.1f} / {bwd_max_us:7.1f} μs"
-              f"   (max/min = {bwd_max_us / max(bwd_min_us, 1e-9):.2f}×)")
-        print(f"  total min / median / max:  {total_min_us:7.1f} / {total_med_us:7.1f} / {total_max_us:7.1f} μs"
-              f"   (max/min = {total_max_us / max(total_min_us, 1e-9):.2f}×)")
+        print(
+            f"  bwd   min / median / max:  {bwd_min_us:7.1f} / {bwd_e2e_us:7.1f} / {bwd_max_us:7.1f} μs"
+            f"   (max/min = {bwd_max_us / max(bwd_min_us, 1e-9):.2f}×)"
+        )
+        print(
+            f"  total min / median / max:  {total_min_us:7.1f} / {total_med_us:7.1f} / {total_max_us:7.1f} μs"
+            f"   (max/min = {total_max_us / max(total_min_us, 1e-9):.2f}×)"
+        )
         print()
         print("=== memory (rank 0) ===")
         print(f"  peak allocated (torch caching allocator):  {torch.cuda.max_memory_allocated() / 2**30:7.2f} GiB")
@@ -674,19 +630,14 @@ def main():
         _hb = H * 2
         _dc = StreamEPBuffer.get_dispatch_config(world_size)
         _cc = StreamEPBuffer.get_combine_config(world_size)
-        _rdma = max(_dc.get_rdma_buffer_size_hint(_hb, world_size),
-                    _cc.get_rdma_buffer_size_hint(_hb, world_size))
-        _nvl = max(_dc.get_nvl_buffer_size_hint(_hb, world_size),
-                   _cc.get_nvl_buffer_size_hint(_hb, world_size))
-        print(f"  comm buffers (outside torch): NVL {_nvl / 2**30:6.2f} GiB   "
-              f"RDMA {_rdma / 2**30:6.2f} GiB  (RDMA scales with ring depth)")
+        _rdma = max(_dc.get_rdma_buffer_size_hint(_hb, world_size), _cc.get_rdma_buffer_size_hint(_hb, world_size))
+        _nvl = max(_dc.get_nvl_buffer_size_hint(_hb, world_size), _cc.get_nvl_buffer_size_hint(_hb, world_size))
+        print(f"  comm buffers (outside torch): NVL {_nvl / 2**30:6.2f} GiB   RDMA {_rdma / 2**30:6.2f} GiB  (RDMA scales with ring depth)")
         print()
         # Per-kernel table — useful for cross-referencing the symbols that
         # got matched to each role above.
         print("=== matched kernel symbols (per-call avg) ===")
-        print(
-            f"{'role':>40s}  {'symbol':>50s}  {'count':>5s}  {'avg (μs)':>10s}"
-        )
+        print(f"{'role':>40s}  {'symbol':>50s}  {'count':>5s}  {'avg (μs)':>10s}")
         print(f"{'-' * 40}  {'-' * 50}  {'-' * 5}  {'-' * 10}")
         any_matched = False
         for key in target_kernels:
@@ -694,10 +645,7 @@ def main():
                 continue
             any_matched = True
             avg = per_call(key)
-            print(
-                f"{key:>40s}  {sample_event_key.get(key, '')[:50]:>50s}  "
-                f"{count_by_key[key]:>5d}  {avg:>10.1f}"
-            )
+            print(f"{key:>40s}  {sample_event_key.get(key, '')[:50]:>50s}  {count_by_key[key]:>5d}  {avg:>10.1f}")
         if not any_matched:
             print(
                 "  (no matching kernels found — check full_kernel_table.txt "

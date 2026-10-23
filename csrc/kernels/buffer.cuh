@@ -63,7 +63,7 @@ public:
     }
 
     __device__ __forceinline__ void advance(int shift) {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < kNumRanks; ++i)
             ptrs[i] = ptrs[i] + shift * sizeof(dtype_t);
     }

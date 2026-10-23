@@ -46,12 +46,16 @@ def main():
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
-    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
+    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
 
     pool, handle, _event = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=1,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        tile_m=tile_m,
+        dispatch_seq=1,
     )
     torch.cuda.synchronize()
 
@@ -63,19 +67,16 @@ def main():
     # dL_dy[t, h] uniquely identifies (rank, t, h). Receiver should land
     # source-rank's value into dL_do_pool — exactly what we want to check.
     g_dy = torch.Generator(device=device).manual_seed(7919 + rank * 31)
-    dL_dy = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device, generator=g_dy)
-             + rank * 100.0)
+    dL_dy = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device, generator=g_dy) + rank * 100.0
     dL_dy = dL_dy.contiguous()
 
     # Run dispatch_grads.
     dL_do_pool, bwd_arrival_count, _grads_started = buf.dispatch_grads(handle, dL_dy, dispatch_seq=1)
     torch.cuda.synchronize()
 
-    assert dL_do_pool.shape == (TK_padded, hidden), \
-        f"dL_do_pool shape {dL_do_pool.shape} != ({TK_padded}, {hidden})"
+    assert dL_do_pool.shape == (TK_padded, hidden), f"dL_do_pool shape {dL_do_pool.shape} != ({TK_padded}, {hidden})"
     assert dL_do_pool.dtype == torch.bfloat16
-    assert bwd_arrival_count.shape == (total_tiles,), \
-        f"bwd_arrival_count shape {bwd_arrival_count.shape} != ({total_tiles},)"
+    assert bwd_arrival_count.shape == (total_tiles,), f"bwd_arrival_count shape {bwd_arrival_count.shape} != ({total_tiles},)"
     assert bwd_arrival_count.dtype == torch.int32
 
     # Build expected: for each rank S, gather S's dL_dy + is_token_in_rank.
@@ -98,8 +99,8 @@ def main():
         src_in = all_is_in_rank[src][:, rank].cpu()
         idx_in_src = torch.nonzero(src_in, as_tuple=False).flatten().to(torch.int32)
         n = idx_in_src.numel()
-        recv_token_src_rank[cur:cur + n] = src
-        recv_token_src_idx[cur:cur + n] = idx_in_src
+        recv_token_src_rank[cur : cur + n] = src
+        recv_token_src_idx[cur : cur + n] = idx_in_src
         cur += n
     assert cur == T_recv
 
@@ -121,8 +122,7 @@ def main():
             mismatches += 1
             if mismatches <= 4:
                 k = int(pool_k_slot[s].item())
-                print(f"[rank {rank}] slot {s} (r={r}, k={k}, src={src}, t_src={t_src}): "
-                      f"expected {expected[:4]}... got {got[:4]}...")
+                print(f"[rank {rank}] slot {s} (r={r}, k={k}, src={src}, t_src={t_src}): expected {expected[:4]}... got {got[:4]}...")
     assert mismatches == 0, f"[rank {rank}] {mismatches} slot mismatches in dL_do_pool"
 
     # bwd_arrival_count[tile_id] should equal pool_arrival_target[tile_id]
@@ -137,15 +137,14 @@ def main():
     # Determinism: re-run dispatch_grads with same handle, same input → same output.
     dL_do_pool2, bwd_arrival_count2, _grads_started2 = buf.dispatch_grads(handle, dL_dy, dispatch_seq=2)
     torch.cuda.synchronize()
-    valid = (handle.pool_recv_token.cpu() >= 0)
-    assert torch.equal(dL_do_pool.cpu()[valid], dL_do_pool2.cpu()[valid]), \
-        "dL_do_pool (valid rows) not deterministic"
-    assert torch.equal(bwd_arrival_count2.cpu(), pool_arrival_target_cpu), \
+    valid = handle.pool_recv_token.cpu() >= 0
+    assert torch.equal(dL_do_pool.cpu()[valid], dL_do_pool2.cpu()[valid]), "dL_do_pool (valid rows) not deterministic"
+    assert torch.equal(bwd_arrival_count2.cpu(), pool_arrival_target_cpu), (
         "bwd_arrival_count did not refire to pool_arrival_target on second call"
+    )
 
     if rank == 0:
-        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} "
-              f"TK_padded={TK_padded} total_tiles={total_tiles}")
+        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} TK_padded={TK_padded} total_tiles={total_tiles}")
 
     cleanup_dist()
 

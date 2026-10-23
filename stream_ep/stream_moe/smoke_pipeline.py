@@ -42,8 +42,7 @@ from stream_ep.stream_moe.profile_pipeline import (
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--num_sms", type=int, default=None,
-                   help="StreamEP num_sms override; default = Buffer auto-pick.")
+    p.add_argument("--num_sms", type=int, default=None, help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=3)
     p.add_argument("--n_iter", type=int, default=5)
@@ -64,13 +63,8 @@ def main():
     )
 
     g = torch.Generator(device=device).manual_seed(42)
-    w1_full = (
-        torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g)
-        * 0.02
-    ).contiguous()
-    w2_full = (
-        torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02
-    ).contiguous()
+    w1_full = (torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
+    w2_full = (torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w1_local.requires_grad_(True)
@@ -80,15 +74,11 @@ def main():
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
     x.requires_grad_(True)
     topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
-    topk_weights = torch.softmax(
-        torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
-    ).contiguous()
+    topk_weights = torch.softmax(torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1).contiguous()
     topk_weights.requires_grad_(True)
 
     rank_idx = topk_idx // local_E
-    is_token_in_rank = torch.zeros(
-        (args.seq_len, world_size), dtype=torch.bool, device=device
-    )
+    is_token_in_rank = torch.zeros((args.seq_len, world_size), dtype=torch.bool, device=device)
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
@@ -113,8 +103,7 @@ def main():
     barrier(group)
     t_warmup = time.time() - t0
     rank_zero_print(
-        f"[smoke] warmup ({args.n_warmup} iters, includes JIT): "
-        f"{t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)"
+        f"[smoke] warmup ({args.n_warmup} iters, includes JIT): {t_warmup:.2f}s ({t_warmup / args.n_warmup * 1e3:.1f} ms/iter avg)"
     )
 
     t0 = time.time()
@@ -134,10 +123,7 @@ def main():
     torch.cuda.synchronize()
     barrier(group)
     t_iter = time.time() - t0
-    rank_zero_print(
-        f"[smoke] timed   ({args.n_iter} iters):              "
-        f"{t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)"
-    )
+    rank_zero_print(f"[smoke] timed   ({args.n_iter} iters):              {t_iter:.2f}s ({t_iter / args.n_iter * 1e3:.1f} ms/iter avg)")
     rank_zero_print("[smoke] OK")
 
     torch_dist.destroy_process_group()

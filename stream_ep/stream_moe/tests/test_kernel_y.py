@@ -32,12 +32,8 @@ import torch
 def _make_tile_metadata(tile_to_expert_list, E_local, device):
     """Build (tile_id_to_expert, expert_pool_block_offset). Same as kernel A test."""
     total_tiles = len(tile_to_expert_list)
-    tile_id_to_expert = torch.tensor(
-        tile_to_expert_list, dtype=torch.int32, device=device
-    )
-    expert_pool_block_offset = torch.zeros(
-        E_local + 1, dtype=torch.int32, device=device
-    )
+    tile_id_to_expert = torch.tensor(tile_to_expert_list, dtype=torch.int32, device=device)
+    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     counts = [0] * E_local
     for e in tile_to_expert_list:
         counts[e] += 1
@@ -55,9 +51,7 @@ def _make_pool_arrival_pair(total_tiles, device, *, target=1, fired=True):
     count-vs-target spin that the scheduler reuses for kernel Y now that
     A → Y is implicit same-stream FIFO.
     """
-    pool_arrival_target = torch.full(
-        (total_tiles,), target, dtype=torch.int32, device=device
-    )
+    pool_arrival_target = torch.full((total_tiles,), target, dtype=torch.int32, device=device)
     if fired:
         pool_arrival_count = pool_arrival_target.clone()
     else:
@@ -126,9 +120,7 @@ def test_streaming_moe_y_compiles(device):
     k_local_remaining = torch.zeros(T_recv, dtype=torch.int32, device=device)
     y_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [0, 0, 0, 0], E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 0, 0, 0], E_local, device)
     pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     import stream_ep.stream_moe.compile_config as cu
@@ -172,9 +164,7 @@ def test_streaming_moe_y_single_tile(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(0)
-    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(
-        0.1
-    )
+    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(0.1)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
     o = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -184,9 +174,7 @@ def test_streaming_moe_y_single_tile(device):
     k_local_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
     y_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [chosen_expert], E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([chosen_expert], E_local, device)
     pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     streaming_moe_y(
@@ -206,9 +194,7 @@ def test_streaming_moe_y_single_tile(device):
     )
     torch.cuda.synchronize()
 
-    o_ref, k_local = _eager_y_reference(
-        postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv
-    )
+    o_ref, k_local = _eager_y_reference(postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv)
 
     o_kernel = o[:T_recv]
     diff = (o_kernel.float() - o_ref.float()).abs()
@@ -224,12 +210,8 @@ def test_streaming_moe_y_single_tile(device):
         f"max rel diff {rel.max().item():.4f}"
     )
 
-    assert (
-        k_local_remaining == 0
-    ).all(), f"k_local_remaining not zeroed: {k_local_remaining}"
-    assert (
-        y_done_per_token == 42
-    ).all(), f"y_done_per_token not all 42: {y_done_per_token}"
+    assert (k_local_remaining == 0).all(), f"k_local_remaining not zeroed: {k_local_remaining}"
+    assert (y_done_per_token == 42).all(), f"y_done_per_token not all 42: {y_done_per_token}"
 
 
 def test_streaming_moe_y_multi_tile_static(device):
@@ -251,9 +233,7 @@ def test_streaming_moe_y_multi_tile_static(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(7)
-    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(
-        0.1
-    )
+    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(0.1)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
     o = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -265,18 +245,12 @@ def test_streaming_moe_y_multi_tile_static(device):
     pool_recv_token_list = []
     for s in range(TK_padded):
         pool_recv_token_list.append(s % T_recv)
-    pool_recv_token = torch.tensor(
-        pool_recv_token_list, dtype=torch.int32, device=device
-    )
+    pool_recv_token = torch.tensor(pool_recv_token_list, dtype=torch.int32, device=device)
     pool_topk_weight = torch.rand(TK_padded, dtype=torch.float32, device=device)
-    k_local_remaining = torch.full(
-        (T_recv,), k_local_each, dtype=torch.int32, device=device
-    )
+    k_local_remaining = torch.full((T_recv,), k_local_each, dtype=torch.int32, device=device)
     y_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
     pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     streaming_moe_y(
@@ -296,15 +270,9 @@ def test_streaming_moe_y_multi_tile_static(device):
     )
     torch.cuda.synchronize()
 
-    o_ref, k_ref = _eager_y_reference(
-        postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv
-    )
+    o_ref, k_ref = _eager_y_reference(postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv)
 
-    assert (
-        k_ref == k_local_each
-    ).all(), (
-        f"reference K_local mismatch: got {k_ref.unique()}, expected {k_local_each}"
-    )
+    assert (k_ref == k_local_each).all(), f"reference K_local mismatch: got {k_ref.unique()}, expected {k_local_each}"
 
     o_kernel = o[:T_recv]
     diff = (o_kernel.float() - o_ref.float()).abs()
@@ -321,12 +289,10 @@ def test_streaming_moe_y_multi_tile_static(device):
     )
 
     assert (k_local_remaining == 0).all(), (
-        f"k_local_remaining not zeroed: bad indices "
-        f"{(k_local_remaining != 0).nonzero().squeeze().tolist()}"
+        f"k_local_remaining not zeroed: bad indices {(k_local_remaining != 0).nonzero().squeeze().tolist()}"
     )
     assert (y_done_per_token == 99).all(), (
-        f"y_done_per_token not all 99: bad indices "
-        f"{(y_done_per_token != 99).nonzero().squeeze().tolist()}"
+        f"y_done_per_token not all 99: bad indices {(y_done_per_token != 99).nonzero().squeeze().tolist()}"
     )
 
 
@@ -348,9 +314,7 @@ def test_streaming_moe_y_padding_rows(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(13)
-    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(
-        0.1
-    )
+    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(0.1)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
     o = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -365,9 +329,7 @@ def test_streaming_moe_y_padding_rows(device):
                 pool_recv_token_list.append(s % T_recv)
             else:
                 pool_recv_token_list.append(-1)
-    pool_recv_token = torch.tensor(
-        pool_recv_token_list, dtype=torch.int32, device=device
-    )
+    pool_recv_token = torch.tensor(pool_recv_token_list, dtype=torch.int32, device=device)
 
     # Padding rows: weight = 0 (matches design's zero-init pad semantics).
     pool_topk_weight = torch.rand(TK_padded, dtype=torch.float32, device=device)
@@ -376,9 +338,7 @@ def test_streaming_moe_y_padding_rows(device):
     k_local_remaining = torch.full((T_recv,), 2, dtype=torch.int32, device=device)
     y_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [0, 1], E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 1], E_local, device)
     pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device)
 
     streaming_moe_y(
@@ -398,9 +358,7 @@ def test_streaming_moe_y_padding_rows(device):
     )
     torch.cuda.synchronize()
 
-    o_ref, _ = _eager_y_reference(
-        postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv
-    )
+    o_ref, _ = _eager_y_reference(postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv)
 
     o_kernel = o[:T_recv]
     diff = (o_kernel.float() - o_ref.float()).abs()
@@ -440,9 +398,7 @@ def test_streaming_moe_y_producer_consumer(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(11)
-    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(
-        0.1
-    )
+    postact_a = torch.randn(total_tiles, tile_m, I, dtype=dtype, device=device).mul_(0.1)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
 
     o = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -451,12 +407,8 @@ def test_streaming_moe_y_producer_consumer(device):
     k_local_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
     y_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(
-        total_tiles, device=device, fired=False
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival_pair(total_tiles, device=device, fired=False)
 
     # Pre-warm the producer JIT.
     fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=0)
@@ -488,9 +440,7 @@ def test_streaming_moe_y_producer_consumer(device):
 
     torch.cuda.synchronize()
 
-    o_ref, _ = _eager_y_reference(
-        postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv
-    )
+    o_ref, _ = _eager_y_reference(postact_a, W2, pool_recv_token, pool_topk_weight, tile_id_to_expert, T_recv)
 
     o_kernel = o[:T_recv]
     diff = (o_kernel.float() - o_ref.float()).abs()

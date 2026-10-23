@@ -37,9 +37,7 @@ def _swiglu_ref(h_two_I: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
-def _make_pool_arrival(
-    total_tiles: int, device, fired: bool = True, target_val: int = 1
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_pool_arrival(total_tiles: int, device, fired: bool = True, target_val: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate (pool_arrival_count, pool_arrival_target) int32 pair.
 
     pool_arrival_target is set to ``target_val`` (per-tile firing target).
@@ -48,13 +46,9 @@ def _make_pool_arrival(
     `red.release.gpu.global.add.s32`'ing ``target_val`` into each slot
     with a delay between fires — see ``fire_tiles_with_delay``).
     """
-    pool_arrival_target = torch.full(
-        (total_tiles,), target_val, dtype=torch.int32, device=device
-    )
+    pool_arrival_target = torch.full((total_tiles,), target_val, dtype=torch.int32, device=device)
     init = target_val if fired else 0
-    pool_arrival_count = torch.full(
-        (total_tiles,), init, dtype=torch.int32, device=device
-    )
+    pool_arrival_count = torch.full((total_tiles,), init, dtype=torch.int32, device=device)
     return pool_arrival_count, pool_arrival_target
 
 
@@ -63,12 +57,8 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
     each tile_id to its expert. Tiles must already be in expert-major order
     (i.e. all tiles for expert e come before any tile for expert e+1)."""
     total_tiles = len(tile_to_expert_list)
-    tile_id_to_expert = torch.tensor(
-        tile_to_expert_list, dtype=torch.int32, device=device
-    )
-    expert_pool_block_offset = torch.zeros(
-        E_local + 1, dtype=torch.int32, device=device
-    )
+    tile_id_to_expert = torch.tensor(tile_to_expert_list, dtype=torch.int32, device=device)
+    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     counts = [0] * E_local
     for e in tile_to_expert_list:
         counts[e] += 1
@@ -77,9 +67,7 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
         expert_pool_block_offset[e] = cum
         cum += counts[e]
     expert_pool_block_offset[E_local] = cum
-    assert (
-        cum == total_tiles
-    ), f"tile_to_expert_list must be expert-major and contiguous; got {tile_to_expert_list}"
+    assert cum == total_tiles, f"tile_to_expert_list must be expert-major and contiguous; got {tile_to_expert_list}"
     return tile_id_to_expert, expert_pool_block_offset
 
 
@@ -107,12 +95,8 @@ def test_streaming_moe_a_compiles(device):
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
 
     # All 4 tiles belong to expert 0.
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [0, 0, 0, 0], E_local, device
-    )
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 0, 0, 0], E_local, device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
     import stream_ep.stream_moe.compile_config as cu
 
     orig = cu.COMPILE_ONLY
@@ -153,12 +137,8 @@ def test_streaming_moe_a_single_tile(device):
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [chosen_expert], E_local, device
-    )
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([chosen_expert], E_local, device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
 
     streaming_moe_a(
         pool,
@@ -179,9 +159,7 @@ def test_streaming_moe_a_single_tile(device):
     a_kernel = postact_a[0]
     diff = (a_kernel.float() - a_ref.float()).abs()
     rel = diff / (a_ref.float().abs() + 1e-3)
-    assert (
-        rel.max().item() < 5e-2
-    ), f"max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
+    assert rel.max().item() < 5e-2, f"max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
 
 
 def test_streaming_moe_a_multi_tile_static(device):
@@ -208,12 +186,8 @@ def test_streaming_moe_a_multi_tile_static(device):
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
 
     streaming_moe_a(
         pool,
@@ -234,10 +208,7 @@ def test_streaming_moe_a_multi_tile_static(device):
         a_ref = _swiglu_ref(h).to(dtype)
         diff = (postact_a[t].float() - a_ref.float()).abs()
         rel = diff / (a_ref.float().abs() + 1e-3)
-        assert rel.max().item() < 5e-2, (
-            f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, "
-            f"max abs diff {diff.max().item():.4f}"
-        )
+        assert rel.max().item() < 5e-2, f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
 
 
 def test_streaming_moe_a_with_preact(device):
@@ -268,12 +239,8 @@ def test_streaming_moe_a_with_preact(device):
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
     preact_a = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
 
     streaming_moe_a(
         pool,
@@ -299,9 +266,7 @@ def test_streaming_moe_a_with_preact(device):
         # didn't change just because we added the mD store.
         diff_a = (postact_a[t].float() - a_ref.float()).abs()
         rel_a = diff_a / (a_ref.float().abs() + 1e-3)
-        assert (
-            rel_a.max().item() < 5e-2
-        ), f"tile {t}: postact mismatch, max rel diff {rel_a.max().item():.4f}"
+        assert rel_a.max().item() < 5e-2, f"tile {t}: postact mismatch, max rel diff {rel_a.max().item():.4f}"
 
         # Preact: the [2I] pre-SwiGLU accumulator. The eager reference is the
         # raw `pool @ W1[e].T` GEMM in fp32 cast to bf16 — exactly what kernel
@@ -310,9 +275,7 @@ def test_streaming_moe_a_with_preact(device):
         diff_h = (preact_a[t].float() - h_ref.float()).abs()
         rel_h = diff_h / (h_ref.float().abs() + 1e-3)
         assert rel_h.max().item() < 5e-2, (
-            f"tile {t}: preact mismatch, expert={e}, "
-            f"max rel diff {rel_h.max().item():.4f}, "
-            f"max abs diff {diff_h.max().item():.4f}"
+            f"tile {t}: preact mismatch, expert={e}, max rel diff {rel_h.max().item():.4f}, max abs diff {diff_h.max().item():.4f}"
         )
 
 
@@ -338,12 +301,8 @@ def test_streaming_moe_a_producer_consumer(device):
     W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
     postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(
-        total_tiles, device=device, fired=False
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device, fired=False)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
     # concurrent launch (one-shot pre-fire then reset).
@@ -378,10 +337,7 @@ def test_streaming_moe_a_producer_consumer(device):
         a_ref = _swiglu_ref(h).to(dtype)
         diff = (postact_a[t].float() - a_ref.float()).abs()
         rel = diff / (a_ref.float().abs() + 1e-3)
-        assert rel.max().item() < 5e-2, (
-            f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, "
-            f"max abs diff {diff.max().item():.4f}"
-        )
+        assert rel.max().item() < 5e-2, f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
 
 
 if __name__ == "__main__":

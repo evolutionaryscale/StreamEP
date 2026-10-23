@@ -51,12 +51,16 @@ def main():
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
-    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
+    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
 
     pool, handle, _event = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=1,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        tile_m=tile_m,
+        dispatch_seq=1,
     )
     torch.cuda.synchronize()
 
@@ -74,7 +78,10 @@ def main():
 
     # Run combine_grads.
     dL_dx, dL_dtopk_weights = buf.combine_grads(
-        dL_dx_per_r, handle, weight_grads, bwd_a_done_per_token,
+        dL_dx_per_r,
+        handle,
+        weight_grads,
+        bwd_a_done_per_token,
         dispatch_seq=1,
     )
     torch.cuda.synchronize()
@@ -114,7 +121,10 @@ def main():
     # Re-run with a different bwd seq to verify per-call statefulness.
     bwd_a_done_per_token2 = torch.full((T_recv,), 2, dtype=torch.int64, device=device)
     dL_dx2, _ = buf.combine_grads(
-        dL_dx_per_r, handle, weight_grads, bwd_a_done_per_token2,
+        dL_dx_per_r,
+        handle,
+        weight_grads,
+        bwd_a_done_per_token2,
         dispatch_seq=2,
     )
     torch.cuda.synchronize()

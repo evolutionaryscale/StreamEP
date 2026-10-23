@@ -29,8 +29,7 @@ def main() -> None:
     DIST.mkdir()
     with tempfile.TemporaryDirectory() as tmp:
         raw, unpacked = Path(tmp, "raw"), Path(tmp, "unpacked")
-        subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-build-isolation", "--no-deps",
-                        "--wheel-dir", raw, REPO], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-build-isolation", "--no-deps", "--wheel-dir", raw, REPO], check=True)
         (wheel,) = raw.glob("*.whl")
         run(sys.executable, "-m", "wheel", "unpack", "--dest", unpacked, wheel)
         (root,) = unpacked.iterdir()

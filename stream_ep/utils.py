@@ -13,15 +13,16 @@ def check_nvlink_connections(group: dist.ProcessGroup):
     # Check NVLink connection
     # NOTES: some A100 PCIE GPUs only have pairwise NVLink connection, so that we can only use EP2
     # TODO: check all cases, all local-node GPUs in the group should be connected via NVLink
-    if 'PCIE' in torch.cuda.get_device_name():
-        assert group.size() <= 2, 'PCIe GPUs only have pairwise NVLink connections'
+    if "PCIE" in torch.cuda.get_device_name():
+        assert group.size() <= 2, "PCIe GPUs only have pairwise NVLink connections"
 
         # noinspection PyUnresolvedReferences
         import pynvml
+
         pynvml.nvmlInit()
 
         # noinspection PyTypeChecker
-        devices = os.environ.get('CUDA_VISIBLE_DEVICES', '0,1,2,3,4,5,6,7').strip(',').split(',')
+        devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").strip(",").split(",")
         physical_device_idx = int(devices[torch.cuda.current_device()])
         physical_device_indices = [
             0,
@@ -36,8 +37,9 @@ def check_nvlink_connections(group: dist.ProcessGroup):
                 if i >= j:
                     continue
                 status = pynvml.nvmlDeviceGetP2PStatus(handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
-                assert status == pynvml.NVML_P2P_STATUS_OK,\
-                    f'GPU {physical_device_indices[i]} and GPU {physical_device_indices[j]} are not connected via NVLink'
+                assert status == pynvml.NVML_P2P_STATUS_OK, (
+                    f"GPU {physical_device_indices[i]} and GPU {physical_device_indices[j]} are not connected via NVLink"
+                )
 
         # Close NVML
         pynvml.nvmlShutdown()

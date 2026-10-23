@@ -113,18 +113,11 @@ class ColVecReduceAtomic(ColVecReduce):
         # varlen_m only: no per-batch dim, no per-pid_n column, no limit_n_tiles
         # gate — every launched pid_n stripe is a real partial (I % tile_n == 0),
         # and all pid_n CTAs race-free atomic-add into the same (slot,) location.
-        assert varlen_manager.varlen_m, (
-            "ColVecReduceAtomic only supports varlen_m mode (the only mode "
-            "kernel_y_bwd uses)"
-        )
+        assert varlen_manager.varlen_m, "ColVecReduceAtomic only supports varlen_m mode (the only mode kernel_y_bwd uses)"
         tile_M = gemm.cta_tile_shape_mnk[0]
         batch_idx = tile_coord_mnkl[3]
-        limit_m = min(
-            varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M
-        )
-        mColVec = cute.domain_offset(
-            (varlen_manager.params.cu_seqlens_m[batch_idx],), param
-        )
+        limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
+        mColVec = cute.domain_offset((varlen_manager.params.cu_seqlens_m[batch_idx],), param)
         gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
         if const_expr(use_swap_shuffle):
             in_warp0 = True if const_expr(warps_in_N == 1) else warp_n_idx == 0
@@ -137,11 +130,7 @@ class ColVecReduceAtomic(ColVecReduce):
                             self._finalize(tuple(v[j] for v in vals_m)),
                         )
         else:
-            should_write_gmem = (
-                is_lane_n_leader
-                if const_expr(warps_in_N == 1)
-                else warp_n_idx == 0 and is_lane_n_leader
-            )
+            should_write_gmem = is_lane_n_leader if const_expr(warps_in_N == 1) else warp_n_idx == 0 and is_lane_n_leader
             if should_write_gmem:
                 for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                     row_idx = tDcD_m[m][0]

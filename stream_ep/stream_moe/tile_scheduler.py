@@ -109,9 +109,7 @@ class StreamingTileSchedulerArguments:
     consumer_head: cute.Tensor  # [1] int32 — global linear claim counter
     arrival_count: cute.Tensor  # [total_tiles] int32 — release-add destination
     arrival_target: cute.Tensor  # [total_tiles] int32 — per-tile firing target
-    expert_pool_block_offset: (
-        cute.Tensor
-    )  # [E_local + 1] int32 — pool-block prefix-sum; consulted by the
+    expert_pool_block_offset: cute.Tensor  # [E_local + 1] int32 — pool-block prefix-sum; consulted by the
     # warp-cooperative ballot lookup below (one entry per scheduler-warp lane,
     # kNumExpertsPerLane entries for E_local > 31).
     total_tiles: Int32  # passed as scalar so launch-time get_grid_shape doesn't deref device tensor
@@ -189,12 +187,8 @@ class StreamingTileScheduler(TileScheduler):
 
         @staticmethod
         @cute.jit
-        def create(
-            args: StreamingTileSchedulerArguments, *, loc=None, ip=None
-        ) -> "StreamingTileScheduler.Params":
-            num_pid_n = cute.ceil_div(
-                args.problem_shape_ntile_mnl[1], args.cluster_shape_mnk[1]
-            )
+        def create(args: StreamingTileSchedulerArguments, *, loc=None, ip=None) -> "StreamingTileScheduler.Params":
+            num_pid_n = cute.ceil_div(args.problem_shape_ntile_mnl[1], args.cluster_shape_mnk[1])
             return StreamingTileScheduler.Params(
                 consumer_head=args.consumer_head,
                 arrival_count=args.arrival_count,
@@ -222,15 +216,11 @@ class StreamingTileScheduler(TileScheduler):
     # StreamEP used to shadow, and which drifted from main).
 
     @staticmethod
-    def to_underlying_arguments(
-        args: StreamingTileSchedulerArguments, *, loc=None, ip=None
-    ) -> Params:
+    def to_underlying_arguments(args: StreamingTileSchedulerArguments, *, loc=None, ip=None) -> Params:
         return StreamingTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
-    def get_grid_shape(
-        params: Params, max_active_clusters: Int32, *, loc=None, ip=None
-    ) -> Tuple[Int32, Int32, Int32]:
+    def get_grid_shape(params: Params, max_active_clusters: Int32, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
         # Grid is sized to fill compute SMs. total_tiles is passed as a scalar
         # (not derived from cumulative_tiles_before_e[num_local_experts]) so
         # we don't need to dereference a device tensor at host launch time.
@@ -303,9 +293,7 @@ class StreamingTileScheduler(TileScheduler):
         return linear_idx
 
     @cute.jit
-    def _delinearize_work_idx(
-        self, work_idx: Int32, *, block_zero_only: bool = False, loc=None, ip=None
-    ) -> WorkTileInfo:
+    def _delinearize_work_idx(self, work_idx: Int32, *, block_zero_only: bool = False, loc=None, ip=None) -> WorkTileInfo:
         """Decode a claimed linear work index into its tile coord via the
         warp-cooperative MoE expert ballot (the base ``_delinearize_work_idx``
         contract). Returns the CTA-0 (leader) coord; the base's
@@ -336,9 +324,7 @@ class StreamingTileScheduler(TileScheduler):
             # E_local up to 63. Out-of-range slots get INT_MAX so they never
             # match; cum[E_local]=total_tiles never matches since tile_id < it.
             kNumExpertsPerLane = const_expr(2)
-            num_local_experts = (
-                cute.size(params.expert_pool_block_offset, mode=[0]) - Int32(1)
-            )
+            num_local_experts = cute.size(params.expert_pool_block_offset, mode=[0]) - Int32(1)
             lane_idx = cute.arch.lane_idx()
             INF = Int32(0x7FFFFFFF)
             cum_slots = []
@@ -352,9 +338,7 @@ class StreamingTileScheduler(TileScheduler):
             # Count cums <= tile_id; monotone non-decreasing so count == expert_id + 1.
             n_matched_total = Int32(0)
             for i in cutlass.range_constexpr(kNumExpertsPerLane):
-                n_matched_total += cute.arch.popc(
-                    cute.arch.vote_ballot_sync(cum_slots[i] <= tile_id)
-                )
+                n_matched_total += cute.arch.popc(cute.arch.vote_ballot_sync(cum_slots[i] <= tile_id))
             expert_id = n_matched_total - Int32(1)
 
             # pid_m = tile_id - block_offset[expert_id]; shuffle the matching cum.

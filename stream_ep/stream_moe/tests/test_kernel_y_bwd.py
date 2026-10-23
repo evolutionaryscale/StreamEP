@@ -25,19 +25,13 @@ import pytest
 import torch
 
 
-def _make_bwd_arrival(
-    total_tiles: int, device, fired: bool = True, target_val: int = 1
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_bwd_arrival(total_tiles: int, device, fired: bool = True, target_val: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate (bwd_dispatch_arrival_count, pool_arrival_target) int32 pair
     for kernel_y_bwd's scheduler (COUNT_VS_TARGET on bwd_dispatch_arrival_count).
     """
-    pool_arrival_target = torch.full(
-        (total_tiles,), target_val, dtype=torch.int32, device=device
-    )
+    pool_arrival_target = torch.full((total_tiles,), target_val, dtype=torch.int32, device=device)
     init = target_val if fired else 0
-    bwd_dispatch_arrival_count = torch.full(
-        (total_tiles,), init, dtype=torch.int32, device=device
-    )
+    bwd_dispatch_arrival_count = torch.full((total_tiles,), init, dtype=torch.int32, device=device)
     return bwd_dispatch_arrival_count, pool_arrival_target
 
 
@@ -47,12 +41,8 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
     (i.e. all tiles for expert e come before any tile for expert e+1).
     """
     total_tiles = len(tile_to_expert_list)
-    tile_id_to_expert = torch.tensor(
-        tile_to_expert_list, dtype=torch.int32, device=device
-    )
-    expert_pool_block_offset = torch.zeros(
-        E_local + 1, dtype=torch.int32, device=device
-    )
+    tile_id_to_expert = torch.tensor(tile_to_expert_list, dtype=torch.int32, device=device)
+    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     counts = [0] * E_local
     for e in tile_to_expert_list:
         counts[e] += 1
@@ -61,9 +51,7 @@ def _make_tile_metadata(tile_to_expert_list, E_local, device):
         expert_pool_block_offset[e] = cum
         cum += counts[e]
     expert_pool_block_offset[E_local] = cum
-    assert (
-        cum == total_tiles
-    ), f"tile_to_expert_list must be expert-major and contiguous; got {tile_to_expert_list}"
+    assert cum == total_tiles, f"tile_to_expert_list must be expert-major and contiguous; got {tile_to_expert_list}"
     return tile_id_to_expert, expert_pool_block_offset
 
 
@@ -89,9 +77,7 @@ def _ref_dL_dswiglu_in(
     total_tiles = len(tile_to_expert_list)
     I = W2.shape[2]
     two_I = 2 * I
-    out = torch.zeros(
-        total_tiles, tile_m, two_I, dtype=dL_do_pool.dtype, device=dL_do_pool.device
-    )
+    out = torch.zeros(total_tiles, tile_m, two_I, dtype=dL_do_pool.dtype, device=dL_do_pool.device)
     for t in range(total_tiles):
         e = tile_to_expert_list[t]
         rows = slice(t * tile_m, (t + 1) * tile_m)
@@ -146,10 +132,7 @@ def _alloc_preact(total_tiles, tile_m, I, dtype, device, seed):
     """Allocate a (total_tiles, tile_m, 2*I) bf16 preact buffer with reproducible
     randn values."""
     g = torch.Generator(device=device).manual_seed(seed)
-    return (
-        torch.randn(total_tiles, tile_m, 2 * I, dtype=dtype, device=device, generator=g)
-        * 0.5
-    )
+    return torch.randn(total_tiles, tile_m, 2 * I, dtype=dtype, device=device, generator=g) * 0.5
 
 
 def _alloc_dL_dweight(TK_padded, device):
@@ -184,9 +167,7 @@ def _ref_postact_a_for_dW2(
     total_tiles, _, two_I = preact_a.shape
     I = two_I // 2
     TK_padded = total_tiles * tile_m
-    out = torch.empty(
-        total_tiles, tile_m, I, dtype=preact_a.dtype, device=preact_a.device
-    )
+    out = torch.empty(total_tiles, tile_m, I, dtype=preact_a.dtype, device=preact_a.device)
     w = pool_topk_weight.view(total_tiles, tile_m, 1)
     gate = preact_a[..., 0::2].float()
     up = preact_a[..., 1::2].float()
@@ -224,12 +205,8 @@ def test_streaming_moe_y_bwd_compiles(device):
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [0, 0, 0, 0], E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 0, 0, 0], E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(total_tiles, device=device)
 
     import stream_ep.stream_moe.compile_config as cu
 
@@ -248,7 +225,7 @@ def test_streaming_moe_y_bwd_compiles(device):
             expert_pool_block_offset,
             bwd_dispatch_arrival_count,
             pool_arrival_target,
-                tile_m=tile_m,
+            tile_m=tile_m,
             tile_n=tile_n,
         )
     finally:
@@ -277,21 +254,15 @@ def test_streaming_moe_y_bwd_single_tile(device):
     dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     # Mix of weights (some negative, some > 1) to exercise the multiplicative
     # ColVec broadcast — `*=` vs `+=` would silently pass under all-ones.
-    pool_topk_weight = torch.linspace(
-        -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
-    )
+    pool_topk_weight = torch.linspace(-0.5, 1.5, TK_padded, dtype=torch.float32, device=device)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=42)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
     tile_to_expert_list = [chosen_expert]
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(total_tiles, device=device)
 
     streaming_moe_y_bwd(
         dL_do_pool,
@@ -310,9 +281,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     )
     torch.cuda.synchronize()
 
-    ref = _ref_dL_dswiglu_in(
-        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
-    )
+    ref = _ref_dL_dswiglu_in(dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m)
     # bf16 GEMM ordering noise + bf16 cast through dswiglu's intermediate
     # fp32 ops + bf16x2 packing on output. Use the same "fail iff BOTH atol
     # AND rtol violated" pattern fwd kernel Y uses.
@@ -330,9 +299,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     # eager `Σ_i postact[i] * g[i]` reference. Tolerance scales with I
     # (the reduction length): per-element noise multiplied by ~sqrt(I)
     # for sum-of-squares-like patterns.
-    dL_dweight_ref = _ref_dL_dweight(
-        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
-    )
+    dL_dweight_ref = _ref_dL_dweight(dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m)
     diff_w = (dL_dweight - dL_dweight_ref).abs()
     rel_w = diff_w / (dL_dweight_ref.abs() + 1e-3)
     abs_thresh_w, rel_thresh_w = 5e-2, 5e-2
@@ -355,9 +322,7 @@ def test_streaming_moe_y_bwd_single_tile(device):
     )
 
 
-def _assert_dL_dswiglu_in_per_tile(
-    dL_dswiglu_in, ref, tile_to_expert_list, abs_thresh=1e-2, rel_thresh=5e-2
-):
+def _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list, abs_thresh=1e-2, rel_thresh=5e-2):
     for t in range(len(tile_to_expert_list)):
         diff = (dL_dswiglu_in[t].float() - ref[t].float()).abs()
         rel = diff / (ref[t].float().abs() + 1e-3)
@@ -390,20 +355,14 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
     dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
-    pool_topk_weight = torch.linspace(
-        -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
-    )
+    pool_topk_weight = torch.linspace(-0.5, 1.5, TK_padded, dtype=torch.float32, device=device)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=43)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(total_tiles, device=device)
 
     streaming_moe_y_bwd(
         dL_do_pool,
@@ -422,15 +381,11 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     )
     torch.cuda.synchronize()
 
-    ref = _ref_dL_dswiglu_in(
-        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
-    )
+    ref = _ref_dL_dswiglu_in(dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m)
     _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list)
 
     # dL/dweight: per-stripe partials summed across the n-stripe dim.
-    dL_dweight_ref = _ref_dL_dweight(
-        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
-    )
+    dL_dweight_ref = _ref_dL_dweight(dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m)
     diff_w = (dL_dweight - dL_dweight_ref).abs()
     rel_w = diff_w / (dL_dweight_ref.abs() + 1e-3)
     abs_thresh_w, rel_thresh_w = 5e-2, 5e-2
@@ -467,26 +422,18 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
     W2 = torch.randn(E_local, H, I, dtype=dtype, device=device).mul_(0.02)
     dL_dswiglu_in = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
-    pool_topk_weight = torch.linspace(
-        -0.5, 1.5, TK_padded, dtype=torch.float32, device=device
-    )
+    pool_topk_weight = torch.linspace(-0.5, 1.5, TK_padded, dtype=torch.float32, device=device)
     pool_recv_token = torch.arange(TK_padded, dtype=torch.int32, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=44)
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     postact_a_for_dW2 = _alloc_postact_a_for_dW2(total_tiles, tile_m, I, dtype, device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
-        total_tiles, device=device, fired=False
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(total_tiles, device=device, fired=False)
 
     # Pre-warm the producer JIT compile so the host doesn't block during the
     # concurrent launch (one-shot pre-fire then reset).
-    fire_tiles_with_delay(
-        bwd_dispatch_arrival_count, pool_arrival_target, delay_us=0
-    )
+    fire_tiles_with_delay(bwd_dispatch_arrival_count, pool_arrival_target, delay_us=0)
     torch.cuda.synchronize()
     bwd_dispatch_arrival_count.zero_()
     torch.cuda.synchronize()
@@ -507,24 +454,18 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
             expert_pool_block_offset,
             bwd_dispatch_arrival_count,
             pool_arrival_target,
-                tile_m=tile_m,
+            tile_m=tile_m,
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(
-            bwd_dispatch_arrival_count, pool_arrival_target, delay_us=50
-        )
+        fire_tiles_with_delay(bwd_dispatch_arrival_count, pool_arrival_target, delay_us=50)
 
     torch.cuda.synchronize()
 
-    ref = _ref_dL_dswiglu_in(
-        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
-    )
+    ref = _ref_dL_dswiglu_in(dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m)
     _assert_dL_dswiglu_in_per_tile(dL_dswiglu_in, ref, tile_to_expert_list)
 
-    dL_dweight_ref = _ref_dL_dweight(
-        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
-    )
+    dL_dweight_ref = _ref_dL_dweight(dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m)
     diff_w = (dL_dweight - dL_dweight_ref).abs()
     rel_w = diff_w / (dL_dweight_ref.abs() + 1e-3)
     abs_thresh_w, rel_thresh_w = 5e-2, 5e-2
@@ -605,9 +546,7 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     # rows are torch::empty() garbage). We populate ALL rows with random data —
     # the kernel will compute on padding rows too, but real-slot output is the
     # only thing we check.
-    dL_do_pool = (
-        torch.randn(TK_padded, H, dtype=dtype, device=device, generator=g) * 0.1
-    )
+    dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device, generator=g) * 0.1
     # Plant inf at padding rows of dL_do_pool so the GEMM through a padding row
     # produces inf and dswiglu(*,*,inf) → NaN; if the mPaddingMask predicate is
     # broken, the NaNs will leak into mD / mPostAct via the TMA store and the
@@ -619,39 +558,27 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     # fired) vs "kernel wrote garbage" (predicate broken). The TMA store
     # overwrites the whole tile regardless, so any sentinel surviving means
     # the kernel didn't run this row.
-    dL_dswiglu_in = torch.full(
-        (total_tiles, tile_m, 2 * I), float("nan"), dtype=dtype, device=device
-    )
+    dL_dswiglu_in = torch.full((total_tiles, tile_m, 2 * I), float("nan"), dtype=dtype, device=device)
     preact_a = _alloc_preact(total_tiles, tile_m, I, dtype, device, seed=124)
 
     # pool_topk_weight: real-slot rows have nonzero values (matching Pass B),
     # padding rows are 0 (matching the Z_pre memset in stream_ep.cpp).
     pool_topk_weight = torch.zeros(TK_padded, dtype=torch.float32, device=device)
-    pool_topk_weight[real_mask] = torch.linspace(
-        -0.5, 1.5, real_mask.sum().item(), dtype=torch.float32, device=device
-    )
+    pool_topk_weight[real_mask] = torch.linspace(-0.5, 1.5, real_mask.sum().item(), dtype=torch.float32, device=device)
     # pool_recv_token: real slots get an arbitrary nonneg id; padding slots
     # are -1 (matching fwd Pass B's N-region 0xFF memset). The kernel's
     # mPaddingMask predicate keys on `recv_token < 0` to zero out (dgate, dup,
     # postact, g) at padding rows BEFORE the colvec_reduce_accumulate / weight
     # multiply / mD / mPostAct stores.
     pool_recv_token = torch.full((TK_padded,), -1, dtype=torch.int32, device=device)
-    pool_recv_token[real_mask] = torch.arange(
-        real_mask.sum().item(), dtype=torch.int32, device=device
-    )
+    pool_recv_token[real_mask] = torch.arange(real_mask.sum().item(), dtype=torch.int32, device=device)
 
     dL_dweight = _alloc_dL_dweight(TK_padded, device)
     # NaN sentinel so the post-kernel padding-row asserts can distinguish
     # "predicate zeroed the padding rows" from "kernel skipped these rows".
-    postact_a_for_dW2 = torch.full(
-        (total_tiles, tile_m, I), float("nan"), dtype=dtype, device=device
-    )
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(
-        total_tiles, device=device
-    )
+    postact_a_for_dW2 = torch.full((total_tiles, tile_m, I), float("nan"), dtype=dtype, device=device)
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_arrival(total_tiles, device=device)
 
     streaming_moe_y_bwd(
         dL_do_pool,
@@ -673,24 +600,15 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     # Reference dL_dweight per slot (computed on ALL rows; we filter to real
     # later). Uses the SAME garbage values the kernel sees, so any per-slot
     # disagreement is a kernel bug, not a missing-input bug.
-    dL_dweight_ref = _ref_dL_dweight(
-        dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m
-    )
-    _assert_dL_dweight_real_slots(
-        dL_dweight, dL_dweight_ref, real_mask, msg_prefix="dense_padding "
-    )
+    dL_dweight_ref = _ref_dL_dweight(dL_do_pool, W2, preact_a, tile_to_expert_list, tile_m)
+    _assert_dL_dweight_real_slots(dL_dweight, dL_dweight_ref, real_mask, msg_prefix="dense_padding ")
 
     # dL/dswiglu_in for real slots — same dual-threshold rule as the
     # multi-tile-static test, but iterate per tile and slice the real-row
     # subrange.
-    ref_dswiglu = _ref_dL_dswiglu_in(
-        dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m
-    )
+    ref_dswiglu = _ref_dL_dswiglu_in(dL_do_pool, W2, pool_topk_weight, preact_a, tile_to_expert_list, tile_m)
     for t in range(total_tiles):
-        diff = (
-            dL_dswiglu_in[t, :real_per_tile].float()
-            - ref_dswiglu[t, :real_per_tile].float()
-        ).abs()
+        diff = (dL_dswiglu_in[t, :real_per_tile].float() - ref_dswiglu[t, :real_per_tile].float()).abs()
         rel = diff / (ref_dswiglu[t, :real_per_tile].float().abs() + 1e-3)
         bad = (diff > 1e-2) & (rel > 5e-2)
         assert not bad.any(), (
@@ -751,9 +669,7 @@ def test_streaming_moe_y_bwd_oversized_tile_raises(device):
     pool_recv_token = torch.full((TK,), -1, dtype=torch.int32, device=device)
     preact_a = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
     dL_dweight = torch.zeros(TK, dtype=torch.float32, device=device)
-    expert_pool_block_offset = torch.tensor(
-        [0, total_tiles], dtype=torch.int32, device=device
-    )
+    expert_pool_block_offset = torch.tensor([0, total_tiles], dtype=torch.int32, device=device)
     cnt, tgt = _make_bwd_arrival(total_tiles, device=device)
 
     with pytest.raises(ValueError, match="ab_stage=4.*shrink tile_n_y_bwd"):

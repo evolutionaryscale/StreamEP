@@ -35,12 +35,8 @@ import torch
 def _make_tile_metadata(tile_to_expert_list, E_local, device):
     """Build (tile_id_to_expert, expert_pool_block_offset). Same as kernel A test."""
     total_tiles = len(tile_to_expert_list)
-    tile_id_to_expert = torch.tensor(
-        tile_to_expert_list, dtype=torch.int32, device=device
-    )
-    expert_pool_block_offset = torch.zeros(
-        E_local + 1, dtype=torch.int32, device=device
-    )
+    tile_id_to_expert = torch.tensor(tile_to_expert_list, dtype=torch.int32, device=device)
+    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     counts = [0] * E_local
     for e in tile_to_expert_list:
         counts[e] += 1
@@ -60,15 +56,11 @@ def _make_bwd_dispatch_arrival_pair(total_tiles, device, *, target=1, fired=True
     terminates immediately; the test artificially feeds delayed signals to
     exercise the scheduler path.
     """
-    pool_arrival_target = torch.full(
-        (total_tiles,), target, dtype=torch.int32, device=device
-    )
+    pool_arrival_target = torch.full((total_tiles,), target, dtype=torch.int32, device=device)
     if fired:
         bwd_dispatch_arrival_count = pool_arrival_target.clone()
     else:
-        bwd_dispatch_arrival_count = torch.zeros(
-            total_tiles, dtype=torch.int32, device=device
-        )
+        bwd_dispatch_arrival_count = torch.zeros(total_tiles, dtype=torch.int32, device=device)
     return bwd_dispatch_arrival_count, pool_arrival_target
 
 
@@ -131,12 +123,8 @@ def test_streaming_moe_a_bwd_compiles(device):
     bwd_k_local_remaining = torch.zeros(T_recv, dtype=torch.int32, device=device)
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [0, 0, 0, 0], E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
-        total_tiles, device=device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 0, 0, 0], E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(total_tiles, device=device)
 
     import stream_ep.stream_moe.compile_config as cu
 
@@ -179,9 +167,7 @@ def test_streaming_moe_a_bwd_single_tile(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(0)
-    dL_dswiglu_in = torch.randn(
-        total_tiles, tile_m, two_I, dtype=dtype, device=device
-    ).mul_(0.05)
+    dL_dswiglu_in = torch.randn(total_tiles, tile_m, two_I, dtype=dtype, device=device).mul_(0.05)
     W1 = torch.randn(E_local, two_I, H, dtype=dtype, device=device).mul_(0.02)
 
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -189,13 +175,9 @@ def test_streaming_moe_a_bwd_single_tile(device):
     bwd_k_local_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [chosen_expert], E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([chosen_expert], E_local, device)
     dispatch_seq = 42
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
-        total_tiles, device=device
-    )
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(total_tiles, device=device)
 
     streaming_moe_a_bwd(
         dL_dswiglu_in,
@@ -213,9 +195,7 @@ def test_streaming_moe_a_bwd_single_tile(device):
     )
     torch.cuda.synchronize()
 
-    ref, _ = _eager_a_bwd_reference(
-        dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv
-    )
+    ref, _ = _eager_a_bwd_reference(dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv)
 
     got = dL_dx_per_r[:T_recv]
     diff = (got.float() - ref.float()).abs()
@@ -229,13 +209,8 @@ def test_streaming_moe_a_bwd_single_tile(device):
         f"max rel diff {rel.max().item():.4f}"
     )
 
-    assert (
-        bwd_k_local_remaining == 0
-    ).all(), f"bwd_k_local_remaining not zeroed: {bwd_k_local_remaining}"
-    assert (bwd_a_done_per_token == dispatch_seq).all(), (
-        f"bwd_a_done_per_token not all {dispatch_seq}: "
-        f"{bwd_a_done_per_token}"
-    )
+    assert (bwd_k_local_remaining == 0).all(), f"bwd_k_local_remaining not zeroed: {bwd_k_local_remaining}"
+    assert (bwd_a_done_per_token == dispatch_seq).all(), f"bwd_a_done_per_token not all {dispatch_seq}: {bwd_a_done_per_token}"
 
 
 def test_streaming_moe_a_bwd_multi_tile_static(device):
@@ -257,9 +232,7 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(7)
-    dL_dswiglu_in = torch.randn(
-        total_tiles, tile_m, two_I, dtype=dtype, device=device
-    ).mul_(0.05)
+    dL_dswiglu_in = torch.randn(total_tiles, tile_m, two_I, dtype=dtype, device=device).mul_(0.05)
     W1 = torch.randn(E_local, two_I, H, dtype=dtype, device=device).mul_(0.02)
 
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -267,21 +240,13 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
     # Each recv-token r appears in exactly TK_padded // T_recv = 3 slots.
     assert TK_padded % T_recv == 0
     k_local_each = TK_padded // T_recv
-    pool_recv_token = torch.tensor(
-        [s % T_recv for s in range(TK_padded)], dtype=torch.int32, device=device
-    )
-    bwd_k_local_remaining = torch.full(
-        (T_recv,), k_local_each, dtype=torch.int32, device=device
-    )
+    pool_recv_token = torch.tensor([s % T_recv for s in range(TK_padded)], dtype=torch.int32, device=device)
+    bwd_k_local_remaining = torch.full((T_recv,), k_local_each, dtype=torch.int32, device=device)
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
     dispatch_seq = 99
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
-        total_tiles, device=device
-    )
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(total_tiles, device=device)
 
     streaming_moe_a_bwd(
         dL_dswiglu_in,
@@ -299,15 +264,9 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
     )
     torch.cuda.synchronize()
 
-    ref, k_ref = _eager_a_bwd_reference(
-        dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv
-    )
+    ref, k_ref = _eager_a_bwd_reference(dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv)
 
-    assert (
-        k_ref == k_local_each
-    ).all(), (
-        f"reference K_local mismatch: got {k_ref.unique()}, expected {k_local_each}"
-    )
+    assert (k_ref == k_local_each).all(), f"reference K_local mismatch: got {k_ref.unique()}, expected {k_local_each}"
 
     got = dL_dx_per_r[:T_recv]
     diff = (got.float() - ref.float()).abs()
@@ -322,12 +281,10 @@ def test_streaming_moe_a_bwd_multi_tile_static(device):
     )
 
     assert (bwd_k_local_remaining == 0).all(), (
-        f"bwd_k_local_remaining not zeroed: bad indices "
-        f"{(bwd_k_local_remaining != 0).nonzero().squeeze().tolist()}"
+        f"bwd_k_local_remaining not zeroed: bad indices {(bwd_k_local_remaining != 0).nonzero().squeeze().tolist()}"
     )
     assert (bwd_a_done_per_token == dispatch_seq).all(), (
-        f"bwd_a_done_per_token not all {dispatch_seq}: bad indices "
-        f"{(bwd_a_done_per_token != dispatch_seq).nonzero().squeeze().tolist()}"
+        f"bwd_a_done_per_token not all {dispatch_seq}: bad indices {(bwd_a_done_per_token != dispatch_seq).nonzero().squeeze().tolist()}"
     )
 
 
@@ -349,9 +306,7 @@ def test_streaming_moe_a_bwd_padding_rows(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(13)
-    dL_dswiglu_in = torch.randn(
-        total_tiles, tile_m, two_I, dtype=dtype, device=device
-    ).mul_(0.05)
+    dL_dswiglu_in = torch.randn(total_tiles, tile_m, two_I, dtype=dtype, device=device).mul_(0.05)
     W1 = torch.randn(E_local, two_I, H, dtype=dtype, device=device).mul_(0.02)
 
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -365,20 +320,14 @@ def test_streaming_moe_a_bwd_padding_rows(device):
                 pool_recv_token_list.append(m)
             else:
                 pool_recv_token_list.append(-1)
-    pool_recv_token = torch.tensor(
-        pool_recv_token_list, dtype=torch.int32, device=device
-    )
+    pool_recv_token = torch.tensor(pool_recv_token_list, dtype=torch.int32, device=device)
 
     bwd_k_local_remaining = torch.full((T_recv,), 2, dtype=torch.int32, device=device)
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        [0, 1], E_local, device
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 1], E_local, device)
     dispatch_seq = 7
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
-        total_tiles, device=device
-    )
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(total_tiles, device=device)
 
     streaming_moe_a_bwd(
         dL_dswiglu_in,
@@ -396,9 +345,7 @@ def test_streaming_moe_a_bwd_padding_rows(device):
     )
     torch.cuda.synchronize()
 
-    ref, _ = _eager_a_bwd_reference(
-        dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv
-    )
+    ref, _ = _eager_a_bwd_reference(dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv)
 
     got = dL_dx_per_r[:T_recv]
     diff = (got.float() - ref.float()).abs()
@@ -439,9 +386,7 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
 
     dtype = torch.bfloat16
     torch.manual_seed(11)
-    dL_dswiglu_in = torch.randn(
-        total_tiles, tile_m, two_I, dtype=dtype, device=device
-    ).mul_(0.05)
+    dL_dswiglu_in = torch.randn(total_tiles, tile_m, two_I, dtype=dtype, device=device).mul_(0.05)
     W1 = torch.randn(E_local, two_I, H, dtype=dtype, device=device).mul_(0.02)
 
     dL_dx_per_r = torch.zeros(T_recv, H, dtype=dtype, device=device)
@@ -449,12 +394,8 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
     bwd_k_local_remaining = torch.ones(T_recv, dtype=torch.int32, device=device)
     bwd_a_done_per_token = torch.zeros(T_recv, dtype=torch.int64, device=device)
 
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(
-        tile_to_expert_list, E_local, device
-    )
-    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(
-        total_tiles, device=device, fired=False
-    )
+    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
+    bwd_dispatch_arrival_count, pool_arrival_target = _make_bwd_dispatch_arrival_pair(total_tiles, device=device, fired=False)
 
     # Pre-warm the producer JIT.
     fire_tiles_with_delay(bwd_dispatch_arrival_count, pool_arrival_target, delay_us=0)
@@ -481,15 +422,11 @@ def test_streaming_moe_a_bwd_producer_consumer(device):
             tile_n=tile_n,
         )
     with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(
-            bwd_dispatch_arrival_count, pool_arrival_target, delay_us=50
-        )
+        fire_tiles_with_delay(bwd_dispatch_arrival_count, pool_arrival_target, delay_us=50)
 
     torch.cuda.synchronize()
 
-    ref, _ = _eager_a_bwd_reference(
-        dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv
-    )
+    ref, _ = _eager_a_bwd_reference(dL_dswiglu_in, W1, pool_recv_token, tile_id_to_expert, T_recv)
 
     got = dL_dx_per_r[:T_recv]
     diff = (got.float() - ref.float()).abs()

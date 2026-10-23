@@ -181,22 +181,12 @@ def _compile_streaming_moe_a_bwd(
 
     # Scatter destination: (T_recv, H), n-major.
     mO = fake_tensor(o_dtype, (Trecv_sym, H_sym), leading_dim=1, divisibility=8)
-    pool_recv_token = fake_tensor(
-        cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
-    )
-    bwd_k_local_remaining = fake_tensor(
-        cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1
-    )
-    bwd_a_done_per_token = fake_tensor(
-        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
-    )
+    pool_recv_token = fake_tensor(cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1)
+    bwd_k_local_remaining = fake_tensor(cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+    bwd_a_done_per_token = fake_tensor(cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
 
-    tile_n_stripes_done = fake_tensor(
-        cutlass.Int32, (total_tiles_sym,), leading_dim=0, divisibility=1
-    )
-    expert_pool_block_offset_scatter = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
-    )
+    tile_n_stripes_done = fake_tensor(cutlass.Int32, (total_tiles_sym,), leading_dim=0, divisibility=1)
+    expert_pool_block_offset_scatter = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1)
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
@@ -211,18 +201,12 @@ def _compile_streaming_moe_a_bwd(
 
     # cu_seqlens_m drives the standard varlen_m m-offset for mA's pool read.
     # Length E_local + 1, each entry = expert_pool_block_offset[e] * tile_m.
-    mCuSeqlensM = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
-    )
+    mCuSeqlensM = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1)
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    bwd_dispatch_arrival_count = fake_tensor(
-        cutlass.Int32, (total_tiles_sym,), divisibility=1
-    )
+    bwd_dispatch_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    expert_pool_block_offset = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
-    )
+    expert_pool_block_offset = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1)
 
     started_flag_fake = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
 
@@ -278,7 +262,8 @@ def streaming_moe_a_bwd(
     pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (shared with fwd)
     dispatch_seq: int,
     *,
-    started_flag: torch.Tensor | None = None,  # (1,) int32 buffer-owned cross-stream launch-gate flag; first CTA bumps it. None → allocate throwaway (tests / standalone harnesses).
+    started_flag: torch.Tensor
+    | None = None,  # (1,) int32 buffer-owned cross-stream launch-gate flag; first CTA bumps it. None → allocate throwaway (tests / standalone harnesses).
     tile_m: int = 128,
     tile_n: int = 128,
     cluster_m: int = 1,
@@ -322,9 +307,7 @@ def streaming_moe_a_bwd(
     assert W1.dim() == 3
     assert dL_dx_per_r.dim() == 2
     total_tiles, in_tile_m, two_I = dL_dswiglu_in.shape
-    assert (
-        in_tile_m == tile_m
-    ), f"dL_dswiglu_in middle dim must equal tile_m={tile_m}; got {in_tile_m}"
+    assert in_tile_m == tile_m, f"dL_dswiglu_in middle dim must equal tile_m={tile_m}; got {in_tile_m}"
     T_recv, H = dL_dx_per_r.shape
     E_local = W1.shape[0]
     assert W1.shape == (
@@ -335,9 +318,7 @@ def streaming_moe_a_bwd(
     # tile_n MUST divide the output N dim (= H). Non-divisible tile_n produces
     # silently-wrong stores in the data-grad GEMM's partial-tile path (the
     # bug that bit production at H=2048 with tile_n=192).
-    assert H % tile_n == 0, (
-        f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
-    )
+    assert H % tile_n == 0, f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
     assert bwd_k_local_remaining.shape == (T_recv,)
@@ -345,14 +326,8 @@ def streaming_moe_a_bwd(
     assert bwd_a_done_per_token.shape == (T_recv,)
     assert bwd_a_done_per_token.dtype == torch.int64
     assert expert_pool_block_offset.shape == (E_local + 1,)
-    assert (
-        bwd_dispatch_arrival_count.shape == (total_tiles,)
-        and bwd_dispatch_arrival_count.dtype == torch.int32
-    )
-    assert (
-        pool_arrival_target.shape == (total_tiles,)
-        and pool_arrival_target.dtype == torch.int32
-    )
+    assert bwd_dispatch_arrival_count.shape == (total_tiles,) and bwd_dispatch_arrival_count.dtype == torch.int32
+    assert pool_arrival_target.shape == (total_tiles,) and pool_arrival_target.dtype == torch.int32
 
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
     # slab has H contiguous along the last axis — same layout fwd kernel A
@@ -361,10 +336,7 @@ def streaming_moe_a_bwd(
     # it as (l, k, n) = (E, 2I, H) and transposes to n-major kernel order
     # (n=H, k=2I, l=E); the mainloop's `Σ_k B[n, k]` then evaluates
     # `W1[2I_idx, h]`.
-    assert W1.stride(-1) == 1, (
-        "W1[e] must have H (last axis) contiguous (k-major weights); caller "
-        "must pass W1 as (E_local, 2*I, H)"
-    )
+    assert W1.stride(-1) == 1, "W1[e] must have H (last axis) contiguous (k-major weights); caller must pass W1 as (E_local, 2*I, H)"
     assert W1.shape == (E_local, two_I, H)
 
     # Flatten dL_dswiglu_in's leading two dims to (total_tiles * tile_m, 2I)
@@ -399,9 +371,7 @@ def streaming_moe_a_bwd(
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:
-        max_active_clusters = min(
-            max_active_clusters, num_sms // (cluster_m * cluster_n)
-        )
+        max_active_clusters = min(max_active_clusters, num_sms // (cluster_m * cluster_n))
 
     # Internal scheduler counter — allocate on the calling stream so the
     # zero-init is naturally ordered with the kernel's first atomic-claim.
@@ -412,9 +382,7 @@ def streaming_moe_a_bwd(
     # owns the per-row bookkeeping (atomicSub bwd_k_local_remaining +
     # hit-zero release-store on bwd_a_done_per_token).
     num_pid_n = (H + tile_n - 1) // tile_n
-    tile_n_stripes_done = torch.zeros(
-        total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device
-    )
+    tile_n_stripes_done = torch.zeros(total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device)
 
     scatter = ScatterParams(
         mO=dL_dx_per_r,
@@ -440,9 +408,7 @@ def streaming_moe_a_bwd(
         total_tiles=Int32(total_tiles),
         started_flag=started_flag,
     )
-    varlen_args = VarlenArguments(
-        mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
-    )
+    varlen_args = VarlenArguments(mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None)
 
     # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
     # slots, always None for plain bf16); main takes no host stream arg.

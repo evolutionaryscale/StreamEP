@@ -24,9 +24,17 @@ from utils import cleanup_dist, make_inputs
 
 
 def validate_dispatch(
-    rank, world_size, num_local_experts, tile_m,
-    x, topk_idx, is_token_in_rank,
-    pool, handle, dispatch_seq, group,
+    rank,
+    world_size,
+    num_local_experts,
+    tile_m,
+    x,
+    topk_idx,
+    is_token_in_rank,
+    pool,
+    handle,
+    dispatch_seq,
+    group,
 ):
     # Gather inputs across ranks to compute expected outputs.
     all_topk = [torch.empty_like(topk_idx) for _ in range(world_size)]
@@ -67,22 +75,16 @@ def validate_dispatch(
         if rt < 0:
             continue
         e_local = int(expected_topk_local[rt, k].item())
-        assert e_local >= 0, (
-            f"dispatch {dispatch_seq}: slot {s} → (rt={rt}, k={k}) but expected_topk_local says nonlocal"
-        )
+        assert e_local >= 0, f"dispatch {dispatch_seq}: slot {s} → (rt={rt}, k={k}) but expected_topk_local says nonlocal"
         block_start = int(expert_pool_block_offset[e_local].item()) * tile_m
         block_end = int(expert_pool_block_offset[e_local + 1].item()) * tile_m
-        assert block_start <= s < block_end, (
-            f"dispatch {dispatch_seq}: slot {s} for expert {e_local} outside [{block_start}, {block_end})"
-        )
+        assert block_start <= s < block_end, f"dispatch {dispatch_seq}: slot {s} for expert {e_local} outside [{block_start}, {block_end})"
         src_rank = int(expected_src_rank[rt].item())
         actual = pool_cpu[s, 0].to(torch.int32).item()
-        assert actual == src_rank, (
-            f"dispatch {dispatch_seq}: slot {s} pool[s,0]={actual} != src_rank {src_rank}"
-        )
+        assert actual == src_rank, f"dispatch {dispatch_seq}: slot {s} pool[s,0]={actual} != src_rank {src_rank}"
         assert not seen_rk[rt, k], f"dispatch {dispatch_seq}: (rt={rt}, k={k}) appears multiple times"
         seen_rk[rt, k] = True
-    expected_seen = (expected_topk_local >= 0)
+    expected_seen = expected_topk_local >= 0
     assert torch.equal(seen_rk, expected_seen), (
         f"dispatch {dispatch_seq}: pool covers {seen_rk.sum()} pairs, expected {expected_seen.sum()}"
     )
@@ -91,8 +93,7 @@ def validate_dispatch(
     arrival_count = handle.pool_arrival_count[:total_tiles].cpu()
     target_v = pool_arrival_target[:total_tiles]
     assert torch.equal(arrival_count, target_v), (
-        f"dispatch {dispatch_seq}: pool_arrival_count mismatches at "
-        f"{(arrival_count != target_v).nonzero().flatten()[:8]}"
+        f"dispatch {dispatch_seq}: pool_arrival_count mismatches at {(arrival_count != target_v).nonzero().flatten()[:8]}"
     )
 
     # (5) pool_arrival_target
@@ -104,9 +105,7 @@ def validate_dispatch(
             tile_in_e = tile_id - e_block_start
             target = int(pool_arrival_target[tile_id].item())
             expected = (n_e - tile_in_e * tile_m) if tile_id == e_block_end - 1 else tile_m
-            assert target == expected, (
-                f"dispatch {dispatch_seq}: pool_arrival_target[{tile_id}]={target} != {expected}"
-            )
+            assert target == expected, f"dispatch {dispatch_seq}: pool_arrival_target[{tile_id}]={target} != {expected}"
 
     return T_recv
 
@@ -139,23 +138,36 @@ def main():
     for i, seed in enumerate(seeds):
         dispatch_seq = i + 1
         x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-            num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=seed)
+            num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=seed
+        )
 
         pool, handle, _event = buf.dispatch(
-            x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-            tile_m=tile_m, dispatch_seq=dispatch_seq,
+            x,
+            topk_idx,
+            topk_weights,
+            is_token_in_rank,
+            num_experts,
+            tile_m=tile_m,
+            dispatch_seq=dispatch_seq,
         )
         torch.cuda.synchronize()
 
         T_recv = validate_dispatch(
-            rank, world_size, num_local_experts, tile_m,
-            x, topk_idx, is_token_in_rank,
-            pool, handle, dispatch_seq, group,
+            rank,
+            world_size,
+            num_local_experts,
+            tile_m,
+            x,
+            topk_idx,
+            is_token_in_rank,
+            pool,
+            handle,
+            dispatch_seq,
+            group,
         )
 
         if rank == 0:
-            print(f"PASS dispatch {dispatch_seq} (seed={seed}): "
-                  f"T_recv={T_recv} total_tiles={handle.total_tiles}")
+            print(f"PASS dispatch {dispatch_seq} (seed={seed}): T_recv={T_recv} total_tiles={handle.total_tiles}")
 
     if rank == 0:
         print(f"PASS: all {len(seeds)} multi-dispatch validations on rank 0 (world={world_size})")

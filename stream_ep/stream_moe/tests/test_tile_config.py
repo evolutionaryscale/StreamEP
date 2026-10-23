@@ -92,9 +92,7 @@ def test_validate_skips_none_fields():
 
 def test_resolve_none_is_bare_baseline():
     assert _resolve_tile_config(None, 2048, 2048) == default_tile_config(2048, 2048)
-    assert _resolve_tile_config(TileConfig(), 2048, 2048) == default_tile_config(
-        2048, 2048
-    )
+    assert _resolve_tile_config(TileConfig(), 2048, 2048) == default_tile_config(2048, 2048)
 
 
 def test_resolve_pins_override_keeps_rest():
@@ -129,10 +127,16 @@ def test_resolve_validates_bad_override():
 # can't codegen. 320 always; 192 only when a tile_n > 128. I=H=2048 so 128 and
 # 256 both divide every dim — isolates the tile_m check from divisibility.
 
+
 def test_validate_rejects_tile_m_320_even_with_small_tile_n():
     cfg = TileConfig(
-        tile_m=320, tile_n_a=128, tile_n_y=128, tile_n_y_bwd=128,
-        tile_n_a_bwd=128, tile_n_dW1=128, tile_n_dW2=128,
+        tile_m=320,
+        tile_n_a=128,
+        tile_n_y=128,
+        tile_n_y_bwd=128,
+        tile_n_a_bwd=128,
+        tile_n_dW1=128,
+        tile_n_dW2=128,
     )
     with pytest.raises(ValueError, match="tile_m=320"):
         cfg.validate(2048, 2048)
@@ -149,8 +153,13 @@ def test_validate_rejects_tile_m_192_with_large_tile_n():
 def test_validate_accepts_tile_m_192_with_all_tile_n_le_128():
     # The verified-working config: tile_m=192 + every tile_n <= 128.
     TileConfig(
-        tile_m=192, tile_n_a=128, tile_n_y=128, tile_n_y_bwd=128,
-        tile_n_a_bwd=128, tile_n_dW1=128, tile_n_dW2=128,
+        tile_m=192,
+        tile_n_a=128,
+        tile_n_y=128,
+        tile_n_y_bwd=128,
+        tile_n_a_bwd=128,
+        tile_n_dW1=128,
+        tile_n_dW2=128,
     ).validate(2048, 2048)
 
 

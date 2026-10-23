@@ -55,8 +55,16 @@ def test_kernel_a_expert_dropout(device):
         postact = torch.empty(len(TILES), TILE_M, I, dtype=torch.bfloat16, device=device)
         preact = torch.empty(len(TILES), TILE_M, 2 * I, dtype=torch.bfloat16, device=device)
         streaming_moe_a(
-            pool, W1, postact, *_meta(device), preact_a=preact, tile_m=TILE_M,
-            tile_n=256, cluster_n=2, dropout_p=p, dropout_seed=seed,
+            pool,
+            W1,
+            postact,
+            *_meta(device),
+            preact_a=preact,
+            tile_m=TILE_M,
+            tile_n=256,
+            cluster_n=2,
+            dropout_p=p,
+            dropout_seed=seed,
         )
         torch.cuda.synchronize()
         return postact.view(TK, I), preact.view(TK, 2 * I)
@@ -93,8 +101,19 @@ def test_kernel_y_bwd_expert_dropout(device):
         post_dW2 = torch.empty(len(TILES), TILE_M, I, dtype=torch.bfloat16, device=device)
         dweight = torch.zeros(TK, dtype=torch.float32, device=device)
         streaming_moe_y_bwd(
-            dL_do_pool, W2, dswiglu_in, post_dW2, w, recv, preact, dweight,
-            *_meta(device), tile_m=TILE_M, tile_n=128, dropout_p=p, dropout_seed=seed,
+            dL_do_pool,
+            W2,
+            dswiglu_in,
+            post_dW2,
+            w,
+            recv,
+            preact,
+            dweight,
+            *_meta(device),
+            tile_m=TILE_M,
+            tile_n=128,
+            dropout_p=p,
+            dropout_seed=seed,
         )
         torch.cuda.synchronize()
         return dswiglu_in.view(TK, 2 * I), post_dW2.view(TK, I), dweight

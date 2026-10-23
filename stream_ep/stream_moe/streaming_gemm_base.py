@@ -55,11 +55,9 @@ class StreamingTileSchedulerOptions(NamedTuple):
     # scheduler does `count[tile] == target[tile]` (count-vs-target). Dispatch's
     # metadata kernel fills `pool_arrival_target` with the per-tile firing
     # target; dispatch's Pass 2 release-adds into `pool_arrival_count`.
-    pool_arrival_count: cute.Tensor   # [total_tiles] int32 — release-add destination
+    pool_arrival_count: cute.Tensor  # [total_tiles] int32 — release-add destination
     pool_arrival_target: cute.Tensor  # [total_tiles] int32 — per-tile firing target
-    expert_pool_block_offset: (
-        cute.Tensor
-    )  # [E_local + 1] int32 — pool-block prefix-sum. Source for the
+    expert_pool_block_offset: cute.Tensor  # [E_local + 1] int32 — pool-block prefix-sum. Source for the
     # warp-cooperative ballot lookup that retired per-claim `tile_id_to_expert`.
     total_tiles: Int32  # passed as scalar so get_grid_shape doesn't deref device tensor
     # Optional cross-stream launch-gate "started" flag (single int32 in

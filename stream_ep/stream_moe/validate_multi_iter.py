@@ -84,11 +84,11 @@ import torch.nn.functional as F
 # Per-tensor (atol, rtol) thresholds. Matched to the bf16 chain noise floor
 # at production shape — see module docstring.
 TOL_DEFAULT = {
-    "out":              (1e-3, 1e-2),
-    "dL/dx":            (1e-3, 1e-2),
+    "out": (1e-3, 1e-2),
+    "dL/dx": (1e-3, 1e-2),
     "dL/dtopk_weights": (1e-3, 1e-2),
-    "dL/dW1_local":     (8e-2, 8e-2),
-    "dL/dW2_local":     (8e-2, 8e-2),
+    "dL/dW1_local": (8e-2, 8e-2),
+    "dL/dW2_local": (8e-2, 8e-2),
 }
 
 from stream_ep.stream_moe.profile_pipeline import (
@@ -149,12 +149,7 @@ def torch_reference_full_moe(
 
     # Flatten (token, k) pairs and bucket by expert.
     flat_e = topk_idx.flatten()  # (T*K,)
-    flat_t = (
-        torch.arange(T, device=x.device)
-        .unsqueeze(1)
-        .expand(T, topk_idx.shape[1])
-        .flatten()
-    )  # (T*K,)
+    flat_t = torch.arange(T, device=x.device).unsqueeze(1).expand(T, topk_idx.shape[1]).flatten()  # (T*K,)
     flat_w = w_f.flatten()  # (T*K,)
 
     for e in range(E_total):
@@ -187,8 +182,7 @@ def torch_reference_full_moe(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--num_sms", type=int, default=None,
-                   help="StreamEP num_sms override; default = Buffer auto-pick.")
+    p.add_argument("--num_sms", type=int, default=None, help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=3)
     p.add_argument("--n_iter", type=int, default=20)
@@ -272,8 +266,7 @@ def main():
     )
     args = p.parse_args()
     assert not (args.vary_routing and not args.no_ref), (
-        "--vary_routing requires --no_ref (the eager reference assumes one "
-        "shared routing draw)"
+        "--vary_routing requires --no_ref (the eager reference assumes one shared routing draw)"
     )
     if args.no_ref:
         assert 1 <= args.n_layers <= 64, f"--n_layers={args.n_layers}: [1, 64]"
@@ -286,11 +279,8 @@ def main():
 
     # Scale (atol, rtol) by sqrt(n_layers) to absorb bf16 chain noise
     # compounding through the depth-N stack. See module docstring.
-    tol_scale = max(1.0, args.n_layers ** 0.5)
-    TOL = {
-        name: (atol * tol_scale, rtol * tol_scale)
-        for name, (atol, rtol) in TOL_DEFAULT.items()
-    }
+    tol_scale = max(1.0, args.n_layers**0.5)
+    TOL = {name: (atol * tol_scale, rtol * tol_scale) for name, (atol, rtol) in TOL_DEFAULT.items()}
 
     device = init_distributed()
     rank, world_size = get_global_rank(), get_world_size()
@@ -305,37 +295,25 @@ def main():
         f"n_warmup={args.n_warmup} n_iter={args.n_iter} "
         f"n_layers={args.n_layers} tol_scale={tol_scale:.2f}"
     )
-    rank_zero_print(
-        "[validate] per-tensor thresholds (atol, rtol): "
-        + ", ".join(f"{n}={a:.0e}/{r:.0e}" for n, (a, r) in TOL.items())
-    )
+    rank_zero_print("[validate] per-tensor thresholds (atol, rtol): " + ", ".join(f"{n}={a:.0e}/{r:.0e}" for n, (a, r) in TOL.items()))
 
     # Build GLOBAL weights (same across ranks via shared seed). w1_local /
     # w2_local are the rank's slice for the streaming pipeline; the eager
     # reference uses the FULL weights to compute each token's expert
     # contributions regardless of which rank owns them.
     g = torch.Generator(device=device).manual_seed(42)
-    w1_full = (
-        torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g)
-        * 0.02
-    ).contiguous()
-    w2_full = (
-        torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02
-    ).contiguous()
+    w1_full = (torch.randn(NUM_EXPERTS, 2 * I, H, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
+    w2_full = (torch.randn(NUM_EXPERTS, H, I, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
     w1_local = w1_full[rank * local_E : (rank + 1) * local_E].contiguous()
     w2_local = w2_full[rank * local_E : (rank + 1) * local_E].contiguous()
 
     torch.manual_seed(100 + rank)
     x = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
     topk_idx = make_uniform_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, rank, device)
-    topk_weights = torch.softmax(
-        torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
-    ).contiguous()
+    topk_weights = torch.softmax(torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1).contiguous()
 
     rank_idx = topk_idx // local_E
-    is_token_in_rank = torch.zeros(
-        (args.seq_len, world_size), dtype=torch.bool, device=device
-    )
+    is_token_in_rank = torch.zeros((args.seq_len, world_size), dtype=torch.bool, device=device)
     for r in range(world_size):
         is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
 
@@ -349,9 +327,7 @@ def main():
     # path's tensors) and a fixed grad_out so cross-iter comparisons stay
     # meaningful.
     torch.manual_seed(200 + rank)
-    grad_out = (
-        torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1
-    ).contiguous()
+    grad_out = (torch.randn(args.seq_len, H, dtype=DTYPE, device=device) * 0.1).contiguous()
 
     if args.no_ref:
         # Pipeline-stress mode: no reference, no comparison (see --no_ref).
@@ -368,9 +344,7 @@ def main():
         # stack — same shape as the streaming path's grads.
         h_ref = x_ref
         for _ in range(args.n_layers):
-            h_ref = torch_reference_full_moe(
-                h_ref, topk_idx, topk_w_ref, w1_full_ref, w2_full_ref
-            )
+            h_ref = torch_reference_full_moe(h_ref, topk_idx, topk_w_ref, w1_full_ref, w2_full_ref)
         out_ref = h_ref
         dL_dx_ref, dL_dtopk_w_ref, dL_dW1_full_ref, dL_dW2_full_ref = torch.autograd.grad(
             out_ref, [x_ref, topk_w_ref, w1_full_ref, w2_full_ref], grad_outputs=grad_out
@@ -401,8 +375,7 @@ def main():
             _ballast = torch.empty(consume, dtype=torch.uint8, device=device)
         free1, _ = torch.cuda.mem_get_info()
         rank_zero_print(
-            f"[validate] ballast: leave_free_gb={args.leave_free_gb} "
-            f"free {free0 / GiB:.1f} -> {free1 / GiB:.1f} of {total0 / GiB:.1f} GB"
+            f"[validate] ballast: leave_free_gb={args.leave_free_gb} free {free0 / GiB:.1f} -> {free1 / GiB:.1f} of {total0 / GiB:.1f} GB"
         )
 
     # Variable routing (see --vary_routing): per-(iter, layer) random draws,
@@ -412,21 +385,15 @@ def main():
     route_gen = torch.Generator(device=device).manual_seed(7000 + rank)
 
     def draw_routing():
-        logits = torch.randn(
-            args.seq_len, NUM_EXPERTS, device=device, generator=route_gen
-        )
+        logits = torch.randn(args.seq_len, NUM_EXPERTS, device=device, generator=route_gen)
         idx = torch.topk(logits, TOPK, dim=-1).indices.to(torch.int64).contiguous()
         r_idx = idx // local_E
-        in_rank = torch.zeros(
-            (args.seq_len, world_size), dtype=torch.bool, device=device
-        )
+        in_rank = torch.zeros((args.seq_len, world_size), dtype=torch.bool, device=device)
         for r in range(world_size):
             in_rank[:, r] = (r_idx == r).any(dim=-1)
         return idx, in_rank
 
-    assert not (args.fixed_rand_routing and args.vary_routing), (
-        "--fixed_rand_routing and --vary_routing are mutually exclusive"
-    )
+    assert not (args.fixed_rand_routing and args.vary_routing), "--fixed_rand_routing and --vary_routing are mutually exclusive"
     if args.fixed_rand_routing:
         topk_idx, is_token_in_rank = draw_routing()
 
@@ -434,9 +401,7 @@ def main():
     # the first in-backward all_reduce isn't a communicator-bootstrap sync.
     ar_buf = None
     if args.side_ar_mb > 0:
-        ar_buf = torch.ones(
-            args.side_ar_mb * (1 << 20) // 2, dtype=torch.bfloat16, device=device
-        )
+        ar_buf = torch.ones(args.side_ar_mb * (1 << 20) // 2, dtype=torch.bfloat16, device=device)
         torch_dist.all_reduce(ar_buf)
         torch.cuda.synchronize()
 
@@ -455,9 +420,7 @@ def main():
         w2_warm = w2_local.detach().clone().requires_grad_(True)
         h_warm = x_warm
         for _ in range(args.n_layers):
-            layer_idx, layer_in_rank = (
-                draw_routing() if args.vary_routing else (topk_idx, is_token_in_rank)
-            )
+            layer_idx, layer_in_rank = draw_routing() if args.vary_routing else (topk_idx, is_token_in_rank)
             h_warm = stream_moe_func(
                 buffer,
                 h_warm,
@@ -470,9 +433,7 @@ def main():
                 num_experts=NUM_EXPERTS,
                 activation_checkpoint_level=args.act_ckpt_level,
             )
-        torch.autograd.grad(
-            h_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out
-        )
+        torch.autograd.grad(h_warm, [x_warm, topk_w_warm, w1_warm, w2_warm], grad_outputs=grad_out)
     torch.cuda.synchronize()
     barrier(group)
 
@@ -490,9 +451,7 @@ def main():
 
         h = x_iter
         for _ in range(args.n_layers):
-            layer_idx, layer_in_rank = (
-                draw_routing() if args.vary_routing else (topk_idx, is_token_in_rank)
-            )
+            layer_idx, layer_in_rank = draw_routing() if args.vary_routing else (topk_idx, is_token_in_rank)
             h = stream_moe_func(
                 buffer,
                 h,
@@ -508,12 +467,10 @@ def main():
             if args.side_ar_mb > 0:
                 h.register_hook(_side_ar_hook)
         out_actual = h
-        dL_dx_actual, dL_dtopk_w_actual, dL_dW1_local_actual, dL_dW2_local_actual = (
-            torch.autograd.grad(
-                out_actual,
-                [x_iter, topk_w_iter, w1_iter, w2_iter],
-                grad_outputs=grad_out,
-            )
+        dL_dx_actual, dL_dtopk_w_actual, dL_dW1_local_actual, dL_dW2_local_actual = torch.autograd.grad(
+            out_actual,
+            [x_iter, topk_w_iter, w1_iter, w2_iter],
+            grad_outputs=grad_out,
         )
         torch.cuda.synchronize()
 
@@ -565,18 +522,14 @@ def main():
             n_bad_t = bad.sum().item()
             max_abs_t = diff.max().item()
             max_rel_t = rel.max().item()
-            diagnostics.append(
-                (name, max_abs_t, max_rel_t, n_bad_t, ref_f.abs().max().item())
-            )
+            diagnostics.append((name, max_abs_t, max_rel_t, n_bad_t, ref_f.abs().max().item()))
             n_bad_per_tensor_local.append(n_bad_t)
             if n_bad_t > 0:
                 ok = False
 
         # Per-tensor world-wide n_bad sum (so we can see WHICH tensor
         # triggered the FAIL even when this rank's local n_bad is 0).
-        n_bad_world_t = torch.tensor(
-            n_bad_per_tensor_local, device=device, dtype=torch.int64
-        )
+        n_bad_world_t = torch.tensor(n_bad_per_tensor_local, device=device, dtype=torch.int64)
         torch_dist.all_reduce(n_bad_world_t, op=torch_dist.ReduceOp.SUM)
         n_bad_world = n_bad_world_t.tolist()
 
@@ -588,9 +541,7 @@ def main():
         tag = "PASS" if all_ok else "FAIL"
         rank_zero_print(f"[validate] iter {step:3d} seq={seq}: {tag}")
         if not all_ok:
-            for (name, max_abs_t, max_rel_t, n_bad_t, ref_max), n_bad_w in zip(
-                diagnostics, n_bad_world, strict=True
-            ):
+            for (name, max_abs_t, max_rel_t, n_bad_t, ref_max), n_bad_w in zip(diagnostics, n_bad_world, strict=True):
                 marker = "  " if n_bad_w == 0 else "!!"
                 rank_zero_print(
                     f"  {marker} {name:20s}  max_abs={max_abs_t:.4g} "
@@ -606,8 +557,7 @@ def main():
             print(f"[validate] ALL {args.n_iter} ITERS OK (fwd + bwd)", flush=True)
         else:
             print(
-                f"[validate] {fail_count} / {args.n_iter} iters FAILED — "
-                "cross-layer race or correctness regression suspected",
+                f"[validate] {fail_count} / {args.n_iter} iters FAILED — cross-layer race or correctness regression suspected",
                 flush=True,
             )
 

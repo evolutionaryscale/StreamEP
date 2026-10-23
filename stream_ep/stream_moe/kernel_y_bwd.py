@@ -235,14 +235,10 @@ class StreamingMoeYBwd(StreamingGemmBase):
         epi_c_stage = cls.EPI_C_STAGE_TARGET
 
         # --- byte accounting (mirrors GemmSm90._compute_stages) ---
-        epi_smem_bytes = cls.epi_smem_bytes(
-            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
-        )
+        epi_smem_bytes = cls.epi_smem_bytes(epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk)
         has_tile_load = epi_smem_bytes.c_stage > 0
         epi_tile_elems = cute.size(cute.shape(epi_tile))
-        d_bytes_per_stage = (
-            epi_tile_elems * d_dtype.width // 8 if d_dtype is not None else 0
-        )
+        d_bytes_per_stage = epi_tile_elems * d_dtype.width // 8 if d_dtype is not None else 0
         epi_bytes_per_stage = d_bytes_per_stage + epi_smem_bytes.d_stage
 
         # SMEM consumed by everything EXCEPT the epi (D-store) staging:
@@ -259,18 +255,12 @@ class StreamingMoeYBwd(StreamingGemmBase):
         # smem the parent now threads in; both are None/0 for y_bwd's plain
         # bf16 GEMM, but we fold them in verbatim to stay a faithful mirror.
         a_bytes = (
-            cute.size(cute.slice_(cta_tile_shape_mnk, (None, 0, None)))
-            * a_dtype.width
-            // 8
+            cute.size(cute.slice_(cta_tile_shape_mnk, (None, 0, None))) * a_dtype.width // 8
             if a_bytes_per_stage_override is None
             else a_bytes_per_stage_override
         )
         b_shape = cute.slice_(cta_tile_shape_mnk, (0, None, None))
-        ab_bytes_per_stage = (
-            a_bytes
-            + cute.size(b_shape) * b_dtype.width // 8
-            + ab_extra_bytes_per_stage
-        )
+        ab_bytes_per_stage = a_bytes + cute.size(b_shape) * b_dtype.width // 8 + ab_extra_bytes_per_stage
         mbar_helpers_bytes = 1024
         # SharedStorage packs [sD|sC|epi op smem][sA|sB][sAuxA]; the parent
         # reserves one 1024 alignment quantum when there is any epi op smem,
@@ -278,32 +268,18 @@ class StreamingMoeYBwd(StreamingGemmBase):
         # (TileStore + ColVec ops), so the first pad applies — without it a
         # pinned-ab_stage epi_stage pick can overflow the real struct at
         # launch (the exact case the parent comment warns about).
-        op_smem_bytes = (
-            epi_smem_bytes.unstaged + epi_smem_bytes.d_stage + epi_smem_bytes.c_stage
-        )
-        align_pad_bytes = (1024 if op_smem_bytes else 0) + (
-            1024 if ab_extra_bytes_per_stage % 1024 else 0
-        )
+        op_smem_bytes = epi_smem_bytes.unstaged + epi_smem_bytes.d_stage + epi_smem_bytes.c_stage
+        align_pad_bytes = (1024 if op_smem_bytes else 0) + (1024 if ab_extra_bytes_per_stage % 1024 else 0)
 
         budget = smem_capacity // occupancy
         # Bytes left for the epi D-store staging after the pinned ab/epi_c
         # allocations, the mbar/helper reservation, and the alignment pads.
-        epi_budget = (
-            budget
-            - mbar_helpers_bytes
-            - align_pad_bytes
-            - fixed_bytes
-            - ab_bytes_per_stage * ab_stage
-        )
+        epi_budget = budget - mbar_helpers_bytes - align_pad_bytes - fixed_bytes - ab_bytes_per_stage * ab_stage
         epi_stage = epi_budget // epi_bytes_per_stage if epi_bytes_per_stage > 0 else 1
 
         if epi_stage < 1:
             needed = (
-                mbar_helpers_bytes
-                + align_pad_bytes
-                + fixed_bytes
-                + ab_bytes_per_stage * ab_stage
-                + epi_bytes_per_stage  # one epi stage
+                mbar_helpers_bytes + align_pad_bytes + fixed_bytes + ab_bytes_per_stage * ab_stage + epi_bytes_per_stage  # one epi stage
             )
             tile_m, tile_n = cta_tile_shape_mnk[0], cta_tile_shape_mnk[1]
             raise ValueError(
@@ -401,8 +377,11 @@ class StreamingMoeYBwd(StreamingGemmBase):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                 crd = tDcD[i]
                 d = keep_scale(
-                    seed, row0 + crd[0], col0 + crd[1],
-                    self.dropout_threshold, self.dropout_scale,
+                    seed,
+                    row0 + crd[0],
+                    col0 + crd[1],
+                    self.dropout_threshold,
+                    self.dropout_scale,
                 )
                 tRS_rdXY_f32[2 * i], tRS_rdXY_f32[2 * i + 1], tRS_rPostAct[i] = dswiglu(
                     tRS_rXY_f32[2 * i], tRS_rXY_f32[2 * i + 1], tRS_rD[i] * d
@@ -425,9 +404,7 @@ class StreamingMoeYBwd(StreamingGemmBase):
                 tRS_rD[i] = tRS_rD[i] if is_active else Float32(0.0)
                 tRS_rPostAct[i] = tRS_rPostAct[i] if is_active else Float32(0.0)
                 tRS_rdXY_f32[2 * i] = tRS_rdXY_f32[2 * i] if is_active else Float32(0.0)
-                tRS_rdXY_f32[2 * i + 1] = (
-                    tRS_rdXY_f32[2 * i + 1] if is_active else Float32(0.0)
-                )
+                tRS_rdXY_f32[2 * i + 1] = tRS_rdXY_f32[2 * i + 1] if is_active else Float32(0.0)
 
         # (3) ColVecReduceAtomic on UNWEIGHTED g — chain rule for dL/dweight.
         # The intra-CTA reduction stays in-register here; the atomic-add
@@ -514,29 +491,21 @@ def _compile_streaming_moe_y_bwd(
     # cu_seqlens_m drives the standard varlen_m m-offset for both mA's pool
     # read and mD's TMA-store row offset: cu_seqlens_m[batch_idx] = expert_pool_block_offset[e]
     # * tile_m so cu_seqlens_m[batch_idx] + pid_m * tile_m = tile_id * tile_m.
-    mCuSeqlensM = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
-    )
+    mCuSeqlensM = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1)
 
     # ColVecLoad's per-row weight broadcast (varlen_m). Shape (TK_padded,) fp32.
-    pool_topk_weight = fake_tensor(
-        cutlass.Float32, (TK_padded_sym,), leading_dim=0, divisibility=1
-    )
+    pool_topk_weight = fake_tensor(cutlass.Float32, (TK_padded_sym,), leading_dim=0, divisibility=1)
 
     # Second ColVecLoad — pool_recv_token (int32, varlen_m via cu_seqlens_m).
     # Cast to fp32 by ColVecLoad's begin_loop; epi_visit_subtile compares
     # against 0 to detect padding rows (recv_token < 0). Shape (TK_padded,).
-    pool_recv_token = fake_tensor(
-        cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
-    )
+    pool_recv_token = fake_tensor(cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1)
 
     # ColVecReduceAtomic destination — flat per-slot fp32 buffer that all
     # pid_n CTAs atomic-add into via red.global.add.f32. Shape (Mflat,).
     # No num_pid_n dim — the atomic-add collapses across stripes in-kernel,
     # so no post-hoc .sum() torch op or cross-stream event is needed.
-    mColVecReduce = fake_tensor(
-        cutlass.Float32, (Mflat_sym,), leading_dim=0, divisibility=1
-    )
+    mColVecReduce = fake_tensor(cutlass.Float32, (Mflat_sym,), leading_dim=0, divisibility=1)
 
     # mAuxOut: postact_a_for_dW2 (M, I) bf16 — dW2 grouped GEMM's input,
     # written via TileStore TMA path (same machinery GemmActMixin uses for
@@ -546,13 +515,9 @@ def _compile_streaming_moe_y_bwd(
 
     # Scheduler tensors
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
-    bwd_dispatch_arrival_count = fake_tensor(
-        cutlass.Int32, (total_tiles_sym,), divisibility=1
-    )
+    bwd_dispatch_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    expert_pool_block_offset = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
-    )
+    expert_pool_block_offset = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1)
 
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),
@@ -720,66 +685,43 @@ def streaming_moe_y_bwd(
     I = two_I // 2
     H = dL_do_pool.shape[1]
     E_local = W2.shape[0]
-    assert W2.shape == (E_local, H, I), (
-        f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected "
-        f"{(E_local, H, I)}"
-    )
+    assert W2.shape == (E_local, H, I), f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected {(E_local, H, I)}"
     # tile_n MUST divide the output N dim (= I, the moe_intermediate_size).
     # Non-divisible tile_n produces silently-wrong stores in the data-grad
     # GEMM's partial-tile path.
-    assert I % tile_n == 0, (
-        f"tile_n ({tile_n}) must divide I ({I}); I % tile_n = {I % tile_n}"
-    )
+    assert I % tile_n == 0, f"tile_n ({tile_n}) must divide I ({I}); I % tile_n = {I % tile_n}"
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert pool_topk_weight.shape == (dL_do_pool.shape[0],)
     assert pool_topk_weight.dtype == torch.float32
     assert pool_recv_token.shape == (dL_do_pool.shape[0],), (
-        f"pool_recv_token must be (TK_padded,) = ({dL_do_pool.shape[0]},); "
-        f"got {tuple(pool_recv_token.shape)}"
+        f"pool_recv_token must be (TK_padded,) = ({dL_do_pool.shape[0]},); got {tuple(pool_recv_token.shape)}"
     )
     assert pool_recv_token.dtype == torch.int32
-    assert (
-        bwd_dispatch_arrival_count.shape == (total_tiles,)
-        and bwd_dispatch_arrival_count.dtype == torch.int32
-    )
-    assert (
-        pool_arrival_target.shape == (total_tiles,)
-        and pool_arrival_target.dtype == torch.int32
-    )
+    assert bwd_dispatch_arrival_count.shape == (total_tiles,) and bwd_dispatch_arrival_count.dtype == torch.int32
+    assert pool_arrival_target.shape == (total_tiles,) and pool_arrival_target.dtype == torch.int32
     # preact contract — bf16 (total_tiles, tile_m, 2*I), same dtype as
     # dL_dswiglu_in (both share the f32-recast packing).
     assert preact_a.is_cuda and preact_a.dim() == 3
     assert preact_a.shape == (total_tiles, tile_m, 2 * I), (
-        f"preact_a must be (total_tiles, tile_m, 2*I) = "
-        f"{(total_tiles, tile_m, 2 * I)}; got {tuple(preact_a.shape)}"
+        f"preact_a must be (total_tiles, tile_m, 2*I) = {(total_tiles, tile_m, 2 * I)}; got {tuple(preact_a.shape)}"
     )
     assert preact_a.dtype == dL_dswiglu_in.dtype, (
-        f"preact_a dtype must match dL_dswiglu_in's; got {preact_a.dtype} vs "
-        f"{dL_dswiglu_in.dtype}"
+        f"preact_a dtype must match dL_dswiglu_in's; got {preact_a.dtype} vs {dL_dswiglu_in.dtype}"
     )
-    assert (
-        preact_a.element_size() == 2
-    ), "preact_a must be 16-bit (bf16/fp16) for the f32-recast trick"
-    assert (
-        dL_dswiglu_in.element_size() == 2
-    ), "dL_dswiglu_in must be 16-bit (bf16/fp16) for the f32-recast trick"
+    assert preact_a.element_size() == 2, "preact_a must be 16-bit (bf16/fp16) for the f32-recast trick"
+    assert dL_dswiglu_in.element_size() == 2, "dL_dswiglu_in must be 16-bit (bf16/fp16) for the f32-recast trick"
     # postact_a_for_dW2: bf16 (total_tiles, tile_m, I) — TMA-stored via
     # mAuxOut. Same dtype as W2 (bf16); plain bf16 write, no f32-recast.
     assert postact_a_for_dW2.is_cuda and postact_a_for_dW2.dim() == 3
     assert postact_a_for_dW2.shape == (total_tiles, tile_m, I), (
-        f"postact_a_for_dW2 must be (total_tiles, tile_m, I) = "
-        f"{(total_tiles, tile_m, I)}; got {tuple(postact_a_for_dW2.shape)}"
+        f"postact_a_for_dW2 must be (total_tiles, tile_m, I) = {(total_tiles, tile_m, I)}; got {tuple(postact_a_for_dW2.shape)}"
     )
-    assert postact_a_for_dW2.dtype == W2.dtype, (
-        f"postact_a_for_dW2 dtype must match W2's; got {postact_a_for_dW2.dtype} "
-        f"vs {W2.dtype}"
-    )
+    assert postact_a_for_dW2.dtype == W2.dtype, f"postact_a_for_dW2 dtype must match W2's; got {postact_a_for_dW2.dtype} vs {W2.dtype}"
     # dL_dweight: flat (TK_padded,) fp32 — atomic-add target. Caller MUST
     # zero-init before launch (the kernel atomic-adds, doesn't overwrite).
     assert dL_dweight.is_cuda and dL_dweight.dim() == 1
     assert dL_dweight.shape == (dL_do_pool.shape[0],), (
-        f"dL_dweight must be (TK_padded,) = ({dL_do_pool.shape[0]},); "
-        f"got {tuple(dL_dweight.shape)}"
+        f"dL_dweight must be (TK_padded,) = ({dL_do_pool.shape[0]},); got {tuple(dL_dweight.shape)}"
     )
     assert dL_dweight.dtype == torch.float32
     assert dL_dweight.is_contiguous()
@@ -790,10 +732,7 @@ def streaming_moe_y_bwd(
     # the kernel reads it as (l, k, n) = (E, H, I) and transposes to n-major
     # kernel order (n=I, k=H, l=E); the mainloop's `Σ_k B[n, k]` then
     # evaluates `W2[h, i]`.
-    assert W2.stride(-1) == 1, (
-        "W2 must have I (last axis) contiguous (k-major weights); caller "
-        "must pass W2 as (E_local, H, I)"
-    )
+    assert W2.stride(-1) == 1, "W2 must have I (last axis) contiguous (k-major weights); caller must pass W2 as (E_local, H, I)"
     assert W2.shape == (E_local, H, I)
 
     # Capture preact's bf16 dtype BEFORE the f32 view (compile-key + post_init).
@@ -805,18 +744,14 @@ def streaming_moe_y_bwd(
     # epi_visit_subtile via `cute.recast_tensor(tRS_rC, implicit_dtype)`.
     preact_flat = preact_a.view(total_tiles * tile_m, 2 * I).view(torch.float32)
     assert preact_flat.shape == (total_tiles * tile_m, I), (
-        f"preact_flat fp32-view shape mismatch: got {tuple(preact_flat.shape)}, "
-        f"expected {(total_tiles * tile_m, I)}"
+        f"preact_flat fp32-view shape mismatch: got {tuple(preact_flat.shape)}, expected {(total_tiles * tile_m, I)}"
     )
     # Flatten dL_dswiglu_in similarly, view as fp32: bf16 (M, 2*I) → fp32 (M, I).
     # mD's host storage is bf16 (M, 2I); the kernel sees fp32 (M, I) and the
     # epilogue recasts back to bf16x2 for the standard mD store.
-    dL_dswiglu_in_flat = dL_dswiglu_in.view(total_tiles * tile_m, 2 * I).view(
-        torch.float32
-    )
+    dL_dswiglu_in_flat = dL_dswiglu_in.view(total_tiles * tile_m, 2 * I).view(torch.float32)
     assert dL_dswiglu_in_flat.shape == (total_tiles * tile_m, I), (
-        f"dL_dswiglu_in_flat fp32-view shape mismatch: got "
-        f"{tuple(dL_dswiglu_in_flat.shape)}, expected {(total_tiles * tile_m, I)}"
+        f"dL_dswiglu_in_flat fp32-view shape mismatch: got {tuple(dL_dswiglu_in_flat.shape)}, expected {(total_tiles * tile_m, I)}"
     )
 
     # Build cu_seqlens_m = expert_pool_block_offset * tile_m. The varlen_m
@@ -855,9 +790,7 @@ def streaming_moe_y_bwd(
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:
-        max_active_clusters = min(
-            max_active_clusters, num_sms // (cluster_m * cluster_n)
-        )
+        max_active_clusters = min(max_active_clusters, num_sms // (cluster_m * cluster_n))
 
     # Internal scheduler counter — allocate on the calling stream so the
     # zero-init is naturally ordered with the kernel's first atomic-claim.
@@ -867,8 +800,7 @@ def streaming_moe_y_bwd(
     # for the mAuxOut TMA path. No f32-recast — plain bf16 store.
     postact_a_for_dW2_flat = postact_a_for_dW2.view(total_tiles * tile_m, I)
     assert postact_a_for_dW2_flat.shape == (total_tiles * tile_m, I), (
-        f"postact_a_for_dW2_flat shape mismatch: got "
-        f"{tuple(postact_a_for_dW2_flat.shape)}, expected {(total_tiles * tile_m, I)}"
+        f"postact_a_for_dW2_flat shape mismatch: got {tuple(postact_a_for_dW2_flat.shape)}, expected {(total_tiles * tile_m, I)}"
     )
 
     if dropout_p > 0:
@@ -889,9 +821,7 @@ def streaming_moe_y_bwd(
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
     )
-    varlen_args = VarlenArguments(
-        mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
-    )
+    varlen_args = VarlenArguments(mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None)
 
     # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
     # slots, always None for plain bf16); main takes no host stream arg.

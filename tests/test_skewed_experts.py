@@ -84,13 +84,14 @@ def _topk_weights_uniform(T: int, K: int, device: torch.device) -> torch.Tensor:
 def _is_token_in_rank(topk_idx: torch.Tensor, world_size: int, num_local_experts: int) -> torch.Tensor:
     """Standard derivation: token t goes to rank r iff any topk_idx[t, :] // E_local == r."""
     T, K = topk_idx.shape
-    rank_idx = topk_idx // num_local_experts            # [T, K]
+    rank_idx = topk_idx // num_local_experts  # [T, K]
     ranks = torch.arange(world_size, device=topk_idx.device).view(1, 1, -1)
-    return (rank_idx.unsqueeze(-1) == ranks).any(dim=1)   # [T, world_size] bool
+    return (rank_idx.unsqueeze(-1) == ranks).any(dim=1)  # [T, world_size] bool
 
 
-def scenario_uniform_rotating(T: int, K: int, E: int, world_size: int, rank: int,
-                              device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scenario_uniform_rotating(
+    T: int, K: int, E: int, world_size: int, rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Control: every token picks K *distinct* experts, rotating through E.
 
     Token t picks experts [(t*K + 0) % E, (t*K + 1) % E, ..., (t*K + K-1) % E].
@@ -104,21 +105,23 @@ def scenario_uniform_rotating(T: int, K: int, E: int, world_size: int, rank: int
     return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
 
 
-def scenario_all_to_first_K(T: int, K: int, E: int, world_size: int, rank: int,
-                             device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scenario_all_to_first_K(
+    T: int, K: int, E: int, world_size: int, rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Every token picks experts [0, 1, ..., K-1]. Maximal expert-dim skew."""
     topk_idx = torch.arange(K, device=device, dtype=torch.int64).unsqueeze(0).expand(T, K).contiguous()
     num_local_experts = E // world_size
     return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
 
 
-def scenario_half_empty_experts(T: int, K: int, E: int, world_size: int, rank: int,
-                                 device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scenario_half_empty_experts(
+    T: int, K: int, E: int, world_size: int, rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tokens only pick even-numbered experts. Odd experts receive 0 tokens."""
-    even = torch.arange(0, E, 2, device=device, dtype=torch.int64)   # [E/2]
+    even = torch.arange(0, E, 2, device=device, dtype=torch.int64)  # [E/2]
     base = torch.arange(T, device=device, dtype=torch.int64).unsqueeze(1) * K
     offsets = torch.arange(K, device=device, dtype=torch.int64).unsqueeze(0)
-    idx_in_even = (base + offsets) % even.numel()                     # [T, K]
+    idx_in_even = (base + offsets) % even.numel()  # [T, K]
     topk_idx = even[idx_in_even].contiguous()
     num_local_experts = E // world_size
     return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
@@ -132,8 +135,9 @@ def make_per_rank_imbalance(skew_pct: int, target_rank: int = 1):
     """
     skew_pct = max(0, min(100, int(skew_pct)))
 
-    def scenario(T: int, K: int, E: int, world_size: int, rank: int,
-                 device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def scenario(
+        T: int, K: int, E: int, world_size: int, rank: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_local_experts = E // world_size
         clamped_target = min(target_rank, world_size - 1)
         target_e_lo = clamped_target * num_local_experts
@@ -145,6 +149,7 @@ def make_per_rank_imbalance(skew_pct: int, target_rank: int = 1):
         is_hot = (t_ix * 100 < skew_pct * T).expand(T, K)
         topk_idx = torch.where(is_hot, hot_idx, cold_idx).contiguous()
         return topk_idx, _topk_weights_uniform(T, K, device), _is_token_in_rank(topk_idx, world_size, num_local_experts)
+
     return scenario
 
 
@@ -154,8 +159,9 @@ def scenario_per_rank_imbalance(T, K, E, world_size, rank, device):
     return make_per_rank_imbalance(90)(T, K, E, world_size, rank, device)
 
 
-def scenario_power_law(T: int, K: int, E: int, world_size: int, rank: int,
-                       device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scenario_power_law(
+    T: int, K: int, E: int, world_size: int, rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Heavy-tailed: expert e's share decays exponentially in e, but tail
     covers ALL experts (so every rank gets some local work).
 
@@ -188,11 +194,11 @@ def scenario_power_law(T: int, K: int, E: int, world_size: int, rank: int,
 # scenarios in the same process can't get clean signal). All scenarios,
 # including the degenerate all_to_first_K, are expected to pass.
 SCENARIOS = [
-    ("uniform_rotating",   scenario_uniform_rotating),   # CONTROL — must pass
-    ("half_empty_experts", scenario_half_empty_experts), # cold-substream
-    ("per_rank_imbalance", scenario_per_rank_imbalance), # NVL imbalance
-    ("power_law",          scenario_power_law),          # realistic skew (Bug B at 4-node)
-    ("all_to_first_K",     scenario_all_to_first_K),     # extreme expert-dim skew
+    ("uniform_rotating", scenario_uniform_rotating),  # CONTROL — must pass
+    ("half_empty_experts", scenario_half_empty_experts),  # cold-substream
+    ("per_rank_imbalance", scenario_per_rank_imbalance),  # NVL imbalance
+    ("power_law", scenario_power_law),  # realistic skew (Bug B at 4-node)
+    ("all_to_first_K", scenario_all_to_first_K),  # extreme expert-dim skew
 ]
 
 
@@ -201,11 +207,22 @@ SCENARIOS = [
 # w1_local / w2_local — only the routing changes. Asserts finite outputs and
 # grads. Returns (passed: bool, msg: str).
 # ---------------------------------------------------------------------------
-def run_scenario(name: str, builder, *,
-                 T: int, K: int, E: int, world_size: int, rank: int,
-                 device: torch.device, buffer, streams,
-                 w1_local: torch.Tensor, w2_local: torch.Tensor,
-                 x: torch.Tensor) -> tuple[bool, str]:
+def run_scenario(
+    name: str,
+    builder,
+    *,
+    T: int,
+    K: int,
+    E: int,
+    world_size: int,
+    rank: int,
+    device: torch.device,
+    buffer,
+    streams,
+    w1_local: torch.Tensor,
+    w2_local: torch.Tensor,
+    x: torch.Tensor,
+) -> tuple[bool, str]:
     # Zero accumulated grads from prior scenarios so each scenario's grads
     # reflect only its own backward pass.
     if w1_local.grad is not None:
@@ -217,13 +234,13 @@ def run_scenario(name: str, builder, *,
 
     # Sanity asserts on routing tensors before passing to dispatch.
     assert topk_idx.shape == (T, K) and topk_idx.dtype == torch.int64, (
-        f"{name}: topk_idx shape/dtype mismatch: got {tuple(topk_idx.shape)} / {topk_idx.dtype}")
-    assert topk_weights.shape == (T, K) and topk_weights.dtype == torch.float32, (
-        f"{name}: topk_weights shape/dtype mismatch")
+        f"{name}: topk_idx shape/dtype mismatch: got {tuple(topk_idx.shape)} / {topk_idx.dtype}"
+    )
+    assert topk_weights.shape == (T, K) and topk_weights.dtype == torch.float32, f"{name}: topk_weights shape/dtype mismatch"
     assert is_token_in_rank.shape == (T, world_size) and is_token_in_rank.dtype == torch.bool, (
-        f"{name}: is_token_in_rank shape/dtype mismatch")
-    assert (topk_idx >= 0).all() and (topk_idx < E).all(), (
-        f"{name}: topk_idx out of range [0, {E})")
+        f"{name}: is_token_in_rank shape/dtype mismatch"
+    )
+    assert (topk_idx >= 0).all() and (topk_idx < E).all(), f"{name}: topk_idx out of range [0, {E})"
 
     try:
         out = stream_moe_func(
@@ -260,17 +277,18 @@ def run_scenario(name: str, builder, *,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--scenario", action="append", default=None,
-                   help="Run only the named scenarios (may repeat). Default: all SCENARIOS in order.")
-    p.add_argument("--per-rank-skew", type=int, default=None,
-                   help="Override skew_pct on the per_rank_imbalance scenario (0-100). "
-                        "Default 90 (the SCENARIOS default).")
-    p.add_argument("--T", type=int, default=SEQ_LEN_PER_RANK,
-                   help="Per-rank token count (default = production SEQ_LEN_PER_RANK).")
-    p.add_argument("--num_sms", type=int, default=None,
-                   help="SMs override; default = Buffer auto-pick by world size.")
-    p.add_argument("--per-rank-target", type=int, default=1,
-                   help="Target rank for per_rank_imbalance scenario (default 1).")
+    p.add_argument(
+        "--scenario", action="append", default=None, help="Run only the named scenarios (may repeat). Default: all SCENARIOS in order."
+    )
+    p.add_argument(
+        "--per-rank-skew",
+        type=int,
+        default=None,
+        help="Override skew_pct on the per_rank_imbalance scenario (0-100). Default 90 (the SCENARIOS default).",
+    )
+    p.add_argument("--T", type=int, default=SEQ_LEN_PER_RANK, help="Per-rank token count (default = production SEQ_LEN_PER_RANK).")
+    p.add_argument("--num_sms", type=int, default=None, help="SMs override; default = Buffer auto-pick by world size.")
+    p.add_argument("--per-rank-target", type=int, default=1, help="Target rank for per_rank_imbalance scenario (default 1).")
     args = p.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -282,8 +300,7 @@ def main():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
-    assert NUM_EXPERTS % world_size == 0, (
-        f"NUM_EXPERTS={NUM_EXPERTS} must be divisible by world_size={world_size}")
+    assert NUM_EXPERTS % world_size == 0, f"NUM_EXPERTS={NUM_EXPERTS} must be divisible by world_size={world_size}"
     num_local_experts = NUM_EXPERTS // world_size
 
     T = args.T
@@ -297,9 +314,9 @@ def main():
         skew = args.per_rank_skew if args.per_rank_skew is not None else 90
         tgt = args.per_rank_target
         scenarios = [
-            (f"per_rank_imbalance_skew{skew}_tgt{tgt}",
-             make_per_rank_imbalance(skew, target_rank=tgt))
-            if name == "per_rank_imbalance" else (name, builder)
+            (f"per_rank_imbalance_skew{skew}_tgt{tgt}", make_per_rank_imbalance(skew, target_rank=tgt))
+            if name == "per_rank_imbalance"
+            else (name, builder)
             for name, builder in scenarios
         ]
     # Filter via --scenario if given. List-based (preserves order + duplicates
@@ -310,6 +327,7 @@ def main():
         # scenario (per_rank_imbalance_skewN_tgtR) when --per-rank-skew or
         # --per-rank-target was supplied.
         scenarios_by_name = {n: b for n, b in scenarios}
+
         def _resolve(name):
             if name in scenarios_by_name:
                 return (name, scenarios_by_name[name])
@@ -317,6 +335,7 @@ def main():
                 if n.startswith("per_rank_imbalance") and name == "per_rank_imbalance":
                     return (n, b)
             return None
+
         scenarios = [r for name in args.scenario for r in [_resolve(name)] if r is not None]
         if not scenarios:
             if rank == 0:
@@ -325,8 +344,11 @@ def main():
             return
 
     if rank == 0:
-        print(f"[skewed-experts] world_size={world_size} T={T} H={H_dim} K={K} E={E} "
-              f"local_E={num_local_experts} per_rank_skew={args.per_rank_skew or 'default(90)'}", flush=True)
+        print(
+            f"[skewed-experts] world_size={world_size} T={T} H={H_dim} K={K} E={E} "
+            f"local_E={num_local_experts} per_rank_skew={args.per_rank_skew or 'default(90)'}",
+            flush=True,
+        )
         print(f"[skewed-experts] scenarios: {[n for n, _ in scenarios]}", flush=True)
 
     # Buffer + streams: shared across scenarios.
@@ -335,10 +357,8 @@ def main():
 
     # Per-rank expert weights (small N(0, 0.02) so output magnitudes are stable).
     torch.manual_seed(100 + rank)
-    w1_local = torch.nn.Parameter(torch.randn(
-        num_local_experts, 2 * I, H_dim, dtype=DTYPE, device=device) * 0.02)
-    w2_local = torch.nn.Parameter(torch.randn(
-        num_local_experts, H_dim, I, dtype=DTYPE, device=device) * 0.02)
+    w1_local = torch.nn.Parameter(torch.randn(num_local_experts, 2 * I, H_dim, dtype=DTYPE, device=device) * 0.02)
+    w2_local = torch.nn.Parameter(torch.randn(num_local_experts, H_dim, I, dtype=DTYPE, device=device) * 0.02)
     x = (torch.randn(T, H_dim, dtype=DTYPE, device=device) * 0.1).contiguous()
 
     # Run scenarios sequentially. Bail on first failure — a kernel-side trap
@@ -359,10 +379,20 @@ def main():
         if rank == 0:
             print(f"[skewed-experts] running {name} ...", flush=True)
         passed, msg = run_scenario(
-            name, builder,
-            T=T, K=K, E=E, world_size=world_size, rank=rank,
-            device=device, buffer=buffer, streams=streams,
-            w1_local=w1_local, w2_local=w2_local, x=x)
+            name,
+            builder,
+            T=T,
+            K=K,
+            E=E,
+            world_size=world_size,
+            rank=rank,
+            device=device,
+            buffer=buffer,
+            streams=streams,
+            w1_local=w1_local,
+            w2_local=w2_local,
+            x=x,
+        )
         # Aggregate pass/fail across ranks: a scenario passes globally iff every
         # rank reports pass. Use all_reduce on an int32 (1=pass, 0=fail).
         my_pass = torch.tensor([1 if passed else 0], dtype=torch.int32, device=device)
@@ -381,8 +411,7 @@ def main():
         n_pass = sum(1 for _, s, _ in results if s == "PASS")
         n_fail = sum(1 for _, s, _ in results if s == "FAIL")
         n_skip = sum(1 for _, s, _ in results if s == "SKIPPED")
-        print(f"[skewed-experts] SUMMARY world_size={world_size}: "
-              f"{n_pass} pass / {n_fail} fail / {n_skip} skipped", flush=True)
+        print(f"[skewed-experts] SUMMARY world_size={world_size}: {n_pass} pass / {n_fail} fail / {n_skip} skipped", flush=True)
         for _, status, msg in results:
             print(f"  {status}: {msg}", flush=True)
 

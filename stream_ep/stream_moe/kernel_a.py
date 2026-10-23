@@ -140,9 +140,7 @@ class StreamingMoeA(StreamingGemmBase):
         half-N ``tRS_rAuxOut`` rides mAuxOut's gated TileStore (SM90-only; the
         STSM permute + half-N tile live in ``TileStore.store_convert``).
         """
-        GemmDefaultEpiMixin.epi_visit_subtile(
-            self, params, epi_loop_tensors, tRS_rD, tRS_rC
-        )
+        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
         for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
@@ -154,8 +152,11 @@ class StreamingMoeA(StreamingGemmBase):
             for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
                 crd = tDcD[2 * i]
                 tRS_rAuxOut[i] *= keep_scale(
-                    seed, row0 + crd[0], (col0 + crd[1]) >> 1,
-                    self.dropout_threshold, self.dropout_scale,
+                    seed,
+                    row0 + crd[0],
+                    (col0 + crd[1]) >> 1,
+                    self.dropout_threshold,
+                    self.dropout_scale,
                 )
         return (tRS_rAuxOut,)
 
@@ -210,29 +211,21 @@ def _compile_streaming_moe_a(
     if store_preact:
         # Same pool layout as postact_a (Mflat = total_tiles * tile_m), but
         # full N=2I instead of half-N=I. n-major (2I contiguous), bf16.
-        mD = fake_tensor(
-            postact_dtype, (Mflat_sym, I2_sym), leading_dim=1, divisibility=8
-        )
+        mD = fake_tensor(postact_dtype, (Mflat_sym, I2_sym), leading_dim=1, divisibility=8)
     else:
         mD = None
     mC = None
     # mAuxOut: flat (total_tiles * tile_m, I), n-major (I contiguous).
-    mAuxOut = fake_tensor(
-        postact_dtype, (Mflat_sym, I_sym), leading_dim=1, divisibility=8
-    )
+    mAuxOut = fake_tensor(postact_dtype, (Mflat_sym, I_sym), leading_dim=1, divisibility=8)
 
     # cu_seqlens_m drives the standard varlen_m m-offset for kernel A: each
     # entry is `expert_pool_block_offset[e] * tile_m`. Length E_local + 1.
-    mCuSeqlensM = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
-    )
+    mCuSeqlensM = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1)
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    expert_pool_block_offset = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
-    )
+    expert_pool_block_offset = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1)
 
     scheduler_args = StreamingTileSchedulerOptions(
         max_active_clusters=Int32(0),  # set at runtime; 0 here keeps fake compile happy
@@ -298,9 +291,9 @@ class _StreamingTileProducer:
         delay_clocks: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(
-            pool_arrival_count, pool_arrival_target, total_tiles, delay_clocks
-        ).launch(grid=[1, 1, 1], block=[1, 1, 1], stream=stream)
+        self.kernel(pool_arrival_count, pool_arrival_target, total_tiles, delay_clocks).launch(
+            grid=[1, 1, 1], block=[1, 1, 1], stream=stream
+        )
 
     @cute.kernel
     def kernel(
@@ -328,6 +321,7 @@ class _StreamingTileProducer:
                 # mirroring the real fire_pool_blocks. Pre-set the target so
                 # one shot brings count to it.
                 from cutlass._mlir.dialects import llvm
+
                 count_ptr_i64 = count_ptr.toint().ir_value()
                 llvm.inline_asm(
                     None,
@@ -444,60 +438,38 @@ def streaming_moe_a(
     assert postact_a.dim() == 3
     total_tiles, postact_tile_m, I = postact_a.shape
     assert postact_tile_m == tile_m
-    assert (
-        pool_arrival_count.shape == (total_tiles,)
-        and pool_arrival_count.dtype == torch.int32
-    )
-    assert (
-        pool_arrival_target.shape == (total_tiles,)
-        and pool_arrival_target.dtype == torch.int32
-    )
+    assert pool_arrival_count.shape == (total_tiles,) and pool_arrival_count.dtype == torch.int32
+    assert pool_arrival_target.shape == (total_tiles,) and pool_arrival_target.dtype == torch.int32
     H = pool.shape[1]
     E_local = W1.shape[0]
     assert expert_pool_block_offset.shape == (E_local + 1,)
-    assert (
-        W1.shape[1] == 2 * I
-    ), f"W1 dim 1 must be 2*I = {2 * I}; got W1.shape={tuple(W1.shape)}"
-    assert (
-        W1.shape[2] == H
-    ), f"W1 dim 2 (H) must match pool dim 1; got W1.shape={tuple(W1.shape)}, H={H}"
+    assert W1.shape[1] == 2 * I, f"W1 dim 1 must be 2*I = {2 * I}; got W1.shape={tuple(W1.shape)}"
+    assert W1.shape[2] == H, f"W1 dim 2 (H) must match pool dim 1; got W1.shape={tuple(W1.shape)}, H={H}"
     two_I = W1.shape[1]
     # tile_n MUST divide the output N dim. The grouped GEMM emits one CTA per
     # (pid_m, pid_n) and writes a full tile_n-wide slab via TMA; partial-tile
     # tail handling silently corrupts adjacent memory. kernel A's output N is
     # 2I (mD/preact) or I (mAuxOut/postact); both must be divisible.
-    assert two_I % tile_n == 0, (
-        f"tile_n ({tile_n}) must divide 2I ({two_I}); 2I % tile_n = {two_I % tile_n}"
-    )
-    assert I % tile_n == 0, (
-        f"tile_n ({tile_n}) must divide I ({I}); I % tile_n = {I % tile_n}"
-    )
+    assert two_I % tile_n == 0, f"tile_n ({tile_n}) must divide 2I ({two_I}); 2I % tile_n = {two_I % tile_n}"
+    assert I % tile_n == 0, f"tile_n ({tile_n}) must divide I ({I}); I % tile_n = {I % tile_n}"
     if preact_a is not None:
         assert preact_a.is_cuda and preact_a.dim() == 3
         assert preact_a.shape == (total_tiles, tile_m, two_I), (
-            f"preact_a must be (total_tiles, tile_m, 2*I) = "
-            f"{(total_tiles, tile_m, two_I)}; got {tuple(preact_a.shape)}"
+            f"preact_a must be (total_tiles, tile_m, 2*I) = {(total_tiles, tile_m, two_I)}; got {tuple(preact_a.shape)}"
         )
-        assert preact_a.dtype == postact_a.dtype, (
-            f"preact_a dtype must match postact_a's; got {preact_a.dtype} vs "
-            f"{postact_a.dtype}"
-        )
+        assert preact_a.dtype == postact_a.dtype, f"preact_a dtype must match postact_a's; got {preact_a.dtype} vs {postact_a.dtype}"
     # Caller passes W1 as (E_local, 2I, H) k-major contiguous (each expert's
     # slab has H contiguous). quack main takes batched B batch-first, so we
     # pass W1 as-is — no host permute. The natural storage is already
     # (l, n, k) = (E, 2I, H), so the kernel's default rotate gives k-major
     # kernel-order B (2I, H, E) — no b_transposed needed.
-    assert (
-        W1.stride(-1) == 1
-    ), "W1[e] must be H-contiguous (caller passes (E_local, 2I, H) k-major weights)"
+    assert W1.stride(-1) == 1, "W1[e] must be H-contiguous (caller passes (E_local, 2I, H) k-major weights)"
     assert W1.shape == (E_local, two_I, H)
 
     # Flatten postact_a's leading two dims to (total_tiles * tile_m, I).
     postact_flat = postact_a.view(total_tiles * tile_m, I)
     # Flatten preact_a similarly when present — same Mflat dim, but full N=2I.
-    preact_flat = (
-        preact_a.view(total_tiles * tile_m, two_I) if preact_a is not None else None
-    )
+    preact_flat = preact_a.view(total_tiles * tile_m, two_I) if preact_a is not None else None
 
     # Build cu_seqlens_m = expert_pool_block_offset * tile_m. The standard
     # varlen_m path inside the GEMM uses this as the per-batch m-row offset:
@@ -534,9 +506,7 @@ def streaming_moe_a(
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:
-        max_active_clusters = min(
-            max_active_clusters, num_sms // (cluster_m * cluster_n)
-        )
+        max_active_clusters = min(max_active_clusters, num_sms // (cluster_m * cluster_n))
 
     # Internal scheduler counter — allocate on the calling stream (which is the
     # one the kernel will run on) so the zero-init is naturally ordered with
@@ -560,14 +530,10 @@ def streaming_moe_a(
         expert_pool_block_offset=expert_pool_block_offset,
         total_tiles=Int32(total_tiles),
     )
-    varlen_args = VarlenArguments(
-        mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
-    )
+    varlen_args = VarlenArguments(mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None)
 
     # Trailing (None, None) are mSFA / mSFB — the unified SM90/100/120 TMA
     # scale-factor slots main's compiled arg spec always requires (None for a
     # plain bf16 GEMM). Note main takes no host `stream` arg (it binds the
     # TVM-FFI env stream), so these two slots follow varlen_args directly.
-    compiled_fn(
-        pool, W1, preact_flat, None, epi_args, scheduler_args, varlen_args, None, None
-    )
+    compiled_fn(pool, W1, preact_flat, None, epi_args, scheduler_args, varlen_args, None, None)

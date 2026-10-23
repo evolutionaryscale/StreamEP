@@ -126,13 +126,8 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
 
 namespace stream_ep {
 
-Buffer::Buffer(int rank,
-               int num_ranks,
-               int64_t num_nvl_bytes,
-               int64_t num_rdma_bytes,
-               bool explicitly_destroy,
-               bool enable_shrink,
-               bool use_fabric)
+Buffer::Buffer(
+    int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool explicitly_destroy, bool enable_shrink, bool use_fabric)
     : rank(rank),
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
@@ -149,8 +144,7 @@ Buffer::Buffer(int rank,
     EP_STATIC_ASSERT(NUM_BUFFER_ALIGNMENT_BYTES % sizeof(int4) == 0, "Invalid alignment");
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                    (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
-    EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                   num_rdma_bytes <= std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and num_rdma_bytes <= std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks and num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS);
@@ -185,8 +179,7 @@ Buffer::Buffer(int rank,
         //     local experts the token routes to). Used for num_recv and combine gating.
         // The inboxes are laid out adjacently at `streaming_section_offset`.
         int max_num_channels = num_device_sms / 2;
-        int64_t e_inbox_bytes =
-            static_cast<int64_t>(max_num_channels) * NUM_MAX_NVL_PEERS * NUM_MAX_LOCAL_EXPERTS * sizeof(int);
+        int64_t e_inbox_bytes = static_cast<int64_t>(max_num_channels) * NUM_MAX_NVL_PEERS * NUM_MAX_LOCAL_EXPERTS * sizeof(int);
         int64_t u_inbox_bytes = static_cast<int64_t>(max_num_channels) * NUM_MAX_NVL_PEERS * sizeof(int);
         streaming_section_bytes = e_inbox_bytes + u_inbox_bytes;
         streaming_section_bytes =
@@ -194,9 +187,9 @@ Buffer::Buffer(int rank,
         streaming_section_offset = num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes;
 
         // Local IPC: alloc local memory and set local IPC handles
-        shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
-                                       num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes +
-                                           streaming_section_bytes);
+        shared_memory_allocator.malloc(
+            &buffer_ptrs[nvl_rank],
+            num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes + streaming_section_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
@@ -216,8 +209,8 @@ Buffer::Buffer(int rank,
         // no per-iter memset + barrier — stale residue is rejected by
         // seq-mismatch on read.
         CUDA_CHECK(cudaMemsetAsync(buffer_ptrs[nvl_rank], 0, num_nvl_bytes, current_stream));
-        CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + streaming_section_offset, 0,
-                                   streaming_section_bytes, current_stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + streaming_section_offset, 0, streaming_section_bytes, current_stream));
     }
 
     // Create 32 MiB workspace
@@ -230,14 +223,10 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaMalloc(&dispatch_grads_started_flag, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&kernel_y_started_flag, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&kernel_a_bwd_started_flag, sizeof(int)));
-    CUDA_CHECK(cudaMemsetAsync(dispatch_main_started_flag, 0, sizeof(int),
-                               at::cuda::getCurrentCUDAStream()));
-    CUDA_CHECK(cudaMemsetAsync(dispatch_grads_started_flag, 0, sizeof(int),
-                               at::cuda::getCurrentCUDAStream()));
-    CUDA_CHECK(cudaMemsetAsync(kernel_y_started_flag, 0, sizeof(int),
-                               at::cuda::getCurrentCUDAStream()));
-    CUDA_CHECK(cudaMemsetAsync(kernel_a_bwd_started_flag, 0, sizeof(int),
-                               at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_main_started_flag, 0, sizeof(int), at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_grads_started_flag, 0, sizeof(int), at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(kernel_y_started_flag, 0, sizeof(int), at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemsetAsync(kernel_a_bwd_started_flag, 0, sizeof(int), at::cuda::getCurrentCUDAStream()));
 
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
@@ -347,10 +336,14 @@ void Buffer::destroy() {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
         internode::free(rdma_buffer_ptr);
-        if (dispatch_reader_prev_head)     CUDA_CHECK(cudaFree(dispatch_reader_prev_head));
-        if (dispatch_reader_prev_tail)     CUDA_CHECK(cudaFree(dispatch_reader_prev_tail));
-        if (combine_reader_prev_head)      CUDA_CHECK(cudaFree(combine_reader_prev_head));
-        if (combine_reader_prev_tail)      CUDA_CHECK(cudaFree(combine_reader_prev_tail));
+        if (dispatch_reader_prev_head)
+            CUDA_CHECK(cudaFree(dispatch_reader_prev_head));
+        if (dispatch_reader_prev_tail)
+            CUDA_CHECK(cudaFree(dispatch_reader_prev_tail));
+        if (combine_reader_prev_head)
+            CUDA_CHECK(cudaFree(combine_reader_prev_head));
+        if (combine_reader_prev_tail)
+            CUDA_CHECK(cudaFree(combine_reader_prev_tail));
         if (enable_shrink) {
             internode::free(mask_buffer_ptr);
             internode::free(sync_buffer_ptr);
@@ -399,31 +392,27 @@ static void wait_value_geq_on_stream(CUstream stream, int* flag, int target) {
 }
 
 void Buffer::wait_dispatch_main_started(int64_t stream_handle) {
-    if (dispatch_main_issued_count == 0) return;  // nothing launched yet
-    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
-                             dispatch_main_started_flag,
-                             dispatch_main_issued_count);
+    if (dispatch_main_issued_count == 0)
+        return;  // nothing launched yet
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle), dispatch_main_started_flag, dispatch_main_issued_count);
 }
 
 void Buffer::wait_dispatch_grads_started(int64_t stream_handle) {
-    if (dispatch_grads_issued_count == 0) return;
-    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
-                             dispatch_grads_started_flag,
-                             dispatch_grads_issued_count);
+    if (dispatch_grads_issued_count == 0)
+        return;
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle), dispatch_grads_started_flag, dispatch_grads_issued_count);
 }
 
 void Buffer::wait_kernel_y_started(int64_t stream_handle) {
-    if (kernel_y_issued_count == 0) return;
-    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
-                             kernel_y_started_flag,
-                             kernel_y_issued_count);
+    if (kernel_y_issued_count == 0)
+        return;
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle), kernel_y_started_flag, kernel_y_issued_count);
 }
 
 void Buffer::wait_kernel_a_bwd_started(int64_t stream_handle) {
-    if (kernel_a_bwd_issued_count == 0) return;
-    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle),
-                             kernel_a_bwd_started_flag,
-                             kernel_a_bwd_issued_count);
+    if (kernel_a_bwd_issued_count == 0)
+        return;
+    wait_value_geq_on_stream(reinterpret_cast<CUstream>(stream_handle), kernel_a_bwd_started_flag, kernel_a_bwd_issued_count);
 }
 
 void Buffer::bump_kernel_y_issued() {
@@ -511,16 +500,15 @@ void Buffer::sync(const std::vector<int>& device_ids,
         // matching the NIC's 4-byte AMO; cross-iter wrap absorbed by
         // modular subtraction + signed-difference CAS).
         const int max_num_channels = num_device_sms / 2;
-        const int64_t prev_array_bytes_32 =
-            static_cast<int64_t>(max_num_channels) * num_rdma_ranks * sizeof(uint32_t);
-        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_head,    prev_array_bytes_32));
-        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail,    prev_array_bytes_32));
-        CUDA_CHECK(cudaMalloc(&combine_reader_prev_head,     prev_array_bytes_32));
-        CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail,     prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(dispatch_reader_prev_head,    0, prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail,    0, prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(combine_reader_prev_head,     0, prev_array_bytes_32));
-        CUDA_CHECK(cudaMemset(combine_reader_prev_tail,     0, prev_array_bytes_32));
+        const int64_t prev_array_bytes_32 = static_cast<int64_t>(max_num_channels) * num_rdma_ranks * sizeof(uint32_t);
+        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_head, prev_array_bytes_32));
+        CUDA_CHECK(cudaMalloc(&dispatch_reader_prev_tail, prev_array_bytes_32));
+        CUDA_CHECK(cudaMalloc(&combine_reader_prev_head, prev_array_bytes_32));
+        CUDA_CHECK(cudaMalloc(&combine_reader_prev_tail, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(dispatch_reader_prev_head, 0, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(dispatch_reader_prev_tail, 0, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(combine_reader_prev_head, 0, prev_array_bytes_32));
+        CUDA_CHECK(cudaMemset(combine_reader_prev_tail, 0, prev_array_bytes_32));
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -567,6 +555,7 @@ public:
         return off;
     }
     int64_t total_bytes() const { return cursor_; }
+
 private:
     int64_t cursor_ = 0;
 };
@@ -583,10 +572,9 @@ private:
 // have a custom deleter and aren't allocator-tracked — recording on a view
 // is silently a no-op.
 inline void record_consumer_stream(const torch::Tensor& t, int64_t consumer_stream_handle) {
-    if (consumer_stream_handle == 0) return;
-    t.record_stream(at::cuda::getStreamFromExternal(
-        reinterpret_cast<cudaStream_t>(consumer_stream_handle),
-        t.device().index()));
+    if (consumer_stream_handle == 0)
+        return;
+    t.record_stream(at::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(consumer_stream_handle), t.device().index()));
 }
 
 // Allocate a fresh `torch::empty` in the REGISTERED default (caller) stream's
@@ -602,12 +590,12 @@ inline torch::Tensor empty_on_default_pool(at::IntArrayRef size,
                                            const torch::TensorOptions& opts,
                                            bool default_stream_registered,
                                            int64_t default_stream_handle) {
-    if (!default_stream_registered) return torch::empty(size, opts);
+    if (!default_stream_registered)
+        return torch::empty(size, opts);
     auto dev = opts.device().index();
     auto target = (default_stream_handle == 0)
         ? at::cuda::getDefaultCUDAStream(dev)
-        : at::cuda::getStreamFromExternal(
-              reinterpret_cast<cudaStream_t>(default_stream_handle), dev);
+        : at::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(default_stream_handle), dev);
     c10::cuda::CUDAStreamGuard guard(target);
     return torch::empty(size, opts);
 }
@@ -633,7 +621,8 @@ inline torch::Tensor empty_on_default(at::IntArrayRef size,
                                       int64_t default_stream_handle,
                                       int64_t consumer_stream_handle) {
     auto t = empty_on_default_pool(size, opts, default_stream_registered, default_stream_handle);
-    if (!default_stream_registered) record_consumer_stream(t, consumer_stream_handle);
+    if (!default_stream_registered)
+        record_consumer_stream(t, consumer_stream_handle);
     return t;
 }
 
@@ -641,8 +630,11 @@ void validate_dispatch_inputs(const torch::Tensor& x,
                               const torch::Tensor& topk_idx,
                               const torch::Tensor& topk_weights,
                               const torch::Tensor& is_token_in_rank,
-                              int num_experts, int num_ranks, int num_local_experts,
-                              int expert_alignment, int tile_m) {
+                              int num_experts,
+                              int num_ranks,
+                              int num_local_experts,
+                              int expert_alignment,
+                              int tile_m) {
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_local_experts <= NUM_MAX_LOCAL_EXPERTS);
     EP_HOST_ASSERT(tile_m > 0);
@@ -692,22 +684,19 @@ struct PrePollBundle {
     torch::Tensor total_tiles_device;        // [1]
 };
 
-PrePollBundle allocate_pre_poll_bundle(int num_ranks,
-                                       int num_channels,
-                                       int num_local_experts,
-                                       at::cuda::CUDAStream stream,
-                                       int64_t consumer_stream_handle) {
+PrePollBundle allocate_pre_poll_bundle(
+    int num_ranks, int num_channels, int num_local_experts, at::cuda::CUDAStream stream, int64_t consumer_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
-    auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
+    auto i8_opts = dtype(torch::kInt8).device(torch::kCUDA);
 
     SlabBuilder b;
-    int64_t off_channel_prefix_matrix    = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
-    int64_t off_expert_frequency         = b.reserve<int>(num_local_experts);
+    int64_t off_channel_prefix_matrix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
+    int64_t off_expert_frequency = b.reserve<int>(num_local_experts);
     int64_t off_expert_pool_block_offset = b.reserve<int>(num_local_experts + 1);
-    int64_t off_base_pool                = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
-    int64_t off_seen_per_substream       = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
-    int64_t off_rank_prefix_matrix       = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
-    int64_t off_total_tiles_device       = b.reserve<int>(1);
+    int64_t off_base_pool = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    int64_t off_seen_per_substream = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    int64_t off_rank_prefix_matrix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
+    int64_t off_total_tiles_device = b.reserve<int>(1);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     record_consumer_stream(bundle, consumer_stream_handle);
@@ -723,13 +712,14 @@ PrePollBundle allocate_pre_poll_bundle(int num_ranks,
     const at::Device blob_dev = bundle.device();
 
     return PrePollBundle{
-        .channel_prefix_matrix    = at::from_blob(base + off_channel_prefix_matrix,    {num_ranks, num_channels},                            keep, i32_opts, blob_dev),
-        .expert_frequency         = at::from_blob(base + off_expert_frequency,         {num_local_experts},                                  keep, i32_opts, blob_dev),
-        .expert_pool_block_offset = at::from_blob(base + off_expert_pool_block_offset, {num_local_experts + 1},                              keep, i32_opts, blob_dev),
-        .base_pool                = at::from_blob(base + off_base_pool,                {num_channels, num_ranks, num_local_experts},         keep, i32_opts, blob_dev),
-        .seen_per_substream       = at::from_blob(base + off_seen_per_substream,       {num_channels, num_ranks, num_local_experts},         keep, i32_opts, blob_dev),
-        .rank_prefix_matrix       = at::from_blob(base + off_rank_prefix_matrix,       {num_ranks, num_ranks},                               keep, i32_opts, blob_dev),
-        .total_tiles_device       = at::from_blob(base + off_total_tiles_device,       {1},                                                  keep, i32_opts, blob_dev),
+        .channel_prefix_matrix = at::from_blob(base + off_channel_prefix_matrix, {num_ranks, num_channels}, keep, i32_opts, blob_dev),
+        .expert_frequency = at::from_blob(base + off_expert_frequency, {num_local_experts}, keep, i32_opts, blob_dev),
+        .expert_pool_block_offset = at::from_blob(base + off_expert_pool_block_offset, {num_local_experts + 1}, keep, i32_opts, blob_dev),
+        .base_pool = at::from_blob(base + off_base_pool, {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
+        .seen_per_substream =
+            at::from_blob(base + off_seen_per_substream, {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
+        .rank_prefix_matrix = at::from_blob(base + off_rank_prefix_matrix, {num_ranks, num_ranks}, keep, i32_opts, blob_dev),
+        .total_tiles_device = at::from_blob(base + off_total_tiles_device, {1}, keep, i32_opts, blob_dev),
     };
 }
 
@@ -746,13 +736,14 @@ HostPollResult host_poll_recv_counts(volatile int* moe_recv_counter,
     auto start_time = std::chrono::high_resolution_clock::now();
     while (true) {
         r.num_recv_tokens = static_cast<int>(*moe_recv_counter);
-        r.total_tiles     = static_cast<int>(*streaming_total_tiles);
+        r.total_tiles = static_cast<int>(*streaming_total_tiles);
         bool ready = (r.num_recv_tokens >= 0) and (r.total_tiles >= 0);
         for (int i = 0; i < num_local_experts and ready; ++i)
             ready &= moe_recv_expert_counter[i] >= 0;
-        if (ready) break;
-        if (std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::high_resolution_clock::now() - start_time).count() > NUM_CPU_TIMEOUT_SECS)
+        if (ready)
+            break;
+        if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
+            NUM_CPU_TIMEOUT_SECS)
             throw std::runtime_error("StreamEP error: CPU recv timeout");
     }
     return r;
@@ -826,7 +817,7 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
                                          int64_t default_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
-    auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
+    auto i8_opts = dtype(torch::kInt8).device(torch::kCUDA);
     auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
 
     PostPollBundle out;
@@ -835,22 +826,22 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
 
     SlabBuilder b;
     // Z_pre region (zeroed before metadata_done event).
-    int64_t off_pool_topk_weight    = b.reserve<float>(TK_padded);
+    int64_t off_pool_topk_weight = b.reserve<float>(TK_padded);
     int64_t off_recv_channel_prefix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
-    int64_t off_send_head           = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_ranks);
-    int64_t off_pool_arrival_count  = b.reserve<int>(total_tiles);
-    int64_t z_pre_bytes             = b.total_bytes();
+    int64_t off_send_head = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_ranks);
+    int64_t off_pool_arrival_count = b.reserve<int>(total_tiles);
+    int64_t z_pre_bytes = b.total_bytes();
 
     // N region (-1 fill, before metadata_done).
     int64_t off_pool_recv_token = b.reserve<int>(TK_padded);
-    int64_t off_pool_k_slot     = b.reserve<int>(TK_padded);
-    int64_t n_end               = b.total_bytes();
+    int64_t off_pool_k_slot = b.reserve<int>(TK_padded);
+    int64_t n_end = b.total_bytes();
 
     // Z_post region (zeroed after metadata_done).
-    int64_t off_k_local_remaining    = b.reserve<int>(num_recv_tokens);
+    int64_t off_k_local_remaining = b.reserve<int>(num_recv_tokens);
     int64_t off_y_done_per_token = b.reserve<int64_t>(num_recv_tokens);
-    int64_t off_recv_token_to_slots    = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
-    int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
+    int64_t off_recv_token_to_slots = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
+    int64_t off_k_local_total = b.reserve<int>(num_recv_tokens);
     // NOTE: `o` is NOT reserved in the slab — it is allocated standalone below
     // so its storage can be freed after fwd combine (forward-only; see below).
 
@@ -858,13 +849,12 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // pool_topk_weight, ...) pin it until bwd return, AFTER the layer-end
     // back-edges, so NO record_consumer_stream — back-edge ordering guards reuse.
     // The memsets below run on `stream` (alloc->first-use via the layer-start gate).
-    auto bundle = empty_on_default_pool({b.total_bytes()}, i8_opts,
-                                        default_stream_registered, default_stream_handle);
+    auto bundle = empty_on_default_pool({b.total_bytes()}, i8_opts, default_stream_registered, default_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
-    CUDA_CHECK(cudaMemsetAsync(base,                0x00, z_pre_bytes,         stream));
-    CUDA_CHECK(cudaMemsetAsync(base + z_pre_bytes,  0xFF, n_end - z_pre_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(base, 0x00, z_pre_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(base + z_pre_bytes, 0xFF, n_end - z_pre_bytes, stream));
 
     auto keep = [bundle](void*) {};
     // Pass bundle's concrete device to every from_blob so TensorMaker never
@@ -876,12 +866,12 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // tensor, so bundle.device() carries a concrete index.
     const at::Device blob_dev = bundle.device();
 
-    out.pool_topk_weight           = at::from_blob(base + off_pool_topk_weight,    {TK_padded},                          keep, f32_opts, blob_dev);
-    out.recv_channel_prefix_matrix = at::from_blob(base + off_recv_channel_prefix, {num_ranks, num_channels},            keep, i32_opts, blob_dev);
-    out.send_head                  = at::from_blob(base + off_send_head,           {num_tokens, num_ranks},              keep, i32_opts, blob_dev);
-    out.pool_arrival_count         = at::from_blob(base + off_pool_arrival_count,  {total_tiles},                        keep, i32_opts, blob_dev);
-    out.pool_recv_token            = at::from_blob(base + off_pool_recv_token,     {TK_padded},                          keep, i32_opts, blob_dev);
-    out.pool_k_slot                = at::from_blob(base + off_pool_k_slot,         {TK_padded},                          keep, i32_opts, blob_dev);
+    out.pool_topk_weight = at::from_blob(base + off_pool_topk_weight, {TK_padded}, keep, f32_opts, blob_dev);
+    out.recv_channel_prefix_matrix = at::from_blob(base + off_recv_channel_prefix, {num_ranks, num_channels}, keep, i32_opts, blob_dev);
+    out.send_head = at::from_blob(base + off_send_head, {num_tokens, num_ranks}, keep, i32_opts, blob_dev);
+    out.pool_arrival_count = at::from_blob(base + off_pool_arrival_count, {total_tiles}, keep, i32_opts, blob_dev);
+    out.pool_recv_token = at::from_blob(base + off_pool_recv_token, {TK_padded}, keep, i32_opts, blob_dev);
+    out.pool_k_slot = at::from_blob(base + off_pool_k_slot, {TK_padded}, keep, i32_opts, blob_dev);
 
     // Z_post memset must precede metadata_done event so that consumer kernels
     // gated on the event (potentially on separate HW queues under CDMC>1)
@@ -905,17 +895,15 @@ PostPollBundle allocate_post_poll_bundle(int64_t TK_padded,
     // layer-start communicate.wait_stream(caller) gate (same as `pool`). Zero-init
     // is load-bearing: kernel Y accumulates K_local(r)>=1 contributions per row
     // via red.global.add.
-    out.o = empty_on_default_pool({num_recv_tokens, hidden}, x_options,
-                                  default_stream_registered, default_stream_handle);
-    CUDA_CHECK(cudaMemsetAsync(out.o.data_ptr(), 0x00,
-                               static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token, stream));
+    out.o = empty_on_default_pool({num_recv_tokens, hidden}, x_options, default_stream_registered, default_stream_handle);
+    CUDA_CHECK(cudaMemsetAsync(out.o.data_ptr(), 0x00, static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token, stream));
 
     out.metadata_done_event = EventHandle(stream);
 
-    out.k_local_remaining    = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                        keep, i32_opts, blob_dev);
-    out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                        keep, i64_opts, blob_dev);
-    out.recv_token_to_slots    = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},              keep, i32_opts, blob_dev);
-    out.k_local_total          = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                        keep, i32_opts, blob_dev);
+    out.k_local_remaining = at::from_blob(base + off_k_local_remaining, {num_recv_tokens}, keep, i32_opts, blob_dev);
+    out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens}, keep, i64_opts, blob_dev);
+    out.recv_token_to_slots = at::from_blob(base + off_recv_token_to_slots, {num_recv_tokens, num_topk}, keep, i32_opts, blob_dev);
+    out.k_local_total = at::from_blob(base + off_k_local_total, {num_recv_tokens}, keep, i32_opts, blob_dev);
 
     return out;
 }
@@ -948,19 +936,19 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int num_ranks,
                                                           at::cuda::CUDAStream stream,
                                                           int64_t consumer_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
-    auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
+    auto i8_opts = dtype(torch::kInt8).device(torch::kCUDA);
 
     SlabBuilder b;
-    int64_t off_rdma_chprefix       = b.reserve<int>(static_cast<int64_t>(num_rdma_ranks) * num_channels);
-    int64_t off_recv_rdma_prefix    = b.reserve<int>(num_rdma_ranks);
-    int64_t off_gbl_chprefix        = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
-    int64_t off_recv_gbl_prefix     = b.reserve<int>(num_ranks);
-    int64_t off_expert_frequency    = b.reserve<int>(num_local_experts);
-    int64_t off_expert_pool_offset  = b.reserve<int>(num_local_experts + 1);
-    int64_t off_base_pool           = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
-    int64_t off_seen_per_substream  = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
-    int64_t off_rank_prefix_matrix  = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
-    int64_t off_total_tiles_device  = b.reserve<int>(1);
+    int64_t off_rdma_chprefix = b.reserve<int>(static_cast<int64_t>(num_rdma_ranks) * num_channels);
+    int64_t off_recv_rdma_prefix = b.reserve<int>(num_rdma_ranks);
+    int64_t off_gbl_chprefix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
+    int64_t off_recv_gbl_prefix = b.reserve<int>(num_ranks);
+    int64_t off_expert_frequency = b.reserve<int>(num_local_experts);
+    int64_t off_expert_pool_offset = b.reserve<int>(num_local_experts + 1);
+    int64_t off_base_pool = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    int64_t off_seen_per_substream = b.reserve<int>(static_cast<int64_t>(num_channels) * num_ranks * num_local_experts);
+    int64_t off_rank_prefix_matrix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_ranks);
+    int64_t off_total_tiles_device = b.reserve<int>(1);
 
     auto bundle = torch::empty({b.total_bytes()}, i8_opts);
     record_consumer_stream(bundle, consumer_stream_handle);
@@ -972,16 +960,17 @@ PrePollBundleInternode allocate_pre_poll_bundle_internode(int num_ranks,
     const at::Device blob_dev = bundle.device();
 
     return PrePollBundleInternode{
-        .rdma_channel_prefix_matrix = at::from_blob(base + off_rdma_chprefix,       {num_rdma_ranks, num_channels},               keep, i32_opts, blob_dev),
-        .recv_rdma_rank_prefix_sum  = at::from_blob(base + off_recv_rdma_prefix,    {num_rdma_ranks},                             keep, i32_opts, blob_dev),
-        .gbl_channel_prefix_matrix  = at::from_blob(base + off_gbl_chprefix,        {num_ranks, num_channels},                    keep, i32_opts, blob_dev),
-        .recv_gbl_rank_prefix_sum   = at::from_blob(base + off_recv_gbl_prefix,     {num_ranks},                                  keep, i32_opts, blob_dev),
-        .expert_frequency           = at::from_blob(base + off_expert_frequency,    {num_local_experts},                          keep, i32_opts, blob_dev),
-        .expert_pool_block_offset   = at::from_blob(base + off_expert_pool_offset,  {num_local_experts + 1},                      keep, i32_opts, blob_dev),
-        .base_pool                  = at::from_blob(base + off_base_pool,           {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
-        .seen_per_substream         = at::from_blob(base + off_seen_per_substream,  {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
-        .rank_prefix_matrix         = at::from_blob(base + off_rank_prefix_matrix,  {num_ranks, num_ranks},                       keep, i32_opts, blob_dev),
-        .total_tiles_device         = at::from_blob(base + off_total_tiles_device,  {1},                                          keep, i32_opts, blob_dev),
+        .rdma_channel_prefix_matrix = at::from_blob(base + off_rdma_chprefix, {num_rdma_ranks, num_channels}, keep, i32_opts, blob_dev),
+        .recv_rdma_rank_prefix_sum = at::from_blob(base + off_recv_rdma_prefix, {num_rdma_ranks}, keep, i32_opts, blob_dev),
+        .gbl_channel_prefix_matrix = at::from_blob(base + off_gbl_chprefix, {num_ranks, num_channels}, keep, i32_opts, blob_dev),
+        .recv_gbl_rank_prefix_sum = at::from_blob(base + off_recv_gbl_prefix, {num_ranks}, keep, i32_opts, blob_dev),
+        .expert_frequency = at::from_blob(base + off_expert_frequency, {num_local_experts}, keep, i32_opts, blob_dev),
+        .expert_pool_block_offset = at::from_blob(base + off_expert_pool_offset, {num_local_experts + 1}, keep, i32_opts, blob_dev),
+        .base_pool = at::from_blob(base + off_base_pool, {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
+        .seen_per_substream =
+            at::from_blob(base + off_seen_per_substream, {num_channels, num_ranks, num_local_experts}, keep, i32_opts, blob_dev),
+        .rank_prefix_matrix = at::from_blob(base + off_rank_prefix_matrix, {num_ranks, num_ranks}, keep, i32_opts, blob_dev),
+        .total_tiles_device = at::from_blob(base + off_total_tiles_device, {1}, keep, i32_opts, blob_dev),
     };
 }
 
@@ -1035,33 +1024,33 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
                                                             int64_t default_stream_handle) {
     auto i32_opts = dtype(torch::kInt32).device(torch::kCUDA);
     auto i64_opts = dtype(torch::kInt64).device(torch::kCUDA);
-    auto i8_opts  = dtype(torch::kInt8).device(torch::kCUDA);
-    auto u8_opts  = dtype(torch::kUInt8).device(torch::kCUDA);
+    auto i8_opts = dtype(torch::kInt8).device(torch::kCUDA);
+    auto u8_opts = dtype(torch::kUInt8).device(torch::kCUDA);
     auto f32_opts = dtype(torch::kFloat32).device(torch::kCUDA);
 
     int64_t hidden_bytes_per_recv_token = static_cast<int64_t>(hidden) * x_options.dtype().itemsize();
 
     SlabBuilder b;
     // Z_pre region (zeroed before metadata_done event).
-    int64_t off_pool_topk_weight       = b.reserve<float>(TK_padded);
-    int64_t off_pool_arrival_count     = b.reserve<int>(total_tiles);
-    int64_t off_recv_rdma_chprefix     = b.reserve<int>(static_cast<int64_t>(num_rdma_ranks) * num_channels);
-    int64_t off_recv_gbl_chprefix      = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
-    int64_t off_send_rdma_head         = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_rdma_ranks);
-    int64_t off_send_nvl_head          = b.reserve<int>(static_cast<int64_t>(num_rdma_recv_tokens) * NUM_MAX_NVL_PEERS);
-    int64_t off_recv_src_meta          = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * source_meta_bytes);
-    int64_t z_pre_bytes                = b.total_bytes();
+    int64_t off_pool_topk_weight = b.reserve<float>(TK_padded);
+    int64_t off_pool_arrival_count = b.reserve<int>(total_tiles);
+    int64_t off_recv_rdma_chprefix = b.reserve<int>(static_cast<int64_t>(num_rdma_ranks) * num_channels);
+    int64_t off_recv_gbl_chprefix = b.reserve<int>(static_cast<int64_t>(num_ranks) * num_channels);
+    int64_t off_send_rdma_head = b.reserve<int>(static_cast<int64_t>(num_tokens) * num_rdma_ranks);
+    int64_t off_send_nvl_head = b.reserve<int>(static_cast<int64_t>(num_rdma_recv_tokens) * NUM_MAX_NVL_PEERS);
+    int64_t off_recv_src_meta = b.reserve_bytes(static_cast<int64_t>(num_recv_tokens) * source_meta_bytes);
+    int64_t z_pre_bytes = b.total_bytes();
 
     // N region (-1 byte-fill, before metadata_done event).
-    int64_t off_pool_recv_token        = b.reserve<int>(TK_padded);
-    int64_t off_pool_k_slot            = b.reserve<int>(TK_padded);
-    int64_t off_recv_token_to_slots    = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
-    int64_t n_end                      = b.total_bytes();
+    int64_t off_pool_recv_token = b.reserve<int>(TK_padded);
+    int64_t off_pool_k_slot = b.reserve<int>(TK_padded);
+    int64_t off_recv_token_to_slots = b.reserve<int>(static_cast<int64_t>(num_recv_tokens) * num_topk);
+    int64_t n_end = b.total_bytes();
 
     // Z_post region (zeroed after metadata_done event).
-    int64_t off_k_local_remaining    = b.reserve<int>(num_recv_tokens);
+    int64_t off_k_local_remaining = b.reserve<int>(num_recv_tokens);
     int64_t off_y_done_per_token = b.reserve<int64_t>(num_recv_tokens);
-    int64_t off_k_local_total          = b.reserve<int>(num_recv_tokens);
+    int64_t off_k_local_total = b.reserve<int>(num_recv_tokens);
     // NOTE: `o` is NOT reserved in the slab — allocated standalone below
     // (forward-only; freed after fwd combine). See intranode allocator.
 
@@ -1069,29 +1058,29 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // after the layer-end back-edges, so NO record_consumer_stream — back-edge
     // ordering guards reuse. Memsets below run on `stream` (alloc->first-use via
     // the layer-start gate). See intranode allocate_post_poll_bundle.
-    auto bundle = empty_on_default_pool({b.total_bytes()}, i8_opts,
-                                        default_stream_registered, default_stream_handle);
+    auto bundle = empty_on_default_pool({b.total_bytes()}, i8_opts, default_stream_registered, default_stream_handle);
     auto* base = static_cast<int8_t*>(bundle.data_ptr());
 
     // Z_pre + N memsets (queued BEFORE metadata_done event recording).
-    CUDA_CHECK(cudaMemsetAsync(base,                0x00, z_pre_bytes,         stream));
-    CUDA_CHECK(cudaMemsetAsync(base + z_pre_bytes,  0xFF, n_end - z_pre_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(base, 0x00, z_pre_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(base + z_pre_bytes, 0xFF, n_end - z_pre_bytes, stream));
 
     auto keep = [bundle](void*) {};
     // Pass bundle's concrete device to every from_blob (see allocate_post_poll_bundle).
     const at::Device blob_dev = bundle.device();
 
     PostPollBundleInternode out;
-    out.pool_topk_weight                = at::from_blob(base + off_pool_topk_weight,       {TK_padded},                                  keep, f32_opts, blob_dev);
-    out.pool_arrival_count              = at::from_blob(base + off_pool_arrival_count,     {total_tiles},                                keep, i32_opts, blob_dev);
-    out.recv_rdma_channel_prefix_matrix = at::from_blob(base + off_recv_rdma_chprefix,     {num_rdma_ranks, num_channels},               keep, i32_opts, blob_dev);
-    out.recv_gbl_channel_prefix_matrix  = at::from_blob(base + off_recv_gbl_chprefix,      {num_ranks, num_channels},                    keep, i32_opts, blob_dev);
-    out.send_rdma_head                  = at::from_blob(base + off_send_rdma_head,         {num_tokens, num_rdma_ranks},                 keep, i32_opts, blob_dev);
-    out.send_nvl_head                   = at::from_blob(base + off_send_nvl_head,          {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS},    keep, i32_opts, blob_dev);
-    out.recv_src_meta                   = at::from_blob(base + off_recv_src_meta,          {num_recv_tokens, source_meta_bytes},         keep, u8_opts, blob_dev);
-    out.pool_recv_token                 = at::from_blob(base + off_pool_recv_token,        {TK_padded},                                  keep, i32_opts, blob_dev);
-    out.pool_k_slot                     = at::from_blob(base + off_pool_k_slot,            {TK_padded},                                  keep, i32_opts, blob_dev);
-    out.recv_token_to_slots             = at::from_blob(base + off_recv_token_to_slots,    {num_recv_tokens, num_topk},                  keep, i32_opts, blob_dev);
+    out.pool_topk_weight = at::from_blob(base + off_pool_topk_weight, {TK_padded}, keep, f32_opts, blob_dev);
+    out.pool_arrival_count = at::from_blob(base + off_pool_arrival_count, {total_tiles}, keep, i32_opts, blob_dev);
+    out.recv_rdma_channel_prefix_matrix =
+        at::from_blob(base + off_recv_rdma_chprefix, {num_rdma_ranks, num_channels}, keep, i32_opts, blob_dev);
+    out.recv_gbl_channel_prefix_matrix = at::from_blob(base + off_recv_gbl_chprefix, {num_ranks, num_channels}, keep, i32_opts, blob_dev);
+    out.send_rdma_head = at::from_blob(base + off_send_rdma_head, {num_tokens, num_rdma_ranks}, keep, i32_opts, blob_dev);
+    out.send_nvl_head = at::from_blob(base + off_send_nvl_head, {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, keep, i32_opts, blob_dev);
+    out.recv_src_meta = at::from_blob(base + off_recv_src_meta, {num_recv_tokens, source_meta_bytes}, keep, u8_opts, blob_dev);
+    out.pool_recv_token = at::from_blob(base + off_pool_recv_token, {TK_padded}, keep, i32_opts, blob_dev);
+    out.pool_k_slot = at::from_blob(base + off_pool_k_slot, {TK_padded}, keep, i32_opts, blob_dev);
+    out.recv_token_to_slots = at::from_blob(base + off_recv_token_to_slots, {num_recv_tokens, num_topk}, keep, i32_opts, blob_dev);
 
     // Z_post memset must precede metadata_done event (see intranode dispatch
     // for rationale: consumers gated on the event may run on a separate HW
@@ -1104,16 +1093,14 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
     // rationale: allocated in the DEFAULT pool and NOT record_stream'd (free-side
     // safety is the layer-end back-edges, the orchestrator releases o after them),
     // zeroed on `stream` before the event (load-bearing — atomic-scatter target).
-    out.o = empty_on_default_pool({num_recv_tokens, hidden}, x_options,
-                                  default_stream_registered, default_stream_handle);
-    CUDA_CHECK(cudaMemsetAsync(out.o.data_ptr(), 0x00,
-                               static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token, stream));
+    out.o = empty_on_default_pool({num_recv_tokens, hidden}, x_options, default_stream_registered, default_stream_handle);
+    CUDA_CHECK(cudaMemsetAsync(out.o.data_ptr(), 0x00, static_cast<int64_t>(num_recv_tokens) * hidden_bytes_per_recv_token, stream));
 
     out.metadata_done_event = EventHandle(stream);
 
-    out.k_local_remaining             = at::from_blob(base + off_k_local_remaining,    {num_recv_tokens},                            keep, i32_opts, blob_dev);
-    out.y_done_per_token          = at::from_blob(base + off_y_done_per_token, {num_recv_tokens},                            keep, i64_opts, blob_dev);
-    out.k_local_total                   = at::from_blob(base + off_k_local_total,          {num_recv_tokens},                            keep, i32_opts, blob_dev);
+    out.k_local_remaining = at::from_blob(base + off_k_local_remaining, {num_recv_tokens}, keep, i32_opts, blob_dev);
+    out.y_done_per_token = at::from_blob(base + off_y_done_per_token, {num_recv_tokens}, keep, i64_opts, blob_dev);
+    out.k_local_total = at::from_blob(base + off_k_local_total, {num_recv_tokens}, keep, i32_opts, blob_dev);
 
     return out;
 }
@@ -1122,16 +1109,15 @@ PostPollBundleInternode allocate_post_poll_bundle_internode(int64_t TK_padded,
 
 }  // namespace
 
-StreamingDispatchOutputs Buffer::intranode_dispatch(
-    const torch::Tensor& x,
-    const torch::Tensor& topk_idx,
-    const torch::Tensor& topk_weights,
-    const torch::Tensor& is_token_in_rank,
-    int num_experts,
-    int expert_alignment,
-    int tile_m,
-    int64_t dispatch_seq,
-    const Config& config) {
+StreamingDispatchOutputs Buffer::intranode_dispatch(const torch::Tensor& x,
+                                                    const torch::Tensor& topk_idx,
+                                                    const torch::Tensor& topk_weights,
+                                                    const torch::Tensor& is_token_in_rank,
+                                                    int num_experts,
+                                                    int expert_alignment,
+                                                    int tile_m,
+                                                    int64_t dispatch_seq,
+                                                    const Config& config) {
     // One channel uses two blocks (sender + receiver).
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -1140,9 +1126,8 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     int hidden = static_cast<int>(x.size(1));
     int num_topk = static_cast<int>(topk_idx.size(1));
 
-    validate_dispatch_inputs(x, topk_idx, topk_weights, is_token_in_rank,
-                             num_experts, num_ranks, num_local_experts,
-                             expert_alignment, tile_m);
+    validate_dispatch_inputs(
+        x, topk_idx, topk_weights, is_token_in_rank, num_experts, num_ranks, num_local_experts, expert_alignment, tile_m);
 
     // All kernels + allocations run on the caller's current stream. The caller
     // is expected to have set its `dispatch_stream` as current via
@@ -1190,16 +1175,14 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     // (`utils.cuh::nvl_seq_match`), so stale residue from a prior iter
     // is rejected without zeroing. Iter-0 cleanliness is handled by the
     // once-only ctor memset of the full slab in `Buffer::initialize`.
-    EP_HOST_ASSERT((num_ranks * num_ranks * sizeof(int))
-                   + (4 * num_channels * num_ranks * sizeof(uint64_t)) <= num_nvl_bytes);
+    EP_HOST_ASSERT((num_ranks * num_ranks * sizeof(int)) + (4 * num_channels * num_ranks * sizeof(uint64_t)) <= num_nvl_bytes);
     CUDA_CHECK(cudaMemcpyAsync(buffer_ptrs[nvl_rank],
                                pre.rank_prefix_matrix.data_ptr<int>(),
                                num_ranks * num_ranks * sizeof(int),
                                cudaMemcpyDeviceToDevice,
                                stream));
 
-    auto poll = host_poll_recv_counts(moe_recv_counter, moe_recv_expert_counter,
-                                      streaming_total_tiles, num_local_experts);
+    auto poll = host_poll_recv_counts(moe_recv_counter, moe_recv_expert_counter, streaming_total_tiles, num_local_experts);
     int64_t TK_padded = static_cast<int64_t>(poll.total_tiles) * tile_m;
 
     // pool[TK_padded, hidden] (~290 MB at production) lives outside the
@@ -1213,9 +1196,8 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     // stream — pool is saved across fwd→bwd and freed at bwd return, after the
     // caller-side layer-end back-edges, so it shares the default pool and reuses
     // freely without a record_consumer_stream deferral. See empty_on_default.
-    auto pool = empty_on_default({TK_padded, hidden}, x.options(),
-                                 default_stream_registered_,
-                                 default_stream_handle_, compute_stream_handle_);
+    auto pool =
+        empty_on_default({TK_padded, hidden}, x.options(), default_stream_registered_, default_stream_handle_, compute_stream_handle_);
 
     // Per-tile metadata arrays sized from the host-polled total_tiles (exact) --
     // not a pre-poll upper bound -- so uneven per-rank token counts can't overflow.
@@ -1224,54 +1206,58 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     // record_consumer_stream. Fill BEFORE the post-poll bundle so metadata_done_event
     // (recorded there) captures it for kernel A's arrival spin.
     auto tile_i32 = x.options().dtype(torch::kInt32);
-    auto tile_id_to_expert = empty_on_default({poll.total_tiles}, tile_i32,
-                                              default_stream_registered_,
-                                              default_stream_handle_, compute_stream_handle_);
-    auto pool_arrival_target = empty_on_default({poll.total_tiles}, tile_i32,
-                                                default_stream_registered_,
-                                                default_stream_handle_, compute_stream_handle_);
-    intranode::launch_fill_tile_metadata(
-        pre.expert_pool_block_offset.data_ptr<int>(),
-        pre.expert_frequency.data_ptr<int>(),
-        tile_id_to_expert.data_ptr<int>(),
-        pool_arrival_target.data_ptr<int>(),
-        poll.total_tiles, num_local_experts, tile_m, stream);
+    auto tile_id_to_expert =
+        empty_on_default({poll.total_tiles}, tile_i32, default_stream_registered_, default_stream_handle_, compute_stream_handle_);
+    auto pool_arrival_target =
+        empty_on_default({poll.total_tiles}, tile_i32, default_stream_registered_, default_stream_handle_, compute_stream_handle_);
+    intranode::launch_fill_tile_metadata(pre.expert_pool_block_offset.data_ptr<int>(),
+                                         pre.expert_frequency.data_ptr<int>(),
+                                         tile_id_to_expert.data_ptr<int>(),
+                                         pool_arrival_target.data_ptr<int>(),
+                                         poll.total_tiles,
+                                         num_local_experts,
+                                         tile_m,
+                                         stream);
 
-    auto post = allocate_post_poll_bundle(
-        TK_padded, hidden, poll.num_recv_tokens, num_topk,
-        num_ranks, num_channels, num_tokens, poll.total_tiles,
-        x.options(), stream, compute_stream_handle_,
-        default_stream_registered_, default_stream_handle_);
+    auto post = allocate_post_poll_bundle(TK_padded,
+                                          hidden,
+                                          poll.num_recv_tokens,
+                                          num_topk,
+                                          num_ranks,
+                                          num_channels,
+                                          num_tokens,
+                                          poll.total_tiles,
+                                          x.options(),
+                                          stream,
+                                          compute_stream_handle_,
+                                          default_stream_registered_,
+                                          default_stream_handle_);
 
-
-    EP_HOST_ASSERT(
-        num_ranks * num_ranks * sizeof(int) +
-            num_channels * num_ranks * sizeof(int) +
-            num_channels * num_ranks * sizeof(int) +
-            num_channels * num_ranks * sizeof(int) * 2 +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * pool.element_size() +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)
-        <= num_nvl_bytes);
+    EP_HOST_ASSERT(num_ranks * num_ranks * sizeof(int) + num_channels * num_ranks * sizeof(int) + num_channels * num_ranks * sizeof(int) +
+                       num_channels * num_ranks * sizeof(int) * 2 +
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * pool.element_size() +
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) <=
+                   num_nvl_bytes);
 
     intranode::DispatchPoolOut dispatch_pool_out{
-        .pool             = reinterpret_cast<int4*>(pool.data_ptr()),
+        .pool = reinterpret_cast<int4*>(pool.data_ptr()),
         .pool_topk_weight = post.pool_topk_weight.data_ptr<float>(),
-        .pool_recv_token  = post.pool_recv_token.data_ptr<int>(),
-        .pool_k_slot      = post.pool_k_slot.data_ptr<int>(),
+        .pool_recv_token = post.pool_recv_token.data_ptr<int>(),
+        .pool_k_slot = post.pool_k_slot.data_ptr<int>(),
     };
     intranode::DispatchPerTokenOut dispatch_per_token_out{
         .recv_channel_prefix_matrix = post.recv_channel_prefix_matrix.data_ptr<int>(),
-        .send_head                  = post.send_head.data_ptr<int>(),
-        .k_local_remaining        = post.k_local_remaining.data_ptr<int>(),
-        .recv_token_to_slots        = post.recv_token_to_slots.data_ptr<int>(),
-        .k_local_total              = post.k_local_total.data_ptr<int>(),
+        .send_head = post.send_head.data_ptr<int>(),
+        .k_local_remaining = post.k_local_remaining.data_ptr<int>(),
+        .recv_token_to_slots = post.recv_token_to_slots.data_ptr<int>(),
+        .k_local_total = post.k_local_total.data_ptr<int>(),
     };
     intranode::DispatchInputs dispatch_inputs{
-        .x                = reinterpret_cast<const int4*>(x.data_ptr()),
-        .topk_idx         = topk_idx.data_ptr<topk_idx_t>(),
-        .topk_weights     = topk_weights.data_ptr<float>(),
+        .x = reinterpret_cast<const int4*>(x.data_ptr()),
+        .topk_idx = topk_idx.data_ptr<topk_idx_t>(),
+        .topk_weights = topk_weights.data_ptr<float>(),
         .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
     };
     // Increment the host-side issued-count BEFORE launching so subsequent
@@ -1279,73 +1265,76 @@ StreamingDispatchOutputs Buffer::intranode_dispatch(
     ++dispatch_main_issued_count;
     intranode::DispatchTileSignal dispatch_tile_signal{
         .channel_prefix_matrix = pre.channel_prefix_matrix.data_ptr<int>(),
-        .base_pool             = pre.base_pool.data_ptr<int>(),
-        .pool_arrival_count    = post.pool_arrival_count.data_ptr<int>(),
-        .pool_arrival_target   = pool_arrival_target.data_ptr<int>(),
-        .dispatch_seq          = dispatch_seq,
-        .started_flag          = dispatch_main_started_flag,
+        .base_pool = pre.base_pool.data_ptr<int>(),
+        .pool_arrival_count = post.pool_arrival_count.data_ptr<int>(),
+        .pool_arrival_target = pool_arrival_target.data_ptr<int>(),
+        .dispatch_seq = dispatch_seq,
+        .started_flag = dispatch_main_started_flag,
     };
     intranode::DispatchShape dispatch_shape{
-        .num_tokens          = num_tokens,
-        .hidden_int4         = static_cast<int>(hidden * pool.element_size() / sizeof(int4)),
-        .num_topk            = num_topk,
-        .num_experts         = num_experts,
-        .tile_m              = tile_m,
+        .num_tokens = num_tokens,
+        .hidden_int4 = static_cast<int>(hidden * pool.element_size() / sizeof(int4)),
+        .num_topk = num_topk,
+        .num_experts = num_experts,
+        .tile_m = tile_m,
     };
     intranode::DispatchEnv dispatch_env{
-        .buffer_ptrs            = buffer_ptrs_gpu,
-        .rank                   = rank,
-        .num_max_send_tokens    = config.num_max_nvl_chunked_send_tokens,
+        .buffer_ptrs = buffer_ptrs_gpu,
+        .rank = rank,
+        .num_max_send_tokens = config.num_max_nvl_chunked_send_tokens,
         .num_recv_buffer_tokens = config.num_max_nvl_chunked_recv_tokens,
     };
-    intranode::launch_dispatch_main(dispatch_pool_out, dispatch_per_token_out,
-                                    dispatch_inputs, dispatch_tile_signal,
-                                    dispatch_shape, dispatch_env,
-                                    num_ranks, stream, config.num_sms);
+    intranode::launch_dispatch_main(dispatch_pool_out,
+                                    dispatch_per_token_out,
+                                    dispatch_inputs,
+                                    dispatch_tile_signal,
+                                    dispatch_shape,
+                                    dispatch_env,
+                                    num_ranks,
+                                    stream,
+                                    config.num_sms);
 
     return StreamingDispatchOutputs{
-        .pool                       = pool,
-        .pool_topk_weight           = post.pool_topk_weight,
-        .pool_recv_token            = post.pool_recv_token,
-        .pool_k_slot                = post.pool_k_slot,
-        .send_head                  = post.send_head,
-        .rank_prefix_matrix         = pre.rank_prefix_matrix,
-        .channel_prefix_matrix      = pre.channel_prefix_matrix,
+        .pool = pool,
+        .pool_topk_weight = post.pool_topk_weight,
+        .pool_recv_token = post.pool_recv_token,
+        .pool_k_slot = post.pool_k_slot,
+        .send_head = post.send_head,
+        .rank_prefix_matrix = pre.rank_prefix_matrix,
+        .channel_prefix_matrix = pre.channel_prefix_matrix,
         .recv_channel_prefix_matrix = post.recv_channel_prefix_matrix,
-        .expert_frequency           = pre.expert_frequency,
-        .expert_pool_block_offset   = pre.expert_pool_block_offset,
-        .base_pool                  = pre.base_pool,
-        .seen_per_substream         = pre.seen_per_substream,
-        .tile_id_to_expert          = tile_id_to_expert,
-        .pool_arrival_target        = pool_arrival_target,
-        .pool_arrival_count         = post.pool_arrival_count,
-        .k_local_remaining        = post.k_local_remaining,
-        .y_done_per_token     = post.y_done_per_token,
-        .o                          = post.o,
-        .recv_token_to_slots        = post.recv_token_to_slots,
-        .k_local_total              = post.k_local_total,
-        .total_tiles                = poll.total_tiles,
-        .metadata_done_event        = post.metadata_done_event,
+        .expert_frequency = pre.expert_frequency,
+        .expert_pool_block_offset = pre.expert_pool_block_offset,
+        .base_pool = pre.base_pool,
+        .seen_per_substream = pre.seen_per_substream,
+        .tile_id_to_expert = tile_id_to_expert,
+        .pool_arrival_target = pool_arrival_target,
+        .pool_arrival_count = post.pool_arrival_count,
+        .k_local_remaining = post.k_local_remaining,
+        .y_done_per_token = post.y_done_per_token,
+        .o = post.o,
+        .recv_token_to_slots = post.recv_token_to_slots,
+        .k_local_total = post.k_local_total,
+        .total_tiles = poll.total_tiles,
+        .metadata_done_event = post.metadata_done_event,
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch_grads(
-    const torch::Tensor& dL_dy,
-    const torch::Tensor& is_token_in_rank,
-    const torch::Tensor& recv_token_to_slots,
-    const torch::Tensor& base_pool,
-    const torch::Tensor& seen_per_substream,
-    const torch::Tensor& pool_arrival_target,
-    const torch::Tensor& rank_prefix_matrix,
-    int num_experts,
-    int num_topk,
-    int tile_m,
-    int64_t TK_padded,
-    int64_t dispatch_seq,
-    const Config& config) {
+std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch_grads(const torch::Tensor& dL_dy,
+                                                                                       const torch::Tensor& is_token_in_rank,
+                                                                                       const torch::Tensor& recv_token_to_slots,
+                                                                                       const torch::Tensor& base_pool,
+                                                                                       const torch::Tensor& seen_per_substream,
+                                                                                       const torch::Tensor& pool_arrival_target,
+                                                                                       const torch::Tensor& rank_prefix_matrix,
+                                                                                       int num_experts,
+                                                                                       int num_topk,
+                                                                                       int tile_m,
+                                                                                       int64_t TK_padded,
+                                                                                       int64_t dispatch_seq,
+                                                                                       const Config& config) {
     EP_HOST_ASSERT(dL_dy.dim() == 2 and dL_dy.is_contiguous());
-    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous() and
-                   is_token_in_rank.scalar_type() == torch::kBool);
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous() and is_token_in_rank.scalar_type() == torch::kBool);
     EP_HOST_ASSERT(recv_token_to_slots.dim() == 2 and recv_token_to_slots.is_contiguous() and
                    recv_token_to_slots.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(base_pool.is_contiguous() and base_pool.scalar_type() == torch::kInt32);
@@ -1354,8 +1343,7 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
                    pool_arrival_target.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(rank_prefix_matrix.dim() == 2 and rank_prefix_matrix.is_contiguous() and
                    rank_prefix_matrix.scalar_type() == torch::kInt32);
-    EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and
-                   rank_prefix_matrix.size(1) == num_ranks);
+    EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
 
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -1385,10 +1373,8 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     // a bwd local freed at bwd return, after the caller-side layer-end
     // back-edges, so it shares the default pool without a record_consumer_stream
     // deferral. See empty_on_default. (torch::empty: no init kernel.)
-    auto dL_do_pool = empty_on_default({TK_padded, hidden}, dL_dy.options(),
-                                       default_stream_registered_,
-                                       default_stream_handle_,
-                                       compute_stream_handle_);
+    auto dL_do_pool =
+        empty_on_default({TK_padded, hidden}, dL_dy.options(), default_stream_registered_, default_stream_handle_, compute_stream_handle_);
 
     // Per-tile signal arrays. Both zero-init: bwd_dispatch_arrival_count
     // accumulates Pass 2 release-adds; kernel_y_bwd's scheduler spins on
@@ -1401,39 +1387,38 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     // (start_offset, end_offset, head_idx, tail_idx) slots are 64-bit
     // genstamped and reader-filtered by seq match. See the fwd dispatch
     // launch above for the full reasoning.
-    EP_HOST_ASSERT((num_ranks * num_ranks * sizeof(int))
-                   + (4 * num_channels * num_ranks * sizeof(uint64_t)) <= num_nvl_bytes);
+    EP_HOST_ASSERT((num_ranks * num_ranks * sizeof(int)) + (4 * num_channels * num_ranks * sizeof(uint64_t)) <= num_nvl_bytes);
 
     intranode::DispatchGradsIO io{
-        .dL_do_pool       = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
-        .dL_dy            = reinterpret_cast<const int4*>(dL_dy.data_ptr()),
+        .dL_do_pool = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
+        .dL_dy = reinterpret_cast<const int4*>(dL_dy.data_ptr()),
         .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
     };
     intranode::DispatchGradsRouting routing{
         .recv_token_to_slots = recv_token_to_slots.data_ptr<int>(),
-        .base_pool           = base_pool.data_ptr<int>(),
-        .seen_per_substream  = seen_per_substream.data_ptr<int>(),
-        .rank_prefix_matrix  = rank_prefix_matrix.data_ptr<int>(),
+        .base_pool = base_pool.data_ptr<int>(),
+        .seen_per_substream = seen_per_substream.data_ptr<int>(),
+        .rank_prefix_matrix = rank_prefix_matrix.data_ptr<int>(),
     };
     // Bump issued-count before launch (see fwd path for rationale).
     ++dispatch_grads_issued_count;
     intranode::DispatchGradsTileSignal tile_signal{
         .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),
-        .pool_arrival_target        = pool_arrival_target.data_ptr<int>(),
-        .dispatch_seq               = dispatch_seq,
-        .started_flag               = dispatch_grads_started_flag,
+        .pool_arrival_target = pool_arrival_target.data_ptr<int>(),
+        .dispatch_seq = dispatch_seq,
+        .started_flag = dispatch_grads_started_flag,
     };
     intranode::DispatchGradsShape shape{
-        .num_tokens  = num_tokens,
+        .num_tokens = num_tokens,
         .hidden_int4 = hidden_int4,
-        .num_topk    = num_topk,
+        .num_topk = num_topk,
         .num_experts = num_experts,
-        .tile_m      = tile_m,
+        .tile_m = tile_m,
     };
     intranode::DispatchEnv env{
-        .buffer_ptrs            = buffer_ptrs_gpu,
-        .rank                   = rank,
-        .num_max_send_tokens    = config.num_max_nvl_chunked_send_tokens,
+        .buffer_ptrs = buffer_ptrs_gpu,
+        .rank = rank,
+        .num_max_send_tokens = config.num_max_nvl_chunked_send_tokens,
         .num_recv_buffer_tokens = config.num_max_nvl_chunked_recv_tokens,
     };
     // Record an event between the channel-control barrier and the main
@@ -1444,26 +1429,23 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::intranode_dispatch
     // dispatch_grads ↔ Y_bwd streaming overlap.
     EventHandle grads_started_event(stream);
 
-    intranode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env,
-                                          num_ranks, stream, config.num_sms);
+    intranode::launch_dispatch_grads_main(io, routing, tile_signal, shape, env, num_ranks, stream, config.num_sms);
 
     return std::make_tuple(dL_do_pool, bwd_dispatch_arrival_count, grads_started_event);
 }
 
-std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combine(
-    const torch::Tensor& x,
-    const torch::Tensor& per_slot_weights,
-    const torch::Tensor& recv_token_to_slots,
-    const torch::Tensor& rank_prefix_matrix,
-    const torch::Tensor& channel_prefix_matrix,
-    const torch::Tensor& send_head,
-    const torch::Tensor& y_done_per_token,
-    int64_t combine_seq,
-    bool is_fwd,
-    const Config& config) {
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combine(const torch::Tensor& x,
+                                                                                  const torch::Tensor& per_slot_weights,
+                                                                                  const torch::Tensor& recv_token_to_slots,
+                                                                                  const torch::Tensor& rank_prefix_matrix,
+                                                                                  const torch::Tensor& channel_prefix_matrix,
+                                                                                  const torch::Tensor& send_head,
+                                                                                  const torch::Tensor& y_done_per_token,
+                                                                                  int64_t combine_seq,
+                                                                                  bool is_fwd,
+                                                                                  const Config& config) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
-    EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and
-                   per_slot_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and per_slot_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(recv_token_to_slots.dim() == 2 and recv_token_to_slots.is_contiguous() and
                    recv_token_to_slots.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
@@ -1475,8 +1457,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
     // (bwd combine_grads) release-stores `combine_seq` into
     // y_done_per_token[r] once the per-recv-token stripe is fully
     // assembled. Sender's per-warp send loop spins on this before reading x[r].
-    EP_HOST_ASSERT(y_done_per_token.dim() == 1 and y_done_per_token.is_contiguous() and
-                   y_done_per_token.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(y_done_per_token.dim() == 1 and y_done_per_token.is_contiguous() and y_done_per_token.scalar_type() == torch::kInt64);
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1512,9 +1493,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
     // every in-layer consumer before any reuse), like `pool`.
     c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
         ? c10::nullopt
-        : c10::optional<torch::Tensor>(empty_on_default_pool(
-              {num_recv_tokens, num_topk}, f32_opts,
-              default_stream_registered_, default_stream_handle_));
+        : c10::optional<torch::Tensor>(
+              empty_on_default_pool({num_recv_tokens, num_topk}, f32_opts, default_stream_registered_, default_stream_handle_));
     float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
 
     // Combine data. Combine carves its sub-buffer chain from
@@ -1524,38 +1504,35 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
     // read, and combine's slots never overlap dispatch's.
     int hidden_int4_x = static_cast<int>(hidden * x.element_size() / sizeof(int4));
     int64_t dispatch_section_bytes = intranode::intranode_get_dispatch_section_bytes(
-        num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens,
-        hidden_int4_x, num_topk);
+        num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens, hidden_int4_x, num_topk);
     int64_t combine_section_bytes = intranode::intranode_get_combine_section_bytes(
-        num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens,
-        hidden_int4_x, num_topk);
+        num_channels, num_ranks, config.num_max_nvl_chunked_recv_tokens, hidden_int4_x, num_topk);
     EP_HOST_ASSERT(dispatch_section_bytes + combine_section_bytes <= num_nvl_bytes);
-    auto recv_x = empty_on_default_pool({num_recv_tokens, hidden}, x.options(),
-                                        default_stream_registered_, default_stream_handle_);
+    auto recv_x = empty_on_default_pool({num_recv_tokens, hidden}, x.options(), default_stream_registered_, default_stream_handle_);
     intranode::launch_combine_main(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
-                       recv_x.data_ptr(),
-                       recv_topk_weights_ptr,
-                       x.data_ptr(),
-                       per_slot_weights.data_ptr<float>(),
-                       recv_token_to_slots.data_ptr<int>(),
-                       rank_prefix_matrix.data_ptr<int>(),
-                       channel_prefix_matrix.data_ptr<int>(),
-                       send_head.data_ptr<int>(),
-                       y_done_per_token.data_ptr<int64_t>(),
-                       combine_seq,
-                       is_fwd,
-                       num_tokens,
-                       num_recv_tokens,
-                       hidden,
-                       num_topk,
-                       buffer_ptrs_gpu,
-                       dispatch_section_bytes,
-                       rank,
-                       num_ranks,
-                       stream,
-                       config.num_sms,
-                       config.num_max_nvl_chunked_send_tokens,
-                       config.num_max_nvl_chunked_recv_tokens);
+                                   recv_x.data_ptr(),
+                                   recv_topk_weights_ptr,
+                                   x.data_ptr(),
+                                   per_slot_weights.data_ptr<float>(),
+                                   recv_token_to_slots.data_ptr<int>(),
+                                   rank_prefix_matrix.data_ptr<int>(),
+                                   channel_prefix_matrix.data_ptr<int>(),
+                                   send_head.data_ptr<int>(),
+                                   y_done_per_token.data_ptr<int64_t>(),
+                                   combine_seq,
+                                   is_fwd,
+                                   num_tokens,
+                                   num_recv_tokens,
+                                   hidden,
+                                   num_topk,
+                                   buffer_ptrs_gpu,
+                                   dispatch_section_bytes,
+                                   rank,
+                                   num_ranks,
+                                   stream,
+                                   config.num_sms,
+                                   config.num_max_nvl_chunked_send_tokens,
+                                   config.num_max_nvl_chunked_recv_tokens);
 
     return {recv_x, recv_topk_weights_out};
 }
@@ -1572,16 +1549,15 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::intranode_combin
 // intranode receiver. RDMA sender + forwarder stages are bulk RDMA→NVL
 // staging only, no slot logic.
 // ─────────────────────────────────────────────────────────────────────────────
-StreamingDispatchOutputs Buffer::internode_dispatch(
-    const torch::Tensor& x,
-    const torch::Tensor& topk_idx,
-    const torch::Tensor& topk_weights,
-    const torch::Tensor& is_token_in_rank,
-    int num_experts,
-    int expert_alignment,
-    int tile_m,
-    int64_t dispatch_seq,
-    const Config& config) {
+StreamingDispatchOutputs Buffer::internode_dispatch(const torch::Tensor& x,
+                                                    const torch::Tensor& topk_idx,
+                                                    const torch::Tensor& topk_weights,
+                                                    const torch::Tensor& is_token_in_rank,
+                                                    int num_experts,
+                                                    int expert_alignment,
+                                                    int tile_m,
+                                                    int64_t dispatch_seq,
+                                                    const Config& config) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 
@@ -1596,9 +1572,8 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     int num_topk = static_cast<int>(topk_idx.size(1));
     int hidden_int4 = static_cast<int>(hidden * x.element_size() / sizeof(int4));
 
-    validate_dispatch_inputs(x, topk_idx, topk_weights, is_token_in_rank,
-                             num_experts, num_ranks, num_local_experts,
-                             expert_alignment, tile_m);
+    validate_dispatch_inputs(
+        x, topk_idx, topk_weights, is_token_in_rank, num_experts, num_ranks, num_local_experts, expert_alignment, tile_m);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -1614,20 +1589,16 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // shapes: base_pool / seen_per_substream / rank_prefix_matrix span
     // num_world_ranks (= num_ranks for the streaming path on internode);
     // channel prefix matrices come in two tiers (rdma + gbl).
-    auto pre = allocate_pre_poll_bundle_internode(num_ranks, num_rdma_ranks,
-                                                  num_channels, num_local_experts, stream,
-                                                  compute_stream_handle_);
+    auto pre =
+        allocate_pre_poll_bundle_internode(num_ranks, num_rdma_ranks, num_channels, num_local_experts, stream, compute_stream_handle_);
 
     // Streaming SymBuffer offset within rdma_buffer_ptr — placed AFTER the
     // metadata kernel's count payload. The count-exchange and streaming-
     // superset payloads share `rdma_buffer_ptr`; the fixed offset keeps the
     // kernel's SymBuffer math consistent across them.
-    int64_t streaming_rdma_offset =
-        2 * static_cast<int64_t>(num_rdma_ranks) *
-        (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int);
+    int64_t streaming_rdma_offset = 2 * static_cast<int64_t>(num_rdma_ranks) * (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int);
     int64_t streaming_rdma_total =
-        2 * static_cast<int64_t>(num_rdma_ranks) * num_channels *
-        NUM_MAX_NVL_PEERS * num_local_experts * sizeof(int);
+        2 * static_cast<int64_t>(num_rdma_ranks) * num_channels * NUM_MAX_NVL_PEERS * num_local_experts * sizeof(int);
     // The metadata kernel's count-exchange + streaming-superset payloads live
     // in a region DISJOINT from the dispatch + combine hot-path SymBuffer
     // chains: the metadata kernel runs at EVERY call, and under cross-rank
@@ -1635,15 +1606,11 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // are still draining their rings. Sharing base offset 0 with the dispatch
     // data ring (channel 0 sits first) let a leading rank's metadata puts
     // clobber a lagging rank's live channel-0 ring slots.
-    const int64_t metadata_rdma_offset =
-        internode::get_dispatch_rdma_region_bytes(
-            hidden_int4, num_topk, config.num_max_rdma_chunked_recv_tokens,
-            num_channels, num_rdma_ranks) +
+    const int64_t metadata_rdma_offset = internode::get_dispatch_rdma_region_bytes(
+                                             hidden_int4, num_topk, config.num_max_rdma_chunked_recv_tokens, num_channels, num_rdma_ranks) +
         internode::get_combine_rdma_region_bytes(
-            hidden_int4, num_topk, config.num_max_rdma_chunked_recv_tokens,
-            num_channels, num_rdma_ranks);
-    EP_HOST_ASSERT(metadata_rdma_offset + streaming_rdma_offset + streaming_rdma_total
-                   <= num_rdma_bytes);
+                                             hidden_int4, num_topk, config.num_max_rdma_chunked_recv_tokens, num_channels, num_rdma_ranks);
+    EP_HOST_ASSERT(metadata_rdma_offset + streaming_rdma_offset + streaming_rdma_total <= num_rdma_bytes);
 
     // The metadata kernel's NVL slabs (count slabs + streaming inbox) live in
     // a region DISJOINT from the dispatch + combine NVL sub-buffer chains,
@@ -1656,42 +1623,48 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // expert_frequency/total_tiles (production signature: sane recv
     // counters, garbage total_tiles → CPU-poll timeout or multi-TiB pool
     // alloc). Disjointness is load-bearing; do NOT move this back to 0.
-    const int64_t nvl_metadata_offset =
-        internode::get_dispatch_nvl_region_bytes(
-            hidden_int4, num_topk, config.num_max_nvl_chunked_recv_tokens,
-            num_channels, num_rdma_ranks) +
+    const int64_t nvl_metadata_offset = internode::get_dispatch_nvl_region_bytes(
+                                            hidden_int4, num_topk, config.num_max_nvl_chunked_recv_tokens, num_channels, num_rdma_ranks) +
         internode::get_combine_nvl_region_bytes(
-            hidden_int4, num_topk, config.num_max_nvl_chunked_recv_tokens,
-            num_channels, num_rdma_ranks);
+                                            hidden_int4, num_topk, config.num_max_nvl_chunked_recv_tokens, num_channels, num_rdma_ranks);
     // Backstop: Config::get_nvl_buffer_size_hint reserves this region with
     // worst-case bounds (kNumMaxTopK / NUM_MAX_LOCAL_EXPERTS); re-check the
     // actual carve against the actual allocation.
-    EP_HOST_ASSERT(nvl_metadata_offset
-                       + internode::get_metadata_nvl_region_bytes(
-                             num_local_experts, num_channels, num_rdma_ranks)
-                   <= num_nvl_bytes);
+    EP_HOST_ASSERT(nvl_metadata_offset + internode::get_metadata_nvl_region_bytes(num_local_experts, num_channels, num_rdma_ranks) <=
+                   num_nvl_bytes);
 
-    internode::streaming_dispatch_metadata(
-        topk_idx.data_ptr<topk_idx_t>(),
-        moe_recv_counter_mapped, moe_recv_rdma_counter_mapped,
-        moe_recv_expert_counter_mapped, streaming_total_tiles_mapped,
-        pre.rdma_channel_prefix_matrix.data_ptr<int>(),
-        pre.recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        pre.gbl_channel_prefix_matrix.data_ptr<int>(),
-        pre.recv_gbl_rank_prefix_sum.data_ptr<int>(),
-        pre.expert_frequency.data_ptr<int>(),
-        pre.expert_pool_block_offset.data_ptr<int>(),
-        pre.base_pool.data_ptr<int>(),
-        pre.seen_per_substream.data_ptr<int>(),
-        pre.rank_prefix_matrix.data_ptr<int>(),
-        pre.total_tiles_device.data_ptr<int>(),
-        num_tokens, num_topk, num_experts, num_channels,
-        hidden_int4, expert_alignment, tile_m,
-        streaming_rdma_offset,
-        nvl_metadata_offset,
-        static_cast<void*>(static_cast<uint8_t*>(rdma_buffer_ptr) + metadata_rdma_offset),
-        buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
-        rank, num_ranks, stream, num_rdma_bytes, num_nvl_bytes);
+    internode::streaming_dispatch_metadata(topk_idx.data_ptr<topk_idx_t>(),
+                                           moe_recv_counter_mapped,
+                                           moe_recv_rdma_counter_mapped,
+                                           moe_recv_expert_counter_mapped,
+                                           streaming_total_tiles_mapped,
+                                           pre.rdma_channel_prefix_matrix.data_ptr<int>(),
+                                           pre.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                                           pre.gbl_channel_prefix_matrix.data_ptr<int>(),
+                                           pre.recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                                           pre.expert_frequency.data_ptr<int>(),
+                                           pre.expert_pool_block_offset.data_ptr<int>(),
+                                           pre.base_pool.data_ptr<int>(),
+                                           pre.seen_per_substream.data_ptr<int>(),
+                                           pre.rank_prefix_matrix.data_ptr<int>(),
+                                           pre.total_tiles_device.data_ptr<int>(),
+                                           num_tokens,
+                                           num_topk,
+                                           num_experts,
+                                           num_channels,
+                                           hidden_int4,
+                                           expert_alignment,
+                                           tile_m,
+                                           streaming_rdma_offset,
+                                           nvl_metadata_offset,
+                                           static_cast<void*>(static_cast<uint8_t*>(rdma_buffer_ptr) + metadata_rdma_offset),
+                                           buffer_ptrs_gpu,
+                                           barrier_signal_ptrs_gpu,
+                                           rank,
+                                           num_ranks,
+                                           stream,
+                                           num_rdma_bytes,
+                                           num_nvl_bytes);
 
     // Host-poll all four host-mapped counters before dispatch_main launch
     // (we need num_recv_tokens to allocate `pool` and num_rdma_recv_tokens
@@ -1699,9 +1672,9 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     int num_recv_tokens = -1, num_rdma_recv_tokens = -1, total_tiles = -1;
     auto t0 = std::chrono::high_resolution_clock::now();
     while (true) {
-        num_recv_tokens      = static_cast<int>(*moe_recv_counter);
+        num_recv_tokens = static_cast<int>(*moe_recv_counter);
         num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
-        total_tiles          = static_cast<int>(*streaming_total_tiles);
+        total_tiles = static_cast<int>(*streaming_total_tiles);
         // -1 is the host-reset sentinel; the kernel publishes the final value
         // once. Accept any total_tiles != -1 (garbage-negative included) so a
         // corrupt counter hits the fail-fast below instead of spinning to
@@ -1709,14 +1682,14 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
         bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0) and (total_tiles != -1);
         for (int i = 0; i < num_local_experts and ready; ++i)
             ready &= moe_recv_expert_counter[i] >= 0;
-        if (ready) break;
-        if (std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::high_resolution_clock::now() - t0).count() > NUM_CPU_TIMEOUT_SECS)
-            throw std::runtime_error("StreamEP error: internode_dispatch CPU timeout"
-                " (rank=" + std::to_string(rank) +
-                ", recv_tokens=" + std::to_string(num_recv_tokens) +
-                ", rdma_recv_tokens=" + std::to_string(num_rdma_recv_tokens) +
-                ", total_tiles=" + std::to_string(total_tiles) + ")");
+        if (ready)
+            break;
+        if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - t0).count() > NUM_CPU_TIMEOUT_SECS)
+            throw std::runtime_error(
+                "StreamEP error: internode_dispatch CPU timeout"
+                " (rank=" +
+                std::to_string(rank) + ", recv_tokens=" + std::to_string(num_recv_tokens) +
+                ", rdma_recv_tokens=" + std::to_string(num_rdma_recv_tokens) + ", total_tiles=" + std::to_string(total_tiles) + ")");
     }
     // Always-on fail-fast: a sane total_tiles is bounded by
     // num_ranks * num_tokens * num_topk / tile_m + num_local_experts (a few
@@ -1728,12 +1701,11 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // the "StreamEP-CORRUPT" prefix — keep it stable.
     constexpr int kMaxSaneTotalTiles = 1 << 20;
     if (total_tiles < 0 or total_tiles > kMaxSaneTotalTiles)
-        throw std::runtime_error("StreamEP-CORRUPT(host): corrupt streaming_total_tiles"
-            " rank=" + std::to_string(rank) +
-            " total_tiles=" + std::to_string(total_tiles) +
-            " (sane: 0.." + std::to_string(kMaxSaneTotalTiles) + ")" +
-            " recv_tokens=" + std::to_string(num_recv_tokens) +
-            " rdma_recv_tokens=" + std::to_string(num_rdma_recv_tokens));
+        throw std::runtime_error(
+            "StreamEP-CORRUPT(host): corrupt streaming_total_tiles"
+            " rank=" +
+            std::to_string(rank) + " total_tiles=" + std::to_string(total_tiles) + " (sane: 0.." + std::to_string(kMaxSaneTotalTiles) +
+            ")" + " recv_tokens=" + std::to_string(num_recv_tokens) + " rdma_recv_tokens=" + std::to_string(num_rdma_recv_tokens));
     int64_t TK_padded = static_cast<int64_t>(total_tiles) * tile_m;
 
     // pool[TK_padded, hidden] (~290 MB at production) lives outside the
@@ -1747,9 +1719,8 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // it shares the default pool without a record_consumer_stream deferral. See
     // empty_on_default. (The internode dL_do_pool, fwd `o`, and intranode pool /
     // dL_do_pool all follow the same default-pool, no-record_stream pattern.)
-    auto pool = empty_on_default({TK_padded, hidden}, x.options(),
-                                 default_stream_registered_,
-                                 default_stream_handle_, compute_stream_handle_);
+    auto pool =
+        empty_on_default({TK_padded, hidden}, x.options(), default_stream_registered_, default_stream_handle_, compute_stream_handle_);
 
     // Per-tile metadata arrays sized from the host-polled total_tiles (exact) --
     // not a pre-poll upper bound -- so uneven per-rank token counts can't overflow.
@@ -1759,116 +1730,125 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
     // BEFORE the post-poll bundle so its metadata_done_event captures it for kernel A;
     // it ran in fwd, so the bwd tile_id_to_expert read is satisfied.
     auto tile_i32 = x.options().dtype(torch::kInt32);
-    auto tile_id_to_expert_n = empty_on_default({total_tiles}, tile_i32,
-                                                default_stream_registered_,
-                                                default_stream_handle_, compute_stream_handle_);
-    auto pool_arrival_target_n = empty_on_default({total_tiles}, tile_i32,
-                                                  default_stream_registered_,
-                                                  default_stream_handle_, compute_stream_handle_);
-    intranode::launch_fill_tile_metadata(
-        pre.expert_pool_block_offset.data_ptr<int>(),
-        pre.expert_frequency.data_ptr<int>(),
-        tile_id_to_expert_n.data_ptr<int>(),
-        pool_arrival_target_n.data_ptr<int>(),
-        total_tiles, num_local_experts, tile_m, stream);
+    auto tile_id_to_expert_n =
+        empty_on_default({total_tiles}, tile_i32, default_stream_registered_, default_stream_handle_, compute_stream_handle_);
+    auto pool_arrival_target_n =
+        empty_on_default({total_tiles}, tile_i32, default_stream_registered_, default_stream_handle_, compute_stream_handle_);
+    intranode::launch_fill_tile_metadata(pre.expert_pool_block_offset.data_ptr<int>(),
+                                         pre.expert_frequency.data_ptr<int>(),
+                                         tile_id_to_expert_n.data_ptr<int>(),
+                                         pool_arrival_target_n.data_ptr<int>(),
+                                         total_tiles,
+                                         num_local_experts,
+                                         tile_m,
+                                         stream);
 
-    auto post = allocate_post_poll_bundle_internode(
-        TK_padded, hidden, num_recv_tokens, num_rdma_recv_tokens, num_topk,
-        num_ranks, num_rdma_ranks, num_channels, num_tokens, total_tiles,
-        internode::get_source_meta_bytes(), x.options(), stream,
-        compute_stream_handle_, default_stream_registered_, default_stream_handle_);
-
+    auto post = allocate_post_poll_bundle_internode(TK_padded,
+                                                    hidden,
+                                                    num_recv_tokens,
+                                                    num_rdma_recv_tokens,
+                                                    num_topk,
+                                                    num_ranks,
+                                                    num_rdma_ranks,
+                                                    num_channels,
+                                                    num_tokens,
+                                                    total_tiles,
+                                                    internode::get_source_meta_bytes(),
+                                                    x.options(),
+                                                    stream,
+                                                    compute_stream_handle_,
+                                                    default_stream_registered_,
+                                                    default_stream_handle_);
 
     internode::DispatchPoolOut pool_out{
-        .pool             = reinterpret_cast<int4*>(pool.data_ptr()),
+        .pool = reinterpret_cast<int4*>(pool.data_ptr()),
         .pool_topk_weight = post.pool_topk_weight.data_ptr<float>(),
-        .pool_recv_token  = post.pool_recv_token.data_ptr<int>(),
-        .pool_k_slot      = post.pool_k_slot.data_ptr<int>(),
+        .pool_recv_token = post.pool_recv_token.data_ptr<int>(),
+        .pool_k_slot = post.pool_k_slot.data_ptr<int>(),
     };
     internode::DispatchPerTokenOut per_token_out{
-        .k_local_remaining               = post.k_local_remaining.data_ptr<int>(),
-        .recv_token_to_slots               = post.recv_token_to_slots.data_ptr<int>(),
-        .k_local_total                     = post.k_local_total.data_ptr<int>(),
-        .recv_src_meta                     = post.recv_src_meta.data_ptr(),
-        .send_rdma_head                    = post.send_rdma_head.data_ptr<int>(),
-        .send_nvl_head                     = post.send_nvl_head.data_ptr<int>(),
-        .recv_rdma_channel_prefix_matrix   = post.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
-        .recv_gbl_channel_prefix_matrix    = post.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
+        .k_local_remaining = post.k_local_remaining.data_ptr<int>(),
+        .recv_token_to_slots = post.recv_token_to_slots.data_ptr<int>(),
+        .k_local_total = post.k_local_total.data_ptr<int>(),
+        .recv_src_meta = post.recv_src_meta.data_ptr(),
+        .send_rdma_head = post.send_rdma_head.data_ptr<int>(),
+        .send_nvl_head = post.send_nvl_head.data_ptr<int>(),
+        .recv_rdma_channel_prefix_matrix = post.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
+        .recv_gbl_channel_prefix_matrix = post.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
     };
     internode::DispatchInputs inputs{
-        .x                          = reinterpret_cast<const int4*>(x.data_ptr()),
-        .topk_idx                   = topk_idx.data_ptr<topk_idx_t>(),
-        .topk_weights               = topk_weights.data_ptr<float>(),
-        .is_token_in_rank           = is_token_in_rank.data_ptr<bool>(),
+        .x = reinterpret_cast<const int4*>(x.data_ptr()),
+        .topk_idx = topk_idx.data_ptr<topk_idx_t>(),
+        .topk_weights = topk_weights.data_ptr<float>(),
+        .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
         .rdma_channel_prefix_matrix = pre.rdma_channel_prefix_matrix.data_ptr<int>(),
-        .recv_rdma_rank_prefix_sum  = pre.recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        .gbl_channel_prefix_matrix  = pre.gbl_channel_prefix_matrix.data_ptr<int>(),
-        .recv_gbl_rank_prefix_sum   = pre.recv_gbl_rank_prefix_sum.data_ptr<int>(),
+        .recv_rdma_rank_prefix_sum = pre.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        .gbl_channel_prefix_matrix = pre.gbl_channel_prefix_matrix.data_ptr<int>(),
+        .recv_gbl_rank_prefix_sum = pre.recv_gbl_rank_prefix_sum.data_ptr<int>(),
     };
     // Bump issued-count before launch (shared Buffer flags across intra/internode).
     ++dispatch_main_issued_count;
     internode::DispatchTileSignal tile_signal{
-        .base_pool                 = pre.base_pool.data_ptr<int>(),
-        .seen_per_substream        = pre.seen_per_substream.data_ptr<int>(),
-        .pool_arrival_count        = post.pool_arrival_count.data_ptr<int>(),
-        .pool_arrival_target       = pool_arrival_target_n.data_ptr<int>(),
-        .dispatch_seq              = dispatch_seq,
-        .started_flag              = dispatch_main_started_flag,
+        .base_pool = pre.base_pool.data_ptr<int>(),
+        .seen_per_substream = pre.seen_per_substream.data_ptr<int>(),
+        .pool_arrival_count = post.pool_arrival_count.data_ptr<int>(),
+        .pool_arrival_target = pool_arrival_target_n.data_ptr<int>(),
+        .dispatch_seq = dispatch_seq,
+        .started_flag = dispatch_main_started_flag,
     };
     internode::DispatchShape shape{
-        .num_tokens  = num_tokens,
+        .num_tokens = num_tokens,
         .hidden_int4 = hidden_int4,
-        .num_topk    = num_topk,
+        .num_topk = num_topk,
         .num_experts = num_experts,
-        .tile_m      = tile_m,
+        .tile_m = tile_m,
     };
     internode::DispatchEnv env{
-        .rdma_buffer_ptr                     = rdma_buffer_ptr,
-        .buffer_ptrs                         = buffer_ptrs_gpu,
-        .rank                                = rank,
-        .num_max_rdma_chunked_send_tokens    = config.num_max_rdma_chunked_send_tokens,
-        .num_max_rdma_chunked_recv_tokens    = config.num_max_rdma_chunked_recv_tokens,
-        .num_max_nvl_chunked_send_tokens     = config.num_max_nvl_chunked_send_tokens,
-        .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
-        .reader_prev_head                    = dispatch_reader_prev_head,
-        .reader_prev_tail                    = dispatch_reader_prev_tail,
+        .rdma_buffer_ptr = rdma_buffer_ptr,
+        .buffer_ptrs = buffer_ptrs_gpu,
+        .rank = rank,
+        .num_max_rdma_chunked_send_tokens = config.num_max_rdma_chunked_send_tokens,
+        .num_max_rdma_chunked_recv_tokens = config.num_max_rdma_chunked_recv_tokens,
+        .num_max_nvl_chunked_send_tokens = config.num_max_nvl_chunked_send_tokens,
+        .num_max_nvl_chunked_recv_tokens = config.num_max_nvl_chunked_recv_tokens,
+        .reader_prev_head = dispatch_reader_prev_head,
+        .reader_prev_tail = dispatch_reader_prev_tail,
     };
 
-    internode::launch_dispatch_main(pool_out, per_token_out, inputs, tile_signal,
-                                    shape, env, num_rdma_ranks, num_channels, stream);
+    internode::launch_dispatch_main(pool_out, per_token_out, inputs, tile_signal, shape, env, num_rdma_ranks, num_channels, stream);
 
     return StreamingDispatchOutputs{
-        .pool                            = pool,
-        .pool_topk_weight                = post.pool_topk_weight,
-        .pool_recv_token                 = post.pool_recv_token,
-        .pool_k_slot                     = post.pool_k_slot,
-        .send_head                       = torch::Tensor(),
-        .rank_prefix_matrix              = pre.rank_prefix_matrix,
-        .channel_prefix_matrix           = torch::Tensor(),
-        .recv_channel_prefix_matrix      = torch::Tensor(),
-        .expert_frequency                = pre.expert_frequency,
-        .expert_pool_block_offset        = pre.expert_pool_block_offset,
-        .base_pool                       = pre.base_pool,
-        .seen_per_substream              = pre.seen_per_substream,
-        .tile_id_to_expert               = tile_id_to_expert_n,
-        .pool_arrival_target             = pool_arrival_target_n,
-        .pool_arrival_count              = post.pool_arrival_count,
-        .k_local_remaining             = post.k_local_remaining,
-        .y_done_per_token          = post.y_done_per_token,
-        .o                               = post.o,
-        .recv_token_to_slots             = post.recv_token_to_slots,
-        .k_local_total                   = post.k_local_total,
-        .total_tiles                     = total_tiles,
-        .metadata_done_event             = post.metadata_done_event,
-        .rdma_channel_prefix_matrix      = pre.rdma_channel_prefix_matrix,
-        .recv_rdma_rank_prefix_sum       = pre.recv_rdma_rank_prefix_sum,
-        .gbl_channel_prefix_matrix       = pre.gbl_channel_prefix_matrix,
-        .recv_gbl_rank_prefix_sum        = pre.recv_gbl_rank_prefix_sum,
+        .pool = pool,
+        .pool_topk_weight = post.pool_topk_weight,
+        .pool_recv_token = post.pool_recv_token,
+        .pool_k_slot = post.pool_k_slot,
+        .send_head = torch::Tensor(),
+        .rank_prefix_matrix = pre.rank_prefix_matrix,
+        .channel_prefix_matrix = torch::Tensor(),
+        .recv_channel_prefix_matrix = torch::Tensor(),
+        .expert_frequency = pre.expert_frequency,
+        .expert_pool_block_offset = pre.expert_pool_block_offset,
+        .base_pool = pre.base_pool,
+        .seen_per_substream = pre.seen_per_substream,
+        .tile_id_to_expert = tile_id_to_expert_n,
+        .pool_arrival_target = pool_arrival_target_n,
+        .pool_arrival_count = post.pool_arrival_count,
+        .k_local_remaining = post.k_local_remaining,
+        .y_done_per_token = post.y_done_per_token,
+        .o = post.o,
+        .recv_token_to_slots = post.recv_token_to_slots,
+        .k_local_total = post.k_local_total,
+        .total_tiles = total_tiles,
+        .metadata_done_event = post.metadata_done_event,
+        .rdma_channel_prefix_matrix = pre.rdma_channel_prefix_matrix,
+        .recv_rdma_rank_prefix_sum = pre.recv_rdma_rank_prefix_sum,
+        .gbl_channel_prefix_matrix = pre.gbl_channel_prefix_matrix,
+        .recv_gbl_rank_prefix_sum = pre.recv_gbl_rank_prefix_sum,
         .recv_rdma_channel_prefix_matrix = post.recv_rdma_channel_prefix_matrix,
-        .recv_gbl_channel_prefix_matrix  = post.recv_gbl_channel_prefix_matrix,
-        .send_rdma_head                  = post.send_rdma_head,
-        .send_nvl_head                   = post.send_nvl_head,
-        .recv_src_meta                   = post.recv_src_meta,
+        .recv_gbl_channel_prefix_matrix = post.recv_gbl_channel_prefix_matrix,
+        .send_rdma_head = post.send_rdma_head,
+        .send_nvl_head = post.send_nvl_head,
+        .recv_src_meta = post.recv_src_meta,
     };
 #else
     EP_HOST_ASSERT(false and "internode_dispatch requires NVSHMEM");
@@ -1881,13 +1861,12 @@ StreamingDispatchOutputs Buffer::internode_dispatch(
 // metadata kernel, no host poll — routing tensors come from the fwd
 // dispatch's StreamingDispatchOutputs (persisted on the StreamingHandle).
 // ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch_grads(
-    const torch::Tensor& dL_dy,
-    const torch::Tensor& is_token_in_rank,
-    const StreamingDispatchOutputs& dispatch_out,
-    int64_t TK_padded,
-    int64_t dispatch_seq,
-    const Config& config) {
+std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch_grads(const torch::Tensor& dL_dy,
+                                                                                       const torch::Tensor& is_token_in_rank,
+                                                                                       const StreamingDispatchOutputs& dispatch_out,
+                                                                                       int64_t TK_padded,
+                                                                                       int64_t dispatch_seq,
+                                                                                       const Config& config) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 
@@ -1939,10 +1918,8 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
     // internode receiver has the same K-fanout-over-recv_token_to_slots write
     // coverage — is a deferred optimization; kept zeroed here to preserve exact
     // behavior, no regression vs the prior torch::zeros.)
-    auto dL_do_pool = empty_on_default_pool({TK_padded, hidden}, dL_dy.options(),
-                                            default_stream_registered_, default_stream_handle_);
-    CUDA_CHECK(cudaMemsetAsync(dL_do_pool.data_ptr(), 0x00,
-                               dL_do_pool.numel() * dL_dy.element_size(), stream));
+    auto dL_do_pool = empty_on_default_pool({TK_padded, hidden}, dL_dy.options(), default_stream_registered_, default_stream_handle_);
+    CUDA_CHECK(cudaMemsetAsync(dL_do_pool.data_ptr(), 0x00, dL_do_pool.numel() * dL_dy.element_size(), stream));
     auto i32_opts = at::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     auto bwd_dispatch_arrival_count = torch::zeros({total_tiles}, i32_opts);
     record_consumer_stream(bwd_dispatch_arrival_count, compute_stream_handle_);
@@ -1954,46 +1931,46 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
     // straight fwd dispatch → bwd dispatch_grads.
 
     internode::DispatchGradsIO io{
-        .dL_do_pool        = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
-        .dL_dy             = reinterpret_cast<const int4*>(dL_dy.data_ptr()),
-        .is_token_in_rank  = is_token_in_rank.data_ptr<bool>(),
+        .dL_do_pool = reinterpret_cast<int4*>(dL_do_pool.data_ptr()),
+        .dL_dy = reinterpret_cast<const int4*>(dL_dy.data_ptr()),
+        .is_token_in_rank = is_token_in_rank.data_ptr<bool>(),
     };
 
     internode::DispatchGradsRouting routing{
-        .recv_token_to_slots                = dispatch_out.recv_token_to_slots.data_ptr<int>(),
-        .base_pool                          = dispatch_out.base_pool.data_ptr<int>(),
-        .seen_per_substream                 = dispatch_out.seen_per_substream.data_ptr<int>(),
-        .tile_id_to_expert                  = dispatch_out.tile_id_to_expert.data_ptr<int>(),
-        .gbl_channel_prefix_matrix          = dispatch_out.gbl_channel_prefix_matrix.data_ptr<int>(),
-        .rdma_channel_prefix_matrix         = dispatch_out.rdma_channel_prefix_matrix.data_ptr<int>(),
-        .recv_rdma_rank_prefix_sum          = dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        .recv_gbl_channel_prefix_matrix     = dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
+        .recv_token_to_slots = dispatch_out.recv_token_to_slots.data_ptr<int>(),
+        .base_pool = dispatch_out.base_pool.data_ptr<int>(),
+        .seen_per_substream = dispatch_out.seen_per_substream.data_ptr<int>(),
+        .tile_id_to_expert = dispatch_out.tile_id_to_expert.data_ptr<int>(),
+        .gbl_channel_prefix_matrix = dispatch_out.gbl_channel_prefix_matrix.data_ptr<int>(),
+        .rdma_channel_prefix_matrix = dispatch_out.rdma_channel_prefix_matrix.data_ptr<int>(),
+        .recv_rdma_rank_prefix_sum = dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        .recv_gbl_channel_prefix_matrix = dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
     };
     // Bump issued-count before launch (shared Buffer flags across intra/internode).
     ++dispatch_grads_issued_count;
     internode::DispatchGradsTileSignal tile_signal{
         .bwd_dispatch_arrival_count = bwd_dispatch_arrival_count.data_ptr<int>(),
-        .pool_arrival_target        = dispatch_out.pool_arrival_target.data_ptr<int>(),
-        .dispatch_seq               = dispatch_seq,
-        .started_flag               = dispatch_grads_started_flag,
+        .pool_arrival_target = dispatch_out.pool_arrival_target.data_ptr<int>(),
+        .dispatch_seq = dispatch_seq,
+        .started_flag = dispatch_grads_started_flag,
     };
     internode::DispatchGradsShape shape{
-        .num_tokens   = num_tokens,
-        .hidden_int4  = hidden_int4,
-        .num_topk     = num_topk,
-        .num_experts  = num_experts,
-        .tile_m       = tile_m,
+        .num_tokens = num_tokens,
+        .hidden_int4 = hidden_int4,
+        .num_topk = num_topk,
+        .num_experts = num_experts,
+        .tile_m = tile_m,
     };
     internode::DispatchEnv env{
-        .rdma_buffer_ptr                     = rdma_buffer_ptr,
-        .buffer_ptrs                         = buffer_ptrs_gpu,
-        .rank                                = rank,
-        .num_max_rdma_chunked_send_tokens    = config.num_max_rdma_chunked_send_tokens,
-        .num_max_rdma_chunked_recv_tokens    = config.num_max_rdma_chunked_recv_tokens,
-        .num_max_nvl_chunked_send_tokens     = config.num_max_nvl_chunked_send_tokens,
-        .num_max_nvl_chunked_recv_tokens     = config.num_max_nvl_chunked_recv_tokens,
-        .reader_prev_head                    = dispatch_reader_prev_head,
-        .reader_prev_tail                    = dispatch_reader_prev_tail,
+        .rdma_buffer_ptr = rdma_buffer_ptr,
+        .buffer_ptrs = buffer_ptrs_gpu,
+        .rank = rank,
+        .num_max_rdma_chunked_send_tokens = config.num_max_rdma_chunked_send_tokens,
+        .num_max_rdma_chunked_recv_tokens = config.num_max_rdma_chunked_recv_tokens,
+        .num_max_nvl_chunked_send_tokens = config.num_max_nvl_chunked_send_tokens,
+        .num_max_nvl_chunked_recv_tokens = config.num_max_nvl_chunked_recv_tokens,
+        .reader_prev_head = dispatch_reader_prev_head,
+        .reader_prev_tail = dispatch_reader_prev_tail,
     };
 
     // Recorded before the main kernel launch — bwd orchestrator's compute
@@ -2020,15 +1997,14 @@ std::tuple<torch::Tensor, torch::Tensor, EventHandle> Buffer::internode_dispatch
 // dispatch_main_kernel's sender / forwarder SM tails; stream-order
 // causality (same communicate stream) guarantees visibility here.
 // ─────────────────────────────────────────────────────────────────────────────
-std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combine(
-    const torch::Tensor& x,
-    const torch::Tensor& per_slot_weights,
-    const StreamingDispatchOutputs& dispatch_out,
-    const torch::Tensor& y_done_per_token,
-    int64_t combine_seq,
-    int64_t combine_phase,
-    bool is_fwd,
-    const Config& config) {
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combine(const torch::Tensor& x,
+                                                                                  const torch::Tensor& per_slot_weights,
+                                                                                  const StreamingDispatchOutputs& dispatch_out,
+                                                                                  const torch::Tensor& y_done_per_token,
+                                                                                  int64_t combine_seq,
+                                                                                  int64_t combine_phase,
+                                                                                  bool is_fwd,
+                                                                                  const Config& config) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 
@@ -2037,18 +2013,16 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
     int num_channels = config.num_sms / 2;
 
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
-    EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and
-                   per_slot_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(per_slot_weights.dim() == 1 and per_slot_weights.is_contiguous() and per_slot_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(dispatch_out.send_rdma_head.dim() == 2 and dispatch_out.send_rdma_head.is_contiguous());
     EP_HOST_ASSERT(dispatch_out.send_nvl_head.dim() == 2 and dispatch_out.send_nvl_head.is_contiguous());
     EP_HOST_ASSERT(dispatch_out.recv_token_to_slots.dim() == 2 and dispatch_out.recv_token_to_slots.is_contiguous());
     EP_HOST_ASSERT(dispatch_out.send_rdma_head.size(1) == num_rdma_ranks);
     EP_HOST_ASSERT(dispatch_out.send_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
-    EP_HOST_ASSERT(y_done_per_token.dim() == 1 and y_done_per_token.is_contiguous() and
-                   y_done_per_token.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(y_done_per_token.dim() == 1 and y_done_per_token.is_contiguous() and y_done_per_token.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(y_done_per_token.size(0) == x.size(0));
 
-    int num_tokens = static_cast<int>(x.size(0));            // recv-side count (= dispatch's T_recv)
+    int num_tokens = static_cast<int>(x.size(0));  // recv-side count (= dispatch's T_recv)
     int num_combined_tokens = static_cast<int>(dispatch_out.send_rdma_head.size(0));
     int hidden = static_cast<int>(x.size(1));
     int num_topk = static_cast<int>(dispatch_out.recv_token_to_slots.size(1));
@@ -2062,43 +2036,49 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
     // Combine outputs (layer result / gradients) returned to the caller and freed
     // by it after the layer-end back-edges — default pool, no record_stream (the
     // back-edges + caller-FIFO order every in-layer consumer before reuse), like `pool`.
-    auto recv_x = empty_on_default_pool({num_combined_tokens, hidden}, x.options(),
-                                        default_stream_registered_, default_stream_handle_);
+    auto recv_x = empty_on_default_pool({num_combined_tokens, hidden}, x.options(), default_stream_registered_, default_stream_handle_);
     auto f32_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     c10::optional<torch::Tensor> recv_topk_weights_out = is_fwd
         ? c10::nullopt
-        : c10::optional<torch::Tensor>(empty_on_default_pool(
-              {num_combined_tokens, num_topk}, f32_opts,
-              default_stream_registered_, default_stream_handle_));
+        : c10::optional<torch::Tensor>(
+              empty_on_default_pool({num_combined_tokens, num_topk}, f32_opts, default_stream_registered_, default_stream_handle_));
     float* recv_topk_weights_ptr = is_fwd ? nullptr : recv_topk_weights_out->data_ptr<float>();
 
     // kNVLSender ships recv-side `x` back to source ranks → it needs the
     // *recv*-side per-(src_world, channel) prefix (`recv_gbl_channel_prefix_matrix`),
     // not the dispatch's send-side `gbl_channel_prefix_matrix`.
-    internode::launch_combine_main(
-        at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
-        recv_x.data_ptr(), recv_topk_weights_ptr,
-        x.data_ptr(), per_slot_weights.data_ptr<float>(),
-        dispatch_out.recv_token_to_slots.data_ptr<int>(),
-        dispatch_out.send_rdma_head.data_ptr<int>(),       // sentinel-encoded by dispatch_main_kernel tail
-        dispatch_out.send_nvl_head.data_ptr<int>(),        // sentinel-encoded by dispatch_main_kernel tail
-        dispatch_out.recv_src_meta.data_ptr(),
-        dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
-        dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
-        y_done_per_token.data_ptr<int64_t>(),
-        combine_seq,
-        static_cast<int>(combine_phase),
-        is_fwd,
-        num_tokens, num_combined_tokens, hidden, num_topk,
-        rdma_buffer_ptr_combine,
-        config.num_max_rdma_chunked_send_tokens,
-        config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens,
-        rank, num_ranks, stream, num_channels,
-        combine_reader_prev_head, combine_reader_prev_tail);
+    internode::launch_combine_main(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
+                                   recv_x.data_ptr(),
+                                   recv_topk_weights_ptr,
+                                   x.data_ptr(),
+                                   per_slot_weights.data_ptr<float>(),
+                                   dispatch_out.recv_token_to_slots.data_ptr<int>(),
+                                   dispatch_out.send_rdma_head.data_ptr<int>(),  // sentinel-encoded by dispatch_main_kernel tail
+                                   dispatch_out.send_nvl_head.data_ptr<int>(),   // sentinel-encoded by dispatch_main_kernel tail
+                                   dispatch_out.recv_src_meta.data_ptr(),
+                                   dispatch_out.recv_rdma_channel_prefix_matrix.data_ptr<int>(),
+                                   dispatch_out.recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                                   dispatch_out.recv_gbl_channel_prefix_matrix.data_ptr<int>(),
+                                   y_done_per_token.data_ptr<int64_t>(),
+                                   combine_seq,
+                                   static_cast<int>(combine_phase),
+                                   is_fwd,
+                                   num_tokens,
+                                   num_combined_tokens,
+                                   hidden,
+                                   num_topk,
+                                   rdma_buffer_ptr_combine,
+                                   config.num_max_rdma_chunked_send_tokens,
+                                   config.num_max_rdma_chunked_recv_tokens,
+                                   buffer_ptrs_gpu,
+                                   config.num_max_nvl_chunked_send_tokens,
+                                   config.num_max_nvl_chunked_recv_tokens,
+                                   rank,
+                                   num_ranks,
+                                   stream,
+                                   num_channels,
+                                   combine_reader_prev_head,
+                                   combine_reader_prev_tail);
 
     return {recv_x, recv_topk_weights_out};
 #else
@@ -2136,40 +2116,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("wait", &stream_ep::EventHandle::wait);
 
     pybind11::class_<stream_ep::StreamingDispatchOutputs>(m, "StreamingDispatchOutputs")
-        .def_readonly("pool",                       &stream_ep::StreamingDispatchOutputs::pool)
-        .def_readonly("pool_topk_weight",           &stream_ep::StreamingDispatchOutputs::pool_topk_weight)
-        .def_readonly("pool_recv_token",            &stream_ep::StreamingDispatchOutputs::pool_recv_token)
-        .def_readonly("pool_k_slot",                &stream_ep::StreamingDispatchOutputs::pool_k_slot)
-        .def_readonly("send_head",                  &stream_ep::StreamingDispatchOutputs::send_head)
-        .def_readonly("rank_prefix_matrix",         &stream_ep::StreamingDispatchOutputs::rank_prefix_matrix)
-        .def_readonly("channel_prefix_matrix",      &stream_ep::StreamingDispatchOutputs::channel_prefix_matrix)
+        .def_readonly("pool", &stream_ep::StreamingDispatchOutputs::pool)
+        .def_readonly("pool_topk_weight", &stream_ep::StreamingDispatchOutputs::pool_topk_weight)
+        .def_readonly("pool_recv_token", &stream_ep::StreamingDispatchOutputs::pool_recv_token)
+        .def_readonly("pool_k_slot", &stream_ep::StreamingDispatchOutputs::pool_k_slot)
+        .def_readonly("send_head", &stream_ep::StreamingDispatchOutputs::send_head)
+        .def_readonly("rank_prefix_matrix", &stream_ep::StreamingDispatchOutputs::rank_prefix_matrix)
+        .def_readonly("channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::channel_prefix_matrix)
         .def_readonly("recv_channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::recv_channel_prefix_matrix)
-        .def_readonly("expert_frequency",           &stream_ep::StreamingDispatchOutputs::expert_frequency)
-        .def_readonly("expert_pool_block_offset",   &stream_ep::StreamingDispatchOutputs::expert_pool_block_offset)
-        .def_readonly("base_pool",                  &stream_ep::StreamingDispatchOutputs::base_pool)
-        .def_readonly("seen_per_substream",         &stream_ep::StreamingDispatchOutputs::seen_per_substream)
-        .def_readonly("tile_id_to_expert",          &stream_ep::StreamingDispatchOutputs::tile_id_to_expert)
-        .def_readonly("pool_arrival_target",        &stream_ep::StreamingDispatchOutputs::pool_arrival_target)
-        .def_readonly("pool_arrival_count",         &stream_ep::StreamingDispatchOutputs::pool_arrival_count)
-        .def_readonly("k_local_remaining",        &stream_ep::StreamingDispatchOutputs::k_local_remaining)
-        .def_readonly("y_done_per_token",     &stream_ep::StreamingDispatchOutputs::y_done_per_token)
-        .def_readonly("o",                          &stream_ep::StreamingDispatchOutputs::o)
-        .def("release_o",                           &stream_ep::StreamingDispatchOutputs::release_o)
-        .def("release_pool",                        &stream_ep::StreamingDispatchOutputs::release_pool)
-        .def_readonly("recv_token_to_slots",        &stream_ep::StreamingDispatchOutputs::recv_token_to_slots)
-        .def_readonly("k_local_total",                   &stream_ep::StreamingDispatchOutputs::k_local_total)
-        .def_readonly("total_tiles",                     &stream_ep::StreamingDispatchOutputs::total_tiles)
-        .def_readonly("metadata_done_event",             &stream_ep::StreamingDispatchOutputs::metadata_done_event)
+        .def_readonly("expert_frequency", &stream_ep::StreamingDispatchOutputs::expert_frequency)
+        .def_readonly("expert_pool_block_offset", &stream_ep::StreamingDispatchOutputs::expert_pool_block_offset)
+        .def_readonly("base_pool", &stream_ep::StreamingDispatchOutputs::base_pool)
+        .def_readonly("seen_per_substream", &stream_ep::StreamingDispatchOutputs::seen_per_substream)
+        .def_readonly("tile_id_to_expert", &stream_ep::StreamingDispatchOutputs::tile_id_to_expert)
+        .def_readonly("pool_arrival_target", &stream_ep::StreamingDispatchOutputs::pool_arrival_target)
+        .def_readonly("pool_arrival_count", &stream_ep::StreamingDispatchOutputs::pool_arrival_count)
+        .def_readonly("k_local_remaining", &stream_ep::StreamingDispatchOutputs::k_local_remaining)
+        .def_readonly("y_done_per_token", &stream_ep::StreamingDispatchOutputs::y_done_per_token)
+        .def_readonly("o", &stream_ep::StreamingDispatchOutputs::o)
+        .def("release_o", &stream_ep::StreamingDispatchOutputs::release_o)
+        .def("release_pool", &stream_ep::StreamingDispatchOutputs::release_pool)
+        .def_readonly("recv_token_to_slots", &stream_ep::StreamingDispatchOutputs::recv_token_to_slots)
+        .def_readonly("k_local_total", &stream_ep::StreamingDispatchOutputs::k_local_total)
+        .def_readonly("total_tiles", &stream_ep::StreamingDispatchOutputs::total_tiles)
+        .def_readonly("metadata_done_event", &stream_ep::StreamingDispatchOutputs::metadata_done_event)
         // Internode-only combine plumbing (empty for intranode):
-        .def_readonly("rdma_channel_prefix_matrix",      &stream_ep::StreamingDispatchOutputs::rdma_channel_prefix_matrix)
-        .def_readonly("recv_rdma_rank_prefix_sum",       &stream_ep::StreamingDispatchOutputs::recv_rdma_rank_prefix_sum)
-        .def_readonly("gbl_channel_prefix_matrix",       &stream_ep::StreamingDispatchOutputs::gbl_channel_prefix_matrix)
-        .def_readonly("recv_gbl_rank_prefix_sum",        &stream_ep::StreamingDispatchOutputs::recv_gbl_rank_prefix_sum)
+        .def_readonly("rdma_channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::rdma_channel_prefix_matrix)
+        .def_readonly("recv_rdma_rank_prefix_sum", &stream_ep::StreamingDispatchOutputs::recv_rdma_rank_prefix_sum)
+        .def_readonly("gbl_channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::gbl_channel_prefix_matrix)
+        .def_readonly("recv_gbl_rank_prefix_sum", &stream_ep::StreamingDispatchOutputs::recv_gbl_rank_prefix_sum)
         .def_readonly("recv_rdma_channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::recv_rdma_channel_prefix_matrix)
-        .def_readonly("recv_gbl_channel_prefix_matrix",  &stream_ep::StreamingDispatchOutputs::recv_gbl_channel_prefix_matrix)
-        .def_readonly("send_rdma_head",                  &stream_ep::StreamingDispatchOutputs::send_rdma_head)
-        .def_readonly("send_nvl_head",                   &stream_ep::StreamingDispatchOutputs::send_nvl_head)
-        .def_readonly("recv_src_meta",                   &stream_ep::StreamingDispatchOutputs::recv_src_meta);
+        .def_readonly("recv_gbl_channel_prefix_matrix", &stream_ep::StreamingDispatchOutputs::recv_gbl_channel_prefix_matrix)
+        .def_readonly("send_rdma_head", &stream_ep::StreamingDispatchOutputs::send_rdma_head)
+        .def_readonly("send_nvl_head", &stream_ep::StreamingDispatchOutputs::send_nvl_head)
+        .def_readonly("recv_src_meta", &stream_ep::StreamingDispatchOutputs::recv_src_meta);
 
     pybind11::class_<stream_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
