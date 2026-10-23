@@ -85,13 +85,16 @@ cmd = "python setup.py build_ext --inplace"
 description = "Incremental in-place build of stream_ep_cpp after .cu / .cpp / .cuh edits"
 
 [feature.test.tasks.test-kernels]
-cmd = "pytest stream_ep/stream_moe/tests"
-description = "Single-process kernel pytest suite (1 GPU)"
+cmd = "python -m stream_ep_tests.run kernels"
+description = "Kernel pytest suite, single process (1 GPU)"
 
 [feature.test.tasks.test-dist]
-args = ["script", { arg = "nproc", default = "8" }]
-cmd = "torchrun --standalone --nproc-per-node={{ nproc }} {{ script }}"
-description = "Run one torchrun test script on this node, e.g. `pixi run -e test test-dist tests/test_dispatch.py`"
+cmd = "python -m stream_ep_tests.run dist"
+description = "Every stream_ep_tests/dist/ script on this node (8 GPUs)"
+
+[feature.test.tasks.test-internode]
+cmd = "python -m stream_ep_tests.run internode"
+description = "dist/ + internode/ scripts across nodes; run once per node: `srun -N2 --ntasks-per-node=1 pixi run -e test test-internode`"
 
 [feature.lint.dependencies]
 pre-commit = "*"

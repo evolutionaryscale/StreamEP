@@ -23,7 +23,7 @@ What you should see in the resulting chrome trace
 Launch
 ------
     torchrun --nproc_per_node=2 \\
-        -m stream_ep.stream_moe.profile_pipeline \\
+        -m stream_ep_bench.profile_pipeline \\
         [--profile_dir /path/to/profiles]
 
 Default --profile_dir is `/tmp/stream_moe_profile_<SLURM_JOB_ID-or-pid>/`.
@@ -39,6 +39,8 @@ import torch
 import torch.distributed as torch_dist
 import torch.profiler
 from stream_ep import Buffer as StreamEPBuffer
+import stream_ep_tests.utils as test_utils
+from stream_ep_tests.utils import DTYPE, SEQ_LEN_PER_RANK, H
 
 from stream_ep.stream_moe.stream_moe import (
     TileConfig,
@@ -90,18 +92,6 @@ def rank_zero_only(fn):
     return wrapper
 
 
-# Default profile shape = the 82ba5b prod config (82B total / 4.3B active):
-# d_model H=3072, per-expert I=768, E=256 experts, top-K=8, 8192 tokens/rank.
-# Override any of these via --hidden / --intermediate / --num_experts / --topk.
-H = 3072
-I = 768
-NUM_EXPERTS = 256
-SEQ_LEN_PER_RANK = 8192
-TOPK = 8
-DTYPE = torch.bfloat16
-NUM_SMS = 64  # 64 SMs (32 channels): tuned for 4+ node RDMA-dominated runs.
-
-
 def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
     base = (torch.arange(n_tokens, device=device) + rank * n_tokens) * topk
     offsets = torch.arange(topk, device=device).unsqueeze(0)
@@ -141,15 +131,7 @@ def make_randn_topk_idx(n_tokens, topk, num_experts, device, generator=None):
 def make_buffer(group, num_sms=None, hidden=H):
     if num_sms is not None:
         StreamEPBuffer.set_num_sms(num_sms)
-    hidden_bytes = hidden * 2
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (
-        StreamEPBuffer.get_dispatch_config(group.size()),
-        StreamEPBuffer.get_combine_config(group.size()),
-    ):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes)
-    return StreamEPBuffer(group, nvl_bytes, rdma_bytes)
+    return StreamEPBuffer.sized_for(group, hidden * DTYPE.itemsize)
 
 
 def _tile_config_from_args(args) -> TileConfig:
@@ -203,10 +185,10 @@ def main():
     # Defaults come via globals() because main() rebinds H/I/NUM_EXPERTS/TOPK
     # as locals below — a bare `default=H` would be an UnboundLocalError on
     # that soon-to-be-local name.
-    p.add_argument("--hidden", type=int, default=globals()["H"], help="d_model H (default: 82ba5b 3072)")
-    p.add_argument("--intermediate", type=int, default=globals()["I"], help="per-expert I (default: 82ba5b 768)")
-    p.add_argument("--num_experts", type=int, default=globals()["NUM_EXPERTS"], help="total experts E (default: 82ba5b 256)")
-    p.add_argument("--topk", type=int, default=globals()["TOPK"], help="top-k K (default: 82ba5b 8)")
+    p.add_argument("--hidden", type=int, default=test_utils.H, help="d_model H (default: 82ba5b 3072)")
+    p.add_argument("--intermediate", type=int, default=test_utils.I, help="per-expert I (default: 82ba5b 768)")
+    p.add_argument("--num_experts", type=int, default=test_utils.NUM_EXPERTS, help="total experts E (default: 82ba5b 256)")
+    p.add_argument("--topk", type=int, default=test_utils.TOPK, help="top-k K (default: 82ba5b 8)")
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)

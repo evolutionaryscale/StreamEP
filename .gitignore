@@ -8,6 +8,6 @@ build/
 .vscode/
 */cmake-build-*/
 stream_ep.egg-info/
-dist/
+/dist/
 .pixi/
 .ruff_cache/

@@ -1,9 +1,10 @@
 """Gate a built wheel before it is published as a release asset.
 
-Checks that dist/ holds exactly one wheel for pyproject.toml's version and that
-its compiled extension is loadable from evoscale's env rather than the build
-machine's: $ORIGIN-relative rpath only, SM90 SASS only, and no glibc symbol
-newer than evoscale's libc floor.
+Checks that dist/ holds exactly one wheel for pyproject.toml's version, that it
+ships only the library (no tests or bench harnesses), and that its compiled
+extension is loadable from evoscale's env rather than the build machine's:
+$ORIGIN-relative rpath only, SM90 SASS only, and no glibc symbol newer than
+evoscale's libc floor.
 
     python scripts/check_wheel.py [dist_dir]
 """
@@ -33,6 +34,13 @@ def tool(*names: str) -> str:
 
 def run(*cmd: str) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def check_contents(wheel: zipfile.ZipFile, version: str) -> None:
+    allowed = ("stream_ep/", f"stream_ep-{version}.dist-info/", EXTENSION)
+    stray = [n for n in wheel.namelist() if not n.startswith(allowed)]
+    assert not stray, f"wheel ships files outside the library: {stray[:5]}"
+    assert not [n for n in wheel.namelist() if "/tests/" in n], "wheel ships tests"
 
 
 def check_metadata(wheel: zipfile.ZipFile, version: str, pinned: list[str]) -> None:
@@ -68,6 +76,7 @@ def main() -> None:
     assert [w.name for w in wheels] == [expected], f"expected only {expected} in {dist}, found {[w.name for w in wheels]}"
 
     with zipfile.ZipFile(wheels[0]) as wheel, tempfile.TemporaryDirectory() as tmp:
+        check_contents(wheel, version)
         check_metadata(wheel, version, project["dependencies"])
         check_extension(Path(wheel.extract(EXTENSION, tmp)))
     print(f"ok: {wheels[0].name}")

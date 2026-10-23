@@ -25,7 +25,7 @@ This catches three classes of bug:
       live until backward returns at the OUTERMOST call site. Bugs that
       need multiple layers' state to coexist (compile + CDMC>1 deadlock
       at 10+ layers; ctx-pinning peak-memory regressions) only surface
-      at ``--n_layers >= ~10``.
+      at ``--n_layers >= ~10``, which needs ``--no_ref`` (see below).
   (c) Any fwd / bwd pipeline regression — per-token gate ↔ release-store
       interaction, per-layer dispatch_seq increment, etc.
 
@@ -36,16 +36,15 @@ numerical drift past the threshold's scaling (see below).
 Launch
 ------
     torchrun --nproc_per_node=8 \\
-        -m stream_ep.stream_moe.validate_multi_iter \\
-        [--n_iter 20] [--n_layers 10]
+        -m stream_ep_bench.validate_multi_iter \\
+        [--n_iter 20] [--n_layers 4]
 
-``--n_layers`` is capped at 10. At production seq_len the eager reference's
-autograd graph (each layer is a functional ``Tensor.index_add`` chain over E
-experts → one (T, H) intermediate per expert pinned for backward) maxes out
-the 80 GB H100 around 10-12 layers. The streaming path itself fits well past
-that — the cap is a property of the eager validator, not the pipeline. If a
-deeper-stack regression-check is needed, use the moe_benchmark harness (no
-reference, just hang / NaN detection).
+``--n_layers`` is capped at 4 with the reference on. At the default shape the
+eager reference's autograd graph (each layer is a functional ``Tensor.index_add``
+chain over E experts, one (T, H) intermediate per expert pinned for backward)
+fits 4 layers on an 80 GB H100 and runs out of memory at 10. The streaming path
+itself fits far deeper: the cap belongs to the eager validator, not the
+pipeline. For deeper stacks use ``--no_ref`` (hang / NaN detection only).
 
 Outputs PASS / FAIL per iter on rank 0, with per-tensor max-abs / max-rel
 diffs for the failing iters.
@@ -91,21 +90,13 @@ TOL_DEFAULT = {
     "dL/dW2_local": (8e-2, 8e-2),
 }
 
-from stream_ep.stream_moe.profile_pipeline import (
-    DTYPE,
-    NUM_EXPERTS,
-    SEQ_LEN_PER_RANK,
-    TOPK,
-    H,
-    I,
-    make_buffer,
-    make_uniform_topk_idx,
-)
+from stream_ep_tests.utils import DTYPE, H, I, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
+from stream_ep_bench.profile_pipeline import make_buffer, make_uniform_topk_idx
 from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )
-from stream_ep.stream_moe.profile_pipeline import (
+from stream_ep_bench.profile_pipeline import (
     barrier,
     get_global_rank,
     get_world_size,
@@ -192,17 +183,17 @@ def main():
         default=1,
         help="Number of stream_moe_func calls chained per iter (shared "
         "weights / routing). >1 exercises the multi-layer-within-iter "
-        "ctx / dispatch_seq surface. Capped at 10: the eager reference's "
-        "autograd graph (functional index_add chain across E experts per "
-        "layer × N layers) is the limiting factor on an 80 GB H100, not "
-        "the streaming path.",
+        "ctx / dispatch_seq surface. Capped at 4 with the reference on: "
+        "the eager reference's autograd graph (functional index_add chain "
+        "across E experts per layer) runs out of memory on an 80 GB H100 "
+        "beyond that, not the streaming path.",
     )
     p.add_argument(
         "--no_ref",
         action="store_true",
         help="Pipeline-stress mode: skip the eager reference and gradient "
         "comparison; run the streaming stack + backward only, asserting "
-        "finiteness. Lifts the n_layers<=10 reference cap — use for deep "
+        "finiteness. Lifts the n_layers<=4 reference cap — use for deep "
         "stacks reproducing the benchmark's per-step structure (per-layer "
         "join + compute/signal stages that the pure-comm stress test lacks).",
     )
@@ -271,8 +262,8 @@ def main():
     if args.no_ref:
         assert 1 <= args.n_layers <= 64, f"--n_layers={args.n_layers}: [1, 64]"
     else:
-        assert 1 <= args.n_layers <= 10, (
-            f"--n_layers={args.n_layers}: must be in [1, 10]. The cap is the "
+        assert 1 <= args.n_layers <= 4, (
+            f"--n_layers={args.n_layers}: must be in [1, 4]. The cap is the "
             "eager-reference autograd-graph size at production seq_len, not a "
             "streaming-pipeline limit (see arg help; --no_ref lifts it)."
         )

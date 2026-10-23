@@ -1697,7 +1697,7 @@ StreamingDispatchOutputs Buffer::internode_dispatch(const torch::Tensor& x,
     // outside [0, kMaxSaneTotalTiles] means the metadata path produced
     // garbage; throw immediately with the diagnostics instead of spinning to
     // timeout (garbage-negative) or letting the multi-TiB `pool` allocation
-    // OOM (garbage-positive). tests/test_metadata_nvl_aliasing.py matches on
+    // OOM (garbage-positive). stream_ep_tests/internode/test_metadata_nvl_aliasing.py matches on
     // the "StreamEP-CORRUPT" prefix — keep it stable.
     constexpr int kMaxSaneTotalTiles = 1 << 20;
     if (total_tiles < 0 or total_tiles > kMaxSaneTotalTiles)

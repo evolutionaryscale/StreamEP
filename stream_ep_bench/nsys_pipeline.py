@@ -18,7 +18,7 @@ Launch (one nsys report per rank):
     STREAM_EP_NVTX=1 torchrun --nproc-per-node=8 --no-python \
         nsys profile --capture-range=cudaProfilerApi --trace=cuda,nvtx \
         -o nsys_pipeline_rank%q{RANK} \
-        python -m stream_ep.stream_moe.nsys_pipeline --n_iter 12
+        python -m stream_ep_bench.nsys_pipeline --n_iter 12
 
 Each profiled iter is wrapped in an `iter_<k>` NVTX range; stream_moe_func's
 own fwd_dispatch/fwd_compute/fwd_combine/moe_bwd ranges fire when
@@ -30,13 +30,8 @@ import argparse
 import torch
 import torch.distributed as torch_dist
 
-from stream_ep.stream_moe.profile_pipeline import (
-    DTYPE,
-    NUM_EXPERTS,
-    SEQ_LEN_PER_RANK,
-    TOPK,
-    H,
-    I,
+from stream_ep_tests.utils import DTYPE, H, I, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
+from stream_ep_bench.profile_pipeline import (
     barrier,
     get_global_rank,
     get_world_size,

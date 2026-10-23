@@ -35,9 +35,12 @@ GEMM tiles and SM counts are picked from the weight shapes and world size; `Tile
 ## Layout
 
 - `stream_ep/` — the `Buffer` class over the `stream_ep_cpp` extension built from `csrc/`.
-- `stream_ep/stream_moe/` — the MoE layer, its kernels, and the profiling / validation harnesses. The package docstring is the code map.
-- `tests/` — multi-rank torchrun scripts. `stream_ep/stream_moe/tests/` — single-process kernel pytest.
-- `scripts/` — release wheel build and checks.
+- `stream_ep/stream_moe/` — the MoE layer and its kernels. The package docstring is the code map.
+- `stream_ep_tests/` — tests: `kernels/` (pytest, 1 GPU), `dist/` (torchrun, any world size), `internode/` (two or more nodes).
+- `stream_ep_bench/` — profiling and multi-iteration validation harnesses (`profile_pipeline`, `validate_multi_iter`, `ncu_microbench`, ...).
+- `scripts/` — release wheel build and checks, and the test-layout check.
+
+Only `stream_ep/` and the extension ship in the wheel.
 
 ## Development
 
@@ -48,14 +51,14 @@ GEMM tiles and SM counts are picked from the weight shapes and world size; `Tile
 - `lint` — pre-commit only.
 
 ```bash
-pixi run -e test build-ext                                # in-place build after .cu / .cpp / .cuh edits
-pixi run -e test test-kernels                             # kernel pytest, 1 GPU
-pixi run -e test test-dist tests/test_dispatch.py         # one torchrun script, 8 GPUs by default
-pixi run -e test test-dist tests/test_dispatch.py 2       # ... on 2 GPUs
-pixi run -e lint lint                                     # pre-commit hooks; `pixi run -e lint pre-commit install` to run them on commit
+pixi run -e test build-ext          # in-place build after .cu / .cpp / .cuh edits
+pixi run -e test test-kernels       # kernel pytest, 1 GPU
+pixi run -e test test-dist          # every dist/ script on this node, 8 GPUs
+srun -N2 --ntasks-per-node=1 pixi run -e test test-internode   # dist/ + internode/ across nodes
+pixi run -e lint lint               # pre-commit hooks; `pixi run -e lint pre-commit install` to run them on commit
 ```
 
-Internode scripts (`tests/test_*_internode.py`) need two or more nodes. Profiling and multi-iteration validation entry points live in `stream_ep/stream_moe/` (`profile_pipeline`, `validate_multi_iter`, `ncu_microbench`).
+The suites are discovered from the directories (`python -m stream_ep_tests.run <suite> --list` shows what would run). One script: `pixi run -e test torchrun --standalone --nproc-per-node=8 -m stream_ep_tests.dist.test_dispatch`.
 
 ## Release
 

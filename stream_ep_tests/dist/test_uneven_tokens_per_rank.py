@@ -1,40 +1,12 @@
-"""Reproduce the uneven-tokens-per-rank dispatch overflow (StreamEP).
+"""Dispatch when ranks contribute different numbers of tokens.
 
-Bug: `intranode_dispatch` / `internode_dispatch` size the two pre-poll per-tile
-metadata arrays (`tile_id_to_expert`, `pool_arrival_target`) from a budget
-computed off the LOCAL rank's token count assuming EVERY rank sent the same
-number:
-
-    total_tiles_max = num_tokens(local) * num_topk * num_ranks / tile_m + ...
-                      (csrc/stream_ep.cpp:1164 intranode, :1610 internode)
-
-In eval / inference each rank has a DIFFERENT local token count. A rank with
-few local tokens under-budgets `total_tiles_max`, while the host-polled ACTUAL
-`total_tiles` (summed cross-rank) reflects what it really receives. When a peer
-sent more tokens than this rank has locally, actual > budget and the narrow
-
-    tile_id_to_expert.narrow(0, 0, poll.total_tiles)   (csrc/stream_ep.cpp:1237-38 / :1705-06)
-
-throws PyTorch's **"start+length exceeds dimension size"**.
-
-Why the existing `test_skewed_experts.py` misses it: it gives every rank the
-SAME T, so the uniform-per-rank assumption holds with equality even under
-maximal expert skew. This test instead gives rank 0 far fewer tokens than its
-peers (uneven per-rank T) under the CONTROL `uniform_rotating` routing — so a
-failure here is unambiguously the uneven token count, not routing skew.
-
-World-agnostic (reproduces on both the intranode and internode paths):
-    torchrun --standalone --nproc-per-node=8 tests/test_uneven_tokens_per_rank.py   # 8 GPU, intranode
-    torchrun --nnodes=2 --nproc-per-node=8 ... tests/test_uneven_tokens_per_rank.py  # 16 GPU, internode
-
-Expected BEFORE the fix: rank 0 raises "start+length exceeds dimension size"
-(the run fails). AFTER sizing total_tiles_max from the GLOBAL token count:
-dispatch succeeds on every rank and the test passes.
-
-Overflow is guaranteed when t_large > t_small * (world_size + 1) (uniform
-routing): the underfull rank still receives ~1/world_size of the global pool,
-which exceeds its local-uniform budget. Defaults (128 vs 8192) hold through
-~60 ranks.
+Rank 0 sends far fewer tokens than its peers under balanced routing. Dispatch
+must size its pre-poll per-tile metadata (``tile_id_to_expert``,
+``pool_arrival_target``) from the global token count: sized from the local
+count, the underfull rank's budget is smaller than the ``total_tiles`` it
+actually receives and narrowing to it fails. The overflow condition holds when
+``t_large > t_small * (world_size + 1)``; the defaults (128 vs 8192) hold up
+to about 60 ranks.
 """
 
 import argparse
@@ -43,22 +15,14 @@ import os
 import torch
 import torch.distributed as dist
 
-from stream_ep.stream_moe.profile_pipeline import (
-    DTYPE,
-    H,
-    NUM_EXPERTS,
-    SEQ_LEN_PER_RANK,
-    TOPK,
-    make_buffer,
-)
+from stream_ep import Buffer
+from stream_ep_tests.utils import DTYPE, H, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
 
-# Reuse the control routing from the skewed-experts stress test (same-dir on
-# sys.path when launched as a torchrun script). uniform_rotating spreads each
-# rank's tokens evenly across all experts -> it PASSES with uniform T, so any
-# failure here is caused purely by the uneven per-rank token counts below.
-from test_skewed_experts import scenario_uniform_rotating
-
-from utils import cleanup_dist
+# The control routing from the skewed-experts test: uniform_rotating spreads each
+# rank's tokens evenly across all experts and passes with uniform T, so any
+# failure here comes from the uneven per-rank token counts below.
+from stream_ep_tests.dist.test_skewed_experts import scenario_uniform_rotating
+from stream_ep_tests.utils import cleanup_dist
 
 
 def local_token_count(rank: int, t_small: int, t_large: int) -> int:
@@ -102,7 +66,9 @@ def main():
                 flush=True,
             )
 
-    buffer = make_buffer(group, args.num_sms)
+    if args.num_sms is not None:
+        Buffer.set_num_sms(args.num_sms)
+    buffer = Buffer.sized_for(group, H * DTYPE.itemsize)
     x = (torch.randn(T, H, dtype=DTYPE, device=device) * 0.1).contiguous()
     topk_idx, topk_weights, is_token_in_rank = scenario_uniform_rotating(T, K, E, world_size, rank, device)
 

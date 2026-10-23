@@ -1,50 +1,17 @@
-"""Streaming-MoE FWD+BWD under deterministic skewed routing distributions.
+"""Full ``stream_moe_func`` forward + backward under deterministic skewed routing.
 
-Stresses the dispatch / combine NVL-region protocol under routing
-distributions that production randomness rarely hits: runs the full
-streaming-MoE fwd+bwd pipeline (dispatch + kernel_a + kernel_y + combine
-+ bwd chain) under a set of explicitly-constructed routing scenarios,
-each exercising a different edge case of the dispatch protocol.
+Each scenario is built from ``(world_size, rank)`` alone, so failures
+reproduce exactly and the script runs unchanged on any topology:
 
-Why "explicitly-constructed": `torch.randint`-based routing makes
-failures luck-dependent. Deterministic scenarios make pass/fail
-reproducible across runs and let us bisect / iterate without
-re-rolling the routing seed.
+  ``uniform_rotating``    balanced load (the control).
+  ``all_to_first_K``      every token picks experts ``0..K-1``; the ranks
+                          owning them get everything, the rest nothing.
+  ``half_empty_experts``  only even experts receive tokens (empty-expert path).
+  ``per_rank_imbalance``  90% of tokens go to experts on rank 1.
+  ``power_law``           expert ``e`` gets half the share of expert ``e - 1``.
 
-Why "world-size agnostic": the same script runs on 1 node (intranode, NVL
-only — fast iteration baseline) and on several nodes (internode — the bug
-catcher). The scenarios are parameterized only by
-``world_size`` / ``rank``, no per-topology branching.
-
-Scenarios (deterministic per ``(world_size, rank)``):
-
-  ``uniform_rotating``     — every (token, k) picks distinct experts so the
-                             total load is exactly balanced. The balanced-load
-                             control.
-  ``all_to_first_K``       — every token picks experts ``[0..K-1]``.
-                             Maximal expert-dim skew toward the first K
-                             experts; ranks owning those experts get all
-                             tokens, others get none.
-  ``half_empty_experts``   — tokens only pick even-numbered experts. Half
-                             of E receive zero tokens. Exercises the
-                             empty-substream / cold-expert edge case.
-  ``per_rank_imbalance``   — 90% of tokens are routed exclusively to
-                             experts owned by rank 1; 10% spread.
-  ``power_law``            — geometric decay: expert 0 gets the largest
-                             share, expert 1 half of that, etc. Most
-                             realistic of training-time routing skew.
-
-For each scenario the test:
-
-  1. Builds ``topk_idx`` / ``topk_weights`` / ``is_token_in_rank``.
-  2. Allocates random ``w1_local`` / ``w2_local`` per rank (small N(0, 0.02)).
-  3. Runs ``stream_moe_func`` forward.
-  4. Runs ``out.sum().backward()`` to produce gradients on the expert
-     weights via the autograd chain through ``stream_moe_func``.
-  5. Asserts ``isfinite(out).all()`` AND ``isfinite(w*.grad).all()``.
-
-Pass / fail summary printed at end. Non-zero exit if any scenario
-fails.
+For each scenario the forward and the backward must produce finite outputs
+and weight gradients. Prints a summary; exits non-zero if any scenario fails.
 """
 
 import argparse
@@ -54,21 +21,14 @@ import torch
 import torch.distributed as dist
 
 # Reuse the production-shape constants + buffer construction utilities.
-from stream_ep.stream_moe.profile_pipeline import (
-    DTYPE,
-    H,
-    I,
-    NUM_EXPERTS,
-    SEQ_LEN_PER_RANK,
-    TOPK,
-    make_buffer,
-)
+from stream_ep import Buffer
+from stream_ep_tests.utils import DTYPE, H, I, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
 from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )
 
-from utils import cleanup_dist
+from stream_ep_tests.utils import cleanup_dist
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +312,9 @@ def main():
         print(f"[skewed-experts] scenarios: {[n for n, _ in scenarios]}", flush=True)
 
     # Buffer + streams: shared across scenarios.
-    buffer = make_buffer(group, args.num_sms)
+    if args.num_sms is not None:
+        Buffer.set_num_sms(args.num_sms)
+    buffer = Buffer.sized_for(group, H * DTYPE.itemsize)
     streams = make_streams(device=device)
 
     # Per-rank expert weights (small N(0, 0.02) so output magnitudes are stable).

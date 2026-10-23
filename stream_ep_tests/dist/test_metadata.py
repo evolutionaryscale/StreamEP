@@ -1,20 +1,10 @@
-"""Standalone correctness test for `streaming_dispatch_metadata_kernel`.
+"""Every output of ``streaming_dispatch_metadata`` against an eager reference.
 
-Per-tensor diff of every metadata-kernel output on the dispatch `handle`
-against an independent eager-torch reference computed from globally-
-gathered `topk_idx`. Self-validating — no v1 / v2 comparison; the kernel
-is "right" iff every output matches the pure-torch reference.
-
-Runs intranode by default (world=8). Pass `--internode` to validate on a
-multi-node alloc (world=16+) — that path additionally verifies the
-NVL/RDMA partitioned `base_pool` ordering plus the internode-only
-counters (`recv_rdma_rank_prefix_sum`, `recv_gbl_rank_prefix_sum`).
-
-Launch:
-    torchrun --standalone --nproc-per-node=8 tests/test_metadata.py
-    torchrun --nnodes=<N> --nproc-per-node=8 ... tests/test_metadata.py --internode
-
-Exits 0 on PASS, non-zero on first FAIL with a printed diff summary.
+The reference is computed in torch from all ranks' gathered ``topk_idx``. On
+more than one node the Buffer takes the internode path, and the test also
+checks the NVL/RDMA-partitioned ``base_pool`` ordering and the internode-only
+counters (``recv_rdma_rank_prefix_sum``, ``recv_gbl_rank_prefix_sum``). Prints
+a per-tensor diff summary on the first mismatch.
 """
 
 import argparse
@@ -24,7 +14,7 @@ import sys
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -270,11 +260,6 @@ def diff_scalar(actual: int, expected: int, name: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--internode",
-        action="store_true",
-        help="Run with the internode metadata kernel (4-node).",
-    )
     parser.add_argument("--num_tokens", type=int, default=8192)
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--num_topk", type=int, default=13)
@@ -309,18 +294,10 @@ def main():
 
     # Size NVL / RDMA bytes (mirror the rest of the test suite).
     hidden_bytes = args.hidden * 2
-    nvl_bytes = 0
-    rdma_bytes = 0
-    for cfg in (
-        Buffer.get_dispatch_config(world_size),
-        Buffer.get_combine_config(world_size),
-    ):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
     num_channels = Buffer.num_sms // 2
 
-    is_internode = args.internode
+    is_internode = buf._is_internode()
     if rank == 0:
         print(
             f"[metadata] world={world_size} num_sms={Buffer.num_sms} "

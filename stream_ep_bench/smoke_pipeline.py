@@ -8,7 +8,7 @@ runs end-to-end without hanging or producing invalid results.
 
 Launch:
     torchrun --nproc_per_node=8 \\
-        -m stream_ep.stream_moe.smoke_pipeline
+        -m stream_ep_bench.smoke_pipeline
 """
 
 import argparse
@@ -17,21 +17,13 @@ import time
 import torch
 import torch.distributed as torch_dist
 
-from stream_ep.stream_moe.profile_pipeline import (
-    DTYPE,
-    NUM_EXPERTS,
-    SEQ_LEN_PER_RANK,
-    TOPK,
-    H,
-    I,
-    make_buffer,
-    make_uniform_topk_idx,
-)
+from stream_ep_tests.utils import DTYPE, H, I, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
+from stream_ep_bench.profile_pipeline import make_buffer, make_uniform_topk_idx
 from stream_ep.stream_moe.stream_moe import (
     make_streams,
     stream_moe_func,
 )
-from stream_ep.stream_moe.profile_pipeline import (
+from stream_ep_bench.profile_pipeline import (
     barrier,
     get_global_rank,
     get_world_size,

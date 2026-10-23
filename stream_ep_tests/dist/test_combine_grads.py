@@ -1,22 +1,14 @@
-"""End-to-end test for the streaming-MoE backward combine_grads.
+"""``Buffer.combine_grads`` against an analytical reference.
 
-Exercises ``Buffer.combine_grads`` (intranode). Uses the SAME underlying
-``combine_main_kernel`` as fwd ``Buffer.combine`` — the test verifies the
-sender's slot-lookup weight payload (loads ``weight_grads[slot]`` via
-``recv_token_to_slots[r, k]``, ships 0 for non-local k) and the receiver's
-sum-reduction in both halves.
+combine_grads shares ``combine_main_kernel`` with forward combine; this checks
+the sender's per-slot weight payload (``weight_grads[slot]`` via
+``recv_token_to_slots[r, k]``, 0 for non-local k) and the receiver's reduction
+of both halves. With ``dL_dx_per_r`` and ``weight_grads`` tagged
+``float(rank)``:
 
-Trick: per-rank tag dL_dx_per_r and weight_grads with ``float(rank)``. Then
-analytical reference is:
-
-  - dL_dx[t] = sum over ranks R that t was sent to of float(R) — same as fwd.
-  - dL_dtopk_weights[t, k] = float(topk_idx[t, k] / num_local_experts) — the
-    one rank that hosts expert topk_idx[t, k] writes float(R), all others 0.
-
-Driver convention matches the rest of the streaming tests:
-
-    torchrun --nproc_per_node=2 StreamEP/tests/test_combine_grads.py
-    torchrun --nproc_per_node=8 StreamEP/tests/test_combine_grads.py
+  - ``dL_dx[t]`` is the sum of the tags of the ranks ``t`` was sent to;
+  - ``dL_dtopk_weights[t, k]`` is the tag of the rank hosting
+    ``topk_idx[t, k]``.
 """
 
 import os
@@ -24,7 +16,7 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 def main():
@@ -44,12 +36,7 @@ def main():
     tile_m = 32
 
     hidden_bytes = hidden * 2
-    nvl_bytes = 0
-    rdma_bytes = 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
 

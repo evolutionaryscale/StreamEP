@@ -120,7 +120,7 @@ class Buffer:
     # auto-picks ``num_sms`` from the group size: 80 SMs for intra-/2-node
     # NVL-dominated runs, 64 SMs from 4+ nodes where RDMA tail latency rewards
     # fewer but larger per-channel chunks. Tuned via
-    # ``stream_ep/stream_moe/profile_pipeline.py``.
+    # ``stream_ep_bench/profile_pipeline.py``.
     _num_sms_explicit: bool = False
 
     def __init__(
@@ -424,7 +424,7 @@ class Buffer:
         """
 
         # Resolve the world-size num_sms auto-pick BEFORE building the config
-        # (which bakes in Buffer.num_sms). Both make_buffer and the evoscale
+        # (which bakes in Buffer.num_sms). Buffer.sized_for and the evoscale
         # StreamMoEWrapper size the comm buffers from this config and then
         # construct the Buffer, so resolving num_sms here makes the
         # allocation's num_sms match the later kernel-launch num_sms — otherwise
@@ -490,6 +490,16 @@ class Buffer:
         }
         assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         return config_map[num_ranks]
+
+    @classmethod
+    def sized_for(cls, group: dist.ProcessGroup, hidden_bytes: int) -> "Buffer":
+        """A Buffer whose NVL / RDMA regions fit dispatch and combine of
+        ``hidden_bytes``-wide tokens at the recommended configs for this group."""
+        num_ranks = group.size()
+        configs = (cls.get_dispatch_config(num_ranks), cls.get_combine_config(num_ranks))
+        num_nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, num_ranks) for cfg in configs)
+        num_rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, num_ranks) for cfg in configs)
+        return cls(group, num_nvl_bytes, num_rdma_bytes)
 
     # noinspection PyTypeChecker
     def dispatch(
