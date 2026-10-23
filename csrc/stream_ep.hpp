@@ -193,8 +193,8 @@ private:
     // (and the array) cycle through 2^32 every ~500k training steps.
     uint32_t* dispatch_reader_prev_head = nullptr;
     uint32_t* dispatch_reader_prev_tail = nullptr;
-    uint32_t* combine_reader_prev_head  = nullptr;
-    uint32_t* combine_reader_prev_tail  = nullptr;
+    uint32_t* combine_reader_prev_head = nullptr;
+    uint32_t* combine_reader_prev_tail = nullptr;
 
     // Shrink mode buffer
     bool enable_shrink = false;
@@ -412,16 +412,15 @@ public:
     // tensors without serializing against dispatch main.
     //
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()` — caller-managed.
-    StreamingDispatchOutputs intranode_dispatch(
-        const torch::Tensor& x,
-        const torch::Tensor& topk_idx,
-        const torch::Tensor& topk_weights,
-        const torch::Tensor& is_token_in_rank,
-        int num_experts,
-        int expert_alignment,
-        int tile_m,
-        int64_t dispatch_seq,
-        const Config& config);
+    StreamingDispatchOutputs intranode_dispatch(const torch::Tensor& x,
+                                                const torch::Tensor& topk_idx,
+                                                const torch::Tensor& topk_weights,
+                                                const torch::Tensor& is_token_in_rank,
+                                                int num_experts,
+                                                int expert_alignment,
+                                                int tile_m,
+                                                int64_t dispatch_seq,
+                                                const Config& config);
 
     // Backward dispatch_grads: ship dL/dy[t] origin → expert ranks along the
     // same (t, dst_rank) routing as forward dispatch. Receiver writes K times
@@ -432,20 +431,19 @@ public:
     // memset and the kernel launch. Returns (dL_do_pool,
     // bwd_dispatch_arrival_count); caller (orchestrator) holds the count for
     // kernel_y_bwd to spin on (count == pool_arrival_target).
-    std::tuple<torch::Tensor, torch::Tensor, EventHandle> intranode_dispatch_grads(
-        const torch::Tensor& dL_dy,
-        const torch::Tensor& is_token_in_rank,
-        const torch::Tensor& recv_token_to_slots,
-        const torch::Tensor& base_pool,
-        const torch::Tensor& seen_per_substream,
-        const torch::Tensor& pool_arrival_target,
-        const torch::Tensor& rank_prefix_matrix,
-        int num_experts,
-        int num_topk,
-        int tile_m,
-        int64_t TK_padded,
-        int64_t dispatch_seq,
-        const Config& config);
+    std::tuple<torch::Tensor, torch::Tensor, EventHandle> intranode_dispatch_grads(const torch::Tensor& dL_dy,
+                                                                                   const torch::Tensor& is_token_in_rank,
+                                                                                   const torch::Tensor& recv_token_to_slots,
+                                                                                   const torch::Tensor& base_pool,
+                                                                                   const torch::Tensor& seen_per_substream,
+                                                                                   const torch::Tensor& pool_arrival_target,
+                                                                                   const torch::Tensor& rank_prefix_matrix,
+                                                                                   int num_experts,
+                                                                                   int num_topk,
+                                                                                   int tile_m,
+                                                                                   int64_t TK_padded,
+                                                                                   int64_t dispatch_seq,
+                                                                                   const Config& config);
 
     // Combine: reduces per-recv-token x[r] back to source ranks. Used for both
     // forward (sums weighted x → out) and backward combine_grads (sums per-recv-token
@@ -464,17 +462,16 @@ public:
     // pool_topk_weight per row, so `recv_x[t]` is the full Σ_k w_k·y_k.
     // `is_fwd` = false (bwd combine_grads): unchanged — ships dL/dweight
     // per K, receiver sums into `recv_topk_weights_out`.
-    std::tuple<torch::Tensor, c10::optional<torch::Tensor>> intranode_combine(
-        const torch::Tensor& x,
-        const torch::Tensor& per_slot_weights,
-        const torch::Tensor& recv_token_to_slots,
-        const torch::Tensor& rank_prefix_matrix,
-        const torch::Tensor& channel_prefix_matrix,
-        const torch::Tensor& send_head,
-        const torch::Tensor& y_done_per_token,
-        int64_t combine_seq,
-        bool is_fwd,
-        const Config& config);
+    std::tuple<torch::Tensor, c10::optional<torch::Tensor>> intranode_combine(const torch::Tensor& x,
+                                                                              const torch::Tensor& per_slot_weights,
+                                                                              const torch::Tensor& recv_token_to_slots,
+                                                                              const torch::Tensor& rank_prefix_matrix,
+                                                                              const torch::Tensor& channel_prefix_matrix,
+                                                                              const torch::Tensor& send_head,
+                                                                              const torch::Tensor& y_done_per_token,
+                                                                              int64_t combine_seq,
+                                                                              bool is_fwd,
+                                                                              const Config& config);
 
     // Streaming-MoE consolidated dispatch (internode, pool layout). Mirrors
     // the intranode entry point: one folded metadata kernel + one host poll +
@@ -483,16 +480,15 @@ public:
     // tensors (see struct definition above).
     //
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()` — caller-managed.
-    StreamingDispatchOutputs internode_dispatch(
-        const torch::Tensor& x,
-        const torch::Tensor& topk_idx,
-        const torch::Tensor& topk_weights,
-        const torch::Tensor& is_token_in_rank,
-        int num_experts,
-        int expert_alignment,
-        int tile_m,
-        int64_t dispatch_seq,
-        const Config& config);
+    StreamingDispatchOutputs internode_dispatch(const torch::Tensor& x,
+                                                const torch::Tensor& topk_idx,
+                                                const torch::Tensor& topk_weights,
+                                                const torch::Tensor& is_token_in_rank,
+                                                int num_experts,
+                                                int expert_alignment,
+                                                int tile_m,
+                                                int64_t dispatch_seq,
+                                                const Config& config);
 
     // Streaming-MoE bwd dispatch (internode, pool layout). Mirrors
     // `Buffer::intranode_dispatch_grads`: ships dL/dy[t] origin → expert ranks
@@ -505,13 +501,12 @@ public:
     // `StreamingDispatchOutputs` from the fwd dispatch and are reused here.
     //
     // Streams: kernel runs on `at::cuda::getCurrentCUDAStream()`.
-    std::tuple<torch::Tensor, torch::Tensor, EventHandle> internode_dispatch_grads(
-        const torch::Tensor& dL_dy,
-        const torch::Tensor& is_token_in_rank,
-        const StreamingDispatchOutputs& dispatch_out,
-        int64_t TK_padded,
-        int64_t dispatch_seq,
-        const Config& config);
+    std::tuple<torch::Tensor, torch::Tensor, EventHandle> internode_dispatch_grads(const torch::Tensor& dL_dy,
+                                                                                   const torch::Tensor& is_token_in_rank,
+                                                                                   const StreamingDispatchOutputs& dispatch_out,
+                                                                                   int64_t TK_padded,
+                                                                                   int64_t dispatch_seq,
+                                                                                   const Config& config);
 
     // Streaming-MoE combine (internode, pool layout). Single
     // `internode::launch_combine_main` call: three-warp-role NVL→RDMA→
@@ -525,19 +520,17 @@ public:
     //
     // Streams: kernels run on `at::cuda::getCurrentCUDAStream()`.
     // See `intranode_combine` for `is_fwd` semantics — same contract.
-    std::tuple<torch::Tensor, c10::optional<torch::Tensor>> internode_combine(
-        const torch::Tensor& x,
-        const torch::Tensor& per_slot_weights,
-        const StreamingDispatchOutputs& dispatch_out,
-        const torch::Tensor& y_done_per_token,
-        int64_t combine_seq,
-        // 0 = fwd combine, 1 = bwd combine_grads. Forwarded into
-        // `internode::launch_combine_main` to phase-distinguish the NVL
-        // gen-stamp tag on the combine ring.
-        int64_t combine_phase,
-        bool is_fwd,
-        const Config& config);
-
+    std::tuple<torch::Tensor, c10::optional<torch::Tensor>> internode_combine(const torch::Tensor& x,
+                                                                              const torch::Tensor& per_slot_weights,
+                                                                              const StreamingDispatchOutputs& dispatch_out,
+                                                                              const torch::Tensor& y_done_per_token,
+                                                                              int64_t combine_seq,
+                                                                              // 0 = fwd combine, 1 = bwd combine_grads. Forwarded into
+                                                                              // `internode::launch_combine_main` to phase-distinguish the
+                                                                              // NVL gen-stamp tag on the combine ring.
+                                                                              int64_t combine_phase,
+                                                                              bool is_fwd,
+                                                                              const Config& config);
 };
 
 }  // namespace stream_ep

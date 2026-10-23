@@ -64,13 +64,18 @@ def populate_handle_o_with_rank_tag(handle, rank, num_recv_tokens, hidden, dtype
     handle.o.fill_(float(rank))
 
 
-def run_one_dispatch_combine(buf, x, topk_idx, topk_weights, is_token_in_rank,
-                             num_experts, num_topk, hidden, num_ranks, rank,
-                             tile_m, dispatch_seq, dtype, device):
+def run_one_dispatch_combine(
+    buf, x, topk_idx, topk_weights, is_token_in_rank, num_experts, num_topk, hidden, num_ranks, rank, tile_m, dispatch_seq, dtype, device
+):
     """One dispatch + manual o/y_done_per_token fill + combine + check."""
     pool, handle, _event = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=dispatch_seq,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        tile_m=tile_m,
+        dispatch_seq=dispatch_seq,
     )
     torch.cuda.synchronize()
 
@@ -84,7 +89,8 @@ def run_one_dispatch_combine(buf, x, topk_idx, topk_weights, is_token_in_rank,
     # Run combine. Use the same int as combine_seq for symmetry with the
     # production layer wrapper.
     out, _recv_topk = buf.combine(
-        handle.o, handle,
+        handle.o,
+        handle,
         combine_seq=dispatch_seq,
     )
     torch.cuda.synchronize()
@@ -125,12 +131,30 @@ def main():
 
     # ─── Test 1: basic combine. Single dispatch + populated o + combine.
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=123,
+        num_tokens,
+        hidden,
+        num_topk,
+        num_experts,
+        world_size,
+        rank,
+        device,
+        seed=123,
     )
     T_recv = run_one_dispatch_combine(
-        buf, x, topk_idx, topk_weights, is_token_in_rank,
-        num_experts, num_topk, hidden, world_size, rank,
-        tile_m, dispatch_seq=1, dtype=dtype, device=device,
+        buf,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        world_size,
+        rank,
+        tile_m,
+        dispatch_seq=1,
+        dtype=dtype,
+        device=device,
     )
     if rank == 0:
         print(f"PASS test_basic_combine: world={world_size} T_recv={T_recv}")
@@ -140,12 +164,30 @@ def main():
     # expected output (no cross-dispatch contamination).
     for seq, seed in enumerate([456, 789, 1011], start=2):
         x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-            num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=seed,
+            num_tokens,
+            hidden,
+            num_topk,
+            num_experts,
+            world_size,
+            rank,
+            device,
+            seed=seed,
         )
         T_recv = run_one_dispatch_combine(
-            buf, x, topk_idx, topk_weights, is_token_in_rank,
-            num_experts, num_topk, hidden, world_size, rank,
-            tile_m, dispatch_seq=seq, dtype=dtype, device=device,
+            buf,
+            x,
+            topk_idx,
+            topk_weights,
+            is_token_in_rank,
+            num_experts,
+            num_topk,
+            hidden,
+            world_size,
+            rank,
+            tile_m,
+            dispatch_seq=seq,
+            dtype=dtype,
+            device=device,
         )
         if rank == 0:
             print(f"PASS test_multi_dispatch_combine #{seq - 1} (seed={seed}): T_recv={T_recv}")

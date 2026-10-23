@@ -49,34 +49,38 @@ from stream_ep import Buffer
 from utils import cleanup_dist, make_inputs
 
 
-def expected_combine_output(is_token_in_rank: torch.Tensor,
-                            num_tokens: int, hidden: int, num_ranks: int,
-                            dtype: torch.dtype,
-                            device: torch.device) -> torch.Tensor:
+def expected_combine_output(
+    is_token_in_rank: torch.Tensor, num_tokens: int, hidden: int, num_ranks: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
     """For ``x[r] = float(rank)``, ``combined_x[t] = sum over r where
     is_token_in_rank[t, r], of float(r)``. Each contributing rank ships
     back its own tag value via combine; receiver sums K_dst contributions.
     """
-    contrib = torch.arange(num_ranks, dtype=torch.float32,
-                           device=device).unsqueeze(0)
-    out_per_token = (is_token_in_rank.float() * contrib).sum(
-        dim=-1, keepdim=True)
+    contrib = torch.arange(num_ranks, dtype=torch.float32, device=device).unsqueeze(0)
+    out_per_token = (is_token_in_rank.float() * contrib).sum(dim=-1, keepdim=True)
     return out_per_token.expand(num_tokens, hidden).to(dtype).contiguous()
 
 
-def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
-                             topk_idx: torch.Tensor,
-                             topk_weights: torch.Tensor,
-                             is_token_in_rank: torch.Tensor,
-                             num_experts: int, num_topk: int, hidden: int,
-                             world_size: int, rank: int, tile_m: int,
-                             dispatch_seq: int, combine_seq: int,
-                             *, dtype: torch.dtype,
-                             device: torch.device) -> int:
+def run_one_dispatch_combine(
+    buf: Buffer,
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    is_token_in_rank: torch.Tensor,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    world_size: int,
+    rank: int,
+    tile_m: int,
+    dispatch_seq: int,
+    combine_seq: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> int:
     """Drive one dispatch + manual o-fill + combine cycle and check output."""
-    _, handle, _ = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=dispatch_seq)
+    _, handle, _ = buf.dispatch(x, topk_idx, topk_weights, is_token_in_rank, num_experts, tile_m=tile_m, dispatch_seq=dispatch_seq)
     torch.cuda.synchronize()
 
     T_recv = handle.o.shape[0]
@@ -84,26 +88,24 @@ def run_one_dispatch_combine(buf: Buffer, x: torch.Tensor,
     handle.o.fill_(float(rank))
     handle.y_done_per_token.fill_(combine_seq)
 
-    recv_x, recv_topk = buf.combine(
-        handle.o, handle, combine_seq=combine_seq)
+    recv_x, recv_topk = buf.combine(handle.o, handle, combine_seq=combine_seq)
 
     torch.cuda.synchronize()
 
-    expected = expected_combine_output(
-        is_token_in_rank, x.shape[0], hidden, world_size, dtype, device)
+    expected = expected_combine_output(is_token_in_rank, x.shape[0], hidden, world_size, dtype, device)
     diff = (recv_x.float() - expected.float()).abs().max().item()
     assert diff < 1e-2, (
         f"combine output mismatch (max abs diff = {diff:.4e}); "
         f"rank={rank} dispatch_seq={dispatch_seq} combine_seq={combine_seq}\n"
         f"  expected[0:4, 0]: {expected[:4, 0].cpu().tolist()}\n"
-        f"  actual[0:4, 0]:   {recv_x[:4, 0].cpu().tolist()}")
+        f"  actual[0:4, 0]:   {recv_x[:4, 0].cpu().tolist()}"
+    )
 
     # Fwd combine doesn't produce per-K topk-weight output (kernel Y
     # pre-multiplies in production; the test fills handle.o directly so this
     # is fine to skip). The bwd combine_grads path still computes
     # dL/dtopk_weights — covered by test_combine_grads.py.
-    assert recv_topk is None, (
-        f"fwd combine should return None for recv_topk_weights; got {recv_topk!r}")
+    assert recv_topk is None, f"fwd combine should return None for recv_topk_weights; got {recv_topk!r}"
 
     return T_recv
 
@@ -118,9 +120,7 @@ def main():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
-    assert world_size % 8 == 0 and world_size > 8, (
-        f"This test requires multi-RDMA (world_size > 8, world_size % 8 == 0); "
-        f"got {world_size}")
+    assert world_size % 8 == 0 and world_size > 8, f"This test requires multi-RDMA (world_size > 8, world_size % 8 == 0); got {world_size}"
 
     num_experts = 64
     num_topk = 4
@@ -131,53 +131,84 @@ def main():
 
     hidden_bytes = hidden * 2
     nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size),
-                Buffer.get_combine_config(world_size)):
-        nvl_bytes  = max(cfg.get_nvl_buffer_size_hint(hidden_bytes,  world_size), nvl_bytes)
+    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
+        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-        seed=123, plant_sentinels=True)
+        num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=123, plant_sentinels=True
+    )
     T_recv = run_one_dispatch_combine(
-        buf, x, topk_idx, topk_weights, is_token_in_rank,
-        num_experts, num_topk, hidden, world_size, rank, tile_m,
-        dispatch_seq=1, combine_seq=1,
-        dtype=dtype, device=device)
+        buf,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        world_size,
+        rank,
+        tile_m,
+        dispatch_seq=1,
+        combine_seq=1,
+        dtype=dtype,
+        device=device,
+    )
     if rank == 0:
-        print(f"PASS test_basic_combine_internode: world={world_size} "
-              f"T_recv={T_recv}", flush=True)
+        print(f"PASS test_basic_combine_internode: world={world_size} T_recv={T_recv}", flush=True)
 
     for seq, seed in enumerate([456, 789, 1011], start=2):
         x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-            num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-            seed=seed, plant_sentinels=True)
+            num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=seed, plant_sentinels=True
+        )
         T_recv = run_one_dispatch_combine(
-            buf, x, topk_idx, topk_weights, is_token_in_rank,
-            num_experts, num_topk, hidden, world_size, rank, tile_m,
-            dispatch_seq=seq, combine_seq=seq,
-            dtype=dtype, device=device)
+            buf,
+            x,
+            topk_idx,
+            topk_weights,
+            is_token_in_rank,
+            num_experts,
+            num_topk,
+            hidden,
+            world_size,
+            rank,
+            tile_m,
+            dispatch_seq=seq,
+            combine_seq=seq,
+            dtype=dtype,
+            device=device,
+        )
         if rank == 0:
-            print(f"PASS test_multi_iter_combine_internode #{seq - 1} "
-                  f"(seed={seed}): T_recv={T_recv}", flush=True)
+            print(f"PASS test_multi_iter_combine_internode #{seq - 1} (seed={seed}): T_recv={T_recv}", flush=True)
 
     plant_e = 0
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-        seed=2024, plant_sentinels=True, plant_empty_expert=plant_e)
+        num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=2024, plant_sentinels=True, plant_empty_expert=plant_e
+    )
     T_recv = run_one_dispatch_combine(
-        buf, x, topk_idx, topk_weights, is_token_in_rank,
-        num_experts, num_topk, hidden, world_size, rank, tile_m,
-        dispatch_seq=10, combine_seq=10,
-        dtype=dtype, device=device)
+        buf,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        world_size,
+        rank,
+        tile_m,
+        dispatch_seq=10,
+        combine_seq=10,
+        dtype=dtype,
+        device=device,
+    )
     if rank == 0:
-        print(f"PASS test_combine_internode_empty_expert (e={plant_e}): "
-              f"world={world_size} T_recv={T_recv}", flush=True)
+        print(f"PASS test_combine_internode_empty_expert (e={plant_e}): world={world_size} T_recv={T_recv}", flush=True)
 
     if rank == 0:
-        print(f"PASS: all internode combine validations on rank 0 "
-              f"(world={world_size})", flush=True)
+        print(f"PASS: all internode combine validations on rank 0 (world={world_size})", flush=True)
 
     cleanup_dist()
 

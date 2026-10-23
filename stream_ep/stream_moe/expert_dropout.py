@@ -56,9 +56,7 @@ class DropoutSeed(Scalar):
     @cutlass.cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
         seed = Scalar.begin(self, gemm, param, smem_tensor, ctx)
-        tDcD = ctx.partition_for_epilogue_fn(
-            cutlass.cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
-        )
+        tDcD = ctx.partition_for_epilogue_fn(cutlass.cute.make_identity_tensor((ctx.tile_M, ctx.tile_N)))
         row0 = ctx.tile_coord_mnkl[0] * ctx.tile_M
         if const_expr(ctx.varlen_manager.varlen_m):
             row0 = row0 + ctx.varlen_manager.params.cu_seqlens_m[ctx.batch_idx]

@@ -70,11 +70,9 @@ struct Config {
         // drift between the two kernels.
         size_t num_bytes = 0;
         num_bytes += internode::get_dispatch_nvl_region_bytes(
-            hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
-            num_channels, num_rdma_ranks);
+            hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens, num_channels, num_rdma_ranks);
         num_bytes += internode::get_combine_nvl_region_bytes(
-            hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens,
-            num_channels, num_rdma_ranks);
+            hidden_int4, kNumMaxTopK, num_max_nvl_chunked_recv_tokens, num_channels, num_rdma_ranks);
         // Internode only: the streaming-metadata kernels carve their NVL
         // slabs (Phase-A5 count slabs + the Phase-B streaming-superset
         // inbox) at nvl_metadata_offset = dispatch region + combine region,
@@ -89,8 +87,7 @@ struct Config {
         // kNumMaxTopK bound above; internode_dispatch re-asserts that the
         // actual carve fits the actual allocation.
         if (num_ranks > NUM_MAX_NVL_PEERS)
-            num_bytes += internode::get_metadata_nvl_region_bytes(
-                NUM_MAX_LOCAL_EXPERTS, num_channels, num_rdma_ranks);
+            num_bytes += internode::get_metadata_nvl_region_bytes(NUM_MAX_LOCAL_EXPERTS, num_channels, num_rdma_ranks);
         // NOTE: upstream DeepEP appends a per-slot fp8-scales block here
         // (num_channels * num_nvl_ranks * recv_tokens * kNumMaxScales floats).
         // stream_ep never quantizes dispatched tokens, so no kernel indexes it
@@ -129,11 +126,9 @@ struct Config {
         // above.
         size_t num_bytes = 0;
         num_bytes += internode::get_dispatch_rdma_region_bytes(
-            hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens,
-            num_channels, num_rdma_ranks);
+            hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens, num_channels, num_rdma_ranks);
         num_bytes += internode::get_combine_rdma_region_bytes(
-            hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens,
-            num_channels, num_rdma_ranks);
+            hidden_int4, kNumMaxTopK, num_max_rdma_chunked_recv_tokens, num_channels, num_rdma_ranks);
         // NOTE: dropped the unused per-slot fp8-scales padding block here; see
         // the matching note in get_nvl_buffer_size_hint above. stream_ep never
         // quantizes dispatched tokens, and the combine SymBuffer offsets past

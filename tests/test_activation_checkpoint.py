@@ -67,14 +67,18 @@ def main():
     # ⟹ bit-identical pool placement ⟹ the only off-vs-on difference is the
     # atomic-reassociation noise (which off-vs-off also has).
     x0, topk_idx, topk_weights0, is_token_in_rank = make_inputs(
-        num_tokens, H, num_topk, num_experts, world_size, rank, device,
+        num_tokens,
+        H,
+        num_topk,
+        num_experts,
+        world_size,
+        rank,
+        device,
         x_kind="randn",
     )
     g = torch.Generator(device=device).manual_seed(2024 + rank)
-    w1_local = (torch.randn(num_local_experts, 2 * I, H, dtype=torch.bfloat16,
-                            device=device, generator=g) * 0.02).contiguous()
-    w2_local = (torch.randn(num_local_experts, H, I, dtype=torch.bfloat16,
-                            device=device, generator=g) * 0.02).contiguous()
+    w1_local = (torch.randn(num_local_experts, 2 * I, H, dtype=torch.bfloat16, device=device, generator=g) * 0.02).contiguous()
+    w2_local = (torch.randn(num_local_experts, H, I, dtype=torch.bfloat16, device=device, generator=g) * 0.02).contiguous()
 
     streams = make_streams()
 
@@ -84,8 +88,15 @@ def main():
         w1 = w1_local.clone().requires_grad_(True)
         w2 = w2_local.clone().requires_grad_(True)
         out = stream_moe_func(
-            buf, x, topk_idx, topk_weights, is_token_in_rank, w1, w2,
-            streams=streams, num_experts=num_experts,
+            buf,
+            x,
+            topk_idx,
+            topk_weights,
+            is_token_in_rank,
+            w1,
+            w2,
+            streams=streams,
+            num_experts=num_experts,
             activation_checkpoint_level=level,
         )
         out.sum().backward()
@@ -117,28 +128,24 @@ def main():
     # preact_a, or a wrong pool re-expansion at level 2) blows past both by
     # orders of magnitude / O(1) relative.
     slack = 4.0
-    atol = 1e-3   # absolute floor for tensors whose values + noise are ~0
-    rtol = 2e-2   # bf16 GEMM-accumulation tolerance (separate recompute kernel)
+    atol = 1e-3  # absolute floor for tensors whose values + noise are ~0
+    rtol = 2e-2  # bf16 GEMM-accumulation tolerance (separate recompute kernel)
     failures = []
     report = []
     for level, recomp in recomps.items():
         # Sanity: no NaN/Inf anywhere.
         for name, t in recomp.items():
-            assert torch.isfinite(t).all(), (
-                f"level {level} produced non-finite {name} (rank={rank})")
+            assert torch.isfinite(t).all(), f"level {level} produced non-finite {name} (rank={rank})"
         # Shapes must match the non-checkpointed path exactly.
         for k in recomp:
-            assert recomp[k].shape == base_a[k].shape, (
-                f"level {level}: {k} shape changed: "
-                f"{base_a[k].shape} vs {recomp[k].shape}")
+            assert recomp[k].shape == base_a[k].shape, f"level {level}: {k} shape changed: {base_a[k].shape} vs {recomp[k].shape}"
         for k in ("out", "dx", "dtopk", "dw1", "dw2"):
             noise = max_abs_diff(base_a[k], base_b[k])
             test = max_abs_diff(base_a[k], recomp[k])
             scale = base_a[k].abs().max().item()
             bound = max(slack * noise, atol, rtol * scale)
             report.append(
-                f"L{level} {k}: off-vs-on={test:.3e}  off-vs-off(noise)={noise:.3e}  "
-                f"rtol*scale={rtol * scale:.3e}  bound={bound:.3e}"
+                f"L{level} {k}: off-vs-on={test:.3e}  off-vs-off(noise)={noise:.3e}  rtol*scale={rtol * scale:.3e}  bound={bound:.3e}"
             )
             if test > bound:
                 failures.append(
@@ -155,8 +162,10 @@ def main():
     assert not failures, "activation_checkpoint_level mismatch:\n" + "\n".join(failures)
 
     if rank == 0:
-        print(f"PASS: activation_checkpoint grads within atomic-noise floor "
-              f"(world={world_size}, T={num_tokens}, H={H}, I={I}, E={num_experts}, K={num_topk})")
+        print(
+            f"PASS: activation_checkpoint grads within atomic-noise floor "
+            f"(world={world_size}, T={num_tokens}, H={H}, I={I}, E={num_experts}, K={num_topk})"
+        )
 
     cleanup_dist()
 

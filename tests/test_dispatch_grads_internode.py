@@ -38,9 +38,7 @@ def main():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
-    assert world_size % 8 == 0 and world_size > 8, (
-        f"This test requires multi-RDMA (world_size > 8, world_size % 8 == 0); "
-        f"got {world_size}")
+    assert world_size % 8 == 0 and world_size > 8, f"This test requires multi-RDMA (world_size > 8, world_size % 8 == 0); got {world_size}"
 
     num_experts = 64
     num_topk = 4
@@ -50,19 +48,16 @@ def main():
 
     hidden_bytes = hidden * 2
     nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size),
-                Buffer.get_combine_config(world_size)):
-        nvl_bytes  = max(cfg.get_nvl_buffer_size_hint(hidden_bytes,  world_size), nvl_bytes)
+    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
+        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device,
-        seed=123, x_kind="randn", plant_sentinels=True)
+        num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=123, x_kind="randn", plant_sentinels=True
+    )
 
-    _, handle, _ = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=1)
+    _, handle, _ = buf.dispatch(x, topk_idx, topk_weights, is_token_in_rank, num_experts, tile_m=tile_m, dispatch_seq=1)
     torch.cuda.synchronize()
 
     total_tiles = handle.total_tiles
@@ -70,19 +65,15 @@ def main():
     T_recv = handle.o.shape[0]
 
     g_dy = torch.Generator(device=device).manual_seed(7919 + rank * 31)
-    dL_dy = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16,
-                         device=device, generator=g_dy)
-             + rank * 100.0)
+    dL_dy = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device, generator=g_dy) + rank * 100.0
     dL_dy = dL_dy.contiguous()
 
     dL_do_pool, bwd_arrival_count, _grads_started = buf.dispatch_grads(handle, dL_dy, dispatch_seq=1)
     torch.cuda.synchronize()
 
-    assert dL_do_pool.shape == (TK_padded, hidden), \
-        f"dL_do_pool shape {dL_do_pool.shape} != ({TK_padded}, {hidden})"
+    assert dL_do_pool.shape == (TK_padded, hidden), f"dL_do_pool shape {dL_do_pool.shape} != ({TK_padded}, {hidden})"
     assert dL_do_pool.dtype == torch.bfloat16
-    assert bwd_arrival_count.shape == (total_tiles,), \
-        f"bwd_arrival_count shape {bwd_arrival_count.shape} != ({total_tiles},)"
+    assert bwd_arrival_count.shape == (total_tiles,), f"bwd_arrival_count shape {bwd_arrival_count.shape} != ({total_tiles},)"
     assert bwd_arrival_count.dtype == torch.int32
 
     all_dL_dy = [torch.empty_like(dL_dy) for _ in range(world_size)]
@@ -97,8 +88,8 @@ def main():
         src_in = all_is_in_rank[src][:, rank].cpu()
         idx_in_src = torch.nonzero(src_in, as_tuple=False).flatten().to(torch.int32)
         n = idx_in_src.numel()
-        recv_token_src_rank[cur:cur + n] = src
-        recv_token_src_idx[cur:cur + n] = idx_in_src
+        recv_token_src_rank[cur : cur + n] = src
+        recv_token_src_idx[cur : cur + n] = idx_in_src
         cur += n
     assert cur == T_recv, f"recv_token mapping size {cur} != T_recv {T_recv}"
 
@@ -120,27 +111,26 @@ def main():
             mismatches += 1
             if mismatches <= 4:
                 k = int(pool_k_slot[s].item())
-                print(f"[rank {rank}] slot {s} (r={r}, k={k}, src={src}, t_src={t_src}): "
-                      f"expected {expected[:4]}... got {got[:4]}...")
+                print(f"[rank {rank}] slot {s} (r={r}, k={k}, src={src}, t_src={t_src}): expected {expected[:4]}... got {got[:4]}...")
     assert mismatches == 0, f"[rank {rank}] {mismatches} slot mismatches in dL_do_pool"
 
     pool_arrival_target_cpu = handle.pool_arrival_target[:total_tiles].cpu()
     bwd_arrival_count_cpu = bwd_arrival_count.cpu()
     assert torch.equal(bwd_arrival_count_cpu, pool_arrival_target_cpu), (
         f"bwd_arrival_count not fully fired; first deviating tile_id: "
-        f"{(bwd_arrival_count_cpu != pool_arrival_target_cpu).nonzero().flatten()[:8]}")
+        f"{(bwd_arrival_count_cpu != pool_arrival_target_cpu).nonzero().flatten()[:8]}"
+    )
 
     dL_do_pool2, bwd_arrival_count2, _grads_started2 = buf.dispatch_grads(handle, dL_dy, dispatch_seq=2)
     torch.cuda.synchronize()
-    valid = (handle.pool_recv_token.cpu() >= 0)
-    assert torch.equal(dL_do_pool.cpu()[valid], dL_do_pool2.cpu()[valid]), \
-        "dL_do_pool (valid rows) not deterministic across re-runs"
-    assert torch.equal(bwd_arrival_count2.cpu(), pool_arrival_target_cpu), \
+    valid = handle.pool_recv_token.cpu() >= 0
+    assert torch.equal(dL_do_pool.cpu()[valid], dL_do_pool2.cpu()[valid]), "dL_do_pool (valid rows) not deterministic across re-runs"
+    assert torch.equal(bwd_arrival_count2.cpu(), pool_arrival_target_cpu), (
         "bwd_arrival_count did not refire to pool_arrival_target on second call"
+    )
 
     if rank == 0:
-        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} "
-              f"TK_padded={TK_padded} total_tiles={total_tiles}", flush=True)
+        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} TK_padded={TK_padded} total_tiles={total_tiles}", flush=True)
 
     cleanup_dist()
 

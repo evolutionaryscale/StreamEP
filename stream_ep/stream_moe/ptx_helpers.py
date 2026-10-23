@@ -35,9 +35,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
-def st_release_sys_global(
-    gmem_ptr: cute.Pointer, val: cutlass.Int64, *, loc=None, ip=None
-) -> None:
+def st_release_sys_global(gmem_ptr: cute.Pointer, val: cutlass.Int64, *, loc=None, ip=None) -> None:
     """Release-store an int64 value to a global pointer with .sys scope.
 
     The ``~{memory}`` clobber tells the LLVM optimizer this asm reads/writes
@@ -58,9 +56,7 @@ def st_release_sys_global(
 
 
 @dsl_user_op
-def st_release_gpu_global(
-    gmem_ptr: cute.Pointer, val: cutlass.Int64, *, loc=None, ip=None
-) -> None:
+def st_release_gpu_global(gmem_ptr: cute.Pointer, val: cutlass.Int64, *, loc=None, ip=None) -> None:
     """Release-store an int64 value to a global pointer with .gpu scope.
 
     Use for intra-GPU producer→consumer int64 stamps (different streams,
@@ -85,9 +81,7 @@ def st_release_gpu_global(
 
 
 @dsl_user_op
-def ld_acquire_sys_global(
-    gmem_ptr: cute.Pointer, *, loc=None, ip=None
-) -> cutlass.Int64:
+def ld_acquire_sys_global(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int64:
     """Acquire-load an int64 value from a global pointer with .sys scope.
 
     The ``~{memory}`` clobber prevents the LLVM optimizer from hoisting
@@ -110,9 +104,7 @@ def ld_acquire_sys_global(
 
 
 @dsl_user_op
-def ld_acquire_gpu_global(
-    gmem_ptr: cute.Pointer, *, loc=None, ip=None
-) -> cutlass.Int64:
+def ld_acquire_gpu_global(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int64:
     """Acquire-load an int64 value from a global pointer with .gpu scope.
 
     Pair with ``st_release_gpu_global`` for intra-GPU producer→consumer
@@ -132,9 +124,7 @@ def ld_acquire_gpu_global(
 
 
 @dsl_user_op
-def ld_acquire_gpu_global_i32(
-    gmem_ptr: cute.Pointer, *, loc=None, ip=None
-) -> cutlass.Int32:
+def ld_acquire_gpu_global_i32(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
     """Acquire-load an int32 value from a global pointer with .gpu scope.
 
     Used by the tile scheduler's spin on
@@ -158,9 +148,7 @@ def ld_acquire_gpu_global_i32(
 @dsl_user_op
 def threadfence_system(*, loc=None, ip=None) -> None:
     """System-scope memory fence (membar.sys)."""
-    llvm.inline_asm(
-        None, [], "membar.sys;", "", has_side_effects=True, is_align_stack=False
-    )
+    llvm.inline_asm(None, [], "membar.sys;", "", has_side_effects=True, is_align_stack=False)
 
 
 @dsl_user_op
@@ -170,9 +158,7 @@ def threadfence_gpu(*, loc=None, ip=None) -> None:
     device — flushes L1 + serializes against L2 without the cost of
     ``membar.sys``'s PCIe / NVLink fence.
     """
-    llvm.inline_asm(
-        None, [], "membar.gl;", "", has_side_effects=True, is_align_stack=False
-    )
+    llvm.inline_asm(None, [], "membar.gl;", "", has_side_effects=True, is_align_stack=False)
 
 
 @dsl_user_op
@@ -225,13 +211,7 @@ def red_add_bf16x2_v4_pred(
             cutlass.Int32(p3).ir_value(loc=loc, ip=ip),
             cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
         ],
-        (
-            "{\n\t"
-            ".reg .pred %p1;\n\t"
-            "setp.ne.b32 %p1, $5, 0;\n\t"
-            "@%p1 red.global.add.noftz.v4.bf16x2 [$0], {$1, $2, $3, $4};\n\t"
-            "}"
-        ),
+        ("{\n\t.reg .pred %p1;\n\tsetp.ne.b32 %p1, $5, 0;\n\t@%p1 red.global.add.noftz.v4.bf16x2 [$0], {$1, $2, $3, $4};\n\t}"),
         "l,r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -239,9 +219,7 @@ def red_add_bf16x2_v4_pred(
 
 
 @dsl_user_op
-def red_release_gpu_add_s32(
-    gmem_ptr: cute.Pointer, val: cutlass.Int32, *, loc=None, ip=None
-) -> None:
+def red_release_gpu_add_s32(gmem_ptr: cute.Pointer, val: cutlass.Int32, *, loc=None, ip=None) -> None:
     """``red.release.gpu.global.add.s32 [ptr], val;`` — release-add int32.
 
     Mirrors `fire_pool_blocks` in csrc/kernels/utils.cuh. Each contributor
@@ -265,9 +243,7 @@ def red_release_gpu_add_s32(
 
 
 @dsl_user_op
-def red_add_f32(
-    gmem_ptr: cute.Pointer, val: cutlass.Float32, *, loc=None, ip=None
-) -> None:
+def red_add_f32(gmem_ptr: cute.Pointer, val: cutlass.Float32, *, loc=None, ip=None) -> None:
     """Single fp32 atomic-add via ``red.global.add.f32 [ptr], val;``.
 
     Used by kernel_y_bwd's epilogue to accumulate per-pid_n stripe partials
@@ -309,8 +285,4 @@ def pack_bf16x2(lo: BFloat16, hi: BFloat16, *, loc=None, ip=None) -> cutlass.Int
         ip=ip,
     )
     vec_i32x1 = vector.bitcast(T.vector(1, T.i32()), vec_bf16x2)
-    return cutlass.Int32(
-        vector.extract(
-            vec_i32x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip
-        )
-    )
+    return cutlass.Int32(vector.extract(vec_i32x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip))

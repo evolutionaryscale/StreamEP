@@ -49,12 +49,16 @@ def main():
         rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
 
-    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
+    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
 
     pool, handle, _event = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=1,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        tile_m=tile_m,
+        dispatch_seq=1,
     )
     torch.cuda.synchronize()
 
@@ -73,9 +77,9 @@ def main():
     # Recv-tokens are laid out source-major: rank 0's first, then rank 1's, etc.
     # Each source rank's contribution is the ordered set of token indices where
     # is_token_in_rank[:, my_rank] is True.
-    expected_recv_token_src_rank = []          # [T_recv] → src_rank
-    expected_recv_token_src_idx = []           # [T_recv] → src_token_idx
-    expected_recv_topk_local = []              # [T_recv, num_topk] → e_local or -1
+    expected_recv_token_src_rank = []  # [T_recv] → src_rank
+    expected_recv_token_src_idx = []  # [T_recv] → src_token_idx
+    expected_recv_topk_local = []  # [T_recv, num_topk] → e_local or -1
     for src in range(world_size):
         src_in = all_is_in_rank[src][:, rank]
         idx_in_src = torch.nonzero(src_in, as_tuple=False).flatten()
@@ -116,9 +120,7 @@ def main():
         # Slot must fall in expert e_local's pool block range.
         block_start = int(expert_pool_block_offset[e_local].item()) * tile_m
         block_end = int(expert_pool_block_offset[e_local + 1].item()) * tile_m
-        assert block_start <= s < block_end, (
-            f"slot {s} for expert {e_local} outside [{block_start}, {block_end})"
-        )
+        assert block_start <= s < block_end, f"slot {s} for expert {e_local} outside [{block_start}, {block_end})"
         # Per-pool-slot data: src_rank's value.
         src_rank = int(expected_recv_token_src_rank[rt].item())
         actual = pool_cpu[s, 0].to(torch.int32).item()
@@ -129,17 +131,14 @@ def main():
         # pool_topk_weight matches the source token's topk_weight for this k.
         # (We don't explicitly gather topk_weights from peers; just sanity-check finiteness.)
         assert torch.isfinite(pool_topk_weight[s])
-    expected_seen = (expected_recv_topk_local >= 0)
-    assert torch.equal(seen_rk, expected_seen), (
-        f"pool covers {seen_rk.sum()} (rt, k) pairs but expected {expected_seen.sum()}"
-    )
+    expected_seen = expected_recv_topk_local >= 0
+    assert torch.equal(seen_rk, expected_seen), f"pool covers {seen_rk.sum()} (rt, k) pairs but expected {expected_seen.sum()}"
 
     # ─── (3) pool_arrival_count[tile] == pool_arrival_target[tile] for all tiles.
     pool_arrival_count = handle.pool_arrival_count[:total_tiles].cpu()
     pool_arrival_target_v = pool_arrival_target[:total_tiles]
     assert torch.equal(pool_arrival_count, pool_arrival_target_v), (
-        "pool_arrival_count not fully fired; mismatches at "
-        f"{(pool_arrival_count != pool_arrival_target_v).nonzero().flatten()[:8]}"
+        f"pool_arrival_count not fully fired; mismatches at {(pool_arrival_count != pool_arrival_target_v).nonzero().flatten()[:8]}"
     )
 
     # ─── (4) tile_id_to_expert agrees with the expert_pool_block_offset partition.
@@ -163,28 +162,21 @@ def main():
                 expected = n_e - tile_in_e * tile_m
             else:
                 expected = tile_m
-            assert target == expected, (
-                f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
-            )
+            assert target == expected, f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
 
     # ─── (6) Pipeline buffer initialization. k_local_remaining[r] should equal
     #         K_local(r) (the count of local-expert landings for recv-token r),
     #         which is also the count of pool slots for r. y_done_per_token
     #         and o should be zero-init.
     k_local_remaining = handle.k_local_remaining.cpu()
-    assert k_local_remaining.shape == (T_recv,), (
-        f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)"
-    )
+    assert k_local_remaining.shape == (T_recv,), f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)"
     expected_k_local = (expected_recv_topk_local >= 0).sum(dim=1).to(torch.int32)
     assert torch.equal(k_local_remaining, expected_k_local), (
-        f"k_local_remaining mismatch; first deviating r: "
-        f"{(k_local_remaining != expected_k_local).nonzero().flatten()[:8]}"
+        f"k_local_remaining mismatch; first deviating r: {(k_local_remaining != expected_k_local).nonzero().flatten()[:8]}"
     )
     compute_done = handle.y_done_per_token.cpu()
     assert (compute_done == 0).all(), "y_done_per_token should be zero-init"
-    assert handle.pool_arrival_count.dtype == torch.int32, (
-        f"pool_arrival_count must be int32; got {handle.pool_arrival_count.dtype}"
-    )
+    assert handle.pool_arrival_count.dtype == torch.int32, f"pool_arrival_count must be int32; got {handle.pool_arrival_count.dtype}"
     o_t = handle.o.cpu()
     assert o_t.shape == (T_recv, hidden), f"o shape {o_t.shape} != ({T_recv}, {hidden})"
     assert (o_t == 0).all(), "o should be zero-init"
@@ -196,9 +188,7 @@ def main():
     #   pool_recv_token[s], pool_k_slot[s]] == s. k_local_total[r] should
     # equal k_local_remaining[r] (write-once mirror that fwd doesn't decrement).
     rtts = handle.recv_token_to_slots.cpu()
-    assert rtts.shape == (T_recv, num_topk), (
-        f"recv_token_to_slots shape {rtts.shape} != ({T_recv}, {num_topk})"
-    )
+    assert rtts.shape == (T_recv, num_topk), f"recv_token_to_slots shape {rtts.shape} != ({T_recv}, {num_topk})"
     expected_rtts = torch.full((T_recv, num_topk), -1, dtype=torch.int32)
     valid_slots = pool_recv_token >= 0
     for s in valid_slots.nonzero().flatten().tolist():
@@ -206,56 +196,48 @@ def main():
         k = int(pool_k_slot[s].item())
         expected_rtts[rt, k] = s
     assert torch.equal(rtts, expected_rtts), (
-        f"recv_token_to_slots mismatch; first deviating (r, k): "
-        f"{(rtts != expected_rtts).nonzero()[:8]}"
+        f"recv_token_to_slots mismatch; first deviating (r, k): {(rtts != expected_rtts).nonzero()[:8]}"
     )
     klc = handle.k_local_total.cpu()
     assert klc.shape == (T_recv,), f"k_local_total shape {klc.shape} != ({T_recv},)"
-    assert torch.equal(klc, k_local_remaining), (
-        "k_local_total should equal k_local_remaining (both = K_local(r) pre-decrement)"
-    )
+    assert torch.equal(klc, k_local_remaining), "k_local_total should equal k_local_remaining (both = K_local(r) pre-decrement)"
 
     # seen_per_substream[c, src, e] = my_e_inbox[c, src, e] from the metadata
     # kernel's IPC count exchange. Invariant: summing over (c, src) gives the
     # per-expert totals, i.e. expert_frequency[e].
     sps = handle.seen_per_substream.cpu()
     expected_sps_shape = (sps.shape[0], world_size, num_local_experts)
-    assert sps.shape == expected_sps_shape, (
-        f"seen_per_substream shape {sps.shape} != {expected_sps_shape}"
-    )
+    assert sps.shape == expected_sps_shape, f"seen_per_substream shape {sps.shape} != {expected_sps_shape}"
     sps_per_expert = sps.sum(dim=(0, 1))
     expected_sps_per_expert = handle.expert_frequency.cpu()
     assert torch.equal(sps_per_expert, expected_sps_per_expert), (
-        f"sum_(c, src) seen_per_substream[c, src, :] should equal expert_frequency; "
-        f"got {sps_per_expert} vs {expected_sps_per_expert}"
+        f"sum_(c, src) seen_per_substream[c, src, :] should equal expert_frequency; got {sps_per_expert} vs {expected_sps_per_expert}"
     )
 
     # ─── (7) Bit-determinism — re-run with same inputs, expect identical pool layout.
     pool2, handle2, _ = buf.dispatch(
-        x, topk_idx, topk_weights, is_token_in_rank, num_experts,
-        tile_m=tile_m, dispatch_seq=2,
+        x,
+        topk_idx,
+        topk_weights,
+        is_token_in_rank,
+        num_experts,
+        tile_m=tile_m,
+        dispatch_seq=2,
     )
     torch.cuda.synchronize()
-    assert torch.equal(handle.pool_recv_token.cpu(), handle2.pool_recv_token.cpu()), \
-        "pool_recv_token not deterministic"
-    assert torch.equal(handle.pool_k_slot.cpu(), handle2.pool_k_slot.cpu()), \
-        "pool_k_slot not deterministic"
-    assert torch.equal(handle.recv_token_to_slots.cpu(), handle2.recv_token_to_slots.cpu()), \
-        "recv_token_to_slots not deterministic"
-    assert torch.equal(handle.k_local_total.cpu(), handle2.k_local_total.cpu()), \
-        "k_local_total not deterministic"
-    assert torch.equal(handle.seen_per_substream.cpu(), handle2.seen_per_substream.cpu()), \
-        "seen_per_substream not deterministic"
+    assert torch.equal(handle.pool_recv_token.cpu(), handle2.pool_recv_token.cpu()), "pool_recv_token not deterministic"
+    assert torch.equal(handle.pool_k_slot.cpu(), handle2.pool_k_slot.cpu()), "pool_k_slot not deterministic"
+    assert torch.equal(handle.recv_token_to_slots.cpu(), handle2.recv_token_to_slots.cpu()), "recv_token_to_slots not deterministic"
+    assert torch.equal(handle.k_local_total.cpu(), handle2.k_local_total.cpu()), "k_local_total not deterministic"
+    assert torch.equal(handle.seen_per_substream.cpu(), handle2.seen_per_substream.cpu()), "seen_per_substream not deterministic"
     # `pool` padding rows are now left uninitialized (kernel Y's pool_recv_token
     # predicate is the actual safety mechanism). Compare valid rows only.
-    valid = (handle.pool_recv_token.cpu() >= 0)
+    valid = handle.pool_recv_token.cpu() >= 0
     assert torch.equal(pool.cpu()[valid], pool2.cpu()[valid]), "pool data (valid rows) not deterministic"
-    assert torch.equal(handle.tile_id_to_expert.cpu(), handle2.tile_id_to_expert.cpu()), \
-        "tile_id_to_expert not deterministic"
+    assert torch.equal(handle.tile_id_to_expert.cpu(), handle2.tile_id_to_expert.cpu()), "tile_id_to_expert not deterministic"
 
     if rank == 0:
-        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} "
-              f"TK_padded={TK_padded} total_tiles={total_tiles}")
+        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} TK_padded={TK_padded} total_tiles={total_tiles}")
 
     cleanup_dist()
 

@@ -18,8 +18,15 @@ from stream_ep.stream_moe.stream_moe import make_streams, stream_moe_func
 buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
 streams = make_streams()
 out = stream_moe_func(
-    buffer, x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local,
-    streams=streams, num_experts=num_experts,
+    buffer,
+    x,
+    topk_idx,
+    topk_weights,
+    is_token_in_rank,
+    w1_local,
+    w2_local,
+    streams=streams,
+    num_experts=num_experts,
 )
 ```
 

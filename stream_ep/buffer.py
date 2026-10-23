@@ -6,6 +6,7 @@ from typing import Any, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
 import stream_ep_cpp
+
 # noinspection PyUnresolvedReferences
 from stream_ep_cpp import Config, EventHandle
 from .utils import check_nvlink_connections
@@ -25,34 +26,34 @@ class StreamingHandle:
 
     # ── Pool data (kernel A reads with strided TMA; kernel Y / combine read via
     # pool_recv_token + pool_k_slot scatter-back).
-    pool: torch.Tensor                         # [TK_padded, hidden] data
-    pool_topk_weight: torch.Tensor             # [TK_padded] float32, per-pool-slot weight
-    pool_recv_token: torch.Tensor              # [TK_padded] int32, slot → recv-token id (-1 = padding)
-    pool_k_slot: torch.Tensor                  # [TK_padded] int32, slot → k (-1 = padding)
+    pool: torch.Tensor  # [TK_padded, hidden] data
+    pool_topk_weight: torch.Tensor  # [TK_padded] float32, per-pool-slot weight
+    pool_recv_token: torch.Tensor  # [TK_padded] int32, slot → recv-token id (-1 = padding)
+    pool_k_slot: torch.Tensor  # [TK_padded] int32, slot → k (-1 = padding)
 
     # ── Combine inputs (per-recv-token; combine sender forwards these back to source).
-    send_head: torch.Tensor                    # [num_tokens, num_ranks] int32
-    is_token_in_rank: torch.Tensor             # [num_tokens, num_ranks] bool
-    rank_prefix_matrix: torch.Tensor           # [num_ranks, num_ranks] int32 (this rank's column populated)
-    channel_prefix_matrix: torch.Tensor        # [num_ranks, num_channels] int32 (sender-side)
-    recv_channel_prefix_matrix: torch.Tensor   # [num_ranks, num_channels] int32 (receiver-side)
+    send_head: torch.Tensor  # [num_tokens, num_ranks] int32
+    is_token_in_rank: torch.Tensor  # [num_tokens, num_ranks] bool
+    rank_prefix_matrix: torch.Tensor  # [num_ranks, num_ranks] int32 (this rank's column populated)
+    channel_prefix_matrix: torch.Tensor  # [num_ranks, num_channels] int32 (sender-side)
+    recv_channel_prefix_matrix: torch.Tensor  # [num_ranks, num_channels] int32 (receiver-side)
 
     # ── Pool metadata (kernel A scheduler + tests).
-    expert_frequency: torch.Tensor             # [E_local] int32
-    expert_pool_block_offset: torch.Tensor     # [E_local + 1] int32 — pool-block prefix-sum (BLOCK_M-tile units)
-    base_pool: torch.Tensor                    # [num_channels, num_ranks, E_local] int32
-    seen_per_substream: torch.Tensor           # [num_channels, num_ranks, E_local] int32 — bwd Pass 2 input (substream's per-expert recv count)
+    expert_frequency: torch.Tensor  # [E_local] int32
+    expert_pool_block_offset: torch.Tensor  # [E_local + 1] int32 — pool-block prefix-sum (BLOCK_M-tile units)
+    base_pool: torch.Tensor  # [num_channels, num_ranks, E_local] int32
+    seen_per_substream: torch.Tensor  # [num_channels, num_ranks, E_local] int32 — bwd Pass 2 input (substream's per-expert recv count)
 
     # ── Per-tile arrays.
-    tile_id_to_expert: torch.Tensor            # [total_tiles] int32 — per-tile expert lookup
-    pool_arrival_target: torch.Tensor          # [total_tiles] int32 (per-tile firing-target)
+    tile_id_to_expert: torch.Tensor  # [total_tiles] int32 — per-tile expert lookup
+    pool_arrival_target: torch.Tensor  # [total_tiles] int32 (per-tile firing-target)
     # Per-tile arrival counter: dispatch's Pass 2 `red.release.gpu.add.s32`s
     # contributors' per-block writes into `pool_arrival_count[tile_id]`; kernel A's
     # scheduler spins on `pool_arrival_count[tile_id] == pool_arrival_target[tile_id]`.
     # Pass 2 walks experts in order, so tile counts hit their target in
     # expert-monotonic order across substream blocks — preserves wave caching
     # of W1[e].
-    pool_arrival_count: torch.Tensor           # [total_tiles] int32
+    pool_arrival_count: torch.Tensor  # [total_tiles] int32
 
     # ── Kernel A → kernel Y / kernel Y → combine pipeline buffers.
     # Cross-stream visibility for dispatch→A is the count-vs-target spin on
@@ -62,17 +63,17 @@ class StreamingHandle:
     # Int64 `y_done_per_token` (Y→combine) and `bwd_a_done_per_token`
     # (A_bwd→combine_grads) drive per-recv-token streaming on the combine
     # sender warps.
-    k_local_remaining: torch.Tensor          # [T_recv] int32 — K_local(r); kernel Y atomicSubs
-    y_done_per_token: torch.Tensor       # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
-    o: torch.Tensor                            # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
+    k_local_remaining: torch.Tensor  # [T_recv] int32 — K_local(r); kernel Y atomicSubs
+    y_done_per_token: torch.Tensor  # [T_recv] int64 — Y→combine per-token release stamp (zero-init)
+    o: torch.Tensor  # [T_recv, hidden] — kernel Y atomic-scatter destination (zero-init)
 
     # ── Backward-pass scaffolding (Phase F).
     # Both populated by fwd Pass B in the same lane-0 K-loop that writes
     # pool_recv_token / pool_k_slot / k_local_remaining; consumed by the
     # backward path (no fwd consumer). Cost: ~512 KB + ~128 KB at production
     # (T_recv≈32K, K=4).
-    recv_token_to_slots: torch.Tensor          # [T_recv, num_topk] int32 — (r, k) → pool slot, -1 for non-local k
-    k_local_total: torch.Tensor                # [T_recv] int32 — write-once K_local mirror (k_local_remaining is decremented to 0 by kernel Y)
+    recv_token_to_slots: torch.Tensor  # [T_recv, num_topk] int32 — (r, k) → pool slot, -1 for non-local k
+    k_local_total: torch.Tensor  # [T_recv] int32 — write-once K_local mirror (k_local_remaining is decremented to 0 by kernel Y)
 
     total_tiles: int
     tile_m: int
@@ -122,15 +123,17 @@ class Buffer:
     # ``stream_ep/stream_moe/profile_pipeline.py``.
     _num_sms_explicit: bool = False
 
-    def __init__(self,
-                 group: Optional[dist.ProcessGroup],
-                 num_nvl_bytes: int = 0,
-                 num_rdma_bytes: int = 0,
-                 allow_mnnvl: bool = False,
-                 use_fabric: bool = False,
-                 explicitly_destroy: bool = False,
-                 enable_shrink: bool = False,
-                 comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
+    def __init__(
+        self,
+        group: Optional[dist.ProcessGroup],
+        num_nvl_bytes: int = 0,
+        num_rdma_bytes: int = 0,
+        allow_mnnvl: bool = False,
+        use_fabric: bool = False,
+        explicitly_destroy: bool = False,
+        enable_shrink: bool = False,
+        comm: Optional["mpi4py.MPI.Comm"] = None,  # noqa: F821
+    ) -> None:
         """
         Initialize the communication buffer.
 
@@ -188,8 +191,9 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
-        self.runtime = stream_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, explicitly_destroy,
-                                          enable_shrink, use_fabric)
+        self.runtime = stream_ep_cpp.Buffer(
+            self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, explicitly_destroy, enable_shrink, use_fabric
+        )
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
@@ -210,14 +214,14 @@ class Buffer:
             # heap on top of our IPC mappings — risks cross-iter NVL ring
             # corruption from coherence interactions between the two
             # mapping sets.
-            os.environ['NVSHMEM_DISABLE_P2P'] = '1'
+            os.environ["NVSHMEM_DISABLE_P2P"] = "1"
 
             # Enable IBGDA
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+            os.environ["NVSHMEM_IB_ENABLE_IBGDA"] = "1"
 
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-            self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
-            os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
+            self.nvshmem_qp_depth = int(os.environ.get("NVSHMEM_QP_DEPTH", "1024"))
+            os.environ["NVSHMEM_QP_DEPTH"] = str(self.nvshmem_qp_depth)
 
             # ``dispatch_main_kernel``'s forwarder coordinator passes
             # ``qp_id = channel_id + num_channels`` to IBGDA, so qp_ids
@@ -228,19 +232,19 @@ class Buffer:
             # ``num_rc_per_pe >= num_sms``. (NVSHMEM's default is 1.)
             # Set BEFORE the runtime.sync() call below — that's where
             # NVSHMEM_INIT_WITH_UNIQUEID creates the RCs and reads this.
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = str(Buffer.num_sms)
+            os.environ["NVSHMEM_IBGDA_NUM_RC_PER_PE"] = str(Buffer.num_sms)
 
             # Reduce gpu memory usage
             # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+            os.environ["NVSHMEM_MAX_TEAMS"] = "7"
             # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+            os.environ["NVSHMEM_DISABLE_NVLS"] = "1"
             # NOTES: NVSHMEM initialization requires at least 256 MiB
-            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+            os.environ["NVSHMEM_CUMEM_GRANULARITY"] = f"{2**29}"
 
             if not allow_mnnvl:
                 # Disable multi-node NVLink detection
-                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+                os.environ["NVSHMEM_DISABLE_MNNVL"] = "1"
 
             # Synchronize using the root ID
             if self.runtime.get_rdma_rank() == 0:
@@ -266,7 +270,7 @@ class Buffer:
 
         """
 
-        assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
+        assert self.explicitly_destroy, "`explicitly_destroy` flag must be set"
 
         self.runtime.destroy()
         self.runtime = None
@@ -355,7 +359,7 @@ class Buffer:
             new_num_sms: the new number to be set.
         """
 
-        assert new_num_sms % 2 == 0, 'The SM count must be even'
+        assert new_num_sms % 2 == 0, "The SM count must be even"
         Buffer.num_sms = new_num_sms
         Buffer._num_sms_explicit = True
 
@@ -378,11 +382,9 @@ class Buffer:
             Buffer.num_sms = 80 if nodes <= 2 else 64
         return Buffer.num_sms
 
-    def get_local_buffer_tensor(self,
-                                dtype: torch.dtype,
-                                size: Optional[torch.Size] = None,
-                                offset: int = 0,
-                                use_rdma_buffer: bool = False) -> torch.Tensor:
+    def get_local_buffer_tensor(
+        self, dtype: torch.dtype, size: Optional[torch.Size] = None, offset: int = 0, use_rdma_buffer: bool = False
+    ) -> torch.Tensor:
         """
         Get the raw buffer (slice supported) as a PyTorch tensor.
 
@@ -397,7 +399,7 @@ class Buffer:
             return tensor
 
         assert tensor.numel() >= size.numel()
-        return tensor[:size.numel()].view(size)
+        return tensor[: size.numel()].view(size)
 
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
@@ -446,7 +448,7 @@ class Buffer:
             144: Config(Buffer.num_sms, 32, 720, 12, 128),
             160: Config(Buffer.num_sms, 28, 720, 12, 128),
         }
-        assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
+        assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         return config_map[num_ranks]
 
     def _is_internode(self) -> bool:
@@ -486,21 +488,23 @@ class Buffer:
             144: Config(Buffer.num_sms, 2, 720, 8, 128),
             160: Config(Buffer.num_sms, 2, 720, 8, 128),
         }
-        assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
+        assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
-    def dispatch(self, x: torch.Tensor,
-                 topk_idx: torch.Tensor,
-                 topk_weights: torch.Tensor,
-                 is_token_in_rank: torch.Tensor,
-                 num_experts: int,
-                 *,
-                 expert_alignment: int = 1,
-                 tile_m: int = 128,
-                 dispatch_seq: Optional[int] = None,
-                 config: Optional[Config] = None) -> \
-            Tuple[torch.Tensor, 'StreamingHandle', EventHandle]:
+    def dispatch(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        is_token_in_rank: torch.Tensor,
+        num_experts: int,
+        *,
+        expert_alignment: int = 1,
+        tile_m: int = 128,
+        dispatch_seq: Optional[int] = None,
+        config: Optional[Config] = None,
+    ) -> Tuple[torch.Tensor, "StreamingHandle", EventHandle]:
         """Streaming-MoE pool-layout dispatch.
 
         Branches on ``self._is_internode()``: routes through
@@ -567,14 +571,26 @@ class Buffer:
 
         if self._is_internode():
             out = self.runtime.internode_dispatch(
-                x, topk_idx, topk_weights, is_token_in_rank,
-                num_experts, expert_alignment, tile_m, seq,
+                x,
+                topk_idx,
+                topk_weights,
+                is_token_in_rank,
+                num_experts,
+                expert_alignment,
+                tile_m,
+                seq,
                 config,
             )
         else:
             out = self.runtime.intranode_dispatch(
-                x, topk_idx, topk_weights, is_token_in_rank,
-                num_experts, expert_alignment, tile_m, seq,
+                x,
+                topk_idx,
+                topk_weights,
+                is_token_in_rank,
+                num_experts,
+                expert_alignment,
+                tile_m,
+                seq,
                 config,
             )
 
@@ -610,10 +626,9 @@ class Buffer:
         return out.pool, handle, out.metadata_done_event
 
     # noinspection PyTypeChecker
-    def dispatch_grads(self, handle: 'StreamingHandle', dL_dy: torch.Tensor,
-                       *,
-                       dispatch_seq: Optional[int] = None,
-                       config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor, EventHandle]:
+    def dispatch_grads(
+        self, handle: "StreamingHandle", dL_dy: torch.Tensor, *, dispatch_seq: Optional[int] = None, config: Optional[Config] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, EventHandle]:
         """Backward dispatch: ship ``dL/dy[t]`` origin → expert ranks along the
         same routing as forward dispatch, write K times into a pool-shaped
         ``dL_do_pool`` using the slot lookup persisted in ``handle.recv_token_to_slots``.
@@ -667,11 +682,9 @@ class Buffer:
         return dL_do_pool, bwd_dispatch_arrival_count, grads_started_event
 
     # noinspection PyTypeChecker
-    def combine(self, x: torch.Tensor, handle: 'StreamingHandle',
-                *,
-                combine_seq: Optional[int] = None,
-                config: Optional[Config] = None) -> \
-            Tuple[torch.Tensor, None]:
+    def combine(
+        self, x: torch.Tensor, handle: "StreamingHandle", *, combine_seq: Optional[int] = None, config: Optional[Config] = None
+    ) -> Tuple[torch.Tensor, None]:
         """Combine (reduce) tokens back to source ranks. Takes the ``StreamingHandle``
         returned by ``Buffer.dispatch``. Intranode only.
 
@@ -702,32 +715,45 @@ class Buffer:
 
         if self._is_internode():
             recv_x, _ = self.runtime.internode_combine(
-                x, handle.pool_topk_weight, handle._dispatch_out,
-                handle.y_done_per_token, seq,
+                x,
+                handle.pool_topk_weight,
+                handle._dispatch_out,
+                handle.y_done_per_token,
+                seq,
                 # `combine_phase=0` = fwd combine. Phase-distinguishes the NVL
                 # gen-stamp tag from bwd `combine_grads` (phase=1) so the two
                 # phases of one layer (which share `combine_seq`) can't alias
                 # on the shared combine NVL ring slots.
                 0,
                 True,  # is_fwd
-                config)
+                config,
+            )
         else:
             recv_x, _ = self.runtime.intranode_combine(
-                x, handle.pool_topk_weight, handle.recv_token_to_slots,
+                x,
+                handle.pool_topk_weight,
+                handle.recv_token_to_slots,
                 handle.rank_prefix_matrix,
-                handle.recv_channel_prefix_matrix, handle.send_head,
-                handle.y_done_per_token, seq,
+                handle.recv_channel_prefix_matrix,
+                handle.send_head,
+                handle.y_done_per_token,
+                seq,
                 True,  # is_fwd
-                config)
+                config,
+            )
         return recv_x, None
 
     # noinspection PyTypeChecker
-    def combine_grads(self, dL_dx_per_r: torch.Tensor, handle: 'StreamingHandle',
-                      weight_grads: torch.Tensor,
-                      bwd_a_done_per_token: torch.Tensor,
-                      *,
-                      dispatch_seq: Optional[int] = None,
-                      config: Optional[Config] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def combine_grads(
+        self,
+        dL_dx_per_r: torch.Tensor,
+        handle: "StreamingHandle",
+        weight_grads: torch.Tensor,
+        bwd_a_done_per_token: torch.Tensor,
+        *,
+        dispatch_seq: Optional[int] = None,
+        config: Optional[Config] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Backward combine_grads: ship ``dL/dx_per_r[r, :H]`` expert → origin and
         reduce K contributions per source token into ``dL/dx[t, :H]``, plus
         scatter weight grads into ``dL/dtopk_weights[t, :K]``.
@@ -762,21 +788,28 @@ class Buffer:
 
         if self._is_internode():
             return self.runtime.internode_combine(
-                dL_dx_per_r, weight_grads, handle._dispatch_out,
-                bwd_a_done_per_token, seq,
+                dL_dx_per_r,
+                weight_grads,
+                handle._dispatch_out,
+                bwd_a_done_per_token,
+                seq,
                 # `combine_phase=1` = bwd combine_grads. Pairs with the fwd
                 # combine call's `combine_phase=0` to make the two phases'
                 # NVL gen-stamp tags differ in the low bit, despite sharing
                 # the `seq` value within a layer.
                 1,
                 False,  # is_fwd — bwd path ships + reduces per-K dL/dweight
-                config)
+                config,
+            )
         return self.runtime.intranode_combine(
-            dL_dx_per_r, weight_grads, handle.recv_token_to_slots,
+            dL_dx_per_r,
+            weight_grads,
+            handle.recv_token_to_slots,
             handle.rank_prefix_matrix,
-            handle.recv_channel_prefix_matrix, handle.send_head,
-            bwd_a_done_per_token, seq,
+            handle.recv_channel_prefix_matrix,
+            handle.send_head,
+            bwd_a_done_per_token,
+            seq,
             False,  # is_fwd — bwd path ships + reduces per-K dL/dweight
-            config)
-
-
+            config,
+        )

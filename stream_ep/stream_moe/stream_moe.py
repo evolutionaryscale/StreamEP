@@ -252,32 +252,20 @@ class TileConfig:
                     "atom_layout_n=2, which the streaming backward GEMMs cannot "
                     "codegen); tile_n > 128: " + ", ".join(over)
                 )
-        if self.tile_n_a is not None and (
-            (2 * I) % self.tile_n_a != 0 or I % self.tile_n_a != 0
-        ):
+        if self.tile_n_a is not None and ((2 * I) % self.tile_n_a != 0 or I % self.tile_n_a != 0):
             errs.append(
                 f"tile_n_a={self.tile_n_a} must divide both 2*I={2 * I} and "
                 f"I={I} (fwd kernel A out N=2I; kernel_a also asserts "
                 f"I % tile_n_a == 0)"
             )
         if self.tile_n_y is not None and H % self.tile_n_y != 0:
-            errs.append(
-                f"tile_n_y={self.tile_n_y} must divide H={H} (fwd kernel Y out N=H)"
-            )
+            errs.append(f"tile_n_y={self.tile_n_y} must divide H={H} (fwd kernel Y out N=H)")
         if self.tile_n_y_bwd is not None and I % self.tile_n_y_bwd != 0:
-            errs.append(
-                f"tile_n_y_bwd={self.tile_n_y_bwd} must divide I={I} "
-                f"(bwd kernel Y out N=I)"
-            )
+            errs.append(f"tile_n_y_bwd={self.tile_n_y_bwd} must divide I={I} (bwd kernel Y out N=I)")
         if self.tile_n_a_bwd is not None and H % self.tile_n_a_bwd != 0:
-            errs.append(
-                f"tile_n_a_bwd={self.tile_n_a_bwd} must divide H={H} "
-                f"(bwd kernel A out N=H)"
-            )
+            errs.append(f"tile_n_a_bwd={self.tile_n_a_bwd} must divide H={H} (bwd kernel A out N=H)")
         if errs:
-            raise ValueError(
-                f"TileConfig invalid for (I={I}, H={H}): " + "; ".join(errs)
-            )
+            raise ValueError(f"TileConfig invalid for (I={I}, H={H}): " + "; ".join(errs))
 
 
 def default_tile_config(I: int, H: int) -> TileConfig:
@@ -336,9 +324,7 @@ def default_tile_config(I: int, H: int) -> TileConfig:
     )
 
 
-def _resolve_tile_config(
-    tile_config: TileConfig | None, I: int, H: int
-) -> TileConfig:
+def _resolve_tile_config(tile_config: TileConfig | None, I: int, H: int) -> TileConfig:
     """Resolve a caller override against the shape-picked baseline.
 
     Overlays ``tile_config``'s non-``None`` fields onto
@@ -354,11 +340,7 @@ def _resolve_tile_config(
     """
     cfg = default_tile_config(I, H)
     if tile_config is not None:
-        overrides = {
-            f.name: getattr(tile_config, f.name)
-            for f in fields(tile_config)
-            if getattr(tile_config, f.name) is not None
-        }
+        overrides = {f.name: getattr(tile_config, f.name) for f in fields(tile_config) if getattr(tile_config, f.name) is not None}
         if overrides:
             cfg = replace(cfg, **overrides)
     cfg.validate(I, H)
@@ -664,8 +646,10 @@ class StreamMoEFunc(torch.autograd.Function):
             # Allocate x_recv on the CALLER stream (current here) -> default pool,
             # then fill in place. A pure default-pool tensor: no record_stream.
             x_recv = torch.empty(
-                handle.recv_token_to_slots.shape[0], pool.shape[1],
-                dtype=pool.dtype, device=pool.device,
+                handle.recv_token_to_slots.shape[0],
+                pool.shape[1],
+                dtype=pool.dtype,
+                device=pool.device,
             )
             compress_pool_to_recv(pool, handle.pool_recv_token, x_recv)
             # Free pool: drop ALL THREE refs. handle.pool=None + the local are
@@ -793,7 +777,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # from it after the dispatch_grads gate (sec 6). Level 0 saved preact_a.
         if ctx.activation_checkpoint_level == 2:
             x_recv, w1_local, w2_local = ctx.saved_tensors
-            pool = None      # re-expanded below (only when total_tiles > 0)
+            pool = None  # re-expanded below (only when total_tiles > 0)
             preact_a = None
         elif ctx.activation_checkpoint_level == 1:
             pool, w1_local, w2_local = ctx.saved_tensors
@@ -831,12 +815,8 @@ class StreamMoEFunc(torch.autograd.Function):
         swizzle_dW2: int = cfg.swizzle_dW2
         # bwd kernels take the *_bwd SM counts (falling back to the fwd count
         # when unset); the fwd-only num_sms_a / num_sms_y aren't used here.
-        num_sms_a_bwd: int | None = (
-            cfg.num_sms_a_bwd if cfg.num_sms_a_bwd is not None else cfg.num_sms_a
-        )
-        num_sms_y_bwd: int | None = (
-            cfg.num_sms_y_bwd if cfg.num_sms_y_bwd is not None else cfg.num_sms_y
-        )
+        num_sms_a_bwd: int | None = cfg.num_sms_a_bwd if cfg.num_sms_a_bwd is not None else cfg.num_sms_a
+        num_sms_y_bwd: int | None = cfg.num_sms_y_bwd if cfg.num_sms_y_bwd is not None else cfg.num_sms_y
 
         # Upstream may pass a non-contiguous grad (e.g. `out.sum().backward()`
         # produces a stride-(0,0) broadcast view); `dispatch_grads` asserts
@@ -863,12 +843,8 @@ class StreamMoEFunc(torch.autograd.Function):
         dL_dx_per_r = torch.empty(T_recv, H, dtype=dtype, device=device)
         bwd_k_local_remaining = torch.empty(T_recv, dtype=torch.int32, device=device)
         bwd_a_done_per_token = torch.empty(T_recv, dtype=torch.int64, device=device)
-        dL_dswiglu_in = torch.empty(
-            total_tiles, tile_m, two_I, dtype=dtype, device=device
-        )
-        postact_a_for_dW2 = torch.empty(
-            total_tiles, tile_m, I, dtype=dtype, device=device
-        )
+        dL_dswiglu_in = torch.empty(total_tiles, tile_m, two_I, dtype=dtype, device=device)
+        postact_a_for_dW2 = torch.empty(total_tiles, tile_m, I, dtype=dtype, device=device)
         # dL_dweight: per-pid_n fp32 atomic-add target; MUST zero-init.
         dL_dweight = torch.empty(TK_padded, dtype=torch.float32, device=device)
         # quack `gemm` with default `add_to_output=False` overwrites D, so neither
@@ -910,9 +886,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # → reads of garbage padding rows of pool → NaN dW2 grads on
         # specific experts.
         with torch.cuda.stream(streams.compute):
-            cu_seqlens_k = (
-                handle.expert_pool_block_offset.to(torch.int32) * tile_m
-            ).contiguous()
+            cu_seqlens_k = (handle.expert_pool_block_offset.to(torch.int32) * tile_m).contiguous()
             seqused_k_dW = handle.expert_frequency.to(torch.int32)
             bwd_k_local_remaining.copy_(handle.k_local_total, non_blocking=True)
 
@@ -924,11 +898,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # is recorded between the channel-control barrier and
         # dispatch_grads_main's launch — analogous to fwd's metadata_done.
         with torch.cuda.stream(streams.communicate):
-            dL_do_pool, bwd_dispatch_arrival_count, grads_started = (
-                buffer.dispatch_grads(
-                    handle, dL_dy, dispatch_seq=handle.dispatch_seq
-                )
-            )
+            dL_do_pool, bwd_dispatch_arrival_count, grads_started = buffer.dispatch_grads(handle, dL_dy, dispatch_seq=handle.dispatch_seq)
 
         # Cross-stream visibility from communicate → compute. Waiting on
         # `grads_started` (recorded BEFORE dispatch_grads_main launches) lets
@@ -978,9 +948,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # its own pool_topk_weight-scaled postact_a_for_dW2 from preact_a.
         if ctx.activation_checkpoint_level >= 1 and total_tiles > 0:
             with torch.cuda.stream(streams.compute):
-                preact_a = torch.empty(
-                    total_tiles, tile_m, two_I, dtype=dtype, device=device
-                )
+                preact_a = torch.empty(total_tiles, tile_m, two_I, dtype=dtype, device=device)
                 # Recompute preact = pool @ w1 with a plain grouped-M GEMM (pool
                 # is fully materialized from the fwd save, so a streaming kernel
                 # would be pure overhead). cu_seqlens_m = the per-expert padded
@@ -994,16 +962,16 @@ class StreamMoEFunc(torch.autograd.Function):
                 # wait_dispatch_grads_started gates above so dispatch_grads_main
                 # is co-resident first and this GEMM only fills leftover SMs.
                 gemm(
-                    pool,                              # A (TK_padded, H) k-major
-                    w1_local,                          # B (E_local, 2I, H)=(l,n,k)
-                    preact_a.view(TK_padded, two_I),   # D (TK_padded, 2I) n-major
-                    None,                              # C
-                    None,                              # tile_count_semaphore
+                    pool,  # A (TK_padded, H) k-major
+                    w1_local,  # B (E_local, 2I, H)=(l,n,k)
+                    preact_a.view(TK_padded, two_I),  # D (TK_padded, 2I) n-major
+                    None,  # C
+                    None,  # tile_count_semaphore
                     tile_M=tile_m,
                     tile_N=tile_n_a,
                     cluster_M=1,
                     cluster_N=1,
-                    cu_seqlens_m=cu_seqlens_k,         # per-expert padded token offsets
+                    cu_seqlens_m=cu_seqlens_k,  # per-expert padded token offsets
                 )
 
         # ── Stage 2 — kernel_y_bwd on streams.compute ──────────────────────

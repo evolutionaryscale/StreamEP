@@ -37,8 +37,7 @@ namespace stream_ep {
 // × 64 layers — effectively infinite for production training, paired-skip
 // invariant covers the modular edge).
 __forceinline__ __device__ uint64_t nvl_pack(int64_t seq, int value) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(seq)) << 32) |
-           static_cast<uint64_t>(static_cast<uint32_t>(value));
+    return (static_cast<uint64_t>(static_cast<uint32_t>(seq)) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(value));
 }
 __forceinline__ __device__ bool nvl_seq_match(uint64_t packed, int64_t seq) {
     return static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(seq);
@@ -59,8 +58,7 @@ __forceinline__ __device__ int nvl_unpack_value(uint64_t packed) {
 // mod 512; within a gen, re-occupancies of a slot differ by the ring size
 // (288 ≢ 0 mod 512 for ≤16 wraps); across gens the seq differs.
 __forceinline__ __device__ int nvl_slot_tag(int64_t seq, int pos) {
-    return ((static_cast<int>(static_cast<uint32_t>(seq)) & 0x7F) << 9) |
-           (pos & 0x1FF);
+    return ((static_cast<int>(static_cast<uint32_t>(seq)) & 0x7F) << 9) | (pos & 0x1FF);
 }
 
 template <int kBytes>
@@ -200,19 +198,15 @@ __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int
 // Used in 4 places (fwd/bwd × intranode/internode) — each passes its own
 // per-tile `arrival_count` tensor (fwd: pool_arrival_count;
 // bwd: bwd_dispatch_arrival_count).
-__device__ __forceinline__ void fire_pool_blocks(
-    int slot_start_e, int n_writes_for_e, int tile_m,
-    int* arrival_count) {
+__device__ __forceinline__ void fire_pool_blocks(int slot_start_e, int n_writes_for_e, int tile_m, int* arrival_count) {
     int slot_end_e = slot_start_e + n_writes_for_e;
     int first_block = slot_start_e / tile_m;
     int last_block = (slot_end_e - 1) / tile_m;
     for (int block_id = first_block; block_id <= last_block; ++block_id) {
         int block_slot_start = block_id * tile_m;
         int block_slot_end = block_slot_start + tile_m;
-        int writes_in_block =
-            min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
-        asm volatile("red.release.gpu.global.add.s32 [%0], %1;"
-                     ::"l"(&arrival_count[block_id]), "r"(writes_in_block));
+        int writes_in_block = min(slot_end_e, block_slot_end) - max(slot_start_e, block_slot_start);
+        asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(&arrival_count[block_id]), "r"(writes_in_block));
     }
 }
 
@@ -573,7 +567,7 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
     auto send_int_values = reinterpret_cast<int*>(&ptr);
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
         recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t*>(recv_int_values);

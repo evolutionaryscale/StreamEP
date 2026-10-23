@@ -19,6 +19,7 @@ so no int64 widening. Compaction is a scatter-by-slot whose only write
 collisions are the ``K_local`` slots of a token writing the *identical*
 broadcast row to the same x_recv row — benign (no atomics, no tearing).
 """
+
 import torch
 import triton
 import triton.language as tl
@@ -28,20 +29,24 @@ _INT32_MAX = 2**31
 
 @triton.jit
 def _index_copy_rows(
-    out_ptr, in_ptr, idx_ptr, H,
-    GATHER: tl.constexpr, BLOCK_H: tl.constexpr,
+    out_ptr,
+    in_ptr,
+    idx_ptr,
+    H,
+    GATHER: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
-    row = tl.program_id(0)                       # slot (both directions)
+    row = tl.program_id(0)  # slot (both directions)
     h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     hmask = h < H
-    tok = tl.load(idx_ptr + row)                 # int32 slot -> recv-token, -1 = pad
+    tok = tl.load(idx_ptr + row)  # int32 slot -> recv-token, -1 = pad
     valid = tok >= 0
-    tokc = tl.maximum(tok, 0)                     # clamp pad to row 0 (masked/zeroed out)
-    if GATHER:                                   # expand: out[row] = in[tok], pad -> 0
+    tokc = tl.maximum(tok, 0)  # clamp pad to row 0 (masked/zeroed out)
+    if GATHER:  # expand: out[row] = in[tok], pad -> 0
         v = tl.load(in_ptr + tokc * H + h, mask=hmask, other=0.0)
-        v = v * valid.to(v.dtype)                # pad row -> 0 (1.0/0.0 multiply, exact)
+        v = v * valid.to(v.dtype)  # pad row -> 0 (1.0/0.0 multiply, exact)
         tl.store(out_ptr + row * H + h, v, mask=hmask)
-    else:                                        # compact: out[tok] = in[row], skip pad
+    else:  # compact: out[tok] = in[row], skip pad
         v = tl.load(in_ptr + row * H + h, mask=hmask)
         tl.store(out_ptr + tokc * H + h, v, mask=hmask & valid)
 
@@ -50,16 +55,14 @@ def _check(pool: torch.Tensor, x_recv: torch.Tensor, pool_recv_token: torch.Tens
     assert pool.is_contiguous() and x_recv.is_contiguous() and pool_recv_token.is_contiguous()
     TK_padded, H = pool.shape
     assert pool_recv_token.shape == (TK_padded,) and pool_recv_token.dtype == torch.int32, (
-        f"pool_recv_token must be [{TK_padded}] int32, got {tuple(pool_recv_token.shape)} {pool_recv_token.dtype}")
+        f"pool_recv_token must be [{TK_padded}] int32, got {tuple(pool_recv_token.shape)} {pool_recv_token.dtype}"
+    )
     assert x_recv.shape[1] == H and x_recv.dtype == pool.dtype
-    assert TK_padded * H < _INT32_MAX, (
-        f"int32 offset overflow: TK_padded*H={TK_padded * H} >= 2**31; widen offsets to int64 in-kernel")
+    assert TK_padded * H < _INT32_MAX, f"int32 offset overflow: TK_padded*H={TK_padded * H} >= 2**31; widen offsets to int64 in-kernel"
     return TK_padded, H
 
 
-def compress_pool_to_recv(
-    pool: torch.Tensor, pool_recv_token: torch.Tensor, out: torch.Tensor, BLOCK_H: int = 512
-) -> None:
+def compress_pool_to_recv(pool: torch.Tensor, pool_recv_token: torch.Tensor, out: torch.Tensor, BLOCK_H: int = 512) -> None:
     """pool[TK_padded, H] -> out[T_recv, H], in place. Scatter-by-slot: every
     token's identical-broadcast slots write the same row, so the collision is
     benign. ``out`` is fully written (every recv-token has >=1 slot)."""
@@ -68,9 +71,7 @@ def compress_pool_to_recv(
     _index_copy_rows[grid](out, pool, pool_recv_token, H, GATHER=False, BLOCK_H=BLOCK_H)
 
 
-def reexpand_recv_to_pool(
-    x_recv: torch.Tensor, pool_recv_token: torch.Tensor, out: torch.Tensor, BLOCK_H: int = 512
-) -> None:
+def reexpand_recv_to_pool(x_recv: torch.Tensor, pool_recv_token: torch.Tensor, out: torch.Tensor, BLOCK_H: int = 512) -> None:
     """x_recv[T_recv, H] -> out[TK_padded, H], in place. Gather-by-slot; padding
     slots (-1) are zeroed (masked / cu_seqlens-excluded by every consumer)."""
     TK_padded, H = _check(out, x_recv, pool_recv_token)

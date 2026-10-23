@@ -53,8 +53,7 @@
     cfg.attrs = attr;                                                           \
     cfg.numAttrs = 3
 #else
-#define SETUP_LAUNCH_CONFIG_PDL_CONSUMER(sms, threads, stream) \
-    SETUP_LAUNCH_CONFIG(sms, threads, stream)
+#define SETUP_LAUNCH_CONFIG_PDL_CONSUMER(sms, threads, stream) SETUP_LAUNCH_CONFIG(sms, threads, stream)
 #endif
 #endif
 

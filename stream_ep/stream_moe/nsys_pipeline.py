@@ -55,9 +55,13 @@ def main():
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
     p.add_argument("--n_warmup", type=int, default=5, help="warmup iters OUTSIDE the profiler fence (JIT + caches)")
     p.add_argument("--n_iter", type=int, default=12, help="steady iters INSIDE the profiler fence")
-    p.add_argument("--skew_hot_frac", type=float, default=0.0,
-                   help="0 = uniform-random routing (randn router logits, production-like "
-                        "~2.72 remote-nodes/tok); >0 = biased/hot-expert routing (heavier comm)")
+    p.add_argument(
+        "--skew_hot_frac",
+        type=float,
+        default=0.0,
+        help="0 = uniform-random routing (randn router logits, production-like "
+        "~2.72 remote-nodes/tok); >0 = biased/hot-expert routing (heavier comm)",
+    )
     p.add_argument("--skew_hot_weight", type=float, default=4.0)
     args = p.parse_args()
 
@@ -85,15 +89,20 @@ def main():
     if args.skew_hot_frac > 0:
         skew_gen = torch.Generator(device=device).manual_seed(7000 + rank)
         topk_idx = make_skewed_topk_idx(
-            args.seq_len, TOPK, NUM_EXPERTS, hot_frac=args.skew_hot_frac,
-            hot_weight=args.skew_hot_weight, device=device, generator=skew_gen,
+            args.seq_len,
+            TOPK,
+            NUM_EXPERTS,
+            hot_frac=args.skew_hot_frac,
+            hot_weight=args.skew_hot_weight,
+            device=device,
+            generator=skew_gen,
         )
     else:
         randn_gen = torch.Generator(device=device).manual_seed(7000 + rank)
         topk_idx = make_randn_topk_idx(args.seq_len, TOPK, NUM_EXPERTS, device, randn_gen)
-    topk_weights = torch.softmax(
-        torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1
-    ).contiguous().requires_grad_(True)
+    topk_weights = (
+        torch.softmax(torch.randn(args.seq_len, TOPK, dtype=torch.float32, device=device), dim=-1).contiguous().requires_grad_(True)
+    )
 
     rank_idx = topk_idx // local_E
     is_token_in_rank = torch.zeros((args.seq_len, world_size), dtype=torch.bool, device=device)
@@ -104,8 +113,15 @@ def main():
 
     def one_iter():
         out = stream_moe_func(
-            buffer, x, topk_idx, topk_weights, is_token_in_rank,
-            w1_local, w2_local, streams=streams, num_experts=NUM_EXPERTS,
+            buffer,
+            x,
+            topk_idx,
+            topk_weights,
+            is_token_in_rank,
+            w1_local,
+            w2_local,
+            streams=streams,
+            num_experts=NUM_EXPERTS,
         )
         out.sum().backward()
 

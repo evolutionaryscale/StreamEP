@@ -84,19 +84,19 @@ void launch_fill_tile_metadata(const int* expert_pool_block_offset,
 // it easy to add / rename / reorder a single field — touch the struct, not
 // every signature copy.
 struct DispatchPoolOut {
-    int4* pool;                    // [TK_padded, hidden]   data (int4-vector)
-    float* pool_topk_weight;       // [TK_padded]           per-pool-slot weight
-    int* pool_recv_token;          // [TK_padded]           slot → recv-token id (-1 = padding)
-    int* pool_k_slot;              // [TK_padded]           slot → k (-1 = padding)
+    int4* pool;               // [TK_padded, hidden]   data (int4-vector)
+    float* pool_topk_weight;  // [TK_padded]           per-pool-slot weight
+    int* pool_recv_token;     // [TK_padded]           slot → recv-token id (-1 = padding)
+    int* pool_k_slot;         // [TK_padded]           slot → k (-1 = padding)
 };
 
 struct DispatchPerTokenOut {
     int* recv_channel_prefix_matrix;  // [num_ranks, num_channels]  receiver-side cumulative
-    int* send_head;                // [num_tokens, num_ranks]
-    int* k_local_remaining;      // [T_recv]              K_local(r); kernel Y atomicSubs to 0
+    int* send_head;                   // [num_tokens, num_ranks]
+    int* k_local_remaining;           // [T_recv]              K_local(r); kernel Y atomicSubs to 0
     // Backward-pass scaffolding written by Pass B's per-recv-token lane-0 K-loop:
-    int* recv_token_to_slots;      // [T_recv, num_topk]    (r, k) → pool slot, -1 for non-local k
-    int* k_local_total;            // [T_recv]              K_local(r); write-once mirror of k_local_remaining
+    int* recv_token_to_slots;  // [T_recv, num_topk]    (r, k) → pool slot, -1 for non-local k
+    int* k_local_total;        // [T_recv]              K_local(r); write-once mirror of k_local_remaining
 };
 
 struct DispatchInputs {
@@ -107,15 +107,15 @@ struct DispatchInputs {
 };
 
 struct DispatchTileSignal {
-    int* channel_prefix_matrix;    // [num_ranks, num_channels]  sender-side cumulative
-    const int* base_pool;          // [num_channels, num_ranks, E_local]
-    int* pool_arrival_count;       // [total_tiles]   release-add target during Pass 2
-                                   //                 (consumer spins on count == arrival_target)
+    int* channel_prefix_matrix;      // [num_ranks, num_channels]  sender-side cumulative
+    const int* base_pool;            // [num_channels, num_ranks, E_local]
+    int* pool_arrival_count;         // [total_tiles]   release-add target during Pass 2
+                                     //                 (consumer spins on count == arrival_target)
     const int* pool_arrival_target;  // [total_tiles] firing target (per-tile expected count)
-    int64_t dispatch_seq;          // NVL gen-stamp (`nvl_seq = dispatch_seq << 1`).
-                                   //   NOT used for the per-tile ready signal — that pair
-                                   //   was retired in favor of
-                                   //   `pool_arrival_count == pool_arrival_target`.
+    int64_t dispatch_seq;            // NVL gen-stamp (`nvl_seq = dispatch_seq << 1`).
+                                     //   NOT used for the per-tile ready signal — that pair
+                                     //   was retired in favor of
+                                     //   `pool_arrival_count == pool_arrival_target`.
     // Monotonic "kernel entered" flag. Block 0 thread 0 atomicAdd's at entry;
     // host queues `cuStreamBatchMemOp` wait_value_geq on the compute stream
     // before launching kernel_a, so kernel_a's launch doesn't grab SMs before
@@ -153,19 +153,19 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // looks up slots from recv_token_to_slots written by fwd Pass B). No Pass A
 // (slots are pre-computed), no scalar metadata writes (already populated).
 struct DispatchGradsIO {
-    int4* dL_do_pool;                 // [TK_padded, hidden_int4] receiver writes K times per recv-token
-    const int4* dL_dy;                // [num_tokens, hidden_int4]   sender reads
-    const bool* is_token_in_rank;     // [num_tokens, num_ranks]     same routing as fwd dispatch
+    int4* dL_do_pool;              // [TK_padded, hidden_int4] receiver writes K times per recv-token
+    const int4* dL_dy;             // [num_tokens, hidden_int4]   sender reads
+    const bool* is_token_in_rank;  // [num_tokens, num_ranks]     same routing as fwd dispatch
 };
 
 struct DispatchGradsRouting {
-    const int* recv_token_to_slots;   // [T_recv, num_topk]                     bwd Pass B slot lookup
-    const int* base_pool;             // [num_channels, num_ranks, E_local]     Pass 2: per-substream slot start
-    const int* seen_per_substream;    // [num_channels, num_ranks, E_local]     Pass 2: per-substream-per-expert recv count
+    const int* recv_token_to_slots;  // [T_recv, num_topk]                     bwd Pass B slot lookup
+    const int* base_pool;            // [num_channels, num_ranks, E_local]     Pass 2: per-substream slot start
+    const int* seen_per_substream;   // [num_channels, num_ranks, E_local]     Pass 2: per-substream-per-expert recv count
     // Passed explicitly (NOT read from IPC slab leading bytes) — the IPC
     // slab's leading bytes are reused across iters and may carry stale
     // residue. Persistent tensor lives on the StreamingHandle.
-    const int* rank_prefix_matrix;    // [num_ranks, num_ranks]                receiver: per-source-rank token offset
+    const int* rank_prefix_matrix;  // [num_ranks, num_ranks]                receiver: per-source-rank token offset
 };
 
 struct DispatchGradsTileSignal {
@@ -204,20 +204,19 @@ void launch_dispatch_grads_main(const DispatchGradsIO& io,
 // iter-N combine writes shadow iter-N+1 dispatch reads via per-channel
 // stride drift, surfacing as wrong-token SourceMeta at the receiver.
 __host__ __device__ inline int64_t intranode_get_dispatch_section_bytes(
-    int num_channels, int num_ranks, int num_recv_buffer_tokens,
-    int hidden_int4, int num_topk) {
+    int num_channels, int num_ranks, int num_recv_buffer_tokens, int hidden_int4, int num_topk) {
     const int64_t channels = num_channels;
     const int64_t ranks = num_ranks;
     const int64_t slots = num_recv_buffer_tokens;
     const int64_t h4 = hidden_int4;
     const int64_t topk = num_topk;
     int64_t bytes = 0;
-    bytes += ranks * ranks * sizeof(int);                                          // rank_prefix_matrix
-    bytes += 4 * channels * ranks * sizeof(uint64_t);                              // start/end/head/tail (genstamped)
-    bytes += channels * ranks * slots * h4 * sizeof(int4);                         // channel_x_buffers
-    bytes += channels * ranks * slots * sizeof(int);                               // channel_src_idx_buffers
-    bytes += channels * ranks * slots * topk * sizeof(topk_idx_t);                 // channel_topk_idx_buffers
-    bytes += channels * ranks * slots * topk * sizeof(float);                      // channel_topk_weights_buffers
+    bytes += ranks * ranks * sizeof(int);                           // rank_prefix_matrix
+    bytes += 4 * channels * ranks * sizeof(uint64_t);               // start/end/head/tail (genstamped)
+    bytes += channels * ranks * slots * h4 * sizeof(int4);          // channel_x_buffers
+    bytes += channels * ranks * slots * sizeof(int);                // channel_src_idx_buffers
+    bytes += channels * ranks * slots * topk * sizeof(topk_idx_t);  // channel_topk_idx_buffers
+    bytes += channels * ranks * slots * topk * sizeof(float);       // channel_topk_weights_buffers
     return (bytes + 127) / 128 * 128;
 }
 
@@ -225,18 +224,17 @@ __host__ __device__ inline int64_t intranode_get_dispatch_section_bytes(
 // (head/tail genstamped) + `channel_x_buffers` + `channel_topk_weights_buffers`.
 // No src_idx / topk_idx because combine doesn't carry those.
 __host__ __device__ inline int64_t intranode_get_combine_section_bytes(
-    int num_channels, int num_ranks, int num_recv_buffer_tokens,
-    int hidden_int4, int num_topk) {
+    int num_channels, int num_ranks, int num_recv_buffer_tokens, int hidden_int4, int num_topk) {
     const int64_t channels = num_channels;
     const int64_t ranks = num_ranks;
     const int64_t slots = num_recv_buffer_tokens;
     const int64_t h4 = hidden_int4;
     const int64_t topk = num_topk;
     int64_t bytes = 0;
-    bytes += 2 * channels * ranks * sizeof(uint64_t);                              // head/tail (genstamped)
-    bytes += channels * ranks * slots * h4 * sizeof(int4);                         // channel_x_buffers
-    bytes += channels * ranks * slots * sizeof(int);                               // src_idx skip (dispatch writes, combine doesn't read — kept for layout parity)
-    bytes += channels * ranks * slots * topk * sizeof(float);                      // channel_topk_weights_buffers
+    bytes += 2 * channels * ranks * sizeof(uint64_t);       // head/tail (genstamped)
+    bytes += channels * ranks * slots * h4 * sizeof(int4);  // channel_x_buffers
+    bytes += channels * ranks * slots * sizeof(int);        // src_idx skip (dispatch writes, combine doesn't read — kept for layout parity)
+    bytes += channels * ranks * slots * topk * sizeof(float);  // channel_topk_weights_buffers
     return (bytes + 127) / 128 * 128;
 }
 
@@ -245,40 +243,40 @@ __host__ __device__ inline int64_t intranode_get_combine_section_bytes(
 // gate variable, output destinations). See the kernel header comment in
 // intranode.cu for the full args table.
 void launch_combine_main(cudaDataType_t type,
-             void* recv_x,
-             float* recv_topk_weights_out,
-             const void* x,
-             const float* per_slot_weights,
-             const int* recv_token_to_slots,
-             const int* rank_prefix_matrix,
-             const int* channel_prefix_matrix,
-             int* send_head,
-             const int64_t* y_done_per_token,
-             int64_t combine_seq,
-             // true → fwd combine: drop per-K topk-weight wire payload +
-             // skip the receiver-side reduce + skip writing
-             // `recv_topk_weights_out` (caller passes nullptr). Kernel Y
-             // already pre-multiplies pool_topk_weight per row so `out` is
-             // the full weighted sum. false → bwd combine_grads: ships per-K
-             // dL/dweight, receiver sums into `recv_topk_weights_out`.
-             bool is_fwd,
-             int num_tokens,
-             int num_recv_tokens,
-             int hidden,
-             int num_topk,
-             void** buffer_ptrs,
-             // Byte offset on each peer's `buffer_ptrs[i]` past dispatch's
-             // sub-buffer chain. Combine's chain lives at
-             // `[dispatch_section_bytes, dispatch_section_bytes +
-             // combine_section_bytes)`, physically disjoint from dispatch.
-             // See `intranode_get_dispatch_section_bytes` above.
-             int64_t dispatch_section_bytes,
-             int rank,
-             int num_ranks,
-             cudaStream_t stream,
-             int num_sms,
-             int num_max_send_tokens,
-             int num_recv_buffer_tokens);
+                         void* recv_x,
+                         float* recv_topk_weights_out,
+                         const void* x,
+                         const float* per_slot_weights,
+                         const int* recv_token_to_slots,
+                         const int* rank_prefix_matrix,
+                         const int* channel_prefix_matrix,
+                         int* send_head,
+                         const int64_t* y_done_per_token,
+                         int64_t combine_seq,
+                         // true → fwd combine: drop per-K topk-weight wire payload +
+                         // skip the receiver-side reduce + skip writing
+                         // `recv_topk_weights_out` (caller passes nullptr). Kernel Y
+                         // already pre-multiplies pool_topk_weight per row so `out` is
+                         // the full weighted sum. false → bwd combine_grads: ships per-K
+                         // dL/dweight, receiver sums into `recv_topk_weights_out`.
+                         bool is_fwd,
+                         int num_tokens,
+                         int num_recv_tokens,
+                         int hidden,
+                         int num_topk,
+                         void** buffer_ptrs,
+                         // Byte offset on each peer's `buffer_ptrs[i]` past dispatch's
+                         // sub-buffer chain. Combine's chain lives at
+                         // `[dispatch_section_bytes, dispatch_section_bytes +
+                         // combine_section_bytes)`, physically disjoint from dispatch.
+                         // See `intranode_get_dispatch_section_bytes` above.
+                         int64_t dispatch_section_bytes,
+                         int rank,
+                         int num_ranks,
+                         cudaStream_t stream,
+                         int num_sms,
+                         int num_max_send_tokens,
+                         int num_recv_buffer_tokens);
 
 }  // namespace intranode
 
@@ -298,10 +296,8 @@ __host__ __device__ inline int get_source_meta_bytes_inline() {
 // topk_idx + topk_weights). Used by the metadata kernel (cleanup-region
 // sizing) and the dispatch_main kernel (stride into the channel data ring).
 __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_topk_idx, int num_topk_weights) {
-    auto raw = hidden_int4 * static_cast<int>(sizeof(int4))
-               + get_source_meta_bytes_inline()
-               + num_topk_idx * static_cast<int>(sizeof(int))
-               + num_topk_weights * static_cast<int>(sizeof(float));
+    auto raw = hidden_int4 * static_cast<int>(sizeof(int4)) + get_source_meta_bytes_inline() +
+        num_topk_idx * static_cast<int>(sizeof(int)) + num_topk_weights * static_cast<int>(sizeof(float));
     auto a = static_cast<int>(sizeof(int4));
     return ((raw + a - 1) / a) * a;
 }
@@ -318,16 +314,13 @@ __host__ __device__ inline int get_num_bytes_per_token(int hidden_int4, int num_
 // side carries the same constraint — see `get_dispatch_rdma_region_bytes`
 // below.
 __host__ __device__ inline int64_t get_dispatch_nvl_region_bytes(
-    int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens,
-    int num_channels, int num_rdma_ranks) {
+    int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens, int num_channels, int num_rdma_ranks) {
     const int64_t nvl_peers = static_cast<int64_t>(NUM_MAX_NVL_PEERS);
     const int64_t channels = num_channels;
-    const int64_t per_slab_x = static_cast<int64_t>(num_max_nvl_chunked_recv_tokens)
-                             * get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
+    const int64_t per_slab_x =
+        static_cast<int64_t>(num_max_nvl_chunked_recv_tokens) * get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
     const int64_t total_x = per_slab_x * nvl_peers * channels;
-    const int64_t per_channel_prefix = static_cast<int64_t>(num_rdma_ranks)
-                                     * static_cast<int64_t>(sizeof(uint64_t))
-                                     * nvl_peers;
+    const int64_t per_channel_prefix = static_cast<int64_t>(num_rdma_ranks) * static_cast<int64_t>(sizeof(uint64_t)) * nvl_peers;
     const int64_t total_prefix = per_channel_prefix * channels;  // each of start/end
     const int64_t per_channel_ht = static_cast<int64_t>(sizeof(uint64_t)) * nvl_peers;
     const int64_t total_ht = per_channel_ht * channels;  // each of head/tail
@@ -341,16 +334,12 @@ __host__ __device__ inline int64_t get_dispatch_nvl_region_bytes(
 // combine's `head`/`tail` use `kNumRDMARanks` elements per slab (vs
 // dispatch's `1`).
 __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
-    int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens,
-    int num_channels, int num_rdma_ranks) {
+    int hidden_int4, int num_topk, int num_max_nvl_chunked_recv_tokens, int num_channels, int num_rdma_ranks) {
     const int64_t nvl_peers = static_cast<int64_t>(NUM_MAX_NVL_PEERS);
     const int64_t channels = num_channels;
-    const int64_t per_slab_x = static_cast<int64_t>(num_max_nvl_chunked_recv_tokens)
-                             * get_num_bytes_per_token(hidden_int4, 0, num_topk);
+    const int64_t per_slab_x = static_cast<int64_t>(num_max_nvl_chunked_recv_tokens) * get_num_bytes_per_token(hidden_int4, 0, num_topk);
     const int64_t total_x = per_slab_x * nvl_peers * channels;
-    const int64_t per_channel_ht = static_cast<int64_t>(num_rdma_ranks)
-                                 * static_cast<int64_t>(sizeof(uint64_t))
-                                 * nvl_peers;
+    const int64_t per_channel_ht = static_cast<int64_t>(num_rdma_ranks) * static_cast<int64_t>(sizeof(uint64_t)) * nvl_peers;
     const int64_t total_ht = per_channel_ht * channels;
     // 1 x_buffer + 1 head + 1 tail
     return total_x + 2 * total_ht;
@@ -372,14 +361,12 @@ __host__ __device__ inline int64_t get_combine_nvl_region_bytes(
 // (internode.cu). Used by `Config::get_nvl_buffer_size_hint` (with the
 // NUM_MAX_LOCAL_EXPERTS upper bound) AND by the runtime fit check in
 // `Buffer::internode_dispatch`.
-__host__ __device__ inline int64_t get_metadata_nvl_region_bytes(
-    int num_local_experts, int num_channels, int num_rdma_ranks) {
+__host__ __device__ inline int64_t get_metadata_nvl_region_bytes(int num_local_experts, int num_channels, int num_rdma_ranks) {
     const int64_t nvl_peers = NUM_MAX_NVL_PEERS;
     // Internode requires num_ranks == num_rdma_ranks * NUM_MAX_NVL_PEERS, so
     // num_rdma_experts (= num_experts / num_rdma_ranks) == E_local * nvl_peers.
     const int64_t num_rdma_experts = static_cast<int64_t>(num_local_experts) * nvl_peers;
-    const int64_t count_ints =
-        num_rdma_experts                                        // nvl_reduced_num_tokens_per_expert
+    const int64_t count_ints = num_rdma_experts                 // nvl_reduced_num_tokens_per_expert
         + static_cast<int64_t>(num_rdma_ranks) * nvl_peers      // nvl_{send,recv}_num_tokens_per_rank
         + static_cast<int64_t>(num_local_experts) * nvl_peers;  // nvl_{send,recv}_num_tokens_per_expert
     const int64_t streaming_ints =                              // nvl_streaming_{send,recv}
@@ -399,22 +386,17 @@ __host__ __device__ inline int64_t get_metadata_nvl_region_bytes(
 // inside dispatch's data region, shadowing the bwd dispatch_grads reads.
 // Mirrors `get_dispatch_nvl_region_bytes`.
 __host__ __device__ inline int64_t get_dispatch_rdma_region_bytes(
-    int hidden_int4, int num_topk, int num_max_rdma_chunked_recv_tokens,
-    int num_channels, int num_rdma_ranks) {
+    int hidden_int4, int num_topk, int num_max_rdma_chunked_recv_tokens, int num_channels, int num_rdma_ranks) {
     const int64_t channels = num_channels;
     const int64_t rdma_ranks = num_rdma_ranks;
     // rdma_channel_data: SymBuffer<uint8_t> (decoupled): num_elems *
     // num_rdma_ranks * num_channels * 2 (send+recv) bytes. The routing header
     // rides this ring (1 slot/iter/link); no separate region.
-    const int64_t bytes_per_token =
-        get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
-    const int64_t data_bytes =
-        2 * static_cast<int64_t>(num_max_rdma_chunked_recv_tokens)
-          * bytes_per_token * rdma_ranks * channels;
+    const int64_t bytes_per_token = get_num_bytes_per_token(hidden_int4, num_topk, num_topk);
+    const int64_t data_bytes = 2 * static_cast<int64_t>(num_max_rdma_chunked_recv_tokens) * bytes_per_token * rdma_ranks * channels;
     // rdma_channel_head + rdma_channel_tail: SymBuffer<uint64_t, false>
     // (non-decoupled), num_elems = 1. data ends int4-aligned so no align slack.
-    const int64_t ht_bytes =
-        2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
+    const int64_t ht_bytes = 2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
     return data_bytes + ht_bytes;
 }
 
@@ -424,17 +406,12 @@ __host__ __device__ inline int64_t get_dispatch_rdma_region_bytes(
 // buffer-size hint to size combine's region after dispatch's. No meta
 // SymBuffer and no L2-line align slack on the combine chain.
 __host__ __device__ inline int64_t get_combine_rdma_region_bytes(
-    int hidden_int4, int num_topk, int num_max_rdma_chunked_recv_tokens,
-    int num_channels, int num_rdma_ranks) {
+    int hidden_int4, int num_topk, int num_max_rdma_chunked_recv_tokens, int num_channels, int num_rdma_ranks) {
     const int64_t channels = num_channels;
     const int64_t rdma_ranks = num_rdma_ranks;
-    const int64_t bytes_per_token =
-        get_num_bytes_per_token(hidden_int4, 0, num_topk);
-    const int64_t data_bytes =
-        2 * static_cast<int64_t>(num_max_rdma_chunked_recv_tokens)
-          * bytes_per_token * rdma_ranks * channels;
-    const int64_t ht_bytes =
-        2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
+    const int64_t bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, num_topk);
+    const int64_t data_bytes = 2 * static_cast<int64_t>(num_max_rdma_chunked_recv_tokens) * bytes_per_token * rdma_ranks * channels;
+    const int64_t ht_bytes = 2 * static_cast<int64_t>(sizeof(uint64_t)) * rdma_ranks * channels;
     return data_bytes + ht_bytes;
 }
 
@@ -526,31 +503,31 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
 // `DispatchInputs` (sender/forwarder reads from metadata kernel), and
 // `DispatchEnv` (RDMA buffer + NVL/RDMA chunked send/recv sizes).
 struct DispatchPoolOut {
-    int4* pool;                    // [TK_padded, hidden_int4]   data (int4-vector)
-    float* pool_topk_weight;       // [TK_padded]                per-pool-slot weight
-    int* pool_recv_token;          // [TK_padded]                slot → recv-token id (-1 = padding)
-    int* pool_k_slot;              // [TK_padded]                slot → k (-1 = padding)
+    int4* pool;               // [TK_padded, hidden_int4]   data (int4-vector)
+    float* pool_topk_weight;  // [TK_padded]                per-pool-slot weight
+    int* pool_recv_token;     // [TK_padded]                slot → recv-token id (-1 = padding)
+    int* pool_k_slot;         // [TK_padded]                slot → k (-1 = padding)
 };
 
 struct DispatchPerTokenOut {
     // Streaming-essential per-recv-token outputs (mirror intranode):
-    int* k_local_remaining;      // [T_recv]                   K_local(r); kernel Y atomicSubs to 0
-    int* recv_token_to_slots;      // [T_recv, num_topk]         (r, k) → pool slot, -1 for non-local k
-    int* k_local_total;            // [T_recv]                   write-once K_local mirror
+    int* k_local_remaining;    // [T_recv]                   K_local(r); kernel Y atomicSubs to 0
+    int* recv_token_to_slots;  // [T_recv, num_topk]         (r, k) → pool slot, -1 for non-local k
+    int* k_local_total;        // [T_recv]                   write-once K_local mirror
 
     // Combine plumbing (internode-specific):
     void* recv_src_meta;                   // [T_recv, get_source_meta_bytes()] (uint8)
-    int*  send_rdma_head;                  // [num_tokens, num_rdma_ranks]
-    int*  send_nvl_head;                   // [num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]
-    int*  recv_rdma_channel_prefix_matrix; // [num_rdma_ranks, num_channels]
-    int*  recv_gbl_channel_prefix_matrix;  // [num_world_ranks, num_channels]
+    int* send_rdma_head;                   // [num_tokens, num_rdma_ranks]
+    int* send_nvl_head;                    // [num_rdma_recv_tokens, NUM_MAX_NVL_PEERS]
+    int* recv_rdma_channel_prefix_matrix;  // [num_rdma_ranks, num_channels]
+    int* recv_gbl_channel_prefix_matrix;   // [num_world_ranks, num_channels]
 };
 
 struct DispatchInputs {
-    const int4* x;                      // [num_tokens, hidden_int4]
-    const topk_idx_t* topk_idx;         // [num_tokens, num_topk]
-    const float* topk_weights;          // [num_tokens, num_topk]
-    const bool* is_token_in_rank;       // [num_tokens, num_world_ranks]
+    const int4* x;                 // [num_tokens, hidden_int4]
+    const topk_idx_t* topk_idx;    // [num_tokens, num_topk]
+    const float* topk_weights;     // [num_tokens, num_topk]
+    const bool* is_token_in_rank;  // [num_tokens, num_world_ranks]
     // Sender / forwarder reads from metadata kernel:
     const int* rdma_channel_prefix_matrix;  // [num_rdma_ranks, num_channels]
     const int* recv_rdma_rank_prefix_sum;   // [num_rdma_ranks]
@@ -583,7 +560,7 @@ struct DispatchShape {
 
 struct DispatchEnv {
     void* rdma_buffer_ptr;
-    void** buffer_ptrs;              // [NUM_MAX_NVL_PEERS]
+    void** buffer_ptrs;  // [NUM_MAX_NVL_PEERS]
     int rank;
     int num_max_rdma_chunked_send_tokens;
     int num_max_rdma_chunked_recv_tokens;
@@ -619,26 +596,26 @@ void launch_dispatch_main(const DispatchPoolOut& pool_out,
 // — the per-token bytes carry data + SourceMeta + topk_* but bwd only
 // writes/reads the data region; metadata bytes are untouched.
 struct DispatchGradsIO {
-    int4* dL_do_pool;                 // [TK_padded, hidden_int4] receiver writes K times per recv-token
-    const int4* dL_dy;                // [num_tokens, hidden_int4] sender reads
-    const bool* is_token_in_rank;     // [num_tokens, num_world_ranks] same routing as fwd dispatch
+    int4* dL_do_pool;              // [TK_padded, hidden_int4] receiver writes K times per recv-token
+    const int4* dL_dy;             // [num_tokens, hidden_int4] sender reads
+    const bool* is_token_in_rank;  // [num_tokens, num_world_ranks] same routing as fwd dispatch
 };
 
 struct DispatchGradsRouting {
-    const int* recv_token_to_slots;   // [T_recv, num_topk]                       bwd Pass B slot lookup
-    const int* base_pool;             // [num_channels, num_world_ranks, E_local] Pass 2: per-substream slot start
-    const int* seen_per_substream;    // [num_channels, num_world_ranks, E_local] Pass 2: per-substream-per-expert recv count
-    const int* tile_id_to_expert;     // [total_tiles] int32                      Eager Pass 2: slot → e_local via slot/tile_m
+    const int* recv_token_to_slots;  // [T_recv, num_topk]                       bwd Pass B slot lookup
+    const int* base_pool;            // [num_channels, num_world_ranks, E_local] Pass 2: per-substream slot start
+    const int* seen_per_substream;   // [num_channels, num_world_ranks, E_local] Pass 2: per-substream-per-expert recv count
+    const int* tile_id_to_expert;    // [total_tiles] int32                      Eager Pass 2: slot → e_local via slot/tile_m
     // Sender-side prefix matrices (drive sender + sender_coordinator's
     // per-channel send counts and the negative-encoded meta the forwarder
     // reads to derive `num_tokens_to_recv_from_rdma`).
-    const int* gbl_channel_prefix_matrix;          // [num_world_ranks, num_channels]   sender-side, per-(dst_world, channel)
-    const int* rdma_channel_prefix_matrix;         // [num_rdma_ranks, num_channels]    sender-side, per-(dst_rdma, channel)
+    const int* gbl_channel_prefix_matrix;   // [num_world_ranks, num_channels]   sender-side, per-(dst_world, channel)
+    const int* rdma_channel_prefix_matrix;  // [num_rdma_ranks, num_channels]    sender-side, per-(dst_rdma, channel)
     // Receiver-side: forwarder uses these for per-(src_rdma) base offset
     // computation; receiver uses recv_gbl_channel_prefix_matrix to map
     // (channel, src_world) → starting recv_token_id.
-    const int* recv_rdma_rank_prefix_sum;          // [num_rdma_ranks]
-    const int* recv_gbl_channel_prefix_matrix;     // [num_world_ranks, num_channels]
+    const int* recv_rdma_rank_prefix_sum;       // [num_rdma_ranks]
+    const int* recv_gbl_channel_prefix_matrix;  // [num_world_ranks, num_channels]
 };
 
 struct DispatchGradsTileSignal {

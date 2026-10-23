@@ -75,15 +75,9 @@ def compute_metadata_reference(
     src_idx = torch.arange(num_ranks, device=device).view(num_ranks, 1, 1).expand(num_ranks, T, K)
 
     # seen[c, src, e] = count of (t, k) where src's topk routes to our (rank, e_local)
-    flat_idx_full = (
-        channel.long() * num_ranks * E_local
-        + src_idx.long() * E_local
-        + e_local_g.long()
-    )
+    flat_idx_full = channel.long() * num_ranks * E_local + src_idx.long() * E_local + e_local_g.long()
     flat_idx_used = flat_idx_full[to_me]
-    seen = torch.zeros(
-        num_channels * num_ranks * E_local, dtype=torch.int32, device=device
-    )
+    seen = torch.zeros(num_channels * num_ranks * E_local, dtype=torch.int32, device=device)
     seen.scatter_add_(0, flat_idx_used, torch.ones_like(flat_idx_used, dtype=torch.int32))
     seen = seen.view(num_channels, num_ranks, E_local)
 
@@ -174,9 +168,7 @@ def compute_metadata_reference(
 
     # ── Stage 6: total recv counters.
     moe_recv_counter = int(per_src_unique.sum().item())
-    moe_recv_expert_counter = (
-        (expert_frequency + expert_alignment - 1) // expert_alignment
-    ) * expert_alignment
+    moe_recv_expert_counter = ((expert_frequency + expert_alignment - 1) // expert_alignment) * expert_alignment
 
     # ── gbl_channel_prefix_matrix + rdma_channel_prefix_matrix from THIS
     # rank's perspective. Both are CUMULATIVE across channels (the kernel
@@ -251,7 +243,7 @@ def diff_int(actual: torch.Tensor, expected: torch.Tensor, name: str) -> int:
     if actual.shape != expected.shape:
         print(f"[{name}] SHAPE MISMATCH: actual {tuple(actual.shape)}, expected {tuple(expected.shape)}")
         return -1
-    diff = (actual != expected)
+    diff = actual != expected
     n_bad = int(diff.sum().item())
     if n_bad > 0:
         bad_idx = diff.nonzero(as_tuple=False)[:8]
@@ -323,12 +315,8 @@ def main():
         Buffer.get_dispatch_config(world_size),
         Buffer.get_combine_config(world_size),
     ):
-        nvl_bytes = max(
-            cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes
-        )
-        rdma_bytes = max(
-            cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes
-        )
+        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
+        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
     buf = Buffer(group, nvl_bytes, rdma_bytes)
     num_channels = Buffer.num_sms // 2
 

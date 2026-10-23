@@ -94,15 +94,9 @@ class ScatterParams(NamedTuple):
     mO: cute.Tensor  # [T_recv, H]  bf16  — atomic-scatter destination
     pool_recv_token: cute.Tensor  # [TK_padded]        int32 — slot → r (-1 = padding)
     k_local_remaining: cute.Tensor  # [T_recv]           int32 — kernel Y atomicSubs
-    y_done_per_token: (
-        cute.Tensor
-    )  # [T_recv]           int64 — Y → combine release stamp
-    tile_n_stripes_done: (
-        cute.Tensor
-    )  # [total_tiles]      int32 — per-tile_id N-stripe arrival counter
-    expert_pool_block_offset: (
-        cute.Tensor
-    )  # [E_local + 1]      int32 — pool-block prefix-sum (for tile_id reconstruct)
+    y_done_per_token: cute.Tensor  # [T_recv]           int64 — Y → combine release stamp
+    tile_n_stripes_done: cute.Tensor  # [total_tiles]      int32 — per-tile_id N-stripe arrival counter
+    expert_pool_block_offset: cute.Tensor  # [E_local + 1]      int32 — pool-block prefix-sum (for tile_id reconstruct)
     T_recv: Int32  # row count == mO.shape[0]
     combine_seq: Int64  # value to release-store on hit-zero
     num_pid_n: Int32  # N-stripe count per tile (= ceil(H / tile_N))
@@ -214,9 +208,7 @@ class AtomicScatterStore(EpiOp):
 
         @cute.struct
         class ScatterStorage:
-            staging: cute.struct.Align[
-                cute.struct.MemRange[scatter_dtype, bf16_size], gemm.buffer_align_bytes
-            ]
+            staging: cute.struct.Align[cute.struct.MemRange[scatter_dtype, bf16_size], gemm.buffer_align_bytes]
             recv_token: cute.struct.Align[cute.struct.MemRange[Int32, tile_M], 16]
             # `is_last_flag`: 1-int32 scratch slot for the last-N-stripe gate
             # broadcast in `end()`. Thread 0 writes 0/1 here after its
@@ -234,9 +226,7 @@ class AtomicScatterStore(EpiOp):
         # staging is a flat row-major padded MemRange, so the layout's strides
         # alone resolve every (m, n, stage) address.
         staging_t = s_struct.staging.get_tensor(smem_layout_staged)
-        recv_token_t = s_struct.recv_token.get_tensor(
-            cute.make_layout(gemm.cta_tile_shape_mnk[0])
-        )
+        recv_token_t = s_struct.recv_token.get_tensor(cute.make_layout(gemm.cta_tile_shape_mnk[0]))
         is_last_t = s_struct.is_last_flag.get_tensor(cute.make_layout(1))
         return (staging_t, recv_token_t, is_last_t)
 
@@ -254,10 +244,7 @@ class AtomicScatterStore(EpiOp):
         # cu_seqlens_m carries `expert_pool_block_offset * tile_m` (host-side build
         # in the streaming_moe_y wrapper); for the streaming scheduler
         # tile_coord_mnkl[0] = pid_m = tile_in_e and tile_coord_mnkl[3] = expert_id.
-        pool_start = (
-            ctx.varlen_manager.params.cu_seqlens_m[ctx.batch_idx]
-            + ctx.tile_coord_mnkl[0] * ctx.tile_M
-        )
+        pool_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.batch_idx] + ctx.tile_coord_mnkl[0] * ctx.tile_M
         # Load tile_M ints from pool_recv_token[pool_start : pool_start + tile_M]
         # into recv_token_t. Each thread (tidx in [0, tile_M)) loads 1 int.
         # Off-tile threads (tidx >= tile_M) skip — the per-row consumers below
@@ -450,9 +437,7 @@ class StreamingScatterBase(StreamingGemmBase):
         Constexpr — folded at trace time, no runtime cost.
         """
         tiled_copy_C_atom = self.epilog_smem_copy_atom(self.tiled_mma)
-        plain_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=32
-        )
+        plain_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=32)
         return cute.make_tiled_copy_S(plain_atom, tiled_copy_C_atom)
 
     # `epi_setup_aux_out` / `epi_convert_aux_out` are no longer overridden:
@@ -532,9 +517,7 @@ class StreamingScatterBase(StreamingGemmBase):
         epi_tile_N = const_expr(self.epi_tile[1])
         cta_tile_N = const_expr(self.cta_tile_shape_mnk[1])
 
-        n_origin = tile_coord_mnkl[1] * Int32(cta_tile_N) + epi_coord[1] * Int32(
-            epi_tile_N
-        )
+        n_origin = tile_coord_mnkl[1] * Int32(cta_tile_N) + epi_coord[1] * Int32(epi_tile_N)
         m_subtile_origin = epi_coord[0] * Int32(epi_tile_M)
 
         # Vector-packed bf16x2 atomic-add. Each `red.global.add.v4.bf16x2`
@@ -728,22 +711,12 @@ def _compile_streaming_moe_y(
 
     # Scatter destination: (T_recv, H), n-major.
     mO = fake_tensor(o_dtype, (Trecv_sym, H_sym), leading_dim=1, divisibility=8)
-    pool_recv_token = fake_tensor(
-        cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1
-    )
-    k_local_remaining = fake_tensor(
-        cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1
-    )
-    y_done_per_token = fake_tensor(
-        cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1
-    )
+    pool_recv_token = fake_tensor(cutlass.Int32, (TK_padded_sym,), leading_dim=0, divisibility=1)
+    k_local_remaining = fake_tensor(cutlass.Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+    y_done_per_token = fake_tensor(cutlass.Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
 
-    tile_n_stripes_done = fake_tensor(
-        cutlass.Int32, (total_tiles_sym,), leading_dim=0, divisibility=1
-    )
-    expert_pool_block_offset_scatter = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
-    )
+    tile_n_stripes_done = fake_tensor(cutlass.Int32, (total_tiles_sym,), leading_dim=0, divisibility=1)
+    expert_pool_block_offset_scatter = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1)
     scatter = ScatterParams(
         mO=mO,
         pool_recv_token=pool_recv_token,
@@ -757,22 +730,16 @@ def _compile_streaming_moe_y(
     )
 
     # ColVecLoad's per-row weight broadcast (varlen_m). Shape (TK_padded,) fp32.
-    pool_topk_weight = fake_tensor(
-        cutlass.Float32, (TK_padded_sym,), leading_dim=0, divisibility=1
-    )
+    pool_topk_weight = fake_tensor(cutlass.Float32, (TK_padded_sym,), leading_dim=0, divisibility=1)
 
     # cu_seqlens_m drives the standard varlen_m m-offset for both A's pool read
     # and ColVecLoad's per-row weight slice. Length E_local + 1.
-    mCuSeqlensM = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1
-    )
+    mCuSeqlensM = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), leading_dim=0, divisibility=1)
 
     consumer_head = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
     pool_arrival_count = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
     pool_arrival_target = fake_tensor(cutlass.Int32, (total_tiles_sym,), divisibility=1)
-    expert_pool_block_offset = fake_tensor(
-        cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1
-    )
+    expert_pool_block_offset = fake_tensor(cutlass.Int32, (cu_seqlens_len_sym,), divisibility=1)
 
     started_flag_fake = fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1)
 
@@ -786,9 +753,7 @@ def _compile_streaming_moe_y(
         started_flag=started_flag_fake,
     )
 
-    epi_args = StreamingMoeY.EpilogueArguments(
-        scatter=scatter, mColVecBroadcast=pool_topk_weight
-    )
+    epi_args = StreamingMoeY.EpilogueArguments(scatter=scatter, mColVecBroadcast=pool_topk_weight)
 
     varlen_args = VarlenArguments(mCuSeqlensM=mCuSeqlensM, mCuSeqlensK=None, mAIdx=None)
 
@@ -828,7 +793,8 @@ def streaming_moe_y(
     pool_arrival_target: torch.Tensor,  # (total_tiles,) int32 — per-tile firing target (set by dispatch metadata)
     combine_seq: int,
     *,
-    started_flag: torch.Tensor | None = None,  # (1,) int32 buffer-owned cross-stream launch-gate flag; first CTA bumps it. None → allocate throwaway (tests / standalone harnesses).
+    started_flag: torch.Tensor
+    | None = None,  # (1,) int32 buffer-owned cross-stream launch-gate flag; first CTA bumps it. None → allocate throwaway (tests / standalone harnesses).
     tile_m: int = 128,
     tile_n: int = 128,
     cluster_m: int = 1,
@@ -870,16 +836,11 @@ def streaming_moe_y(
     assert postact_tile_m == tile_m
     T_recv, H = o.shape
     E_local = W2.shape[0]
-    assert W2.shape == (E_local, H, I), (
-        f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected "
-        f"{(E_local, H, I)}"
-    )
+    assert W2.shape == (E_local, H, I), f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected {(E_local, H, I)}"
     # tile_n MUST divide the output N dim (= H). Non-divisible tile_n produces
     # partial-tile stores that silently corrupt adjacent memory in the
     # atomic-scatter epilogue.
-    assert H % tile_n == 0, (
-        f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
-    )
+    assert H % tile_n == 0, f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
     assert pool_topk_weight.shape == (total_tiles * tile_m,)
@@ -932,9 +893,7 @@ def streaming_moe_y(
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:
-        max_active_clusters = min(
-            max_active_clusters, num_sms // (cluster_m * cluster_n)
-        )
+        max_active_clusters = min(max_active_clusters, num_sms // (cluster_m * cluster_n))
 
     # Internal scheduler counter — allocate on the calling stream so the
     # zero-init is naturally ordered with kernel Y's atomic claims.
@@ -944,9 +903,7 @@ def streaming_moe_y(
     # CTA whose atomic-add returns `num_pid_n - 1` is the last N-stripe and
     # does the per-row decrement + compute_done release.
     num_pid_n = (H + tile_n - 1) // tile_n
-    tile_n_stripes_done = torch.zeros(
-        total_tiles, dtype=torch.int32, device=postact_a.device
-    )
+    tile_n_stripes_done = torch.zeros(total_tiles, dtype=torch.int32, device=postact_a.device)
 
     scatter = ScatterParams(
         mO=o,
@@ -959,9 +916,7 @@ def streaming_moe_y(
         combine_seq=Int64(combine_seq),
         num_pid_n=Int32(num_pid_n),
     )
-    epi_args = StreamingMoeY.EpilogueArguments(
-        scatter=scatter, mColVecBroadcast=pool_topk_weight
-    )
+    epi_args = StreamingMoeY.EpilogueArguments(scatter=scatter, mColVecBroadcast=pool_topk_weight)
     if started_flag is None:
         started_flag = torch.zeros(1, dtype=torch.int32, device=postact_a.device)
     assert started_flag.shape == (1,) and started_flag.dtype == torch.int32
@@ -974,15 +929,11 @@ def streaming_moe_y(
         total_tiles=Int32(total_tiles),
         started_flag=started_flag,
     )
-    varlen_args = VarlenArguments(
-        mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None
-    )
+    varlen_args = VarlenArguments(mCuSeqlensM=cu_seqlens_m, mCuSeqlensK=None, mAIdx=None)
 
     # Trailing (None, None) = mSFA / mSFB (main's unified TMA scale-factor
     # slots, always None for plain bf16); main takes no host stream arg.
-    compiled_fn(
-        postact_flat, W2, None, None, epi_args, scheduler_args, varlen_args, None, None
-    )
+    compiled_fn(postact_flat, W2, None, None, epi_args, scheduler_args, varlen_args, None, None)
 
 
 # Tests for kernel Y reuse ``kernel_a.fire_tiles_with_delay`` against the
