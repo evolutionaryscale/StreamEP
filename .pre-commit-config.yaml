@@ -1,10 +1,20 @@
 # Local: `pixi run -e lint pre-commit install` once per clone. CI runs the same
-# hooks on every PR (`pixi run -e lint lint`).
+# hooks on every PR (`pixi run -e lint lint`). Formatters: ruff format for
+# Python, clang-format (.clang-format) for csrc; the vendored headers under
+# csrc/third_party are left as shipped upstream.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.0
     hooks:
       - id: ruff-check
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v23.1.3
+    hooks:
+      - id: clang-format
+        types_or: [c, c++, cuda]
+        exclude: ^csrc/third_party/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

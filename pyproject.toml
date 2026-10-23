@@ -17,10 +17,9 @@ version = "0.1.14"
 # install torch before stream-ep's metadata prep under no-build-isolation.
 dependencies = ["torch==2.11.0", "nvidia-nvshmem-cu13==3.4.5"]
 
-[tool.yapf]
-based_on_style = "pep8"
-column_limit = 140
-indent_width = 4
+[tool.ruff]
+# Matches .clang-format's ColumnLimit.
+line-length = 140
 
 [tool.ruff.lint]
 select = [
@@ -48,6 +47,8 @@ ignore = [
     "E501",
     # key in dict.keys()
     "SIM118",
+    # ternary vs if/else is left to the author
+    "SIM108",
     # memory leaks
     "B019",
     # No such file or directory

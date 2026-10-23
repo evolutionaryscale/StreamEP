@@ -16,6 +16,10 @@ BreakBeforeBinaryOperators: None
 Cpp11BracedListStyle: true
 ContinuationIndentWidth: 4
 
+# Include order is significant: configs.cuh undefines torch's
+# __CUDA_NO_*_CONVERSIONS__ before CUDA headers that read them.
+SortIncludes: Never
+
 BinPackArguments: false
 BinPackParameters: false
 
