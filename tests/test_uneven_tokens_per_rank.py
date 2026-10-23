@@ -24,8 +24,8 @@ peers (uneven per-rank T) under the CONTROL `uniform_rotating` routing — so a
 failure here is unambiguously the uneven token count, not routing skew.
 
 World-agnostic (reproduces on both the intranode and internode paths):
-    ./scripts/srun_1node.sh StreamEP/tests/test_uneven_tokens_per_rank.py   # 8 GPU, intranode (:1164/:1237)
-    ./scripts/srun_2node.sh StreamEP/tests/test_uneven_tokens_per_rank.py   # 16 GPU, internode (:1610/:1705)
+    torchrun --standalone --nproc-per-node=8 tests/test_uneven_tokens_per_rank.py   # 8 GPU, intranode
+    torchrun --nnodes=2 --nproc-per-node=8 ... tests/test_uneven_tokens_per_rank.py  # 16 GPU, internode
 
 Expected BEFORE the fix: rank 0 raises "start+length exceeds dimension size"
 (the run fails). AFTER sizing total_tiles_max from the GLOBAL token count:

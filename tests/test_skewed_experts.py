@@ -11,11 +11,9 @@ failures luck-dependent. Deterministic scenarios make pass/fail
 reproducible across runs and let us bisect / iterate without
 re-rolling the routing seed.
 
-Why "world-size agnostic": same script under
-``./scripts/srun_1node.sh -m stream_ep.tests.test_skewed_experts`` (1-node
-intranode, NVL only — fast iteration baseline) and
-``./scripts/srun_4node.sh -m stream_ep.tests.test_skewed_experts`` (4-node
-internode — the bug catcher). The scenarios are parameterized only by
+Why "world-size agnostic": the same script runs on 1 node (intranode, NVL
+only — fast iteration baseline) and on several nodes (internode — the bug
+catcher). The scenarios are parameterized only by
 ``world_size`` / ``rank``, no per-topology branching.
 
 Scenarios (deterministic per ``(world_size, rank)``):

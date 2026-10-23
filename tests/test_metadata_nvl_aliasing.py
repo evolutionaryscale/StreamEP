@@ -46,7 +46,7 @@ offset-0 layout -- reproducing red requires building the pre-fix source
 Launch (torchrun-style, internode: world > 8 and world % 8 == 0; prod-ish
 shapes H=512 latent bf16, E=512, K=8, T=8192, num_sms=64 -> 32 channels):
 
-    ./scripts/srun_4node.sh StreamEP/tests/test_metadata_nvl_aliasing.py
+    torchrun --nproc-per-node=8 tests/test_metadata_nvl_aliasing.py   (one torchrun per node: add --nnodes=<N> --node-rank=<i> and c10d rendezvous args)
 
 This test intentionally relies on two permanent, zero-overhead-when-off
 pieces of the C++ side: the `STREAMEP_DEBUG_PB_DELAY_US` Phase-B entry spin

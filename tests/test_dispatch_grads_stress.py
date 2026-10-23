@@ -23,8 +23,9 @@ Per "step" it mirrors the benchmark's per-training-step comm structure:
 Progress is printed per (step, layer) and flushed, so when it hangs the log
 pinpoints the exact step/layer/op that stalled. A clean run prints PASS.
 
-Driver (4 nodes / world=32 — internode is where the bug lives):
-    ./scripts/srun_4node.sh StreamEP/tests/test_dispatch_grads_stress.py \
+Launch internode, world >= 16 (the hang was seen at 4 nodes / world=32)
+(one torchrun per node: add --nnodes=<N> --node-rank=<i> and c10d rendezvous args):
+    torchrun --nproc-per-node=8 tests/test_dispatch_grads_stress.py \
         [--num_layers 44] [--num_steps 8] [--hidden 3072] [--num_experts 256] \
         [--topk 8] [--num_tokens 8192] [--tile_m 128]
 

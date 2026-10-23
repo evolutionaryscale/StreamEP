@@ -11,8 +11,8 @@ NVL/RDMA partitioned `base_pool` ordering plus the internode-only
 counters (`recv_rdma_rank_prefix_sum`, `recv_gbl_rank_prefix_sum`).
 
 Launch:
-    ./scripts/srun_1node.sh StreamEP/tests/test_metadata.py
-    ./scripts/srun_4node.sh StreamEP/tests/test_metadata.py --internode
+    torchrun --standalone --nproc-per-node=8 tests/test_metadata.py
+    torchrun --nnodes=<N> --nproc-per-node=8 ... tests/test_metadata.py --internode
 
 Exits 0 on PASS, non-zero on first FAIL with a printed diff summary.
 """
