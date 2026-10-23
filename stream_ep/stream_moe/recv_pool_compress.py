@@ -1,5 +1,5 @@
 """Triton kernels for activation_checkpoint_level=2 pool <-> x_recv row
-compaction / re-expansion (markdowns/act_ckpt_level2_plan.md sec 5).
+compaction / re-expansion.
 
 One ``@triton.jit`` kernel, two ``GATHER`` specializations:
   * expand  (GATHER=True):  pool[slot]                = x_recv[pool_recv_token[slot]]  (0 if -1 pad)

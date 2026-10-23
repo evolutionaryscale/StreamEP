@@ -13,8 +13,6 @@ restores before recomputing.
 and unfused references.
 """
 
-from __future__ import annotations
-
 import cutlass
 import torch
 import torch.distributed as dist

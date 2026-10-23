@@ -991,14 +991,12 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 // across the RDMA + NVL hops with no slot logic; only the NVL receiver
 // (which owns the destination's `pool` memory) does Pass A/B/2.
 //
-// Per `internode.md` §"Where slot allocation lives — NVL receiver", placing
-// Pass A on the receiver (rather than baking slot indices into the NVL
+// Placing Pass A on the receiver (rather than baking slot indices into the NVL
 // message header from the forwarder) avoids cross-NVL-peer `base_pool` IPC
 // plumbing, keeps the receiver symmetric with intranode (same single-writer
 // proof: each (channel, src_nvl_rank) warp uniquely owns the
-// `(c, src_world, e_local)` tuple), and keeps the forwarder lean (it stays
-// the current bottleneck per the TMA-double-buffer perf opt called out in
-// `internode.md` §"Optional perf follow-ups").
+// `(c, src_world, e_local)` tuple), and keeps the forwarder lean (it is the
+// internode bottleneck).
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Per-warp lane-0-resident scratch for Pass A's K-loop slot mapping.

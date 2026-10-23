@@ -80,8 +80,6 @@ under CDMC>1 would deadlock the ``barrier_block`` inside the metadata
 kernel.
 """
 
-from __future__ import annotations
-
 import os
 from dataclasses import dataclass, fields, replace
 
@@ -154,7 +152,7 @@ class TileConfig:
     backward GEMMs can't codegen): 320 outright, 192 unless every ``tile_n`` <=
     128. In practice ``tile_m`` 128 is the operating point — 256 keeps
     ``atom_layout_n=1`` but exceeds the dispatch-pool memory budget at
-    production shapes. See markdowns/reserved_memory_stream_segregation.md.
+    production shapes.
 
     Constraints NOT checked by :meth:`validate` (quack ``GemmSm90`` raises on
     them directly, see ``quack/gemm_sm90.py``):
@@ -228,8 +226,7 @@ class TileConfig:
         # (verified: SIGABRT deep in backward). 320 forces it unconditionally;
         # 192 forces it only when a tile_n > 128. So tile_m=192 is allowed iff
         # every tile_n <= 128 (atom_layout_n=1); 320 is not. tile_m in
-        # {64,128,256} keep atom_layout_n=1 and are unaffected. See
-        # markdowns/reserved_memory_stream_segregation.md.
+        # {64,128,256} keep atom_layout_n=1 and are unaffected.
         if self.tile_m == 320:
             errs.append(
                 "tile_m=320 forces quack atom_layout_n=2 unconditionally; the "
@@ -464,8 +461,7 @@ class StreamMoEFunc(torch.autograd.Function):
     ) -> torch.Tensor:
         # activation_checkpoint_level: 0 = save preact_a + pool (no ckpt);
         # 1 = save pool, recompute preact_a in bwd; 2 = save compressed
-        # recv-token x_recv, re-expand pool + recompute preact_a in bwd
-        # (markdowns/act_ckpt_level2_plan.md).
+        # recv-token x_recv, re-expand pool + recompute preact_a in bwd.
         if activation_checkpoint_level not in (0, 1, 2):
             raise ValueError(f"activation_checkpoint_level must be 0/1/2, got {activation_checkpoint_level}")
         global _NVTX_FWD_COUNT
@@ -661,7 +657,7 @@ class StreamMoEFunc(torch.autograd.Function):
         # bracketing). pool is freed right after (its last reader, this
         # compaction, is done) with no extra wait — combine reads `o`, never
         # pool. The saved x_recv (T_recv rows) replaces the expanded, 128-padded
-        # pool (TK_padded rows); bwd re-expands it. markdowns/act_ckpt_level2_plan.md sec 4.
+        # pool (TK_padded rows); bwd re-expands it.
         x_recv = None
         if activation_checkpoint_level == 2:
             caller_stream.wait_stream(streams.compute)
@@ -953,7 +949,6 @@ class StreamMoEFunc(torch.autograd.Function):
         # Stage 1.5 (preact recompute) and Stage 5 (dW1) — pool's only bwd
         # consumers. Transient: a bwd local on the compute pool, freed at bwd
         # return; one layer live at a time, so it never touches the fwd-end peak.
-        # markdowns/act_ckpt_level2_plan.md sec 6.
         if ctx.activation_checkpoint_level == 2 and total_tiles > 0:
             # Allocate the transient pool on the CALLER stream -> default pool
             # (so it reuses freed x_recv space as bwd drains them, instead of
@@ -1229,8 +1224,7 @@ def stream_moe_func(
         OOMs (e.g. the 82B shape on 80 GB H100 vs 141 GB H200).
       * 2 — additionally save only the *unexpanded* recv tokens
         ``x_recv [T_recv, H]`` instead of the expanded, 128-padded ``pool``,
-        re-expanding ``pool`` in backward. NOT YET IMPLEMENTED (raises);
-        see ``markdowns/act_ckpt_level2_plan.md``.
+        re-expanding ``pool`` in backward.
 
     ``expert_dropout`` (default 0): inverted dropout rate on the expert hidden
     activation (SwiGLU postact, between W1 and W2). The caller gates it on

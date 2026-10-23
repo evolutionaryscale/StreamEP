@@ -28,8 +28,8 @@ at tile_m=128 -> total_tiles=512 (M_recv=65536). Override --world / --tiles /
 kernel is pulled from the production `_resolve_tile_config(I, H)` so you
 measure the bench-tuned tiles unless you pass --tile_n_*.
 
-Launch (under ncu; see scripts/ncu_microbench.sh which wraps this)
-------------------------------------------------------------------
+Launch (under ncu)
+------------------
     ncu --profile-from-start off --launch-count 1 \
         --kernel-name 'regex:StreamingMoe' --set full \
         --clock-control none -f -o report \
@@ -49,8 +49,6 @@ recv-token destination. This harness uses an identity slot->token map
 has no atomic contention. The GEMM dominates; treat the epilogue numbers as a
 lower bound on scatter cost.
 """
-
-from __future__ import annotations
 
 import argparse
 

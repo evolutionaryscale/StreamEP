@@ -365,7 +365,7 @@ def main():
 
     # Warm: dispatch + kernel A + kernel Y + combine JIT, kernel cache, allocator.
     # Includes the bwd path so its kernels JIT during warmup too.
-    for warm_seq in range(1, 6):
+    for _ in range(5):
         out = stream_moe_func(
             buffer,
             x,
@@ -416,7 +416,6 @@ def main():
         with_stack=False,
         profile_memory=False,
     ) as prof:
-        seq = 100  # bumped past warmup seqs so it's clearly distinct in the trace
         for step in range(n_steps):
             fwd_starts[step].record()
             with torch.profiler.record_function(f"step_{step}_fwd"):

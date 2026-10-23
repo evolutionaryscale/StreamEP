@@ -15,8 +15,6 @@ Validates:
   5. pool_arrival_target sized correctly per tile.
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

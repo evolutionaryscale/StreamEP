@@ -35,13 +35,13 @@ locally inside the scheduler warp's queue-pull and used only for the
 ready-spin and to derive expert_id/pid_m.
 """
 
-from typing import Callable, NamedTuple, Optional, Type
+from typing import NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Float32, Int32, const_expr
 from quack.activation import gate_fn_map
 from quack.cache import jit_cache
 from stream_ep.stream_moe import compile_config

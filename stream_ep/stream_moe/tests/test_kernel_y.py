@@ -3,7 +3,7 @@
 Mirrors the kernel-A 4-case suite plus an extra padding-row case.
 
   * test_compile: kernel compiles for a representative shape (compile-only).
-  * test_single_tile: total_tiles=1, a_ready pre-set, no padding rows. Validates
+  * test_single_tile: total_tiles=1, arrival gate pre-fired, no padding rows. Validates
     GEMM + per-row weight multiply + atomic-scatter against a torch reference.
   * test_multi_tile_static: total_tiles=N spread across multiple experts,
     multiple recv-tokens per tile, K_local>1 per recv-token (so o[r] gets
@@ -12,8 +12,9 @@ Mirrors the kernel-A 4-case suite plus an extra padding-row case.
   * test_padding_rows: tile contains some pool slots with pool_recv_token == -1.
     Validates PTX-predicated atomic-add: padding lanes skip the atomic at
     issue time so no contributions land in valid rows from padding slots.
-  * test_producer_consumer: kernel Y on compute_y_stream spins on a_ready while
-    a producer kernel on a separate stream fires slot-by-slot.
+  * test_producer_consumer: kernel Y on compute_y_stream spins on
+    pool_arrival_count while a producer kernel on a separate stream fires
+    slot-by-slot.
 
 All cases assert:
   - o[r, :] equals sum over slots s mapping to r of
@@ -23,8 +24,6 @@ All cases assert:
   - No trash row needed: predicated atomic skips padding lanes entirely
     (verified by k_local_remaining[r] == 0 for all valid r).
 """
-
-from __future__ import annotations
 
 import pytest
 import torch

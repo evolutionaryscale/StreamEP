@@ -10,7 +10,6 @@ per token and -1 padding slots. Verifies:
     zeros the padding rows,
   - H both a multiple and a non-multiple of BLOCK_H (mask path).
 """
-from __future__ import annotations
 
 import pytest
 import torch

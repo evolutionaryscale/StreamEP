@@ -11,13 +11,11 @@ NVL/RDMA partitioned `base_pool` ordering plus the internode-only
 counters (`recv_rdma_rank_prefix_sum`, `recv_gbl_rank_prefix_sum`).
 
 Launch:
-    ./scripts/srun_1node.sh StreamEP/tests/test_metadata.py
-    ./scripts/srun_4node.sh StreamEP/tests/test_metadata.py --internode
+    torchrun --standalone --nproc-per-node=8 tests/test_metadata.py
+    torchrun --nnodes=<N> --nproc-per-node=8 ... tests/test_metadata.py --internode
 
 Exits 0 on PASS, non-zero on first FAIL with a printed diff summary.
 """
-
-from __future__ import annotations
 
 import argparse
 import os
@@ -122,7 +120,6 @@ def compute_metadata_reference(
         # Partition 2: cs with src_rdma != rdma_rank.
         src_world_arr = torch.arange(num_ranks, device=device)
         src_rdma_arr = src_world_arr // num_max_nvl_peers
-        is_nvl_local = (src_rdma_arr == rdma_rank)  # (num_ranks,)
 
         # In lex order (c, src_world): NVL-local first then RDMA-remote.
         # Build a mask matching the iteration order; use torch arithmetic to scan.

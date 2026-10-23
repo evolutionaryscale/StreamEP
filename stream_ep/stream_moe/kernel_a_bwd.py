@@ -51,7 +51,7 @@ Shares streaming machinery with fwd kernels:
     `expert_pool_block_offset`.
 """
 
-from typing import NamedTuple, Optional, Type
+from typing import NamedTuple, Type
 
 import cutlass
 import cutlass.cute as cute

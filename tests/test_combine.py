@@ -26,8 +26,6 @@ Driver convention: torchrun env-driven (``RANK`` / ``WORLD_SIZE`` /
     torchrun --nproc_per_node=8 StreamEP/tests/test_combine.py
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

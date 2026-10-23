@@ -20,7 +20,6 @@ import torch.distributed as torch_dist
 from stream_ep.stream_moe.profile_pipeline import (
     DTYPE,
     NUM_EXPERTS,
-    NUM_SMS,
     SEQ_LEN_PER_RANK,
     TOPK,
     H,
@@ -97,7 +96,7 @@ def main():
     barrier(group)
 
     t0 = time.time()
-    for warm_seq in range(1, args.n_warmup + 1):
+    for _ in range(args.n_warmup):
         out = stream_moe_func(
             buffer,
             x,
@@ -119,7 +118,7 @@ def main():
     )
 
     t0 = time.time()
-    for step in range(args.n_iter):
+    for _ in range(args.n_iter):
         out = stream_moe_func(
             buffer,
             x,

@@ -28,7 +28,6 @@ libcusparse-dev = "*"
 ninja = "*"
 patchelf = "*"
 pip = "*"
-rdma-core = "*"  # infiniband/mlx5dv.h, included by NVSHMEM's IBGDA headers
 setuptools = ">=77,<82"  # torch 2.11 requires setuptools<82
 wheel = "*"
 
@@ -47,3 +46,60 @@ description = "Build the release wheel into dist/"
 [tasks.check-wheel]
 cmd = "python scripts/check_wheel.py"
 description = "Check dist/ holds one release-ready wheel matching pyproject's version"
+
+# Dev / GPU-test env: the build env plus the runtime-only deps of the
+# streaming-MoE kernels, at the same pins as evoscale (the quack fork rev and
+# cutlass-dsl come from evoscale's pixi.toml). stream-ep itself is an editable
+# install built by the env, so `build-ext` followed by a test task runs the
+# working tree.
+[feature.test.pypi-dependencies]
+stream-ep = { path = ".", editable = true }
+quack-kernels = { git = "https://github.com/evolutionaryscale/quack.git", rev = "1843cb2b9c698cdaddc27cb92026740d88d24624", extras = ["cu13", "heuristics"] }
+nvidia-cutlass-dsl = { version = "==4.7.0", extras = ["cu13"] }
+pytest = "*"
+
+# evoscale lifts torch's cuda-toolkit==13.0.2 to the 13.3 runtime (its conda
+# cuda-version pin holds it at 13.3); mirror that so tests run on the same CUDA
+# runtime, NCCL and CuTeDSL bindings (NCCL pinned to evoscale's locked
+# version). cuDNN / tvm-ffi use evoscale's ranges and may sit ahead of its lock.
+[feature.test.pypi-options.dependency-overrides]
+cuda-toolkit = { version = ">=13.3,<13.4", extras = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"] }
+cuda-bindings = ">=13.3,<13.4"
+cuda-python = ">=13.3,<13.4"
+nvidia-nccl-cu13 = "==2.30.7"
+nvidia-cudnn-cu13 = ">=9.23.2,<10"
+apache-tvm-ffi = ">=0.1.12,<0.2"
+
+[feature.test.activation.env]
+# The cluster's IB NICs are named ibp* rather than mlx5*; NVSHMEM's default
+# HCA prefix "mlx5" skips them all and internode init hangs (same setting as
+# evoscale's env).
+NVSHMEM_HCA_PREFIX = "ibp"
+
+# setup.py imports torch, so build stream-ep against this env's torch.
+[feature.test.pypi-options]
+no-build-isolation = ["stream-ep"]
+
+[feature.test.tasks.build-ext]
+cmd = "python setup.py build_ext --inplace"
+description = "Incremental in-place build of stream_ep_cpp after .cu / .cpp / .cuh edits"
+
+[feature.test.tasks.test-kernels]
+cmd = "pytest stream_ep/stream_moe/tests"
+description = "Single-process kernel pytest suite (1 GPU)"
+
+[feature.test.tasks.test-dist]
+args = ["script", { arg = "nproc", default = "8" }]
+cmd = "torchrun --standalone --nproc-per-node={{ nproc }} {{ script }}"
+description = "Run one torchrun test script on this node, e.g. `pixi run -e test test-dist tests/test_dispatch.py`"
+
+[feature.lint.dependencies]
+pre-commit = "*"
+
+[feature.lint.tasks.lint]
+cmd = "pre-commit run --all-files"
+description = "Run the pre-commit hooks (ruff, config checks) on the whole repo"
+
+[environments]
+test = ["test"]
+lint = { features = ["lint"], no-default-feature = true }

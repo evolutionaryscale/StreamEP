@@ -284,7 +284,7 @@ class StreamingTileScheduler(TileScheduler):
         # started_flag once so combine (on the communicate stream) can't grab SMs
         # ahead of this kernel. Only kernel_y / kernel_a_bwd carry a non-None
         # started_flag; skipped at compile time otherwise.
-        if const_expr(params.started_flag is not None):
+        if const_expr(params.started_flag is not None):  # noqa: SIM102 (compile-time gate, keep separate)
             if linear_idx == Int32(0) and cute.arch.lane_idx() == 0:
                 flag_ptr = utils.elem_pointer(params.started_flag, (Int32(0),))
                 cute.arch.atomic_add(flag_ptr, Int32(1))
@@ -380,9 +380,9 @@ class StreamingTileScheduler(TileScheduler):
 
         The first work tile must come from the producer's atomic-claim +
         queue spin + sched_smem write — there is no static initial
-        `_current_work_idx` to decompose. Both v0.4.1 call sites
-        (`quack/gemm_sm90.py:682` AB-load context, `:810` math context)
-        invoke this with no args; we recompute `is_scheduler_warp` here from
+        `_current_work_idx` to decompose. quack's call sites (the AB-load
+        and math contexts) invoke this with no args; we recompute
+        `is_scheduler_warp` here from
         `cute.arch.warp_idx() == self.params.scheduler_warp_id` (kernel side
         sets `scheduler_warp_id = self.ab_load_warp_id`). The producer warp
         runs the atomic claim + smem write inside `advance_to_next_work`;

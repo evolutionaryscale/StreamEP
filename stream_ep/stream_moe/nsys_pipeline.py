@@ -14,10 +14,11 @@ Shape defaults to the 82ba5b prod MoE (inherited from profile_pipeline globals:
 H=3072, I=768, E=256, K=8, T=8192/rank). World size = however many ranks
 torchrun launches (8 = 1 node intranode/NVL; 16/32 = 2/4 nodes internode/RDMA).
 
-Launch (via scripts/srun_nsys_pipeline.sh, which sets the nsys env):
-    NSYS_CAPTURE=cudaProfilerApi STREAM_EP_NVTX=1 \
-    torchrun --nproc-per-node=8 --no-python scripts/nsys_wrap.sh \
-        -m stream_ep.stream_moe.nsys_pipeline --n_iter 12
+Launch (one nsys report per rank):
+    STREAM_EP_NVTX=1 torchrun --nproc-per-node=8 --no-python \
+        nsys profile --capture-range=cudaProfilerApi --trace=cuda,nvtx \
+        -o nsys_pipeline_rank%q{RANK} \
+        python -m stream_ep.stream_moe.nsys_pipeline --n_iter 12
 
 Each profiled iter is wrapped in an `iter_<k>` NVTX range; stream_moe_func's
 own fwd_dispatch/fwd_compute/fwd_combine/moe_bwd ranges fire when

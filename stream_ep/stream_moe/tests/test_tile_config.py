@@ -14,8 +14,6 @@ extension), so this collects on a GPU node like the other stream_moe pytest
 modules.
 """
 
-from __future__ import annotations
-
 from dataclasses import replace
 
 import pytest

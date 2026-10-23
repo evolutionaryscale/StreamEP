@@ -11,11 +11,9 @@ failures luck-dependent. Deterministic scenarios make pass/fail
 reproducible across runs and let us bisect / iterate without
 re-rolling the routing seed.
 
-Why "world-size agnostic": same script under
-``./scripts/srun_1node.sh -m stream_ep.tests.test_skewed_experts`` (1-node
-intranode, NVL only — fast iteration baseline) and
-``./scripts/srun_4node.sh -m stream_ep.tests.test_skewed_experts`` (4-node
-internode — the bug catcher). The scenarios are parameterized only by
+Why "world-size agnostic": the same script runs on 1 node (intranode, NVL
+only — fast iteration baseline) and on several nodes (internode — the bug
+catcher). The scenarios are parameterized only by
 ``world_size`` / ``rank``, no per-topology branching.
 
 Scenarios (deterministic per ``(world_size, rank)``):
@@ -49,8 +47,6 @@ Pass / fail summary printed at end. Non-zero exit if any scenario
 fails.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 
@@ -63,7 +59,6 @@ from stream_ep.stream_moe.profile_pipeline import (
     H,
     I,
     NUM_EXPERTS,
-    NUM_SMS,
     SEQ_LEN_PER_RANK,
     TOPK,
     make_buffer,
@@ -388,7 +383,7 @@ def main():
         n_skip = sum(1 for _, s, _ in results if s == "SKIPPED")
         print(f"[skewed-experts] SUMMARY world_size={world_size}: "
               f"{n_pass} pass / {n_fail} fail / {n_skip} skipped", flush=True)
-        for name, status, msg in results:
+        for _, status, msg in results:
             print(f"  {status}: {msg}", flush=True)
 
     cleanup_dist()

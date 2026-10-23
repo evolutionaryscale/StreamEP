@@ -1,0 +1,15 @@
+# Local: `pixi run -e lint pre-commit install` once per clone. CI runs the same
+# hooks on every PR (`pixi run -e lint lint`).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.0
+    hooks:
+      - id: ruff-check
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml

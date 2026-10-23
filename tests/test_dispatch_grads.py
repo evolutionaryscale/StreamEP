@@ -15,8 +15,6 @@ Verifies:
 Mirror of test_dispatch.py for the bwd path.
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

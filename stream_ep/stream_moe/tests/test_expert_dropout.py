@@ -5,8 +5,6 @@ Zero patterns are checked exactly (a dropped unit is exactly 0 in every
 masked output, a kept one never is); values to bf16 tolerance.
 """
 
-from __future__ import annotations
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -118,7 +116,7 @@ def test_kernel_y_bwd_expert_dropout(device):
     for p, seed in ((0.0, None), (P, 99)):
         d = _mask(seed, device) if p > 0 else torch.ones(TK, I, device=device)
         out, out_ref = run(p, seed), ref(d)
-        for o, r, name in zip(out, out_ref, ("dswiglu_in", "postact_for_dW2", "dweight")):
+        for o, r, name in zip(out, out_ref, ("dswiglu_in", "postact_for_dW2", "dweight"), strict=True):
             _assert_close(o, r, f"{name} p={p}", atol=3e-2 if name == "dweight" else 3e-3)
         if p > 0:
             dropped = (d == 0) | (active == 0)

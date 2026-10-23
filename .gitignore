@@ -7,10 +7,7 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
-deep_ep.egg-info/
 stream_ep.egg-info/
 dist/
-logbook.md
-autoresearch.md
-next-step.md
 .pixi/
+.ruff_cache/

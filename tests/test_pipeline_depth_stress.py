@@ -20,14 +20,13 @@ repeated ``num_steps`` times.
 Progress is printed + flushed per (step, fwd-layer) and around backward, so a
 hang pinpoints the stalling step/phase. Clean run prints PASS.
 
-Driver (4 nodes / world=32):
-    ./scripts/srun_4node.sh StreamEP/tests/test_pipeline_depth_stress.py \
+Launch internode, world >= 16 (the hang was seen at 4 nodes / world=32)
+(one torchrun per node: add --nnodes=<N> --node-rank=<i> and c10d rendezvous args):
+    torchrun --nproc-per-node=8 tests/test_pipeline_depth_stress.py \
         [--num_layers 44] [--num_steps 6]
 
 Defaults = the 82B shape/depth that hung. preact ckpt OFF (default).
 """
-
-from __future__ import annotations
 
 import argparse
 import os

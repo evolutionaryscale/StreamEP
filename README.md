@@ -1,75 +1,61 @@
 # StreamEP
 
-A streaming-tile expert-parallel dispatch / combine library for intranode MoE training on H100 NVLink. Fork of [DeepSeek's DeepEP](https://github.com/deepseek-ai/DeepEP) — see [`NOTICE.md`](NOTICE.md) for fork details.
+Expert-parallel dispatch / combine plus an integrated streaming-MoE layer for MoE training on H100 (SM90), intranode over NVLink and internode over RDMA. Fork of [DeepSeek's DeepEP](https://github.com/deepseek-ai/DeepEP); see [`CHANGES.md`](CHANGES.md) for how it diverges and [`NOTICE.md`](NOTICE.md) for attribution.
 
-The headline feature is **per-tile streaming**: dispatch fires release-stamps on expert-major BLOCK_M tiles as soon as their pool slots fill, so a consumer GEMM can spin on `tile_ready[tile_id]` and begin processing while later tokens are still landing. The complementary per-recv-token gate on combine (`y_done_per_token`) lets the combine sender ship the first packet as soon as that recv-token's compute drains, instead of waiting for the whole compute kernel.
+It is an internal component of evoscale's MoE training stack, which consumes it as a release wheel.
 
-## What's in the box
+## How it works
 
-- `stream_ep` — the C++ extension + `Buffer` Python class. Exposes `Buffer.dispatch` (pool-layout receiver, returns a `StreamingHandle`), `Buffer.combine` (consumes the per-recv-token gate), `Buffer.dispatch_grads` / `combine_grads` for the backward symmetry. Internode dispatch / combine inherited from upstream DeepEP.
-- `stream_ep.stream_moe` — a complete streaming-MoE pipeline built on top of the buffer:
-  - `kernel_a` / `kernel_a_bwd` — first grouped GEMM (`gate * up` SwiGLU, `kFlatten` persistent) with a per-tile `TileReadyRelease` EpiOp. Built on [Quack](https://github.com/Dao-AILab/quack)'s `GemmGatedMixin`.
-  - `kernel_y` / `kernel_y_bwd` — second grouped GEMM (`down`) with an `AtomicScatterStore` EpiOp that does per-warp coalesced bf16 atomic-scatter into the output buffer. Spins on `a_ready[tile_id]` from kernel A.
-  - `tile_scheduler.StreamingTileScheduler` — Quack `TileScheduler` subclass with a per-tile-ready spin acquire (`tile_ready` for kernel A, `a_ready` for kernel Y) and `cute.lens_k`-based variable-K tile sizes that ride the GEMM's TMA OOB-zero-fill to handle dispatch-padding rows at zero compute cost.
-  - `epi_ops` — composable Quack EpiOps (`TileReadyRelease`, `AtomicScatterStore`).
-  - `ptx_helpers` — system-scope `st_release_sys_global`, `ld_acquire_sys_global`, `red_add_bf16x2`, etc. Used for cross-stream signaling without Torch event overhead.
-  - `stream_moe.stream_moe_func` — public layer entry point. Orchestrates dispatch → kernel A → kernel Y → combine on **two caller-owned streams** (`compute` and `communicate`) and the symmetric backward (dispatch_grads → kernel_y_bwd → kernel_a_bwd → combine_grads + dW1 / dW2 on the compute stream). All grouped-GEMM tile / cluster / pingpong / num_sms knobs are picked internally from `w1_local.shape`; the public surface is just `(buffer, x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local, streams, num_experts)`.
-  - `Buffer.num_sms` is auto-picked from world size in `Buffer.__init__` (80 SMs at ≤2 nodes, 64 SMs at ≥3 nodes; override via `Buffer.set_num_sms`).
+- **Pool-layout dispatch.** Received `(token, k)` pairs land directly in an expert-major, tile-padded pool, so dispatch's output is the grouped GEMM's input with no separate permute.
+- **Per-tile streaming.** Dispatch signals each pool tile as it fills, and the compute kernels claim ready tiles while later tokens are still arriving. Combine starts sending a token as soon as its compute is done. The backward pass mirrors both overlaps.
+- **Caller-owned streams.** A layer runs on a compute stream and a communicate stream supplied by the caller. The only host sync per layer is one poll that sizes the dropless pool allocation.
+- **CuTeDSL compute kernels.** The four grouped GEMMs (forward A / Y, backward A / Y) are built on [Quack](https://github.com/Dao-AILab/quack) with streaming-specific schedulers and epilogues.
 
-## Streaming dispatch in one paragraph
+```python
+from stream_ep import Buffer
+from stream_ep.stream_moe.stream_moe import make_streams, stream_moe_func
 
-Dispatch's receiver writes each landed `(token, k)` pair into a stable **pool slot**: pool is laid out expert-major and BLOCK_M-padded, with per-expert blocks at `expert_pool_block_offset[e] * tile_m` rows. Pool slots within an expert can be filled in any order (sender substreams race to fill them), but every slot belongs to exactly one expert and one BLOCK_M tile. As each expert-major substream finishes draining its share of pool slots, dispatch's Pass 2 atomic-adds `pool_arrival_count[tile_id]` and, when it hits the pre-computed `pool_arrival_target[tile_id]`, release-stores `dispatch_seq` into `tile_ready[tile_id]`. A consumer kernel spins on `ld_acquire_sys_global(tile_ready[tile_id]) >= dispatch_seq` from a different stream and proceeds. Padding rows in the pool are never read — `pool_recv_token >= 0` predicates them out, and Quack's `cute.lens_k` bounds the K-tile so the TMA's OOB-zero-fill handles padding columns at zero compute cost.
+buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+streams = make_streams()
+out = stream_moe_func(
+    buffer, x, topk_idx, topk_weights, is_token_in_rank, w1_local, w2_local,
+    streams=streams, num_experts=num_experts,
+)
+```
 
-The dispatch / combine ring protocol underneath (channel send/recv buffers, NVL barrier scheme, RDMA notifier mechanics) is inherited from upstream DeepEP unchanged. See the upstream repo for those details.
+GEMM tiles and SM counts are picked from the weight shapes and world size; `TileConfig` overrides them. `stream_moe_func` is eager-only, so wrap the call in `@torch.compiler.disable` inside a compiled model.
 
-## What was removed from upstream
+## Layout
 
-- FP8 dispatch path (~200 LoC). bf16 only.
-- Low-latency inference kernels (`internode_ll.cu` + `Buffer::low_latency_*` methods, ~1700 LoC). High-throughput training only.
-- `csrc/kernels/layout.cu` and `Buffer::get_dispatch_layout` (~200 LoC). The streaming dispatch synthesizes its own routing metadata via `streaming_dispatch_metadata` in a single kernel launch.
-- CMake build path (`csrc/CMakeLists.txt`, `csrc/kernels/CMakeLists.txt`). Builds via `setup.py` directly.
+- `stream_ep/` — the `Buffer` class over the `stream_ep_cpp` extension built from `csrc/`.
+- `stream_ep/stream_moe/` — the MoE layer, its kernels, and the profiling / validation harnesses. The package docstring is the code map.
+- `tests/` — multi-rank torchrun scripts. `stream_ep/stream_moe/tests/` — single-process kernel pytest.
+- `scripts/` — release wheel build and checks.
 
-## Build
+## Development
 
-`pixi.toml` pins the build env to the versions the wheel's consumer (evoscale) runs: python 3.12, torch 2.11.0+cu130, nvcc 13.3, gcc 14.3, and `nvidia-nvshmem-cu13==3.4.5`. No GPU is needed to build.
+`pixi.toml` defines three environments:
+
+- `default` — the wheel build env, pinned to the versions evoscale runs (python 3.12, torch 2.11.0+cu130, nvcc 13.3, gcc 14.3, `nvidia-nvshmem-cu13==3.4.5`). No GPU needed.
+- `test` — `default` plus the runtime deps of the MoE kernels (evoscale's Quack fork, cutlass-dsl, CUDA 13.3 runtime), with StreamEP itself installed editable.
+- `lint` — pre-commit only.
 
 ```bash
-pixi run build-wheel   # release wheel into dist/, rpath rewritten to $ORIGIN-relative entries only
-pixi run check-wheel   # version, pinned requirements, rpath, SM90 SASS, glibc / libstdc++ ceilings
-
-# incremental in-place rebuild after .cu / .cpp / .cuh edits
-pixi run python setup.py build_ext --inplace
+pixi run -e test build-ext                                # in-place build after .cu / .cpp / .cuh edits
+pixi run -e test test-kernels                             # kernel pytest, 1 GPU
+pixi run -e test test-dist tests/test_dispatch.py         # one torchrun script, 8 GPUs by default
+pixi run -e test test-dist tests/test_dispatch.py 2       # ... on 2 GPUs
+pixi run -e lint lint                                     # pre-commit hooks; `pixi run -e lint pre-commit install` to run them on commit
 ```
+
+Internode scripts (`tests/test_*_internode.py`) need two or more nodes. Profiling and multi-iteration validation entry points live in `stream_ep/stream_moe/` (`profile_pipeline`, `validate_multi_iter`, `ncu_microbench`).
 
 ## Release
 
-Bump `version` in `pyproject.toml` and merge to `main`. `.github/workflows/wheel.yml` builds and checks the wheel on every PR; on a push to `main` whose version has no release yet, it publishes the wheel as the single asset of release `v<version>`. Release assets are never replaced: uv caches wheel URLs as immutable, so a fix ships as a new version. Then bump the `stream-ep` URL in evoscale's `pixi.toml` to the new release.
+Bump `version` in `pyproject.toml` and merge to `main`. `.github/workflows/wheel.yml` builds and checks the wheel on every PR; on a push to `main` whose version has no release yet, it publishes the wheel as the single asset of release `v<version>`. Release assets are never replaced, because uv caches wheel URLs as immutable; a fix ships as a new version.
 
-Produces `stream_ep` (Python package) backed by `stream_ep_cpp` (C++ extension). Coexists with upstream `deep_ep` in the same env if both are installed — different module names, different `.so` filenames, so neither shadows the other.
-
-## Tests
-
-Multi-rank tests under `tests/` are torchrun-style stand-alone scripts (each one reads `RANK`/`WORLD_SIZE`/`LOCAL_RANK` from env and calls `dist.init_process_group` directly — no pytest harness):
-
-```bash
-# Cross-rank streaming-dispatch correctness (8 GPU intranode):
-torchrun --standalone --nproc-per-node=8 tests/test_dispatch.py
-torchrun --standalone --nproc-per-node=8 tests/test_combine.py
-torchrun --standalone --nproc-per-node=8 tests/test_dispatch_grads.py
-torchrun --standalone --nproc-per-node=8 tests/test_combine_grads.py
-torchrun --standalone --nproc-per-node=8 tests/test_skewed_experts.py
-```
-
-Streaming-MoE kernel tests at `stream_ep/stream_moe/tests/` are pytest-driven (single-process, small shapes — they exercise the kernel logic, not multi-rank dispatch):
-
-```bash
-pytest stream_ep/stream_moe/tests/ -v
-```
-
-Internode tests (`tests/test_*_internode.py`) need ≥2 nodes.
-
-For broader context on testing conventions and design rationale, see [`CHANGES.md`](CHANGES.md).
+To build locally: `pixi run build-wheel && pixi run check-wheel`.
 
 ## License
 
-MIT. The unmodified `LICENSE` file from upstream DeepEP is preserved as required by the MIT license.
+MIT. The unmodified `LICENSE` file from upstream DeepEP is preserved.

@@ -18,8 +18,6 @@ Verifies:
      identical ``dL_do_pool`` (valid rows) and refires the arrival count.
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

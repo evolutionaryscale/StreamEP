@@ -22,8 +22,6 @@ Pool layout:
     expert_id = tile_id_to_expert[t].
 """
 
-from __future__ import annotations
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -316,7 +314,6 @@ def test_streaming_moe_a_with_preact(device):
             f"max rel diff {rel_h.max().item():.4f}, "
             f"max abs diff {diff_h.max().item():.4f}"
         )
-
 
 
 def test_streaming_moe_a_producer_consumer(device):
