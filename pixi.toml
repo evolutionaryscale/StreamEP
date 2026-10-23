@@ -28,7 +28,6 @@ libcusparse-dev = "*"
 ninja = "*"
 patchelf = "*"
 pip = "*"
-rdma-core = "*"  # infiniband/mlx5dv.h, included by NVSHMEM's IBGDA headers
 setuptools = ">=77,<82"  # torch 2.11 requires setuptools<82
 wheel = "*"
 
@@ -61,15 +60,21 @@ pytest = "*"
 
 # evoscale lifts torch's cuda-toolkit==13.0.2 to the 13.3 runtime (its conda
 # cuda-version pin holds it at 13.3); mirror that so tests run on the same CUDA
-# runtime and CuTeDSL bindings. NCCL / cuDNN / tvm-ffi use evoscale's ranges
-# and may sit a patch or minor ahead of its lock.
+# runtime, NCCL and CuTeDSL bindings (NCCL pinned to evoscale's locked
+# version). cuDNN / tvm-ffi use evoscale's ranges and may sit ahead of its lock.
 [feature.test.pypi-options.dependency-overrides]
 cuda-toolkit = { version = ">=13.3,<13.4", extras = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"] }
 cuda-bindings = ">=13.3,<13.4"
 cuda-python = ">=13.3,<13.4"
-nvidia-nccl-cu13 = ">=2.30.4,<3"
+nvidia-nccl-cu13 = "==2.30.7"
 nvidia-cudnn-cu13 = ">=9.23.2,<10"
 apache-tvm-ffi = ">=0.1.12,<0.2"
+
+[feature.test.activation.env]
+# The cluster's IB NICs are named ibp* rather than mlx5*; NVSHMEM's default
+# HCA prefix "mlx5" skips them all and internode init hangs (same setting as
+# evoscale's env).
+NVSHMEM_HCA_PREFIX = "ibp"
 
 # setup.py imports torch, so build stream-ep against this env's torch.
 [feature.test.pypi-options]

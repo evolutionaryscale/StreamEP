@@ -42,7 +42,10 @@ if __name__ == '__main__':
     # lines. Cost: ~5% larger .so + ~negligible launch overhead. Always on.
     nvcc_flags.append('-lineinfo')
     sources = ['csrc/stream_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu']
-    include_dirs = ['csrc/']
+    # rdma-core headers for <infiniband/mlx5dv.h>; see its README for why they are vendored.
+    # Absolute: ninja compiles from the build directory.
+    rdma_core_include = str(Path(__file__).resolve().parent / 'csrc/third_party/rdma-core/include')
+    include_dirs = ['csrc/', rdma_core_include]
     library_dirs = []
 
     nvcc_dlink = []
