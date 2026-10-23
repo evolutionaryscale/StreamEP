@@ -50,9 +50,11 @@ description = "Check dist/ holds one release-ready wheel matching pyproject's ve
 
 # Dev / GPU-test env: the build env plus the runtime-only deps of the
 # streaming-MoE kernels, at the same pins as evoscale (the quack fork rev and
-# cutlass-dsl come from evoscale's pixi.toml). The checkout is on PYTHONPATH,
-# so `build-ext` followed by a test task runs the working tree.
+# cutlass-dsl come from evoscale's pixi.toml). stream-ep itself is an editable
+# install built by the env, so `build-ext` followed by a test task runs the
+# working tree.
 [feature.test.pypi-dependencies]
+stream-ep = { path = ".", editable = true }
 quack-kernels = { git = "https://github.com/evolutionaryscale/quack.git", rev = "1843cb2b9c698cdaddc27cb92026740d88d24624", extras = ["cu13", "heuristics"] }
 nvidia-cutlass-dsl = { version = "==4.7.0", extras = ["cu13"] }
 pytest = "*"
@@ -69,8 +71,9 @@ nvidia-nccl-cu13 = ">=2.30.4,<3"
 nvidia-cudnn-cu13 = ">=9.23.2,<10"
 apache-tvm-ffi = ">=0.1.12,<0.2"
 
-[feature.test.activation.env]
-PYTHONPATH = "$PIXI_PROJECT_ROOT"
+# setup.py imports torch, so build stream-ep against this env's torch.
+[feature.test.pypi-options]
+no-build-isolation = ["stream-ep"]
 
 [feature.test.tasks.build-ext]
 cmd = "python setup.py build_ext --inplace"

@@ -266,6 +266,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-64-2.28-h4ee821c_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.48.0-pyhd8ed1ab_0.conda
+      - pypi: .
       - pypi: git+https://github.com/evolutionaryscale/quack.git?rev=1843cb2b9c698cdaddc27cb92026740d88d24624#1843cb2b9c698cdaddc27cb92026740d88d24624
       - pypi: https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/08/97/896495b02ec87fd19372f3e5245be12e301651f610b6ec7408bc7e562426/nvidia_cutlass_dsl_libs_base-4.7.0-cp312-cp312-manylinux_2_28_x86_64.whl
@@ -1811,6 +1812,11 @@ packages:
   run_exports: {}
   size: 34528
   timestamp: 1786613220176
+- pypi: .
+  name: stream-ep
+  requires_dist:
+  - torch==2.11.0
+  - nvidia-nvshmem-cu13==3.4.5
 - pypi: git+https://github.com/evolutionaryscale/quack.git?rev=1843cb2b9c698cdaddc27cb92026740d88d24624#1843cb2b9c698cdaddc27cb92026740d88d24624
   name: quack-kernels
   version: 0.6.4

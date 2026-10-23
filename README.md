@@ -37,7 +37,7 @@ GEMM tiles and SM counts are picked from the weight shapes and world size; `Tile
 `pixi.toml` defines three environments:
 
 - `default` — the wheel build env, pinned to the versions evoscale runs (python 3.12, torch 2.11.0+cu130, nvcc 13.3, gcc 14.3, `nvidia-nvshmem-cu13==3.4.5`). No GPU needed.
-- `test` — `default` plus the runtime deps of the MoE kernels (evoscale's Quack fork, cutlass-dsl, CUDA 13.3 runtime), with the checkout on `PYTHONPATH`.
+- `test` — `default` plus the runtime deps of the MoE kernels (evoscale's Quack fork, cutlass-dsl, CUDA 13.3 runtime), with StreamEP itself installed editable.
 - `lint` — pre-commit only.
 
 ```bash
