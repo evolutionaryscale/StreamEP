@@ -1,18 +1,14 @@
-"""Multi-dispatch correctness test for streaming dispatch (pool layout).
+"""Several dispatches on one Buffer, each with different routing.
 
-Runs N>1 dispatches on the same Buffer with different routing each time and
-validates pool placement on each. Catches state leaks between dispatches in:
-  - the IPC count_exchange e_inbox / u_inbox slabs,
-  - the per-tile pool_arrival_count counters,
-  - any device-resident streaming buffers reused across dispatches.
+Catches state leaking between dispatches through the count-exchange inbox
+slabs, the per-tile ``pool_arrival_count`` counters, or any device buffer
+reused across dispatches. After each dispatch:
 
-Validates:
-  1. pool[s] data tag matches its source rank (per-pool-slot).
-  2. Pool layout — slots fall in the right expert's pool region.
-  3. Per-(recv_token, k) coverage — every routed-to-local pair has exactly
-     one pool slot.
-  4. pool_arrival_count[i] == pool_arrival_target[i] after each dispatch.
-  5. pool_arrival_target sized correctly per tile.
+  1. Each pool slot holds its source rank's data tag.
+  2. Slots fall in the right expert's pool region.
+  3. Every (recv_token, k) routed to a local expert has exactly one slot.
+  4. ``pool_arrival_count == pool_arrival_target`` per tile, with targets
+     sized per tile.
 """
 
 import os
@@ -20,7 +16,7 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 def validate_dispatch(
@@ -127,12 +123,7 @@ def main():
     tile_m = 32
 
     hidden_bytes = hidden * 2
-    nvl_bytes = 0
-    rdma_bytes = 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     seeds = [123, 456, 789]
     for i, seed in enumerate(seeds):

@@ -1,42 +1,17 @@
-"""End-to-end test for the streaming-MoE internode combine (pool layout).
+"""Internode ``Buffer.combine`` against an analytical reference.
 
-Mirrors ``tests/test_streaming_combine.py`` (intranode combine) for the
-internode topology — 2 RDMA × 8 NVL = 16 GPUs via ``./srun_internode.sh``.
-Drives ``Buffer.dispatch`` and ``Buffer.combine`` (which route through the
-internode entry points via the topology branch when ``num_rdma_ranks > 1``).
+As in the dist combine test, kernel Y is not run: ``y_done_per_token`` is
+pre-filled so the per-token gate is open, and only the reduction is checked.
 
-The combine reduction is direction- and topology-uniform (same arg surface
-intranode's unified ``combine_main_kernel`` uses); the internode delta is
-the three-warp-role wire format on top of the same per-(t, k) reduction
-semantics. Test verifies:
+  1. With rank-tagged inputs, each combined token equals the sum of the tags
+     of the ranks it was sent to.
+  2. Forward combine returns ``None`` for the per-k weight slot (kernel Y
+     applies the weights; backward coverage is in the dist combine_grads test).
+  3. Three combines with different routing seeds each read only their own
+     dispatch's state.
 
-  1. Cross-rank reduction at production shape — for the rank-tag input
-     ``x[r] = float(rank)``, ``combined_x[t]`` should equal the sum of
-     contributing ranks' tags (exactly the contributing set encoded in
-     ``is_token_in_rank[t, :]``).
-  2. Fwd ``Buffer.combine`` returns ``None`` for the per-K weight slot —
-     fwd combine drops the K-weight wire payload entirely (kernel Y
-     pre-multiplies in production). Bwd combine_grads coverage of
-     ``dL/dtopk_weights`` lives in ``test_combine_grads.py``.
-  3. Multi-iter ``combine_seq`` reuse (1 → 2 → 3) with different routing
-     seeds — each combine sees its own dispatch's state, no cross-iter
-     contamination.
-
-Note on the streaming gate: this test fills ``y_done_per_token``
-with ``combine_seq`` before invoking combine (gate trivially open),
-mirroring the intranode combine test. End-to-end gate exercise (kernel-Y
-release fires the gate while combine is spinning) requires the production
-pipeline with real compute streams — closing the gate then firing it
-from the same stream the kernel runs on deadlocks. That coverage lives
-in the multi-stream pipeline tests, not here.
-
-Edge cases planted in inputs:
-  - ~5% ``-1`` sentinels in ``topk_idx`` (skip branch, no contribution).
-  - One expert pinned to receive zero tokens this iter (forces empty-
-    expert branch through combine's reverse path).
-
-Driver convention: torchrun env-driven (``RANK`` / ``WORLD_SIZE`` /
-``LOCAL_RANK``), matching ``test_streaming_dispatch_internode.py``.
+Inputs plant ~5% ``-1`` sentinels in ``topk_idx`` and one expert that
+receives no tokens.
 """
 
 import os
@@ -46,7 +21,7 @@ import torch.distributed as dist
 
 from stream_ep import Buffer
 
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 def expected_combine_output(
@@ -130,11 +105,7 @@ def main():
     dtype = torch.bfloat16
 
     hidden_bytes = hidden * 2
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device, seed=123, plant_sentinels=True

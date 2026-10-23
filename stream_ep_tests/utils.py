@@ -2,6 +2,16 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
+# The 82ba5b production MoE shape (82B total / 4.3B active): d_model H, per-expert
+# intermediate I, E experts, top-K routing, tokens per rank. Shared by the
+# production-shape tests and the stream_ep_bench harnesses.
+H = 3072
+I = 768
+NUM_EXPERTS = 256
+SEQ_LEN_PER_RANK = 8192
+TOPK = 8
+DTYPE = torch.bfloat16
+
 
 def cleanup_dist():
     # Sync all ranks then tear down so the TCPStore client closes in lockstep.
@@ -41,7 +51,7 @@ def make_inputs(
     ``topk_idx == e`` to ``-1`` so expert ``e`` receives zero tokens this
     iter (exercises the empty-expert branch on receivers).
     """
-    import stream_ep  # late import — tests/utils.py is imported by harnesses pre-Buffer-init
+    import stream_ep  # late import: the stream_ep_bench harnesses import this module before Buffer init
 
     g = torch.Generator(device=device).manual_seed(seed + rank)
     if x_kind == "rank_tag":

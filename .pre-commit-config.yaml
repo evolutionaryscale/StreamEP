@@ -16,6 +16,15 @@ repos:
         types_or: [c, c++, cuda]
         exclude: ^csrc/third_party/
 
+  - repo: local
+    hooks:
+      - id: check-tests
+        name: test layout (stream_ep_tests.run discovery)
+        entry: python scripts/check_tests.py
+        language: python
+        pass_filenames: false
+        always_run: true
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:

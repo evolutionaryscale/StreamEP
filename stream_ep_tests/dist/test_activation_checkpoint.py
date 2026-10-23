@@ -1,31 +1,17 @@
-"""Gradient-equivalence test for ``activation_checkpoint_level`` 0 vs 1.
+"""Gradient equivalence of ``activation_checkpoint_level`` 1 and 2 against 0.
 
-``stream_moe_func(..., activation_checkpoint_level=1)`` skips saving ``preact_a``
-in forward and recomputes it from ``pool @ w1_local`` in backward with a plain
-grouped-M GEMM (``quack.gemm`` with ``cu_seqlens_m``). Because that is a
-DIFFERENT kernel than forward's gated kernel A, the reconstructed ``preact_a``
-matches forward's within bf16 GEMM-accumulation tolerance (not bit-identical) —
-same math, different tile/accumulation order. Every downstream gradient must
-therefore match the non-checkpointed path within that tolerance.
+Level 1 skips saving ``preact_a`` and recomputes it in backward from
+``pool @ w1_local`` with a plain grouped-M GEMM; level 2 additionally saves
+only the unexpanded recv tokens and re-expands ``pool`` in backward. The
+recompute uses a different kernel than forward's gated kernel A, so
+``preact_a`` matches within bf16 accumulation tolerance, not bit-exactly.
 
-What "match" means here has two components: (1) the streaming bwd accumulates
-``dL_dweight`` (fp32 atomic-add), ``dL_dx_per_r`` (bf16x2 atomic-add) and the
-fwd kernel-Y scatter in non-deterministic order, so two runs with the SAME flag
-already differ at the floating-point-reassociation level (pool *placement* is
-deterministic, atomic-add *order* is not);
-(2) the recompute's different-kernel GEMM adds a bf16-accumulation difference on
-top, which scales with tensor magnitude. So a bit-exact ``torch.equal`` would
-fail even off-vs-off. We measure the off-vs-off run-to-run noise floor, allow a
-bf16-relative term, and assert the off-vs-ON difference is within that bound —
-a real recompute bug (wrong preact) blows past it by orders of magnitude.
-
-The recompute lives entirely in the compute kernels, which are identical
-intranode vs internode, so 1-node coverage exercises the full feature. Driver
-convention matches the rest of
-the streaming tests:
-
-    torchrun --nproc_per_node=8 StreamEP/tests/test_activation_checkpoint.py
-    torchrun --nproc_per_node=2 StreamEP/tests/test_activation_checkpoint.py
+Two runs with the same level already differ: the backward accumulates
+``dL_dweight`` / ``dL_dx_per_r`` and forward scatters ``y`` with atomics in
+nondeterministic order. So the test measures the level-0 run-to-run noise
+floor, allows a bf16-relative term on top, and asserts each checkpointed
+level stays within that bound; a wrong recompute misses it by orders of
+magnitude.
 """
 
 import os
@@ -34,7 +20,7 @@ import torch
 import torch.distributed as dist
 from stream_ep import Buffer
 from stream_ep.stream_moe.stream_moe import make_streams, stream_moe_func
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 def main():
@@ -57,11 +43,7 @@ def main():
     I = 256
 
     hidden_bytes = H * 2
-    nvl_bytes = rdma_bytes = 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     # Identical, deterministic inputs reused across all three runs. Same routing
     # ⟹ bit-identical pool placement ⟹ the only off-vs-on difference is the

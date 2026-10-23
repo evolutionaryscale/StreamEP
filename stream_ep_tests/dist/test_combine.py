@@ -1,29 +1,13 @@
-"""End-to-end test for the consolidated streaming-MoE combine (intranode).
+"""``Buffer.combine`` against an analytical reference.
 
-Exercises ``Buffer.combine`` with the Phase-D per-token gate. Combine sender
-spins on ``y_done_per_token[r] >= combine_seq`` before pushing
-``handle.o[r]`` back to ``r``'s origin rank; in production the release-store
-of ``combine_seq`` is fired by kernel Y. Here we do not run kernel Y — we
-manually populate ``handle.o`` with rank-tagged sentinel values and fill
-``y_done_per_token`` with ``combine_seq`` so the gate clears
-unconditionally, then call ``buf.combine`` and verify the cross-rank
-reduction in ``recv_x``.
+Kernel Y is not run: ``handle.o`` is filled with rank-tagged sentinels and
+``y_done_per_token`` with ``combine_seq``, so the per-token gate is open and
+the test checks only the cross-rank reduction into ``recv_x``.
 
-Two test cases:
-
-  1. ``test_basic_combine`` — single dispatch + populated o + combine; assert
-     the output matches an analytical reference (sum over contributing ranks
-     of their per-rank sentinel value).
-  2. ``test_multi_dispatch_combine`` — three sequential dispatches with
-     different routing seeds and per-call manual fills. Verifies no cross-
-     dispatch contamination (each combine reads its own dispatch's state
-     from the corresponding ``handle``).
-
-Driver convention: torchrun env-driven (``RANK`` / ``WORLD_SIZE`` /
-``LOCAL_RANK``), matching ``test_streaming_dispatch.py``. Run as:
-
-    torchrun --nproc_per_node=2 StreamEP/tests/test_combine.py
-    torchrun --nproc_per_node=8 StreamEP/tests/test_combine.py
+  1. Single dispatch + combine: each output token equals the sum of the
+     sentinels of the ranks it was sent to.
+  2. Three dispatches with different routing seeds: each combine reads only
+     its own dispatch's state.
 """
 
 import os
@@ -31,15 +15,8 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
-
-def make_buffer(group, hidden_bytes):
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), rdma_bytes)
-    return Buffer(group, nvl_bytes, rdma_bytes)
 
 
 def expected_combine_output(is_token_in_rank, num_tokens, hidden, num_ranks, dtype, device):
@@ -127,7 +104,7 @@ def main():
     dtype = torch.bfloat16
     hidden_bytes = hidden * 2
 
-    buf = make_buffer(group, hidden_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     # ─── Test 1: basic combine. Single dispatch + populated o + combine.
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(

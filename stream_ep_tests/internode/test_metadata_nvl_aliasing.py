@@ -1,56 +1,17 @@
-"""Regression test: internode NVL metadata <-> dispatch-data ring aliasing.
+"""The internode metadata NVL slabs must not alias the dispatch data ring.
 
-Bug (root-caused 2026-08-29, prod failures 2026-08-27): the internode
-`streaming_dispatch_metadata` kernels carve their NVL slabs (count slabs +
-streaming inbox) from `buffer_ptrs[*]` at byte offset 0 -- the same bytes as
-the dispatch data kernel's `nvl_channel_x` (channel 0, writer nvl_rank 0)
-ring slice. The metadata Phase B kernel reads the streaming inbox AFTER the
-last cross-rank barrier (Phase A's trailing `barrier_block`), in a separate,
-purely-local cooperative kernel. A leading NVL peer -- whose own host poll
-finished -- launches its SAME-iteration `dispatch_main_kernel`, whose
-channel-0 forwarder writes ring slots 0..~60 into the victim's NVL buffer
-(the NVL ring restarts slot indexing at 0 every generation), overwriting the
-victim's streaming inbox with bf16 token payload while the victim's Phase B
-is still pending. The payload bytes, read back as int32 substream counts,
-produce garbage `expert_frequency` -> garbage `streaming_total_tiles`
-(negative -> internode_dispatch CPU timeout; huge positive -> multi-TiB
-`pool` alloc / OOM). Only the victim's Phase-B-derived outputs corrupt; the
-Phase-A count exchange (recv_tokens / rdma_recv_tokens / per-expert
-counters) stays sane -- the exact production signature.
+The internode metadata kernels' NVL slabs (count slabs and streaming inbox)
+must sit in their own region (``nvl_metadata_offset``, after the dispatch and
+combine NVL regions). If they overlapped the data ring, a peer's
+same-iteration ``dispatch_main_kernel`` could overwrite the inbox while this
+rank's metadata Phase B is still reading it, corrupting ``total_tiles``.
 
-In production the reader wins the race by only the ~O(100us) poll+launch
-pipeline latency, so the bug fires rarely (victim's cooperative Phase B
-delayed by SM contention from the overlapped GEMM/dense streams). This test
-makes the race deterministic through the permanent, default-off
-`STREAMEP_DEBUG_PB_DELAY_US` hook: a device-side spin at Phase B entry on
-the nvl_rank==7 rank of each node, emulating a legal scheduling delay. Under
-the delay, UNFIXED code corrupts within the first few dispatches, every run.
-
-Detection is layered:
-  * the host poll's always-on fail-fast raises
-    `RuntimeError: StreamEP-CORRUPT(host)` on an insane `total_tiles`
-    (negative or > 2^20);
-  * a garbage-positive `total_tiles` big enough to OOM the `pool` alloc
-    raises `torch.OutOfMemoryError` before any kernel touches it;
-  * this test additionally bounds the returned pool's tile count by the
-    routing-independent maximum (world*T*K/tile_m + E_local).
-
-PASS/FAIL semantics: the test PASSES iff NO corruption occurs on any rank.
-The fix is always-on (unconditional): the metadata NVL slabs are carved at
-nvl_metadata_offset = dispatch + combine NVL region bytes, disjoint from
-both data rings. This test passes on correct code and FAILS if that fix
-ever regresses. There is deliberately NO runtime way to select the buggy
-offset-0 layout -- reproducing red requires building the pre-fix source
-(metadata NVL carve at buffer offset 0), not flipping a flag.
-
-Launch (torchrun-style, internode: world > 8 and world % 8 == 0; prod-ish
-shapes H=512 latent bf16, E=512, K=8, T=8192, num_sms=64 -> 32 channels):
-
-    torchrun --nproc-per-node=8 tests/test_metadata_nvl_aliasing.py   (one torchrun per node: add --nnodes=<N> --node-rank=<i> and c10d rendezvous args)
-
-This test intentionally relies on two permanent, zero-overhead-when-off
-pieces of the C++ side: the `STREAMEP_DEBUG_PB_DELAY_US` Phase-B entry spin
-and the host-poll `total_tiles` sanity fail-fast. Do not remove them.
+The race is made deterministic with the default-off
+``STREAMEP_DEBUG_PB_DELAY_US`` hook, which delays Phase B on each node's
+``nvl_rank == 7``. The test passes if no rank sees corruption, detected by the
+host poll's ``total_tiles`` fail-fast, an out-of-memory ``pool`` allocation,
+or a pool larger than the routing-independent maximum. It relies on the
+delay hook and the fail-fast staying in the C++ side.
 """
 
 import os
@@ -71,7 +32,7 @@ import torch.distributed as dist
 
 from stream_ep import Buffer
 
-from utils import cleanup_dist
+from stream_ep_tests.utils import cleanup_dist
 
 
 def random_routing(n_tokens, topk, num_experts, num_local_experts, world_size, device, gen):
@@ -137,11 +98,7 @@ def main():
     num_local_experts = E // world_size
 
     hidden_bytes = H * 2  # bf16
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     torch.manual_seed(100 + rank)
     x = (torch.randn(T, H, dtype=torch.bfloat16, device=device) * 0.1).contiguous()

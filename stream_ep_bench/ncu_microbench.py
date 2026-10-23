@@ -15,7 +15,7 @@ replay.
 This harness sidesteps both problems. It drives each compute kernel
 standalone, single-GPU, with NO comm and the per-tile arrival gate
 **pre-fired** (`pool_arrival_count == pool_arrival_target`), exactly like the
-per-kernel unit tests (`tests/test_kernel_a.py` etc.). With the gate already
+kernel tests (`stream_ep_tests/kernels/test_kernel_a.py` etc.). With the gate already
 satisfied the kernel never spins, so default kernel replay works perfectly and
 you get full SM / tensor-core / memory / occupancy / roofline counters per
 kernel.
@@ -33,10 +33,10 @@ Launch (under ncu)
     ncu --profile-from-start off --launch-count 1 \
         --kernel-name 'regex:StreamingMoe' --set full \
         --clock-control none -f -o report \
-        python -m stream_ep.stream_moe.ncu_microbench --kernel a
+        python -m stream_ep_bench.ncu_microbench --kernel a
 
 Or run bare (no ncu) to sanity-check shapes / timing:
-    python -m stream_ep.stream_moe.ncu_microbench --kernel a --bare
+    python -m stream_ep_bench.ncu_microbench --kernel a --bare
 
 The single profiled launch is wrapped in `cudaProfilerStart/Stop`
 (torch.cuda.profiler.start/stop), so with `--profile-from-start off` ncu

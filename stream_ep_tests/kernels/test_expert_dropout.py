@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from stream_ep.stream_moe.expert_dropout import keep_scale_ref
-from stream_ep.stream_moe.tests.test_kernel_a import (
+from stream_ep_tests.kernels.test_kernel_a import (
     _make_pool_arrival,
     _make_tile_metadata,
 )

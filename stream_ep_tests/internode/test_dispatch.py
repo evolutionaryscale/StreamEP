@@ -1,39 +1,21 @@
-"""End-to-end test for the streaming-MoE internode dispatch (pool layout).
+"""Raw internode dispatch outputs against references built from all ranks' inputs.
 
-Mirrors ``tests/test_dispatch.py`` (which exercises the intranode streaming
-path) for the internode topology — 2 RDMA × 8 NVL = 16 GPUs. Drives the
-C++ entry point ``Buffer.runtime.internode_dispatch`` directly so the
-test can assert on the raw outputs of the dispatch kernel without going
-through ``Buffer.dispatch``'s topology branch.
+Calls ``Buffer.runtime.internode_dispatch`` directly so it can check the
+kernel's outputs before ``Buffer.dispatch`` wraps them.
 
-Verifies, against an eager reference computed from all-gather'd per-rank
-inputs:
+  1. Each pool slot holds its source rank's token data.
+  2. Slots fall in their expert's pool block; padding rows have
+     ``pool_recv_token == -1``.
+  3. Every (recv_token, k) routed to a local expert has exactly one slot.
+  4. ``pool_arrival_count == pool_arrival_target`` for every tile.
+  5. ``tile_id_to_expert`` and ``pool_arrival_target`` agree with
+     ``expert_pool_block_offset``.
+  6. ``k_local_remaining`` counts each recv token's local landings, and
+     ``recv_token_to_slots`` inverts ``pool_recv_token`` / ``pool_k_slot``.
+  7. Re-running reproduces placement and valid pool rows bit for bit.
 
-  1. Pool data correctness — for every pool slot ``s`` with
-     ``pool_recv_token[s] >= 0``, ``pool[s, 0]`` matches the source rank's
-     ``x[t, 0]`` value.
-  2. Pool layout — every populated slot falls inside its expert's pool block
-     range (``[expert_pool_block_offset[e], expert_pool_block_offset[e+1]) *
-     tile_m``); padding rows have ``pool_recv_token == -1``.
-  3. Per-(recv_token, k) coverage — every (r, k) routing to a local expert is
-     recorded in exactly one pool slot.
-  4. ``pool_arrival_count[tile_id] == pool_arrival_target[tile_id]`` for
-     every tile_id in ``[0, total_tiles)``.
-  5. ``tile_id_to_expert`` and ``pool_arrival_target`` agree with the
-     ``expert_pool_block_offset`` partition.
-  6. ``k_local_remaining[r]`` matches the count of local-expert landings
-     for recv-token ``r``; ``recv_token_to_slots[r, k]`` is the inverse of
-     ``pool_recv_token`` / ``pool_k_slot``.
-  7. Bit-determinism: re-running produces identical ``pool_recv_token`` /
-     ``pool_k_slot`` / ``recv_token_to_slots`` and identical valid-row pool
-     data.
-
-Edge cases planted in inputs:
-  - ~5% ``-1`` sentinels in ``topk_idx`` to exercise the skip branch.
-  - One expert pinned to receive zero tokens this iter (forces empty-expert
-    branch in Pass 2 fire).
-  - Multi-iter dispatch_seq reuse (1 then 2) to verify cross-iter
-    correctness.
+Inputs plant ~5% ``-1`` sentinels and one expert that receives no tokens,
+and the test runs two dispatches to cover ``dispatch_seq`` reuse.
 """
 
 import os
@@ -43,7 +25,7 @@ import torch.distributed as dist
 
 from stream_ep import Buffer
 
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 def compute_expected_recv_layout(
@@ -139,11 +121,7 @@ def main():
     plant_empty_expert = None
 
     hidden_bytes = hidden * 2
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
         num_tokens, hidden, num_topk, num_experts, world_size, rank, device, plant_sentinels=True, plant_empty_expert=plant_empty_expert

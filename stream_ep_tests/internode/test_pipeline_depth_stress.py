@@ -1,31 +1,12 @@
-"""Full-pipeline depth stress repro for the internode dispatch_grads hang.
+"""The full ``stream_moe_func`` pipeline chained ``num_layers`` deep, internode.
 
-The pure-comm repro (``test_dispatch_grads_stress.py``) does NOT hang — bare
-``dispatch``+``dispatch_grads`` rapid-fire at production shape/depth is clean.
-So the trigger is in the *interaction* the pure-comm loop omits: the compute
-kernels between collectives, combine/combine_grads, and the 2-stream overlap +
-launch gates. This repro exercises the FULL ``stream_moe_func`` pipeline
-(dispatch -> kernel_a -> kernel_y -> combine ; bwd: dispatch_grads ->
-kernel_y_bwd -> kernel_a_bwd -> combine_grads, on the two caller streams),
-chained ``num_layers`` deep then a single ``backward()`` — i.e. the benchmark's
-MoE stack with attention/FSDP/optimizer/compile stripped away.
-
-The benchmark hangs at config=82ba5b, n_layers>=32, dp_shard=32 (4-node) in the
-backward dispatch_grads (``NVL receiver timeout (prefix)`` / ``forwarder
-timeout``), around warmup step ~4. This repro reproduces that regime: each
-"step" chains ``num_layers`` stream_moe_func calls (so backward runs
-``num_layers`` dispatch_grads back-to-back, exactly like a deep model's bwd),
-repeated ``num_steps`` times.
-
-Progress is printed + flushed per (step, fwd-layer) and around backward, so a
-hang pinpoints the stalling step/phase. Clean run prints PASS.
-
-Launch internode, world >= 16 (the hang was seen at 4 nodes / world=32)
-(one torchrun per node: add --nnodes=<N> --node-rank=<i> and c10d rendezvous args):
-    torchrun --nproc-per-node=8 tests/test_pipeline_depth_stress.py \
-        [--num_layers 44] [--num_steps 6]
-
-Defaults = the 82B shape/depth that hung. preact ckpt OFF (default).
+Each step runs ``num_layers`` forward layers (dispatch, kernel A, kernel Y,
+combine on the two caller streams) and one ``backward()``, so ``num_layers``
+``dispatch_grads`` / ``combine_grads`` run back to back between the backward
+compute kernels, as in a deep model. Covers the compute / collective
+interaction that the communication-only stress test leaves out. Progress is
+printed per (step, layer) and around backward. Defaults are the 82ba5b shape
+and depth.
 """
 
 import argparse
@@ -37,7 +18,7 @@ import torch.distributed as dist
 from stream_ep import Buffer
 from stream_ep.stream_moe.stream_moe import make_streams, stream_moe_func
 
-from utils import cleanup_dist
+from stream_ep_tests.utils import cleanup_dist
 
 
 def uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
@@ -94,11 +75,7 @@ def main():
     E_local = E // world_size
 
     hidden_bytes = H * 2
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
     streams = make_streams()
 
     g = torch.Generator(device=device).manual_seed(42 + rank)

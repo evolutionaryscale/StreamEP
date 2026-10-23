@@ -1,20 +1,12 @@
-"""End-to-end test for the consolidated streaming-MoE dispatch (intranode, pool layout).
+"""``Buffer.dispatch`` (pool layout) against references built from all ranks' inputs.
 
-Exercises ``Buffer.dispatch`` (pool-layout: dispatch's receiver writes each
-landed (token, k) pair routing to a local expert into its own pool slot, and
-release-adds into ``pool_arrival_count`` in expert-major order at substream
-end). Verifies:
-
-  1. Pool data correctness — each pool slot matches its source rank's token data.
-  2. Pool layout — slots fall in their expert's pool region (bounded by
-     expert_pool_block_offset[e] * tile_m for each expert e); padding rows
-     have pool_recv_token == -1.
-  3. Per-(recv_token, k) coverage — every (r, k) with recv-side k routing to a
-     local expert is recorded in exactly one pool slot.
-  4. pool_arrival_count[tile_id] == pool_arrival_target[tile_id] for every
-     tile_id in [0, total_tiles) — every tile fully fired by dispatch.
-  5. tile_id_to_expert agrees with the slot range.
-  6. Bit-determinism: re-running dispatch produces identical pool placement.
+  1. Each pool slot holds its source rank's token data.
+  2. Slots fall in their expert's pool region; padding rows have
+     ``pool_recv_token == -1``.
+  3. Every (recv_token, k) routed to a local expert has exactly one pool slot.
+  4. ``pool_arrival_count[tile] == pool_arrival_target[tile]`` for every tile.
+  5. ``tile_id_to_expert`` agrees with the slot ranges.
+  6. Re-running dispatch reproduces the same placement bit for bit.
 """
 
 import os
@@ -22,7 +14,7 @@ import os
 import torch
 import torch.distributed as dist
 from stream_ep import Buffer
-from utils import cleanup_dist, make_inputs
+from stream_ep_tests.utils import cleanup_dist, make_inputs
 
 
 def main():
@@ -42,12 +34,7 @@ def main():
     tile_m = 32
 
     hidden_bytes = hidden * 2
-    nvl_bytes = 0
-    rdma_bytes = 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     x, topk_idx, topk_weights, is_token_in_rank = make_inputs(num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
 

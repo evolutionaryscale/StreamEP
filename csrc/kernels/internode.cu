@@ -599,7 +599,7 @@ __global__ void streaming_dispatch_metadata_phase_b_kernel(
     // inbox. Emulates a legal scheduling delay of this cooperative
     // kernel (e.g. SM contention from a concurrent GEMM stream). Driven
     // by STREAMEP_DEBUG_PB_DELAY_US/_RANK; the NVL-aliasing regression
-    // test (tests/test_metadata_nvl_aliasing.py) depends on it — keep.
+    // test (stream_ep_tests/internode/test_metadata_nvl_aliasing.py) depends on it — keep.
     int debug_delay_us,
     // Env
     void** buffer_ptrs,
@@ -896,7 +896,7 @@ void streaming_dispatch_metadata(const topk_idx_t* topk_idx,
     // ── Test timing hook (supported, default-off, zero overhead when
     // unset): optional Phase-B entry delay (µs) on selected ranks. Emulates
     // the legal scheduling delay that opens the NVL metadata/dispatch-ring
-    // race window on pre-fix layouts; tests/test_metadata_nvl_aliasing.py
+    // race window on pre-fix layouts; stream_ep_tests/internode/test_metadata_nvl_aliasing.py
     // relies on it — keep. Env is read once per process (static init).
     // STREAMEP_DEBUG_PB_DELAY_US: microseconds to spin (0/unset = off).
     // STREAMEP_DEBUG_PB_DELAY_RANK: global rank to delay; -1 (default) =

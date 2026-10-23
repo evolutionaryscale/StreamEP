@@ -1,35 +1,10 @@
-"""Repetition stress repro for the internode dispatch_grads hang.
+"""Many back-to-back internode dispatch / dispatch_grads calls, communication only.
 
-The single-shot ``test_dispatch_grads_internode`` passes, but the full
-benchmark hangs in the BACKWARD internode ``dispatch_grads`` path at depth
-(``StreamEP dispatch_grads NVL receiver timeout (prefix)`` / ``forwarder
-timeout``), only after ~100+ back-to-back dispatch_grads calls
-(N layers x several steps). `profile_pipeline.py`'s docstring notes the
-collectives need "natural per-iter slack to satisfy the single-slot
-``rdma_channel_meta`` protocol, which the full fwd+bwd pipeline provides but a
-rapid-fire bench loop does not" — so the hypothesis is that many rapid
-back-to-back dispatches overwhelm the single-slot meta protocol.
-
-This test reproduces that **rapid-fire** regime with PURE COMM (no compute
-kernels, so no JIT and the dispatch_grads calls are maximally back-to-back —
-even less slack than the real pipeline, which only helps trigger the race).
-Per "step" it mirrors the benchmark's per-training-step comm structure:
-
-  * issue ``num_layers`` forward ``dispatch`` calls, KEEPING all handles alive
-    (as autograd keeps every layer's saved state until backward);
-  * then issue ``num_layers`` ``dispatch_grads`` calls in REVERSE order
-    (as autograd runs layer backwards in reverse) — back-to-back, no slack.
-
-Progress is printed per (step, layer) and flushed, so when it hangs the log
-pinpoints the exact step/layer/op that stalled. A clean run prints PASS.
-
-Launch internode, world >= 16 (the hang was seen at 4 nodes / world=32)
-(one torchrun per node: add --nnodes=<N> --node-rank=<i> and c10d rendezvous args):
-    torchrun --nproc-per-node=8 tests/test_dispatch_grads_stress.py \
-        [--num_layers 44] [--num_steps 8] [--hidden 3072] [--num_experts 256] \
-        [--topk 8] [--num_tokens 8192] [--tile_m 128]
-
-Defaults match the 82B shape / depth that hung (config=82ba5b, dp_shard=32).
+Each step issues ``num_layers`` forward dispatches, keeping every handle
+alive as autograd would, then ``num_layers`` ``dispatch_grads`` calls in
+reverse order with no compute in between: less slack between collectives
+than the real pipeline gives. Progress is printed per (step, layer), so a
+hang shows exactly where it stalled. Defaults are the 82ba5b shape and depth.
 """
 
 import argparse
@@ -47,7 +22,7 @@ import torch.distributed as dist
 
 from stream_ep import Buffer
 
-from utils import cleanup_dist
+from stream_ep_tests.utils import cleanup_dist
 
 
 # ── stall diagnostic ─────────────────────────────────────────────────────────
@@ -351,11 +326,7 @@ def main():
     num_local_experts = E // world_size
 
     hidden_bytes = H * 2
-    nvl_bytes, rdma_bytes = 0, 0
-    for cfg in (Buffer.get_dispatch_config(world_size), Buffer.get_combine_config(world_size)):
-        nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, world_size), nvl_bytes)
-        rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, world_size), rdma_bytes)
-    buf = Buffer(group, nvl_bytes, rdma_bytes)
+    buf = Buffer.sized_for(group, hidden_bytes)
 
     # NVL-receiver lag (see --lag_ms). ~1.8e6 cycles/ms on H100; precision is
     # irrelevant — only cumulative skew vs the un-lagged ranks matters.
