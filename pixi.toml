@@ -1,0 +1,49 @@
+# Wheel build env. The wheel is consumed by evoscale, so every pin below that
+# reaches the compiled extension must match evoscale's env: python 3.12, torch
+# 2.11.0+cu130 (C++ ABI of libtorch/libc10), nvcc 13.3 (cudart 13 soname), and
+# nvidia-nvshmem-cu13 3.4.5 (device lib is linked statically, host lib is
+# loaded from the consumer's env). pyproject.toml declares the same torch /
+# nvshmem pins as runtime requirements, so a mismatched consumer fails to
+# resolve instead of crashing at import.
+[workspace]
+name = "stream-ep"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[system-requirements]
+libc = "2.28"
+
+[dependencies]
+python = "3.12.*"
+cxx-compiler = "*"
+gxx_linux-64 = "14.3.*"  # evoscale's compiler
+cuda-version = "13.3.*"
+cuda-compiler = "13.3.*"
+cuda-cudart-dev = "13.3.*"
+cuda-driver-dev = "13.3.*"
+cuda-nvtx-dev = "13.3.*"
+libcublas-dev = "*"
+libcusolver-dev = "*"
+libcusparse-dev = "*"
+ninja = "*"
+patchelf = "*"
+pip = "*"
+rdma-core = "*"  # infiniband/mlx5dv.h, included by NVSHMEM's IBGDA headers
+setuptools = ">=77,<82"  # torch 2.11 requires setuptools<82
+wheel = "*"
+
+[pypi-dependencies]
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+nvidia-nvshmem-cu13 = "==3.4.5"
+
+[activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+TORCH_CUDA_ARCH_LIST = "9.0"
+
+[tasks.build-wheel]
+cmd = "python scripts/build_wheel.py"
+description = "Build the release wheel into dist/"
+
+[tasks.check-wheel]
+cmd = "python scripts/check_wheel.py"
+description = "Check dist/ holds one release-ready wheel matching pyproject's version"

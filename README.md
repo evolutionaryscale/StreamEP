@@ -31,15 +31,19 @@ The dispatch / combine ring protocol underneath (channel send/recv buffers, NVL 
 
 ## Build
 
-Build environment requirements: torch 2.8 (cu128), CUDA 12.8, upstream NVSHMEM 3.5.19 (`nvidia-nvshmem-cu12==3.5.19` pip wheel), and the `nvidia/*` pip wheels providing the dev headers (cusparse / cublas / cusolver) the C++ extension needs.
+`pixi.toml` pins the build env to the versions the wheel's consumer (evoscale) runs: python 3.12, torch 2.11.0+cu130, nvcc 13.3, gcc 14.3, and `nvidia-nvshmem-cu13==3.4.5`. No GPU is needed to build.
 
 ```bash
-# editable install (incremental rebuilds via `python setup.py build_ext --inplace`)
-pip install --no-build-isolation --no-deps -e .
+pixi run build-wheel   # release wheel into dist/, rpath rewritten to $ORIGIN-relative entries only
+pixi run check-wheel   # version, pinned requirements, rpath, SM90 SASS, glibc / libstdc++ ceilings
 
-# wheel
-pip wheel --no-build-isolation --no-deps --wheel-dir dist .
+# incremental in-place rebuild after .cu / .cpp / .cuh edits
+pixi run python setup.py build_ext --inplace
 ```
+
+## Release
+
+Bump `version` in `pyproject.toml` and merge to `main`. `.github/workflows/wheel.yml` builds and checks the wheel on every PR; on a push to `main` whose version has no release yet, it publishes the wheel as the single asset of release `v<version>`. Release assets are never replaced: uv caches wheel URLs as immutable, so a fix ships as a new version. Then bump the `stream-ep` URL in evoscale's `pixi.toml` to the new release.
 
 Produces `stream_ep` (Python package) backed by `stream_ep_cpp` (C++ extension). Coexists with upstream `deep_ep` in the same env if both are installed — different module names, different `.so` filenames, so neither shadows the other.
 

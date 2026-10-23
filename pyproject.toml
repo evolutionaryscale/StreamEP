@@ -1,19 +1,21 @@
 [build-system]
 # stream-ep's setup.py imports `torch.utils.cpp_extension.{BuildExtension,CUDAExtension}`
 # at the top, so torch must be importable when uv prepares the wheel metadata.
-# Consumers (evoscale) install with `no-build-isolation = ["stream-ep"]` so the
-# env's already-pinned torch (cu128 ABI) is used directly; the requires line
-# below documents the contract and lets pure-isolation builds find the deps too.
-requires = ["setuptools>=61", "wheel", "torch>=2.11,<2.12"]
+# Builds run with `--no-build-isolation` in pixi.toml's env (or the consumer's
+# env), which already provides the pinned torch; the requires line documents
+# the contract and lets pure-isolation builds find the deps too.
+requires = ["setuptools>=77", "wheel", "torch==2.11.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "stream-ep"
 version = "0.1.14"
-# Declared explicitly so uv installs torch FIRST (the env's existing pin) and
-# stream-ep's setup.py can import it at metadata-prep time under
-# no-build-isolation. Without this, uv has no dep edge to enforce ordering.
-dependencies = ["torch>=2.11,<2.12"]
+# The compiled extension is ABI-bound to the torch it was built against and
+# statically links NVSHMEM's device library, so both are pinned to the exact
+# versions in pixi.toml's build env: a consumer env with different versions
+# fails to resolve instead of failing at import. The torch edge also makes uv
+# install torch before stream-ep's metadata prep under no-build-isolation.
+dependencies = ["torch==2.11.0", "nvidia-nvshmem-cu13==3.4.5"]
 
 [tool.yapf]
 based_on_style = "pep8"
