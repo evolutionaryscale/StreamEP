@@ -28,8 +28,6 @@ the streaming tests:
     torchrun --nproc_per_node=2 StreamEP/tests/test_activation_checkpoint.py
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

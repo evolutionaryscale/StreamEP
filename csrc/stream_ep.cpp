@@ -2074,8 +2074,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Buffer::internode_combin
 
     // kNVLSender ships recv-side `x` back to source ranks → it needs the
     // *recv*-side per-(src_world, channel) prefix (`recv_gbl_channel_prefix_matrix`),
-    // not the dispatch's send-side `gbl_channel_prefix_matrix`. Same bug class
-    // as Phase D's intranode combine fix (see logbook 2026-05-04).
+    // not the dispatch's send-side `gbl_channel_prefix_matrix`.
     internode::launch_combine_main(
         at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
         recv_x.data_ptr(), recv_topk_weights_ptr,

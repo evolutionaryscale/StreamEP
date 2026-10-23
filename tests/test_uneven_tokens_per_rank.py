@@ -37,8 +37,6 @@ which exceeds its local-uniform budget. Defaults (128 vs 8192) hold through
 ~60 ranks.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 
@@ -121,7 +119,7 @@ def main():
         # narrow is now blocked inside dispatch_main waiting on this rank's
         # (never-launched) participation. Fail the process; torchrun tears the
         # rest down.
-        raise SystemExit(1)
+        raise SystemExit(1) from e
 
     got_tiles = int(handle.total_tiles)
     print(f"[uneven-toks] rank{rank} (T={T}) OK: actual total_tiles={got_tiles}, "

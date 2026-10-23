@@ -36,8 +36,6 @@ Edge cases planted in inputs:
     correctness.
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

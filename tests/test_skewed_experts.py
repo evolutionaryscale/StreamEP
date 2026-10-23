@@ -49,8 +49,6 @@ Pass / fail summary printed at end. Non-zero exit if any scenario
 fails.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 
@@ -63,7 +61,6 @@ from stream_ep.stream_moe.profile_pipeline import (
     H,
     I,
     NUM_EXPERTS,
-    NUM_SMS,
     SEQ_LEN_PER_RANK,
     TOPK,
     make_buffer,
@@ -388,7 +385,7 @@ def main():
         n_skip = sum(1 for _, s, _ in results if s == "SKIPPED")
         print(f"[skewed-experts] SUMMARY world_size={world_size}: "
               f"{n_pass} pass / {n_fail} fail / {n_skip} skipped", flush=True)
-        for name, status, msg in results:
+        for _, status, msg in results:
             print(f"  {status}: {msg}", flush=True)
 
     cleanup_dist()

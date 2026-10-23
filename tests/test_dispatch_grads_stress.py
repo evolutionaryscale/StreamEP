@@ -31,8 +31,6 @@ Driver (4 nodes / world=32 — internode is where the bug lives):
 Defaults match the 82B shape / depth that hung (config=82ba5b, dp_shard=32).
 """
 
-from __future__ import annotations
-
 import argparse
 import faulthandler
 import os
@@ -41,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -88,9 +87,9 @@ def _proc_thread_states():
         for tid in sorted(os.listdir("/proc/self/task")):
             d = f"/proc/self/task/{tid}"
             try:
-                comm = open(f"{d}/comm").read().strip()
-                wchan = open(f"{d}/wchan").read().strip() or "0"
-                state = open(f"{d}/stat").read().rsplit(") ", 1)[1][0]
+                comm = Path(d, "comm").read_text().strip()
+                wchan = Path(d, "wchan").read_text().strip() or "0"
+                state = Path(d, "stat").read_text().rsplit(") ", 1)[1][0]
             except OSError:
                 continue
             out.append(f"    tid {tid} [{comm}] state={state} wchan={wchan}")
@@ -137,7 +136,7 @@ def start_stall_watchdog(rank, timeout_s):
             path = f"logs/diag_stall/rank{rank:02d}_pid{pid}.txt"
             try:
                 os.makedirs("logs/diag_stall", exist_ok=True)
-                f = open(path, "a")
+                f = open(path, "a")  # noqa: SIM115 (falls back to sys.stderr, which must stay open)
             except OSError:
                 f = sys.stderr
             sys.stderr.write(f"[diag][rank {rank}] STALL #{n} ({idle:.0f}s, '{what}') -> {path}\n")

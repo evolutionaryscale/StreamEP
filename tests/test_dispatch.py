@@ -17,8 +17,6 @@ end). Verifies:
   6. Bit-determinism: re-running dispatch produces identical pool placement.
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

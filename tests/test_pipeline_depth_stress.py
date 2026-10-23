@@ -27,8 +27,6 @@ Driver (4 nodes / world=32):
 Defaults = the 82B shape/depth that hung. preact ckpt OFF (default).
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 

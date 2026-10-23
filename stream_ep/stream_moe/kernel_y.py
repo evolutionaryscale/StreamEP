@@ -53,7 +53,6 @@ trash row needed.
 from dataclasses import MISSING
 from typing import NamedTuple, Optional, Type
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import quack.copy_utils as copy_utils
@@ -188,10 +187,9 @@ class AtomicScatterStore(EpiOp):
         if arg is None:
             return EpiSmemBytes()
         # bf16 staging buffer is per-D-stage; recv_token + is_last_flag scratch
-        # are per-CTA-tile (unstaged). v0.4.1 EpiSmemBytes accounting separates
-        # the two so the framework can multiply d_stage by `epi_stage` at
-        # allocation time. v0.3.11 we conservatively allocated for 4 stages
-        # in one int return; the new structure expresses it directly.
+        # are per-CTA-tile (unstaged). EpiSmemBytes keeps the two separate so
+        # the framework can multiply the staged part by `epi_stage` at
+        # allocation time.
         #
         # The staging is the un-swizzled, N-padded layout (see SMEM_N_PAD), so
         # the per-stage byte count uses the PADDED row stride (epi_tile_M rows ×
@@ -428,7 +426,7 @@ class StreamingScatterBase(StreamingGemmBase):
     _epi_param_bases = (ParamsBase,)
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
-        # v0.4.1 GemmBase.epilogue reads `self.rounding_mode` to decide
+        # quack's epilogue reads `self.rounding_mode` to decide
         # whether to take the stochastic-rounding store path. The streaming-MoE
         # pipeline does not use SR (atomic-scatter handles the output store
         # path directly, bypassing the framework's R2S → SMEM → TMA path that

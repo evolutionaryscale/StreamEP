@@ -79,13 +79,12 @@ Shares streaming machinery with fwd kernels:
     Y_bwd retires; no per-tile Y_bwd → A_bwd device-side signal is needed.
 """
 
-from typing import Callable, NamedTuple, Optional, Type
+from typing import NamedTuple, Optional, Type
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Float32, Int32, const_expr
 from quack.activation import dswiglu
 from quack.cache import jit_cache
 from stream_ep.stream_moe import compile_config
@@ -187,7 +186,7 @@ class StreamingMoeYBwd(StreamingGemmBase):
 
     # y_bwd is memory-LATENCY-bound — the dominant ncu stall is the L1TEX
     # global-load scoreboard (warps waiting on global loads), ~66% of CPI at
-    # baseline. A gating sweep (see markdowns/logbook.md) showed the stall is
+    # baseline. A gating sweep showed the stall is
     # the long-K (K=H=3072) W2/A *mainloop* load, NOT the per-subtile preact
     # reload: deepening the mainloop prefetch (ab_stage 3 -> 4, epi_c_stage=2)
     # drops the scoreboard stall 67% -> 52% and cuts duration ~13% (626 ->
@@ -216,8 +215,8 @@ class StreamingMoeYBwd(StreamingGemmBase):
 
         Replaces the default heuristic (which picks ab_stage=3) — y_bwd's
         bottleneck is the L1TEX global-load scoreboard on the long-K W2/A
-        mainloop, so a deeper mainloop pipeline is the win (see class
-        comment / markdowns/logbook.md). ``ab_stage`` and ``epi_c_stage``
+        mainloop, so a deeper mainloop pipeline is the win (see the class
+        comment). ``ab_stage`` and ``epi_c_stage``
         are pinned to ``AB_STAGE_TARGET`` / ``EPI_C_STAGE_TARGET``; the freed
         ``epi_stage`` is set to the largest value (>= 1) that still fits the
         per-CTA SMEM budget. The byte accounting mirrors the parent
@@ -777,7 +776,6 @@ def streaming_moe_y_bwd(
     )
     # dL_dweight: flat (TK_padded,) fp32 — atomic-add target. Caller MUST
     # zero-init before launch (the kernel atomic-adds, doesn't overwrite).
-    num_pid_n = (I + tile_n - 1) // tile_n
     assert dL_dweight.is_cuda and dL_dweight.dim() == 1
     assert dL_dweight.shape == (dL_do_pool.shape[0],), (
         f"dL_dweight must be (TK_padded,) = ({dL_do_pool.shape[0]},); "

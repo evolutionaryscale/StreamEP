@@ -28,8 +28,6 @@ All cases assert:
   - No trash row needed: predicated atomic skips padding lanes entirely.
 """
 
-from __future__ import annotations
-
 import pytest
 import torch
 

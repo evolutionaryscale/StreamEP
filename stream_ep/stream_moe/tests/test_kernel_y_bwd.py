@@ -21,8 +21,6 @@ recast (via the f32-recast trick on mD) produces up to the standard
 MMA-ordering tolerance.
 """
 
-from __future__ import annotations
-
 import pytest
 import torch
 
@@ -215,7 +213,6 @@ def test_streaming_moe_y_bwd_compiles(device):
     tile_m, tile_n = 128, 128
     total_tiles = 4
     TK_padded = total_tiles * tile_m
-    seq = 1
 
     dtype = torch.bfloat16
     dL_do_pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
@@ -272,7 +269,6 @@ def test_streaming_moe_y_bwd_single_tile(device):
     total_tiles = 1
     TK_padded = total_tiles * tile_m
     chosen_expert = 2
-    seq = 7
 
     dtype = torch.bfloat16
     torch.manual_seed(0)
@@ -388,7 +384,6 @@ def test_streaming_moe_y_bwd_multi_tile_static(device):
     tile_to_expert_list = [0, 0, 1, 2, 2, 3]
     total_tiles = len(tile_to_expert_list)
     TK_padded = total_tiles * tile_m
-    seq = 11
 
     dtype = torch.bfloat16
     torch.manual_seed(7)
@@ -466,7 +461,6 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     tile_to_expert_list = [0, 0, 1, 2, 2, 3]
     total_tiles = len(tile_to_expert_list)
     TK_padded = total_tiles * tile_m
-    seq = 13
 
     dtype = torch.bfloat16
     torch.manual_seed(11)
@@ -543,7 +537,6 @@ def test_streaming_moe_y_bwd_producer_consumer(device):
     )
 
 
-
 def _assert_dL_dweight_real_slots(
     dL_dweight,
     dL_dweight_ref,
@@ -596,7 +589,6 @@ def test_streaming_moe_y_bwd_dense_padding(device):
     total_tiles = len(tile_to_expert_list)
     TK_padded = total_tiles * tile_m
     real_per_tile = 32  # mirrors seq_len=64 single-hot routing on rank 0
-    seq = 17
 
     dtype = torch.bfloat16
     g = torch.Generator(device=device).manual_seed(123)

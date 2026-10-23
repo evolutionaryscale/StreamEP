@@ -53,8 +53,6 @@ pieces of the C++ side: the `STREAMEP_DEBUG_PB_DELAY_US` Phase-B entry spin
 and the host-poll `total_tiles` sanity fail-fast. Do not remove them.
 """
 
-from __future__ import annotations
-
 import os
 
 # The C++ launcher caches STREAMEP_DEBUG_PB_DELAY_US on its first call; set it

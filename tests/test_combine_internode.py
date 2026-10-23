@@ -39,8 +39,6 @@ Driver convention: torchrun env-driven (``RANK`` / ``WORLD_SIZE`` /
 ``LOCAL_RANK``), matching ``test_streaming_dispatch_internode.py``.
 """
 
-from __future__ import annotations
-
 import os
 
 import torch

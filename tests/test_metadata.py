@@ -17,8 +17,6 @@ Launch:
 Exits 0 on PASS, non-zero on first FAIL with a printed diff summary.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import sys
@@ -122,7 +120,6 @@ def compute_metadata_reference(
         # Partition 2: cs with src_rdma != rdma_rank.
         src_world_arr = torch.arange(num_ranks, device=device)
         src_rdma_arr = src_world_arr // num_max_nvl_peers
-        is_nvl_local = (src_rdma_arr == rdma_rank)  # (num_ranks,)
 
         # In lex order (c, src_world): NVL-local first then RDMA-remote.
         # Build a mask matching the iteration order; use torch arithmetic to scan.

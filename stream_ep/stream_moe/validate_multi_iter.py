@@ -64,7 +64,7 @@ swiglu_bwd into dL_dswiglu_in / postact_a_for_dW2; when summed over K=8192
 in the dW gemm the noise lands at ~0.06 max-abs. This matches sonic-moe's
 bf16 grad tolerance (atol=2e-2 at x_scale=0.02) once scaled to our x_scale=0.1
 and our larger K. Storing preact in fp32 would tighten this 5-10× at the
-cost of ~256 MB / layer; see logbook.
+cost of ~256 MB / layer.
 
 At ``--n_layers > 1`` all (atol, rtol) thresholds are scaled by
 ``sqrt(n_layers)`` to absorb bf16 chain noise compounding through the depth-N
@@ -94,7 +94,6 @@ TOL_DEFAULT = {
 from stream_ep.stream_moe.profile_pipeline import (
     DTYPE,
     NUM_EXPERTS,
-    NUM_SMS,
     SEQ_LEN_PER_RANK,
     TOPK,
     H,
@@ -390,7 +389,7 @@ def main():
 
     # Memory-stress ballast (see --leave_free_gb): held alive for the whole
     # run so every per-iter allocation works against near-full memory.
-    ballast = None
+    _ballast = None
     if args.leave_free_gb is not None:
         torch.cuda.synchronize()
         GiB = 1 << 30
@@ -399,7 +398,7 @@ def main():
         if rank == 0 and args.rank0_extra_gb > 0:
             consume = min(free0, consume + int(args.rank0_extra_gb * GiB))
         if consume > 0:
-            ballast = torch.empty(consume, dtype=torch.uint8, device=device)
+            _ballast = torch.empty(consume, dtype=torch.uint8, device=device)
         free1, _ = torch.cuda.mem_get_info()
         rank_zero_print(
             f"[validate] ballast: leave_free_gb={args.leave_free_gb} "
@@ -449,7 +448,7 @@ def main():
 
     # Warmup (no validation). Detach + clone per warmup iter so the warmup's
     # autograd graph doesn't leak into the validated iters' state.
-    for warm_seq in range(1, args.n_warmup + 1):
+    for _ in range(args.n_warmup):
         x_warm = x.detach().clone().requires_grad_(True)
         topk_w_warm = topk_weights.detach().clone().requires_grad_(True)
         w1_warm = w1_local.detach().clone().requires_grad_(True)
@@ -590,7 +589,7 @@ def main():
         rank_zero_print(f"[validate] iter {step:3d} seq={seq}: {tag}")
         if not all_ok:
             for (name, max_abs_t, max_rel_t, n_bad_t, ref_max), n_bad_w in zip(
-                diagnostics, n_bad_world
+                diagnostics, n_bad_world, strict=True
             ):
                 marker = "  " if n_bad_w == 0 else "!!"
                 rank_zero_print(
