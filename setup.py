@@ -1,5 +1,4 @@
 import os
-import subprocess
 import setuptools
 import importlib
 
@@ -58,7 +57,12 @@ if __name__ == '__main__':
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
-        extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
+        extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a'])
+
+    # The extension lands at site-packages root; resolve torch, the CUDA
+    # runtime and NVSHMEM from the consumer's site-packages, never from the
+    # build machine.
+    extra_link_args.extend(f'-Wl,-rpath,$ORIGIN/{d}' for d in ('torch/lib', 'nvidia/cu13/lib', 'nvidia/nvshmem/lib'))
 
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Prefer A100
@@ -112,16 +116,8 @@ if __name__ == '__main__':
     print(f' > NVSHMEM path: {nvshmem_dir}')
     print()
 
-    # noinspection PyBroadException
-    try:
-        cmd = ['git', 'rev-parse', '--short', 'HEAD']
-        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-    except Exception as _:
-        revision = ''
-
-    setuptools.setup(name='stream_ep',
-                     version='0.1.14' + revision,
-                     packages=setuptools.find_packages(include=['stream_ep', 'stream_ep.*']),
+    # Name and version come from pyproject.toml.
+    setuptools.setup(packages=setuptools.find_packages(include=['stream_ep', 'stream_ep.*']),
                      ext_modules=[
                          CUDAExtension(name='stream_ep_cpp',
                                        include_dirs=include_dirs,
