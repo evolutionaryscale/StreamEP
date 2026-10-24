@@ -1,420 +1,124 @@
-"""Every output of ``streaming_dispatch_metadata`` against an eager reference.
+"""The metadata kernel's outputs against a torch reference from the gathered routing.
 
-The reference is computed in torch from all ranks' gathered ``topk_idx``. On
-more than one node the Buffer takes the internode path, and the test also
-checks the NVL/RDMA-partitioned ``base_pool`` ordering and the internode-only
-counters (``recv_rdma_rank_prefix_sum``, ``recv_gbl_rank_prefix_sum``). Prints
-a per-tensor diff summary on the first mismatch.
+Covers what ``test_dispatch`` does not: the per-(channel, source, expert)
+counts and pool offsets the receivers allocate slots from (``base_pool``,
+NVL-local sources before RDMA-remote ones on the internode path), the
+receive-side rank prefix, and the internode channel and rank prefix sums.
+
+On the internode path the metadata kernel's NVL slabs must not alias the
+dispatch data ring: a leading peer's dispatch would overwrite a lagging
+peer's metadata inbox mid-read and corrupt ``total_tiles``. This file delays
+metadata Phase B on one rank per node (``STREAMEP_DEBUG_PB_DELAY_US``, read
+once per process, so it applies to this file's session only) and issues
+dispatches back to back, which opens that race window on every dispatch.
 """
 
-import argparse
 import os
-import sys
 
+import pytest
 import torch
-import torch.distributed as dist
+
 from stream_ep import Buffer
-from stream_ep_tests.utils import cleanup_dist, make_inputs
+from stream_ep_tests import routing
+from stream_ep_tests.reference import Global
+from stream_ep_tests.utils import DTYPE, H
+
+os.environ.setdefault("STREAMEP_DEBUG_PB_DELAY_US", "20000")
+
+TILE_M = 128
+NUM_NVL_PEERS = 8
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Eager reference for the metadata kernel outputs.
-# ──────────────────────────────────────────────────────────────────────────
+def expected_metadata(inputs: Global, num_channels: int, internode: bool) -> dict[str, torch.Tensor]:
+    W, E_local = inputs.group.size(), inputs.num_local_experts
+    device = inputs.x.device
+    counts = torch.tensor(inputs.offsets, device=device).diff()
+    src = torch.repeat_interleave(torch.arange(W, device=device), counts)  # [N] source rank
+    t = torch.arange(inputs.x.shape[0], device=device) - torch.tensor(inputs.offsets[:-1], device=device)[src]
+    channel = torch.minimum(t // ((counts[src] + num_channels - 1) // num_channels), torch.tensor(num_channels - 1))
 
+    local_topk = inputs.local_topk()
+    token, k = (local_topk >= 0).nonzero(as_tuple=True)
+    seen = torch.zeros(num_channels, W, E_local, dtype=torch.long, device=device)
+    seen.index_put_((channel[token], src[token], local_topk[token, k]), torch.ones_like(token), accumulate=True)
 
-def compute_metadata_reference(
-    all_topk_idx: torch.Tensor,  # (num_ranks, T, K) int64 — globally gathered
-    rank: int,
-    num_ranks: int,
-    num_channels: int,
-    num_experts: int,
-    expert_alignment: int,
-    tile_m: int,
-    *,
-    is_internode: bool,
-    num_max_nvl_peers: int = 8,
-) -> dict:
-    """Pure-torch reference for `streaming_dispatch_metadata_kernel`'s
-    outputs *as observed by `rank`*. Returns a dict of expected tensors.
+    freq = seen.sum(dim=(0, 1))
+    blocks = torch.cat([freq.new_zeros(1), torch.cumsum((freq + TILE_M - 1) // TILE_M, 0)])
+    # Receivers take each expert's slots substream by substream in (channel, source) order;
+    # internode, the NVL-local sources come first.
+    c_idx, s_idx = torch.meshgrid(torch.arange(num_channels, device=device), torch.arange(W, device=device), indexing="ij")
+    remote = (s_idx // NUM_NVL_PEERS != inputs.rank // NUM_NVL_PEERS) if internode else torch.zeros_like(s_idx, dtype=torch.bool)
+    order = (remote.long() * num_channels * W + c_idx * W + s_idx).flatten().argsort()
+    flat = seen.view(num_channels * W, E_local)[order]
+    base = torch.empty_like(flat)
+    base[order] = blocks[:-1] * TILE_M + flat.cumsum(0) - flat
 
-    The eager reference works for both intranode and internode topologies:
-    the only place they differ is `base_pool`'s lex ordering — intranode
-    is (c, src_world) lex; internode partitions into NVL-local first then
-    RDMA-remote, with (c, src_world) lex within each partition.
-    """
-    device = all_topk_idx.device
-    T = all_topk_idx.shape[1]
-    K = all_topk_idx.shape[2]
-    E_local = num_experts // num_ranks
-    tokens_per_channel = (T + num_channels - 1) // num_channels
-    rdma_rank = rank // num_max_nvl_peers  # only meaningful in internode
-
-    # ── Stage 1: per-(c, src_world, e_local) counts of (token, k) pairs
-    # that route to (this rank, e_local). Plus per-(c, src_world) unique
-    # token counts (= |{ t : ∃ k with topk_idx[src, t, k] // E_local == rank }|).
-
-    valid = all_topk_idx >= 0  # (num_ranks, T, K)
-    # Map invalid entries to dst_rank=-1 so the rank==our_rank filter excludes them.
-    dst_rank = torch.where(valid, all_topk_idx // E_local, torch.full_like(all_topk_idx, -1))
-    e_local_g = torch.where(valid, all_topk_idx - dst_rank.clamp(min=0) * E_local, torch.zeros_like(all_topk_idx))
-
-    to_me = valid & (dst_rank == rank)  # (num_ranks, T, K)
-
-    t_idx = torch.arange(T, device=device).view(1, T, 1).expand(num_ranks, T, K)
-    channel = torch.clamp(t_idx // tokens_per_channel, max=num_channels - 1)
-    src_idx = torch.arange(num_ranks, device=device).view(num_ranks, 1, 1).expand(num_ranks, T, K)
-
-    # seen[c, src, e] = count of (t, k) where src's topk routes to our (rank, e_local)
-    flat_idx_full = channel.long() * num_ranks * E_local + src_idx.long() * E_local + e_local_g.long()
-    flat_idx_used = flat_idx_full[to_me]
-    seen = torch.zeros(num_channels * num_ranks * E_local, dtype=torch.int32, device=device)
-    seen.scatter_add_(0, flat_idx_used, torch.ones_like(flat_idx_used, dtype=torch.int32))
-    seen = seen.view(num_channels, num_ranks, E_local)
-
-    # u_inbox[c, src] = #tokens from src with ANY k routing to our rank.
-    to_me_any_k = to_me.any(dim=-1)  # (num_ranks, T)
-    u_channel = channel[:, :, 0]  # (num_ranks, T)
-    u_src = src_idx[:, :, 0]
-    u_flat = u_channel.long() * num_ranks + u_src.long()
-    u_idx_used = u_flat[to_me_any_k]
-    u_inbox_flat = torch.zeros(num_channels * num_ranks, dtype=torch.int32, device=device)
-    u_inbox_flat.scatter_add_(0, u_idx_used, torch.ones_like(u_idx_used, dtype=torch.int32))
-    u_inbox = u_inbox_flat.view(num_channels, num_ranks)
-
-    # ── Stage 2: derived counters.
-
-    # expert_frequency[e] = sum over (c, src) of seen[c, src, e]
-    expert_frequency = seen.sum(dim=(0, 1)).to(torch.int32)
-
-    # expert_pool_block_offset: prefix sum of ceil(expert_frequency / tile_m)
-    n_blocks_per_e = (expert_frequency + tile_m - 1) // tile_m
-    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
-    expert_pool_block_offset[1:] = n_blocks_per_e.cumsum(0).to(torch.int32)
-    total_tiles = int(expert_pool_block_offset[-1].item())
-
-    # ── Stage 3: base_pool[c, src, e] — cumulative lex offset.
-    # Intranode: lex over (c, src_world).
-    # Internode: NVL-local (src_rdma == rdma_rank) first, then RDMA-remote.
-    # Within each partition: (c, src_world) lex.
-    base_pool = torch.zeros_like(seen)
-
-    if is_internode:
-        # Build a permutation: cs_order[partition_pos] = (c, src_world)
-        # Partition 1: cs with src_rdma == rdma_rank (NVL-local).
-        # Partition 2: cs with src_rdma != rdma_rank.
-        src_world_arr = torch.arange(num_ranks, device=device)
-        src_rdma_arr = src_world_arr // num_max_nvl_peers
-
-        # In lex order (c, src_world): NVL-local first then RDMA-remote.
-        # Build a mask matching the iteration order; use torch arithmetic to scan.
-        # For simplicity (eager reference): do the two-pass loop directly.
-        for e in range(E_local):
-            acc = int(expert_pool_block_offset[e].item()) * tile_m
-            # Pass 1: NVL-local
-            for cs in range(num_channels * num_ranks):
-                c = cs // num_ranks
-                src_w = cs - c * num_ranks
-                if int(src_rdma_arr[src_w].item()) != rdma_rank:
-                    continue
-                base_pool[c, src_w, e] = acc
-                acc += int(seen[c, src_w, e].item())
-            # Pass 2: RDMA-remote
-            for cs in range(num_channels * num_ranks):
-                c = cs // num_ranks
-                src_w = cs - c * num_ranks
-                if int(src_rdma_arr[src_w].item()) == rdma_rank:
-                    continue
-                base_pool[c, src_w, e] = acc
-                acc += int(seen[c, src_w, e].item())
-    else:
-        # Intranode: simple (c, src) lex.
-        for e in range(E_local):
-            acc = int(expert_pool_block_offset[e].item()) * tile_m
-            for c in range(num_channels):
-                for src in range(num_ranks):
-                    base_pool[c, src, e] = acc
-                    acc += int(seen[c, src, e].item())
-
-    # ── Stage 4: tile_id_to_expert + pool_arrival_target.
-    tile_id_to_expert = torch.zeros(total_tiles, dtype=torch.int32, device=device)
-    pool_arrival_target = torch.zeros(total_tiles, dtype=torch.int32, device=device)
-    for e in range(E_local):
-        e_start = int(expert_pool_block_offset[e].item())
-        e_end = int(expert_pool_block_offset[e + 1].item())
-        n_tiles_e = e_end - e_start
-        n_e = int(expert_frequency[e].item())
-        for t in range(n_tiles_e):
-            tile_id = e_start + t
-            tile_id_to_expert[tile_id] = e
-            target = tile_m if t < n_tiles_e - 1 else (n_e - t * tile_m)
-            pool_arrival_target[tile_id] = target
-
-    # ── Stage 5: rank_prefix_matrix column for this rank.
-    # per_src_unique[src] = sum over c of u_inbox[c, src] = total unique tokens
-    # from sender `src` routing to our rank.
-    per_src_unique = u_inbox.sum(dim=0).to(torch.int32)  # (num_ranks,)
-    # rank_prefix_matrix[i, rank] = cumsum of per_src_unique over senders 0..i.
-    rank_prefix_column = per_src_unique.cumsum(0).to(torch.int32)
-
-    # ── Stage 6: total recv counters.
-    moe_recv_counter = int(per_src_unique.sum().item())
-    moe_recv_expert_counter = ((expert_frequency + expert_alignment - 1) // expert_alignment) * expert_alignment
-
-    # ── gbl_channel_prefix_matrix + rdma_channel_prefix_matrix from THIS
-    # rank's perspective. Both are CUMULATIVE across channels (the kernel
-    # cumsums after the per-channel write). gbl[dst_world, c] = cumulative
-    # count of THIS rank's tokens in channels 0..c routing to dst_world (any-K).
-    # rdma[dst_rdma, c] = cumulative count of unique tokens going to dst_rdma
-    # (= 1 per token if any K hits any nvl_rank in dst_rdma).
-    this_topk = all_topk_idx[rank]  # (T, K)
-    valid_this = this_topk >= 0
-    dst_world_this = torch.where(valid_this, this_topk // E_local, torch.full_like(this_topk, -1))
-    in_rank_this = torch.zeros(T, num_ranks, dtype=torch.bool, device=device)
-    for k in range(K):
-        vk = valid_this[:, k]
-        if not bool(vk.any()):
-            continue
-        tk = torch.arange(T, device=device)[vk]
-        rk = dst_world_this[:, k][vk]
-        in_rank_this[tk, rk] = True
-    t_idx_1d = torch.arange(T, device=device)
-    channel_1d = torch.clamp(t_idx_1d // tokens_per_channel, max=num_channels - 1)
-    gbl_per_channel = torch.zeros(num_ranks, num_channels, dtype=torch.int32, device=device)
-    for c in range(num_channels):
-        gbl_per_channel[:, c] = in_rank_this[channel_1d == c].sum(dim=0).to(torch.int32)
-    gbl_channel_prefix_matrix_ref = gbl_per_channel.cumsum(dim=1).to(torch.int32)
-
+    unique_per_src = torch.zeros(W, dtype=torch.long, device=device).index_add_(0, src, (local_topk >= 0).any(1).long())
     out = {
-        "expert_frequency": expert_frequency,
-        "expert_pool_block_offset": expert_pool_block_offset,
         "seen_per_substream": seen,
-        "base_pool": base_pool,
-        "tile_id_to_expert": tile_id_to_expert,
-        "pool_arrival_target": pool_arrival_target,
-        "rank_prefix_column": rank_prefix_column,
-        "total_tiles": total_tiles,
-        "moe_recv_counter": moe_recv_counter,
-        "moe_recv_expert_counter": moe_recv_expert_counter,
-        "gbl_channel_prefix_matrix": gbl_channel_prefix_matrix_ref,
+        "base_pool": base.view(num_channels, W, E_local),
+        "rank_prefix_column": unique_per_src.cumsum(0),
     }
-
-    if is_internode:
-        # Additional internode-only outputs.
-        kNumRDMARanks = num_ranks // num_max_nvl_peers
-        # recv_rdma_rank_prefix_sum[i] = cumulative unique tokens from RDMA-rank
-        # senders 0..i (across all NVL peers within that RDMA rank).
-        # In intranode-eager form: sum per-src then group by RDMA rank.
-        per_src = per_src_unique  # (num_ranks,)
-        per_rdma_unique = per_src.view(kNumRDMARanks, num_max_nvl_peers).sum(dim=1)
-        out["recv_rdma_rank_prefix_sum"] = per_rdma_unique.cumsum(0).to(torch.int32)
-        out["recv_gbl_rank_prefix_sum"] = per_src.cumsum(0).to(torch.int32)
-
-        # rdma_channel_prefix_matrix[dst_rdma, c] cumulative count of THIS
-        # rank's tokens going to ANY nvl in dst_rdma in channels 0..c.
-        # = per-token "does any K hit any expert in dst_rdma's experts" / channel.
-        is_in_rdma_this = in_rank_this.view(T, kNumRDMARanks, num_max_nvl_peers).any(dim=-1)  # (T, kNumRDMARanks)
-        rdma_per_channel = torch.zeros(kNumRDMARanks, num_channels, dtype=torch.int32, device=device)
-        for c in range(num_channels):
-            rdma_per_channel[:, c] = is_in_rdma_this[channel_1d == c].sum(dim=0).to(torch.int32)
-        out["rdma_channel_prefix_matrix"] = rdma_per_channel.cumsum(dim=1).to(torch.int32)
-
+    if internode:
+        num_nodes = W // NUM_NVL_PEERS
+        owner = torch.where(inputs.topk_idx >= 0, inputs.topk_idx // E_local, -1)
+        in_rank = (owner.unsqueeze(-1) == torch.arange(W, device=device)).any(1)  # [N, W]
+        in_node = in_rank.view(-1, num_nodes, NUM_NVL_PEERS).any(-1)  # [N, nodes]
+        mine = inputs.local_rows(torch.arange(inputs.x.shape[0], device=device))
+        per_channel = torch.zeros(num_channels, W, dtype=torch.long, device=device).index_add_(0, channel[mine], in_rank[mine].long())
+        per_channel_node = torch.zeros(num_channels, num_nodes, dtype=torch.long, device=device).index_add_(0, channel[mine], in_node[mine].long())
+        # Over RDMA this rank receives, from the rank with its NVL index on each
+        # node, every token bound for any rank on this node.
+        node, nvl = divmod(inputs.rank, NUM_NVL_PEERS)
+        from_peers = torch.stack(
+            [in_node[inputs.offsets[n * NUM_NVL_PEERS + nvl] : inputs.offsets[n * NUM_NVL_PEERS + nvl + 1], node].sum() for n in range(num_nodes)]
+        )
+        out |= {
+            "gbl_channel_prefix_matrix": per_channel.cumsum(0).T,
+            "rdma_channel_prefix_matrix": per_channel_node.cumsum(0).T,
+            "recv_gbl_rank_prefix_sum": unique_per_src.cumsum(0),
+            "recv_rdma_rank_prefix_sum": from_peers.cumsum(0),
+        }
     return out
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Comparison utilities.
-# ──────────────────────────────────────────────────────────────────────────
+def actual_metadata(handle, rank: int, internode: bool) -> dict[str, torch.Tensor]:
+    out = {
+        "seen_per_substream": handle.seen_per_substream,
+        "base_pool": handle.base_pool,
+        "rank_prefix_column": handle.rank_prefix_matrix[:, rank],
+    }
+    if internode:
+        d = handle._dispatch_out
+        out |= {name: getattr(d, name) for name in ("gbl_channel_prefix_matrix", "rdma_channel_prefix_matrix", "recv_gbl_rank_prefix_sum", "recv_rdma_rank_prefix_sum")}
+    return out
 
 
-def diff_int(actual: torch.Tensor, expected: torch.Tensor, name: str) -> int:
-    """Return number of mismatched elements; print first few diffs."""
-    actual = actual.cpu()
-    expected = expected.cpu()
-    if actual.shape != expected.shape:
-        print(f"[{name}] SHAPE MISMATCH: actual {tuple(actual.shape)}, expected {tuple(expected.shape)}")
-        return -1
-    diff = actual != expected
-    n_bad = int(diff.sum().item())
-    if n_bad > 0:
-        bad_idx = diff.nonzero(as_tuple=False)[:8]
-        print(f"[{name}] {n_bad} mismatches (of {actual.numel()}). First diffs:")
-        for idx in bad_idx:
-            idx_tup = tuple(int(x) for x in idx.tolist())
-            a = actual[idx_tup].item()
-            e = expected[idx_tup].item()
-            print(f"  idx={idx_tup}: actual={a}, expected={e}")
-    return n_bad
+def check(handle, inputs: Global, internode: bool):
+    expected = expected_metadata(inputs, Buffer.num_sms // 2, internode)
+    for name, actual in actual_metadata(handle, inputs.rank, internode).items():
+        assert actual.shape == expected[name].shape, f"{name}: shape {tuple(actual.shape)} != {tuple(expected[name].shape)}"
+        assert torch.equal(actual.long(), expected[name]), f"{name}: {(actual.long() != expected[name]).sum().item()} mismatches"
 
 
-def diff_scalar(actual: int, expected: int, name: str) -> int:
-    if actual != expected:
-        print(f"[{name}] MISMATCH: actual={actual}, expected={expected}")
-        return 1
-    return 0
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Test entry point.
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num_tokens", type=int, default=8192)
-    parser.add_argument("--hidden", type=int, default=2048)
-    parser.add_argument("--num_topk", type=int, default=13)
-    parser.add_argument("--num_experts", type=int, default=384)
-    parser.add_argument("--tile_m", type=int, default=128)
-    parser.add_argument(
-        "--num_sms",
-        type=int,
-        default=None,
-        help="StreamEP num_sms override; default = Buffer auto-pick by world size.",
-    )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=3,
-        help="Number of dispatch iters to validate (each with a fresh routing).",
-    )
-    args = parser.parse_args()
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    device = torch.device("cuda")
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    group = dist.group.WORLD
-
-    if args.num_sms is not None:
-        Buffer.set_num_sms(args.num_sms)
-
-    expert_alignment = 1  # default in C++ launch path (no quack alignment)
-    num_local_experts = args.num_experts // world_size
-
-    # Size NVL / RDMA bytes (mirror the rest of the test suite).
-    hidden_bytes = args.hidden * 2
-    buf = Buffer.sized_for(group, hidden_bytes)
-    num_channels = Buffer.num_sms // 2
-
-    is_internode = buf._is_internode()
-    if rank == 0:
-        print(
-            f"[metadata] world={world_size} num_sms={Buffer.num_sms} "
-            f"num_channels={num_channels} T={args.num_tokens} K={args.num_topk} "
-            f"E={args.num_experts} E_local={num_local_experts} "
-            f"tile_m={args.tile_m} is_internode={is_internode} "
-            f"n_iter={args.n_iter}"
-        )
-
-    overall_fail = 0
-    for it in range(args.n_iter):
-        x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-            args.num_tokens,
-            args.hidden,
-            args.num_topk,
-            args.num_experts,
-            world_size,
-            rank,
-            device,
-            seed=1000 + it,  # different routing per iter
-        )
-
-        pool, handle, _event = buf.dispatch(
-            x,
-            topk_idx,
-            topk_weights,
-            is_token_in_rank,
-            args.num_experts,
-            tile_m=args.tile_m,
-            dispatch_seq=it + 1,
-        )
+@pytest.mark.parametrize("scenario", routing.SCENARIOS)
+@pytest.mark.parametrize("num_sms", [None, 64])
+def test_metadata(buffer, group, scenario, num_sms):
+    """Back-to-back dispatches with fresh routing, checked after the last one."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    saved = Buffer.num_sms
+    Buffer.num_sms = num_sms or saved
+    try:
+        runs = []
+        for seed in range(4):
+            r = routing.SCENARIOS[scenario](group.rank(), group.size(), device, seed=seed)
+            x = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
+            _, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)
+            runs.append((handle, x, r))
         torch.cuda.synchronize()
-
-        # Gather topk_idx from every rank for the eager reference.
-        topk_int64 = topk_idx.to(torch.int64)
-        all_topk = [torch.empty_like(topk_int64) for _ in range(world_size)]
-        dist.all_gather(all_topk, topk_int64, group=group)
-        all_topk = torch.stack(all_topk, dim=0)  # (world_size, T, K)
-
-        ref = compute_metadata_reference(
-            all_topk,
-            rank,
-            world_size,
-            num_channels,
-            args.num_experts,
-            expert_alignment,
-            args.tile_m,
-            is_internode=is_internode,
-        )
-
-        # Compare every output the handle exposes.
-        fail = 0
-        fail += diff_int(handle.expert_frequency, ref["expert_frequency"], f"iter{it} expert_frequency")
-        fail += diff_int(
-            handle.expert_pool_block_offset,
-            ref["expert_pool_block_offset"],
-            f"iter{it} expert_pool_block_offset",
-        )
-        fail += diff_int(handle.seen_per_substream, ref["seen_per_substream"], f"iter{it} seen_per_substream")
-        fail += diff_int(handle.base_pool, ref["base_pool"], f"iter{it} base_pool")
-        fail += diff_int(
-            handle.tile_id_to_expert[: ref["total_tiles"]],
-            ref["tile_id_to_expert"],
-            f"iter{it} tile_id_to_expert",
-        )
-        fail += diff_int(
-            handle.pool_arrival_target[: ref["total_tiles"]],
-            ref["pool_arrival_target"],
-            f"iter{it} pool_arrival_target",
-        )
-        # rank_prefix_matrix: this rank fills its own column.
-        rpm_actual_col = handle.rank_prefix_matrix[:, rank]
-        fail += diff_int(rpm_actual_col, ref["rank_prefix_column"], f"iter{it} rank_prefix_matrix[:,rank]")
-        fail += diff_scalar(handle.total_tiles, ref["total_tiles"], f"iter{it} total_tiles")
-
-        # Validate the metadata kernel's channel-prefix outputs against the
-        # eager reference. These were NOT covered by the original test and the
-        # dispatch forwarder/sender read them directly — a mismatch here is the
-        # class of bug behind the 8-node over-subscription hang. Both are
-        # internode-only outputs (empty for intranode).
-        if is_internode:
-            fail += diff_int(
-                handle._dispatch_out.gbl_channel_prefix_matrix,
-                ref["gbl_channel_prefix_matrix"],
-                f"iter{it} gbl_channel_prefix_matrix",
-            )
-            fail += diff_int(
-                handle._dispatch_out.rdma_channel_prefix_matrix,
-                ref["rdma_channel_prefix_matrix"],
-                f"iter{it} rdma_channel_prefix_matrix",
-            )
-
-        # Note: pool_recv_token is downstream of metadata + post-poll bundle —
-        # its count of non-padding rows must match moe_recv_counter, but we don't
-        # verify the recv-token slot ordering here (covered by test_dispatch).
-
-        if fail == 0 and rank == 0:
-            print(f"[metadata] iter {it}: PASS")
-        elif fail > 0:
-            print(f"[metadata] rank {rank} iter {it}: {fail} FAILURES")
-            overall_fail += fail
-        dist.barrier(group=group)
-
-    # Aggregate fail across ranks.
-    fail_tensor = torch.tensor([overall_fail], dtype=torch.int64, device=device)
-    dist.all_reduce(fail_tensor, op=dist.ReduceOp.SUM, group=group)
-    total_fail = int(fail_tensor.item())
-
-    if rank == 0:
-        if total_fail == 0:
-            print(f"[metadata] ALL {args.n_iter} ITERS OK ({world_size} ranks)")
-        else:
-            print(f"[metadata] FAIL — {total_fail} mismatches across all ranks/iters")
-
-    cleanup_dist()
-    sys.exit(0 if total_fail == 0 else 1)
-
-
-if __name__ == "__main__":
-    main()
+        # Gather everything before checking: a rank that fails a check must not skip a later gather.
+        gathered = [(handle, Global.gather(x, r, group)) for handle, x, r in runs]
+        for handle, inputs in gathered:
+            check(handle, inputs, buffer._is_internode())
+    finally:
+        Buffer.num_sms = saved

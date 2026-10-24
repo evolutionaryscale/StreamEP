@@ -1,233 +1,86 @@
-"""``Buffer.dispatch`` (pool layout) against references built from all ranks' inputs.
+"""``Buffer.dispatch`` against the layout the gathered routing implies.
 
-  1. Each pool slot holds its source rank's token data.
-  2. Slots fall in their expert's pool region; padding rows have
-     ``pool_recv_token == -1``.
-  3. Every (recv_token, k) routed to a local expert has exactly one pool slot.
-  4. ``pool_arrival_count[tile] == pool_arrival_target[tile]`` for every tile.
-  5. ``tile_id_to_expert`` agrees with the slot ranges.
-  6. Re-running dispatch reproduces the same placement bit for bit.
+Tokens are random rows, so a pool row equal to its source row pins down
+exactly which token landed in which slot. Every routing scenario checks:
+
+- each real slot holds its (token, k)'s data and topk weight, inside its
+  expert's tile-aligned block, and every local (token, k) has exactly one slot;
+- padding rows are marked ``pool_recv_token == -1``;
+- the per-expert counts, block offsets, per-tile expert and arrival targets,
+  and the per-token maps (``recv_token_to_slots``, ``k_local_total`` /
+  ``k_local_remaining``, ``seen_per_substream``);
+- every tile's arrival count reached its target, and the combine-side
+  buffers start at zero.
 """
 
-import os
-
+import pytest
 import torch
-import torch.distributed as dist
-from stream_ep import Buffer
-from stream_ep_tests.utils import cleanup_dist, make_inputs
+
+from stream_ep_tests import routing
+from stream_ep_tests.reference import Global
+from stream_ep_tests.utils import DTYPE, H
+
+TILE_M = 128
 
 
-def main():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    device = torch.device("cuda")
-
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    group = dist.group.WORLD
-
-    num_experts = 64
-    num_local_experts = num_experts // world_size
-    num_topk = 4
-    num_tokens = 256
-    hidden = 256
-    tile_m = 32
-
-    hidden_bytes = hidden * 2
-    buf = Buffer.sized_for(group, hidden_bytes)
-
-    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(num_tokens, hidden, num_topk, num_experts, world_size, rank, device)
-
-    pool, handle, _event = buf.dispatch(
-        x,
-        topk_idx,
-        topk_weights,
-        is_token_in_rank,
-        num_experts,
-        tile_m=tile_m,
-        dispatch_seq=1,
-    )
+def dispatch(buffer, group, scenario, seed=0):
+    device = torch.device("cuda", torch.cuda.current_device())
+    r = routing.SCENARIOS[scenario](group.rank(), group.size(), device, seed=seed)
+    x = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
+    pool, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)
     torch.cuda.synchronize()
-
-    total_tiles = handle.total_tiles
-    TK_padded = total_tiles * tile_m
-    e_lo, e_hi = rank * num_local_experts, (rank + 1) * num_local_experts
-
-    # Build expected (recv_token_id, k_local) → src_rank mapping by gathering.
-    all_x = [torch.empty_like(x) for _ in range(world_size)]
-    dist.all_gather(all_x, x, group=group)
-    all_topk = [torch.empty_like(topk_idx) for _ in range(world_size)]
-    dist.all_gather(all_topk, topk_idx, group=group)
-    all_is_in_rank = [torch.empty_like(is_token_in_rank) for _ in range(world_size)]
-    dist.all_gather(all_is_in_rank, is_token_in_rank, group=group)
-
-    # Recv-tokens are laid out source-major: rank 0's first, then rank 1's, etc.
-    # Each source rank's contribution is the ordered set of token indices where
-    # is_token_in_rank[:, my_rank] is True.
-    expected_recv_token_src_rank = []  # [T_recv] → src_rank
-    expected_recv_token_src_idx = []  # [T_recv] → src_token_idx
-    expected_recv_topk_local = []  # [T_recv, num_topk] → e_local or -1
-    for src in range(world_size):
-        src_in = all_is_in_rank[src][:, rank]
-        idx_in_src = torch.nonzero(src_in, as_tuple=False).flatten()
-        src_topk = all_topk[src][idx_in_src]
-        local_mask = (src_topk >= e_lo) & (src_topk < e_hi)
-        local_topk = torch.where(local_mask, src_topk - e_lo, torch.full_like(src_topk, -1))
-        expected_recv_token_src_rank.append(torch.full((idx_in_src.numel(),), src, dtype=torch.int32, device=device))
-        expected_recv_token_src_idx.append(idx_in_src.to(torch.int32))
-        expected_recv_topk_local.append(local_topk)
-    expected_recv_token_src_rank = torch.cat(expected_recv_token_src_rank, dim=0).cpu()
-    expected_recv_token_src_idx = torch.cat(expected_recv_token_src_idx, dim=0).cpu()
-    expected_recv_topk_local = torch.cat(expected_recv_topk_local, dim=0).cpu()
-    T_recv = expected_recv_token_src_rank.shape[0]
-
-    pool_cpu = pool.cpu()
-    pool_recv_token = handle.pool_recv_token.cpu()
-    pool_k_slot = handle.pool_k_slot.cpu()
-    pool_topk_weight = handle.pool_topk_weight.cpu()
-    expert_pool_block_offset = handle.expert_pool_block_offset.cpu()
-    tile_id_to_expert = handle.tile_id_to_expert.cpu()
-    pool_arrival_target = handle.pool_arrival_target.cpu()
-    expert_frequency = handle.expert_frequency.cpu()
-
-    # ─── (1) Per-pool-slot validation. For every slot s with pool_recv_token[s] >= 0:
-    #         (a) the slot lies in the right expert's pool region,
-    #         (b) pool[s, :] == src_rank's tokens-of-ones value,
-    #         (c) (recv_token, k) pair is unique across slots.
-    seen_rk = torch.zeros((T_recv, num_topk), dtype=torch.bool)
-    for s in range(TK_padded):
-        rt = int(pool_recv_token[s].item())
-        k = int(pool_k_slot[s].item())
-        if rt < 0:
-            continue  # padding slot
-        assert 0 <= rt < T_recv, f"slot {s} pool_recv_token {rt} out of [0, {T_recv})"
-        assert 0 <= k < num_topk, f"slot {s} pool_k_slot {k} out of [0, {num_topk})"
-        e_local = int(expected_recv_topk_local[rt, k].item())
-        assert e_local >= 0, f"slot {s} maps to (rt={rt}, k={k}) but expected_recv_topk_local[rt,k] = {e_local}"
-        # Slot must fall in expert e_local's pool block range.
-        block_start = int(expert_pool_block_offset[e_local].item()) * tile_m
-        block_end = int(expert_pool_block_offset[e_local + 1].item()) * tile_m
-        assert block_start <= s < block_end, f"slot {s} for expert {e_local} outside [{block_start}, {block_end})"
-        # Per-pool-slot data: src_rank's value.
-        src_rank = int(expected_recv_token_src_rank[rt].item())
-        actual = pool_cpu[s, 0].to(torch.int32).item()
-        assert actual == src_rank, f"slot {s}: pool[s,0] = {actual} != src_rank {src_rank}"
-        # Uniqueness.
-        assert not seen_rk[rt, k], f"(recv_token={rt}, k={k}) appears in multiple slots"
-        seen_rk[rt, k] = True
-        # pool_topk_weight matches the source token's topk_weight for this k.
-        # (We don't explicitly gather topk_weights from peers; just sanity-check finiteness.)
-        assert torch.isfinite(pool_topk_weight[s])
-    expected_seen = expected_recv_topk_local >= 0
-    assert torch.equal(seen_rk, expected_seen), f"pool covers {seen_rk.sum()} (rt, k) pairs but expected {expected_seen.sum()}"
-
-    # ─── (3) pool_arrival_count[tile] == pool_arrival_target[tile] for all tiles.
-    pool_arrival_count = handle.pool_arrival_count[:total_tiles].cpu()
-    pool_arrival_target_v = pool_arrival_target[:total_tiles]
-    assert torch.equal(pool_arrival_count, pool_arrival_target_v), (
-        f"pool_arrival_count not fully fired; mismatches at {(pool_arrival_count != pool_arrival_target_v).nonzero().flatten()[:8]}"
-    )
-
-    # ─── (4) tile_id_to_expert agrees with the expert_pool_block_offset partition.
-    for tile_id in range(total_tiles):
-        e_actual = int(tile_id_to_expert[tile_id].item())
-        e_block_start = int(expert_pool_block_offset[e_actual].item())
-        e_block_end = int(expert_pool_block_offset[e_actual + 1].item())
-        assert e_block_start <= tile_id < e_block_end, (
-            f"tile {tile_id}: tile_id_to_expert={e_actual} but tile not in [{e_block_start}, {e_block_end})"
-        )
-
-    # ─── (5) pool_arrival_target: BLOCK_M for full tiles, leftover for last per expert.
-    for e in range(num_local_experts):
-        e_block_start = int(expert_pool_block_offset[e].item())
-        e_block_end = int(expert_pool_block_offset[e + 1].item())
-        n_e = int(expert_frequency[e].item())
-        for tile_id in range(e_block_start, e_block_end):
-            tile_in_e = tile_id - e_block_start
-            target = int(pool_arrival_target[tile_id].item())
-            if tile_id == e_block_end - 1:
-                expected = n_e - tile_in_e * tile_m
-            else:
-                expected = tile_m
-            assert target == expected, f"pool_arrival_target[{tile_id}] = {target} != expected {expected} (e={e}, tile_in_e={tile_in_e})"
-
-    # ─── (6) Pipeline buffer initialization. k_local_remaining[r] should equal
-    #         K_local(r) (the count of local-expert landings for recv-token r),
-    #         which is also the count of pool slots for r. y_done_per_token
-    #         and o should be zero-init.
-    k_local_remaining = handle.k_local_remaining.cpu()
-    assert k_local_remaining.shape == (T_recv,), f"k_local_remaining shape {k_local_remaining.shape} != ({T_recv},)"
-    expected_k_local = (expected_recv_topk_local >= 0).sum(dim=1).to(torch.int32)
-    assert torch.equal(k_local_remaining, expected_k_local), (
-        f"k_local_remaining mismatch; first deviating r: {(k_local_remaining != expected_k_local).nonzero().flatten()[:8]}"
-    )
-    compute_done = handle.y_done_per_token.cpu()
-    assert (compute_done == 0).all(), "y_done_per_token should be zero-init"
-    assert handle.pool_arrival_count.dtype == torch.int32, f"pool_arrival_count must be int32; got {handle.pool_arrival_count.dtype}"
-    o_t = handle.o.cpu()
-    assert o_t.shape == (T_recv, hidden), f"o shape {o_t.shape} != ({T_recv}, {hidden})"
-    assert (o_t == 0).all(), "o should be zero-init"
-
-    # ─── (6.5) Backward scaffolding: recv_token_to_slots[r, k] should equal the
-    # slot for (r, k) when k routes to a local expert, and -1 otherwise. The
-    # expected mapping is the inverse of the existing per-slot writes:
-    # for every slot s with pool_recv_token[s] >= 0, recv_token_to_slots[
-    #   pool_recv_token[s], pool_k_slot[s]] == s. k_local_total[r] should
-    # equal k_local_remaining[r] (write-once mirror that fwd doesn't decrement).
-    rtts = handle.recv_token_to_slots.cpu()
-    assert rtts.shape == (T_recv, num_topk), f"recv_token_to_slots shape {rtts.shape} != ({T_recv}, {num_topk})"
-    expected_rtts = torch.full((T_recv, num_topk), -1, dtype=torch.int32)
-    valid_slots = pool_recv_token >= 0
-    for s in valid_slots.nonzero().flatten().tolist():
-        rt = int(pool_recv_token[s].item())
-        k = int(pool_k_slot[s].item())
-        expected_rtts[rt, k] = s
-    assert torch.equal(rtts, expected_rtts), (
-        f"recv_token_to_slots mismatch; first deviating (r, k): {(rtts != expected_rtts).nonzero()[:8]}"
-    )
-    klc = handle.k_local_total.cpu()
-    assert klc.shape == (T_recv,), f"k_local_total shape {klc.shape} != ({T_recv},)"
-    assert torch.equal(klc, k_local_remaining), "k_local_total should equal k_local_remaining (both = K_local(r) pre-decrement)"
-
-    # seen_per_substream[c, src, e] = my_e_inbox[c, src, e] from the metadata
-    # kernel's IPC count exchange. Invariant: summing over (c, src) gives the
-    # per-expert totals, i.e. expert_frequency[e].
-    sps = handle.seen_per_substream.cpu()
-    expected_sps_shape = (sps.shape[0], world_size, num_local_experts)
-    assert sps.shape == expected_sps_shape, f"seen_per_substream shape {sps.shape} != {expected_sps_shape}"
-    sps_per_expert = sps.sum(dim=(0, 1))
-    expected_sps_per_expert = handle.expert_frequency.cpu()
-    assert torch.equal(sps_per_expert, expected_sps_per_expert), (
-        f"sum_(c, src) seen_per_substream[c, src, :] should equal expert_frequency; got {sps_per_expert} vs {expected_sps_per_expert}"
-    )
-
-    # ─── (7) Bit-determinism — re-run with same inputs, expect identical pool layout.
-    pool2, handle2, _ = buf.dispatch(
-        x,
-        topk_idx,
-        topk_weights,
-        is_token_in_rank,
-        num_experts,
-        tile_m=tile_m,
-        dispatch_seq=2,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(handle.pool_recv_token.cpu(), handle2.pool_recv_token.cpu()), "pool_recv_token not deterministic"
-    assert torch.equal(handle.pool_k_slot.cpu(), handle2.pool_k_slot.cpu()), "pool_k_slot not deterministic"
-    assert torch.equal(handle.recv_token_to_slots.cpu(), handle2.recv_token_to_slots.cpu()), "recv_token_to_slots not deterministic"
-    assert torch.equal(handle.k_local_total.cpu(), handle2.k_local_total.cpu()), "k_local_total not deterministic"
-    assert torch.equal(handle.seen_per_substream.cpu(), handle2.seen_per_substream.cpu()), "seen_per_substream not deterministic"
-    # `pool` padding rows are now left uninitialized (kernel Y's pool_recv_token
-    # predicate is the actual safety mechanism). Compare valid rows only.
-    valid = handle.pool_recv_token.cpu() >= 0
-    assert torch.equal(pool.cpu()[valid], pool2.cpu()[valid]), "pool data (valid rows) not deterministic"
-    assert torch.equal(handle.tile_id_to_expert.cpu(), handle2.tile_id_to_expert.cpu()), "tile_id_to_expert not deterministic"
-
-    if rank == 0:
-        print(f"PASS: rank={rank} world={world_size} T_recv={T_recv} TK_padded={TK_padded} total_tiles={total_tiles}")
-
-    cleanup_dist()
+    return pool, handle, Global.gather(x, r, group)
 
 
-if __name__ == "__main__":
-    main()
+def check_layout(pool, handle, inputs: Global):
+    recv_ids = inputs.recv_tokens()
+    local_topk = inputs.local_topk()[recv_ids]  # [T_recv, K]
+    T_recv, E_local = recv_ids.numel(), inputs.num_local_experts
+    assert handle.o.shape[0] == T_recv, f"T_recv {handle.o.shape[0]} != expected {T_recv}"
+
+    freq = torch.bincount(local_topk[local_topk >= 0], minlength=E_local)
+    assert torch.equal(handle.expert_frequency.long(), freq)
+    blocks = torch.cat([freq.new_zeros(1), torch.cumsum((freq + TILE_M - 1) // TILE_M, 0)])
+    assert torch.equal(handle.expert_pool_block_offset.long(), blocks)
+    assert handle.total_tiles == blocks[-1].item()
+    assert pool.shape[0] == handle.TK_padded == handle.total_tiles * TILE_M
+
+    slot_expert = torch.repeat_interleave(torch.arange(E_local, device=pool.device), blocks.diff() * TILE_M)
+    real = (handle.pool_recv_token >= 0).nonzero().flatten()
+    r, k = handle.pool_recv_token[real].long(), handle.pool_k_slot[real].long()
+    assert torch.equal(local_topk[r, k], slot_expert[real]), "slot outside its expert's block"
+    assert torch.equal(pool[real], inputs.x[recv_ids[r]]), "pool rows differ from their source tokens"
+    assert torch.equal(handle.pool_topk_weight[real], inputs.topk_weights[recv_ids[r], k])
+
+    expected_slots = torch.full_like(local_topk, -1)
+    expected_slots[r, k] = real
+    assert torch.equal(handle.recv_token_to_slots.long(), expected_slots), "not exactly one slot per local (token, k)"
+    assert torch.equal(handle.k_local_total.long(), (local_topk >= 0).sum(1))
+    assert torch.equal(handle.k_local_remaining, handle.k_local_total)
+    assert torch.equal(handle.seen_per_substream.sum(dim=(0, 1)).long(), freq)
+
+    tile_expert = torch.repeat_interleave(torch.arange(E_local, device=pool.device), blocks.diff())
+    assert torch.equal(handle.tile_id_to_expert.long(), tile_expert)
+    per_tile = torch.bincount(real // TILE_M, minlength=handle.total_tiles)
+    assert torch.equal(handle.pool_arrival_target.long(), per_tile)
+    assert torch.equal(handle.pool_arrival_count[: handle.total_tiles], handle.pool_arrival_target)
+    assert not handle.o.any() and not handle.y_done_per_token.any()
+
+
+@pytest.mark.parametrize("scenario", routing.SCENARIOS)
+def test_layout(buffer, group, scenario):
+    check_layout(*dispatch(buffer, group, scenario))
+
+
+def test_back_to_back_dispatches(buffer, group):
+    """Fresh routing each call on one Buffer: no state leaks between dispatches."""
+    for seed in range(4):
+        check_layout(*dispatch(buffer, group, "sentinels", seed=seed))
+
+
+def test_placement_is_deterministic(buffer, group):
+    _, a, _ = dispatch(buffer, group, "power_law", seed=7)
+    _, b, _ = dispatch(buffer, group, "power_law", seed=7)
+    assert torch.equal(a.pool_recv_token, b.pool_recv_token)
+    assert torch.equal(a.pool_k_slot, b.pool_k_slot)
+    assert torch.equal(a.recv_token_to_slots, b.recv_token_to_slots)

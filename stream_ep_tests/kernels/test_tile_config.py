@@ -3,15 +3,14 @@
 Covers the three pieces that make up the ``tile_config`` API:
   - ``default_tile_config(I, H)`` — the bench-tuned resolved baseline, including
     the power-of-2 divisibility fallback when a default tile_n doesn't divide.
-  - ``TileConfig.validate(I, H)`` — the four StreamEP-specific output-tile_n
-    divisibility constraints (None fields skipped).
+  - ``TileConfig.validate(I, H)`` — the StreamEP-specific output-tile_n
+    divisibility and tile_m constraints (None fields skipped).
   - ``_resolve_tile_config`` — overlay a caller's non-None overrides onto the
     baseline. The load-bearing property: pinning ONE knob must NOT freeze the
     others at a hardcoded default — they stay auto-picked for the shape.
 
-Pure tile-math (no kernels launch), but the import pulls ``stream_ep`` (CUDA
-extension), so this collects on a GPU node like the other stream_moe pytest
-modules.
+Pure tile math (no kernels launch), but importing ``stream_ep`` loads the CUDA
+extension, so it runs on a GPU node like the other kernel tests.
 """
 
 from dataclasses import replace
@@ -24,9 +23,10 @@ from stream_ep.stream_moe.stream_moe import (
     default_tile_config,
 )
 
-# (I, H): first row hits all four bench-tuned defaults; the rest force a
-# power-of-2 fallback on one or more tile_n values.
+# (I, H): the production shape, then one that hits all four bench-tuned
+# defaults; the rest force a power-of-2 fallback on one or more tile_n values.
 _SHAPES = [
+    (768, 3072),
     (1536, 2048),
     (2048, 2048),
     (2048, 1536),
@@ -173,3 +173,9 @@ def test_resolve_rejects_tile_m_192_with_autopicked_tile_n():
     # validate must reject, since auto tile_n exceed 128.
     with pytest.raises(ValueError, match="tile_m=192"):
         _resolve_tile_config(TileConfig(tile_m=192), 2048, 2048)
+
+
+def test_production_shape_defaults():
+    # The tiles the kernel tests and stream_moe_func run at the production shape.
+    cfg = default_tile_config(768, 3072)
+    assert (cfg.tile_n_a, cfg.tile_n_y, cfg.tile_n_y_bwd, cfg.tile_n_a_bwd) == (192, 256, 192, 256)

@@ -1,143 +1,82 @@
-"""Expert dropout in kernel A (fwd) and kernel_y_bwd against a torch reference
-that regenerates the same mask with ``keep_scale_ref``.
+"""Expert dropout in kernel A (forward) and kernel_y_bwd against a torch
+reference that regenerates the mask with ``keep_scale_ref``.
 
-Zero patterns are checked exactly (a dropped unit is exactly 0 in every
-masked output, a kept one never is); values to bf16 tolerance.
+The mask is keyed on ``(seed, pool row, column)``. A dropped unit must be
+exactly zero in every masked output and a kept one scaled by ``1 / (1 - p)``;
+``preact_a`` stays unmasked, and a different seed gives a different mask.
 """
 
-import pytest
 import torch
-import torch.nn.functional as F
 
 from stream_ep.stream_moe.expert_dropout import keep_scale_ref
-from stream_ep_tests.kernels.test_kernel_a import (
-    _make_pool_arrival,
-    _make_tile_metadata,
-)
+from stream_ep.stream_moe.kernel_a import streaming_moe_a
+from stream_ep.stream_moe.kernel_y_bwd import streaming_moe_y_bwd
+from stream_ep_tests.kernels._common import LAYOUTS, TILE_M, expert_weights, fired, per_expert, randn
+from stream_ep_tests.reference import swiglu
+from stream_ep_tests.utils import DTYPE, H, I, assert_rows_close
 
 P = 0.2
-H, I, E_LOCAL, TILE_M = 512, 512, 3, 128
-TILES = [0, 0, 1, 2, 2]
-TK = len(TILES) * TILE_M
+SEED = 1234
+RTOL = 1e-2
+LAYOUT = LAYOUTS["small"]
 
 
-@pytest.fixture
-def device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    return torch.device("cuda")
+def mask(seed: int) -> torch.Tensor:
+    """[num_slots, I] keep scale (``1 / (1 - P)`` or 0) of every pool slot."""
+    return keep_scale_ref(seed, torch.arange(LAYOUT.num_slots, device="cuda"), torch.arange(I, device="cuda"), P)
 
 
-def _meta(device):
-    _, block_offset = _make_tile_metadata(TILES, E_LOCAL, device)
-    count, target = _make_pool_arrival(len(TILES), device=device)
-    return block_offset, count, target
+def run_kernel_a(seed):
+    pool, w1 = randn(LAYOUT.num_slots, H, seed=1), expert_weights(LAYOUT, 2 * I, H, seed=2)
+    postact = torch.empty(LAYOUT.total_tiles, TILE_M, I, dtype=DTYPE, device="cuda")
+    preact = torch.empty(LAYOUT.total_tiles, TILE_M, 2 * I, dtype=DTYPE, device="cuda")
+    target = LAYOUT.arrival_target()
+    streaming_moe_a(pool, w1, postact, LAYOUT.block_offset(), fired(target), target, preact_a=preact, tile_m=TILE_M, tile_n=192, cluster_n=2,
+                    dropout_p=P, dropout_seed=seed)  # fmt: skip
+    torch.cuda.synchronize()
+    return pool, w1, postact.view(-1, I), preact.view(-1, 2 * I)
 
 
-def _mask(seed, device):
-    rows = torch.arange(TK, device=device)
-    return keep_scale_ref(seed, rows, torch.arange(I, device=device), P)
+def test_kernel_a_expert_dropout():
+    real = LAYOUT.real()
+    pool, w1, postact, preact = run_kernel_a(SEED)
+    _, _, other_seed, _ = run_kernel_a(SEED + 1)
+
+    preact_ref = per_expert(LAYOUT, pool, w1, lambda x, w: x @ w.T)
+    keep = mask(SEED)
+    expected = swiglu(preact_ref.to(DTYPE).float()) * keep
+    assert_rows_close(preact[real], preact_ref[real], RTOL, "preact (unmasked)")
+    assert_rows_close(postact[real], expected[real], RTOL, "postact")
+    assert torch.equal(postact[real] == 0, expected[real] == 0), "dropped units differ from the reference mask"
+    assert abs((keep[real] > 0).float().mean().item() - (1 - P)) < 5e-3
+    assert not torch.equal(postact[real] == 0, other_seed[real] == 0), "a different seed must change the mask"
 
 
-def _assert_close(out, ref, what, rtol=3e-2, atol=3e-3):
-    bad = (out.float() - ref.float()).abs() > atol + rtol * ref.float().abs()
-    assert not bad.any(), f"{what}: {bad.sum().item()} / {bad.numel()} out of tolerance"
+def test_kernel_y_bwd_expert_dropout():
+    real = LAYOUT.real()
+    dL_do = randn(LAYOUT.num_slots, H, seed=7)
+    w2 = expert_weights(LAYOUT, H, I, seed=8)
+    preact = randn(LAYOUT.num_slots, 2 * I, seed=9)
+    weight = torch.where(real, torch.rand(LAYOUT.num_slots, device="cuda"), 0.0)
+    recv = LAYOUT.recv_tokens(LAYOUT.num_slots // 3)
+    dswiglu = torch.empty(LAYOUT.total_tiles, TILE_M, 2 * I, dtype=DTYPE, device="cuda")
+    postact = torch.empty(LAYOUT.total_tiles, TILE_M, I, dtype=DTYPE, device="cuda")
+    dweight = torch.zeros(LAYOUT.num_slots, dtype=torch.float32, device="cuda")
+    target = LAYOUT.arrival_target()
+    streaming_moe_y_bwd(dL_do, w2, dswiglu, postact, weight, recv, preact.view(-1, TILE_M, 2 * I), dweight, LAYOUT.block_offset(), fired(target), target,
+                        tile_m=TILE_M, tile_n=192, dropout_p=P, dropout_seed=SEED)  # fmt: skip
+    torch.cuda.synchronize()
 
-
-def test_kernel_a_expert_dropout(device):
-    from stream_ep.stream_moe.kernel_a import streaming_moe_a
-
-    torch.manual_seed(0)
-    pool = torch.randn(TK, H, dtype=torch.bfloat16, device=device)
-    W1 = torch.randn(E_LOCAL, 2 * I, H, dtype=torch.bfloat16, device=device) * 0.05
-
-    def run(p, seed=None):
-        postact = torch.empty(len(TILES), TILE_M, I, dtype=torch.bfloat16, device=device)
-        preact = torch.empty(len(TILES), TILE_M, 2 * I, dtype=torch.bfloat16, device=device)
-        streaming_moe_a(
-            pool,
-            W1,
-            postact,
-            *_meta(device),
-            preact_a=preact,
-            tile_m=TILE_M,
-            tile_n=256,
-            cluster_n=2,
-            dropout_p=p,
-            dropout_seed=seed,
-        )
-        torch.cuda.synchronize()
-        return postact.view(TK, I), preact.view(TK, 2 * I)
-
-    post0, pre0 = run(0.0)
-    post1, pre1 = run(P, seed=1234)
-    post2, _ = run(P, seed=1235)
-    assert torch.equal(pre1, pre0), "preact must stay unmasked"
-
-    d = _mask(1234, device)
-    kept = d > 0
-    assert abs(kept.float().mean().item() - (1 - P)) < 5e-3
-    assert torch.equal(post1 != 0, kept & (post0 != 0)), "mask mismatch vs reference"
-    assert not torch.equal(post1 != 0, post2 != 0), "seed must change the mask"
-    ref = F.silu(pre0[:, 0::2].float()) * pre0[:, 1::2].float()
-    _assert_close(post0, ref, "postact p=0")
-    _assert_close(post1, ref * d, "postact p>0")
-
-
-def test_kernel_y_bwd_expert_dropout(device):
-    from stream_ep.stream_moe.kernel_y_bwd import streaming_moe_y_bwd
-
-    torch.manual_seed(1)
-    dL_do_pool = torch.randn(TK, H, dtype=torch.bfloat16, device=device)
-    W2 = torch.randn(E_LOCAL, H, I, dtype=torch.bfloat16, device=device) * 0.05
-    preact = torch.randn(len(TILES), TILE_M, 2 * I, dtype=torch.bfloat16, device=device)
-    w = torch.rand(TK, dtype=torch.float32, device=device)
-    recv = torch.arange(TK, dtype=torch.int32, device=device)
-    recv[TILE_M + 90 : 2 * TILE_M] = -1  # expert 0's padding tail
-    recv[-17:] = -1
-
-    def run(p, seed=None):
-        dswiglu_in = torch.empty_like(preact)
-        post_dW2 = torch.empty(len(TILES), TILE_M, I, dtype=torch.bfloat16, device=device)
-        dweight = torch.zeros(TK, dtype=torch.float32, device=device)
-        streaming_moe_y_bwd(
-            dL_do_pool,
-            W2,
-            dswiglu_in,
-            post_dW2,
-            w,
-            recv,
-            preact,
-            dweight,
-            *_meta(device),
-            tile_m=TILE_M,
-            tile_n=128,
-            dropout_p=p,
-            dropout_seed=seed,
-        )
-        torch.cuda.synchronize()
-        return dswiglu_in.view(TK, 2 * I), post_dW2.view(TK, I), dweight
-
-    expert = torch.tensor(TILES, device=device).repeat_interleave(TILE_M)
-    g = torch.bmm(dL_do_pool.float().unsqueeze(1), W2.float()[expert]).squeeze(1)
-    gate, up = preact.view(TK, 2 * I)[:, 0::2].float(), preact.view(TK, 2 * I)[:, 1::2].float()
-    h = F.silu(gate) * up
-    active = (recv >= 0).float()[:, None]
-
-    def ref(d):
-        dout = w[:, None] * d * g
-        sig = torch.sigmoid(gate)
-        dgate = sig * (1 + gate * (1 - sig)) * up * dout
-        dup = F.silu(gate) * dout
-        dswiglu_in = torch.stack([dgate, dup], dim=-1).view(TK, 2 * I)
-        return dswiglu_in * active, w[:, None] * d * h * active, (d * h * g).sum(-1) * active[:, 0]
-
-    for p, seed in ((0.0, None), (P, 99)):
-        d = _mask(seed, device) if p > 0 else torch.ones(TK, I, device=device)
-        out, out_ref = run(p, seed), ref(d)
-        for o, r, name in zip(out, out_ref, ("dswiglu_in", "postact_for_dW2", "dweight"), strict=True):
-            _assert_close(o, r, f"{name} p={p}", atol=3e-2 if name == "dweight" else 3e-3)
-        if p > 0:
-            dropped = (d == 0) | (active == 0)
-            assert (out[1][dropped] == 0).all() and (out[0][:, 0::2][dropped] == 0).all()
-            assert (out[1][~dropped] != 0).float().mean() > 0.99
+    g = per_expert(LAYOUT, dL_do, w2, lambda d, w: d @ w)[real]
+    pre = preact[real].float().requires_grad_()
+    a = swiglu(pre) * mask(SEED)[real]
+    w = weight[real, None]
+    (dswiglu_ref,) = torch.autograd.grad(a, pre, w * g)
+    assert_rows_close(dswiglu.view(-1, 2 * I)[real], dswiglu_ref, RTOL, "dL_dswiglu_in")
+    assert_rows_close(postact.view(-1, I)[real], (w * a).detach(), RTOL, "postact_a_for_dW2")
+    dropped = mask(SEED)[real] == 0
+    assert not postact.view(-1, I)[real][dropped].any(), "postact_a_for_dW2 nonzero at dropped units"
+    terms = (a * g).detach()
+    assert ((dweight[real] - terms.sum(1)).abs() <= I * 2**-24 * terms.abs().sum(1)).all(), (
+        "dL_dweight off beyond fp32 dot-product rounding"
+    )
