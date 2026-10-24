@@ -102,21 +102,49 @@ waste, or fork the kernel forcing it. "Just for now" syncs stay forever.
 
 ## Testing
 
-- `stream_ep_tests/kernels/` — pytest, single process, kernel logic only.
-- `stream_ep_tests/dist/` — torchrun scripts that run at any world size.
-- `stream_ep_tests/internode/` — torchrun scripts that need two or more nodes.
-  Internode paths are disjoint from intranode ones and need their own tests.
+All suites are pytest, run one session per file by `stream_ep_tests/run.py`
+(the `test-*` pixi tasks), so a crash or hang costs one file:
 
-`scripts/check_tests.py` (a pre-commit hook) enforces the layout: torchrun
-scripts have a `__main__` guard and call `cleanup_dist()`, internode scripts
-assert `world_size > 8`, and imports are package-qualified.
+- `stream_ep_tests/kernels/` — single process, one GPU, kernel logic only.
+- `stream_ep_tests/dist/` — every rank runs the same session under torchrun;
+  passes at any world size, and takes the internode paths on two or more nodes.
+- `stream_ep_tests/internode/` — needs two or more nodes (skips below).
 
-New functionality lands with tests: a new kernel gets a pytest case, a new
-dispatch / combine path or `Buffer` method gets a torchrun script. Assert
+Shared pieces: `routing.py` (the routing scenarios the distributed tests
+sweep), `reference.py` (torch references built from every rank's gathered
+inputs), `conftest.py` (the process group, one `Buffer` and the streams per
+session), `kernels/_common.py` (pool layouts and a tile producer). Tests run
+at the production shape in `utils.py`.
+
+Rules for the distributed tests, which `conftest.py` cannot enforce:
+
+- Every rank must issue the same collectives in the same order. Do all
+  gathers and other collectives first, then assert: a rank that fails between
+  two collectives leaves its peers waiting. Skip conditions must evaluate the
+  same on every rank. Each test phase ends with a cross-rank verdict, so a
+  failure on any rank fails the test everywhere and is reported by rank 0.
+- Never reuse a `dispatch_seq` on a `Buffer`; each call takes a fresh one.
+
+Tolerances come from measurement or analysis, never from loosening until a
+test passes: exact equality where the operation copies data; bf16 ulp bounds
+derived from the rounding steps for reductions; and for GEMM outputs a
+per-row relative error set at about twice the worst row measured at the
+production shape, against a reference that models only the roundings the
+kernels make by design. A known bug gets a `pytest.skip` whose reason names
+it, removed by the fix.
+
+`scripts/check_tests.py` (a pre-commit hook) enforces the layout: files sit in
+the three suites, distributed tests take the process group from the fixture,
+internode modules declare the `internode_only` mark, and imports are
+package-qualified.
+
+New functionality lands with tests: a new kernel gets a kernel test, a new
+dispatch / combine path or `Buffer` method a distributed one. Assert
 numerical contracts, not "did it run", and cover the edge cases the code
-handles (padding rows, single-batch and single-expert shapes, `dispatch_seq`
-reuse across iterations). A test that fails at production shape but passes at
-a smaller config has not passed; find out why instead of shrinking the config.
+handles (padding rows, empty experts and ranks, uneven token counts,
+`dispatch_seq` reuse across iterations). A test that fails at production shape
+but passes at a smaller config has not passed; find out why instead of
+shrinking the config.
 
 ## Forks and dependencies
 

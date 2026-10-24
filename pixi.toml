@@ -90,11 +90,11 @@ description = "Kernel pytest suite, single process (1 GPU)"
 
 [feature.test.tasks.test-dist]
 cmd = "python -m stream_ep_tests.run dist"
-description = "Every stream_ep_tests/dist/ script on this node (8 GPUs)"
+description = "Every stream_ep_tests/dist/ file on this node (8 GPUs), one pytest session per file"
 
 [feature.test.tasks.test-internode]
 cmd = "python -m stream_ep_tests.run internode"
-description = "dist/ + internode/ scripts across nodes; run once per node: `srun -N2 --ntasks-per-node=1 pixi run -e test test-internode`"
+description = "dist/ + internode/ files across nodes; run once per node: `srun -N2 --ntasks-per-node=1 pixi run -e test test-internode`"
 
 [feature.lint.dependencies]
 pre-commit = "*"
