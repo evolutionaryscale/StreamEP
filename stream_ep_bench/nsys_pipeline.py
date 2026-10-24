@@ -10,7 +10,7 @@ compute overlap geometry, exposed comm, and per-rank/per-node imbalance. Run
 the FULL pipeline (not isolated kernels) because overlap only exists across the
 2 concurrent streams (the communicate stream + the compute stream).
 
-Shape defaults to the 82ba5b prod MoE (inherited from profile_pipeline globals:
+Shape defaults to the 82ba5b prod MoE (``stream_ep_tests.utils``:
 H=3072, I=768, E=256, K=8, T=8192/rank). World size = however many ranks
 torchrun launches (8 = 1 node intranode/NVL; 16/32 = 2/4 nodes internode/RDMA).
 
