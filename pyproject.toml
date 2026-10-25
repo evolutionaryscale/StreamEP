@@ -57,3 +57,8 @@ ignore = [
 exclude = [
     "stream_ep/__init__.py"
 ]
+
+[tool.pytest.ini_options]
+# Dump every thread's stack when a test stalls, before the 5-minute
+# process-group timeout ends a hung distributed run.
+faulthandler_timeout = 240

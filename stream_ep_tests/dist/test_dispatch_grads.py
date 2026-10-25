@@ -12,11 +12,14 @@ import torch
 from stream_ep_tests import routing
 from stream_ep_tests.dist.test_dispatch import dispatch
 from stream_ep_tests.reference import all_gather_rows
+from stream_ep_tests.utils import SHAPES
 
 
 @pytest.mark.parametrize("scenario", routing.SCENARIOS)
-def test_dispatch_grads(buffer, group, scenario):
-    _, handle, inputs = dispatch(buffer, group, scenario)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_dispatch_grads(buffers, group, shape, scenario):
+    buffer = buffers(shape)
+    _, handle, inputs = dispatch(buffer, group, shape, scenario)
     dL_dy = torch.randn(inputs.local_rows(inputs.x).shape, dtype=inputs.x.dtype, device=inputs.x.device)
 
     dL_do_pool, arrival_count, _ = buffer.dispatch_grads(handle, dL_dy)

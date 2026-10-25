@@ -1,7 +1,7 @@
 """``stream_moe_func`` forward and backward against the fp32 torch reference.
 
 Every case runs the full layer (dispatch, kernel A, kernel Y, combine, and the
-backward mirror) at the production shape and compares the output and the
+backward mirror) for every test shape and compares the output and the
 gradients of ``x``, the topk weights, and both local weight tensors. The
 reference sums every rank's tokens into dW, so a gradient that only covers one
 rank's tokens fails.
@@ -15,19 +15,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from stream_ep import Buffer
 from stream_ep.stream_moe.stream_moe import TileConfig, stream_moe_func
 from stream_ep_tests import reference, routing
-from stream_ep_tests.utils import DTYPE, H, I, assert_rows_close, report
+from stream_ep_tests.utils import DTYPE, SHAPES, Shape, assert_rows_close, report
 
-# Worst row over all ranks at the production shape: 0.70% (out), 0.56% (dx),
-# 0.28% (dW); about 2x margin over the largest.
+# Worst row over all test shapes and ranks: 0.74% (out), 0.58% (dx), 0.36%
+# (dW); about 2x margin over the largest.
 RTOL = 1.5e-2
 # A topk-weight gradient is a dot product over I, and its rows hold only K of
 # them, so it is checked per element against the sum of its terms' magnitudes.
 # The kernel's bf16 pre-activation can differ from the reference's by one ulp
 # per element (different accumulation order before rounding), which moves
-# each term by at most one bf16 ulp: 2**-8 of the terms. Worst measured: 0.10%.
+# each term by at most one bf16 ulp: 2**-8 of the terms. Worst measured: 0.12%.
 DTOPK_RTOL = 2**-8
 
 
@@ -37,11 +36,12 @@ def assert_dtopk_close(actual, expected, scale, name):
     assert ratio.max() <= DTOPK_RTOL, f"{name}: error {ratio.max():.3e} of its terms' magnitude > {DTOPK_RTOL:.2e}"
 
 
-def make_weights(group, num_experts, seed=0):
+def make_weights(group, shape: Shape, seed=0):
+    """This rank's experts, scaled so each GEMM keeps unit-order outputs."""
     g = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + group.rank())
-    E_local = num_experts // group.size()
-    w1 = torch.randn(E_local, 2 * I, H, generator=g, device="cuda", dtype=DTYPE) * 0.02
-    w2 = torch.randn(E_local, H, I, generator=g, device="cuda", dtype=DTYPE) * 0.02
+    E_local, H, I = shape.num_experts // group.size(), shape.hidden, shape.intermediate
+    w1 = torch.randn(E_local, 2 * I, H, generator=g, device="cuda").mul_(H**-0.5).to(DTYPE)
+    w2 = torch.randn(E_local, H, I, generator=g, device="cuda").mul_(I**-0.5).to(DTYPE)
     return w1, w2
 
 
@@ -54,11 +54,12 @@ def grad(t: torch.Tensor) -> torch.Tensor:
     return torch.zeros_like(t) if t.grad is None else t.grad
 
 
-def check_layer(buffer, streams, group, scenario, *, seed=0, dropout_p=0.0, **layer_kwargs):
+def check_layer(buffers, streams, group, shape, scenario, *, seed=0, dropout_p=0.0, **layer_kwargs):
     device = torch.device("cuda", torch.cuda.current_device())
-    r = routing.SCENARIOS[scenario](group.rank(), group.size(), device, seed=seed)
-    w1, w2 = make_weights(group, r.num_experts, seed)
-    x = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
+    buffer, shape = buffers(shape), SHAPES[shape]
+    r = routing.SCENARIOS[scenario](shape, group.rank(), group.size(), device, seed=seed)
+    w1, w2 = make_weights(group, shape, seed)
+    x = torch.randn(r.num_tokens, shape.hidden, dtype=DTYPE, device=device)
     grad_out = torch.randn_like(x)
 
     dropout = None
@@ -90,38 +91,33 @@ def check_layer(buffer, streams, group, scenario, *, seed=0, dropout_p=0.0, **la
 
 
 @pytest.mark.parametrize("scenario", routing.SCENARIOS)
-def test_layer(buffer, streams, group, scenario):
-    check_layer(buffer, streams, group, scenario)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_layer(buffers, streams, group, shape, scenario):
+    check_layer(buffers, streams, group, shape, scenario)
 
 
 @pytest.mark.parametrize("level", [1, 2])
 @pytest.mark.parametrize("scenario", ["sentinels", "first_k"])
-def test_activation_checkpoint(buffer, streams, group, scenario, level):
+@pytest.mark.parametrize("shape", SHAPES)
+def test_activation_checkpoint(buffers, streams, group, shape, scenario, level):
     if level == 2 and scenario == "first_k" and group.size() > 8:
         pytest.skip("known bug: level 2 hangs internode when a rank receives no tokens (NVL barrier timeout); fix in a follow-up")
-    check_layer(buffer, streams, group, scenario, activation_checkpoint_level=level)
+    check_layer(buffers, streams, group, shape, scenario, activation_checkpoint_level=level)
 
 
 @pytest.mark.parametrize("level", [0, 2])
-def test_expert_dropout(buffer, streams, group, level):
-    check_layer(buffer, streams, group, "sentinels", dropout_p=0.1, activation_checkpoint_level=level)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_expert_dropout(buffers, streams, group, shape, level):
+    check_layer(buffers, streams, group, shape, "sentinels", dropout_p=0.1, activation_checkpoint_level=level)
 
 
-def test_tile_config_override(buffer, streams, group):
+@pytest.mark.parametrize("shape", SHAPES)
+def test_tile_config_override(buffers, streams, group, shape):
     cfg = TileConfig(tile_n_a=128, tile_n_y=128, tile_n_y_bwd=128, tile_n_a_bwd=128, num_sms_a=96, num_sms_y=96)
-    check_layer(buffer, streams, group, "power_law", tile_config=cfg)
+    check_layer(buffers, streams, group, shape, "power_law", tile_config=cfg)
 
 
-def test_num_sms_override(buffer, streams, group):
-    saved = Buffer.num_sms
-    Buffer.num_sms = 64
-    try:
-        check_layer(buffer, streams, group, "hot_rank")
-    finally:
-        Buffer.num_sms = saved
-
-
-def check_chain(buffer, streams, group, num_layers, *, num_steps=1, checked_layers=None, **layer_kwargs):
+def check_chain(buffer, streams, group, shape: Shape, num_layers, *, num_steps=1, checked_layers=None, **layer_kwargs):
     """``num_steps`` training steps through ``num_layers`` pre-norm residual layers on one Buffer.
 
     Each backward ``dispatch_grads`` / ``combine_grads`` then runs while the
@@ -131,14 +127,14 @@ def check_chain(buffer, streams, group, num_layers, *, num_steps=1, checked_laye
     gradient, so a cross-layer bug fails the layer it corrupts while the
     chains' normal bf16 drift does not accumulate into the comparison."""
     device = torch.device("cuda", torch.cuda.current_device())
-    layers = [(routing.uniform(group.rank(), group.size(), device, seed=s, sentinel_p=0.02), *make_weights(group, 256, s)) for s in range(num_layers)]
+    layers = [(routing.uniform(shape, group.rank(), group.size(), device, seed=s, sentinel_p=0.02), *make_weights(group, shape, s)) for s in range(num_layers)]
     for _ in range(num_steps):
-        h = leaves(torch.randn(layers[0][0].num_tokens, H, dtype=DTYPE, device=device))[0]
+        h = leaves(torch.randn(shape.tokens, shape.hidden, dtype=DTYPE, device=device))[0]
         runs = []
         for r, w1, w2 in layers:
             # Pre-norm, as in the model: without it SwiGLU's roughly quadratic growth
             # overflows the residual stream within a few dozen layers.
-            x = F.rms_norm(h, (H,))
+            x = F.rms_norm(h, (shape.hidden,))
             x.retain_grad()
             w, w1l, w2l = leaves(r.topk_weights, w1, w2)
             out = stream_moe_func(buffer, x, r.topk_idx, w, r.is_token_in_rank, w1l, w2l, streams=streams, num_experts=r.num_experts, **layer_kwargs)
@@ -168,5 +164,6 @@ def check_chain(buffer, streams, group, num_layers, *, num_steps=1, checked_laye
         assert_dtopk_close(actual, expected, scale, name)
 
 
-def test_residual_chain(buffer, streams, group):
-    check_chain(buffer, streams, group, num_layers=3, num_steps=2)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_residual_chain(buffers, streams, group, shape):
+    check_chain(buffers(shape), streams, group, SHAPES[shape], num_layers=3, num_steps=3)

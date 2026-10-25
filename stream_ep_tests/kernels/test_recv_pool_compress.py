@@ -27,7 +27,7 @@ def broadcast_pool(num_tokens, slots_per_token, num_padding, H, seed=0):
 
 
 CASES = {
-    "duplicates_and_padding": (200, [1 + t % 3 for t in range(200)], 137, 3072),
+    "duplicates_and_padding": (200, [1 + t % 3 for t in range(200)], 137, 1024),
     "identity": (64, [1] * 64, 0, 512),
     "partial_block": (50, [2] * 50, 20, 513),  # H % BLOCK_H != 0
 }

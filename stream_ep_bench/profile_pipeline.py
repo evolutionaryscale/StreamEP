@@ -39,8 +39,8 @@ import torch
 import torch.distributed as torch_dist
 import torch.profiler
 from stream_ep import Buffer as StreamEPBuffer
-import stream_ep_tests.utils as test_utils
-from stream_ep_tests.utils import DTYPE, SEQ_LEN_PER_RANK, H
+import stream_ep_bench as defaults
+from stream_ep_bench import DTYPE, SEQ_LEN_PER_RANK, H
 
 from stream_ep.stream_moe.stream_moe import (
     TileConfig,
@@ -164,18 +164,18 @@ def main():
     )
     p.add_argument("--num_sms", type=int, default=None, help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
-    # MoE shape overrides — default to the 82ba5b prod shape (H=3072 I=768
-    # E=256 K=8), so the profile runs at the real GEMM size (2I·H) that
+    # MoE shape overrides — default to the stream_ep_bench profiling shape
+    # (H=3072 I=768 E=256 K=8), so the profile runs at a GEMM size (2I·H) that
     # determines whether the bwd preact_a recompute hides behind
     # dispatch_grads' comm. Pass flags for a different shape, e.g. the esm4
     # 18.6B: --hidden 2048 --intermediate 384 --num_experts 384 --topk 13.
-    # Defaults read through the module (test_utils.H, ...) because main()
+    # Defaults read through the module (defaults.H, ...) because main()
     # rebinds H/I/NUM_EXPERTS/TOPK as locals below; a bare `default=H` would
     # be an UnboundLocalError on that soon-to-be-local name.
-    p.add_argument("--hidden", type=int, default=test_utils.H, help="d_model H (default: 82ba5b 3072)")
-    p.add_argument("--intermediate", type=int, default=test_utils.I, help="per-expert I (default: 82ba5b 768)")
-    p.add_argument("--num_experts", type=int, default=test_utils.NUM_EXPERTS, help="total experts E (default: 82ba5b 256)")
-    p.add_argument("--topk", type=int, default=test_utils.TOPK, help="top-k K (default: 82ba5b 8)")
+    p.add_argument("--hidden", type=int, default=defaults.H, help="d_model H")
+    p.add_argument("--intermediate", type=int, default=defaults.I, help="per-expert I")
+    p.add_argument("--num_experts", type=int, default=defaults.NUM_EXPERTS, help="total experts E")
+    p.add_argument("--topk", type=int, default=defaults.TOPK, help="top-k K")
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)

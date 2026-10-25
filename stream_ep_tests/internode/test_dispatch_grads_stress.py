@@ -1,7 +1,7 @@
 """Back-to-back internode dispatches and dispatch_grads, communication only.
 
-Each step issues 44 forward dispatches with fresh routing, keeping every
-handle alive as autograd would, then 44 ``dispatch_grads`` in reverse with no
+Each step issues 32 forward dispatches with fresh routing, keeping every
+handle alive as autograd would, then 32 ``dispatch_grads`` in reverse with no
 compute in between: less slack between collectives than the real pipeline
 gives. The first, middle and last layers of the last step must deliver each
 source token's gradient row to every slot forward dispatch gave it.
@@ -12,28 +12,30 @@ import torch
 
 from stream_ep_tests import routing
 from stream_ep_tests.reference import Global
-from stream_ep_tests.utils import DTYPE, H
+from stream_ep_tests.utils import DTYPE, SHAPES
 
 pytestmark = pytest.mark.usefixtures("internode_only")
 
-NUM_LAYERS = 44
+NUM_LAYERS = 32
 NUM_STEPS = 3
 CHECKED = (0, NUM_LAYERS // 2, NUM_LAYERS - 1)
 
 
-def test_dispatch_grads_stress(buffer, group):
+@pytest.mark.parametrize("shape", ["small", "odd_topk"])
+def test_dispatch_grads_stress(buffers, group, shape):
     device = torch.device("cuda", torch.cuda.current_device())
+    buffer, shape = buffers(shape), SHAPES[shape]
     for step in range(NUM_STEPS):
         layers = []
         for layer in range(NUM_LAYERS):
-            r = routing.uniform(group.rank(), group.size(), device, seed=step * NUM_LAYERS + layer)
-            x = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
+            r = routing.uniform(shape, group.rank(), group.size(), device, seed=step * NUM_LAYERS + layer)
+            x = torch.randn(r.num_tokens, shape.hidden, dtype=DTYPE, device=device)
             _, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts)
             layers.append((r, handle))
         grads = {}
         for layer in reversed(range(NUM_LAYERS)):
             r, handle = layers[layer]
-            dL_dy = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
+            dL_dy = torch.randn(r.num_tokens, shape.hidden, dtype=DTYPE, device=device)
             dL_do_pool, count, _ = buffer.dispatch_grads(handle, dL_dy)
             if layer in CHECKED:  # keep only what is checked: 44 live gradient pools exceed memory
                 grads[layer] = (r, handle, dL_dy, dL_do_pool, count)

@@ -113,8 +113,10 @@ All suites are pytest, run one session per file by `stream_ep_tests/run.py`
 Shared pieces: `routing.py` (the routing scenarios the distributed tests
 sweep), `reference.py` (torch references built from every rank's gathered
 inputs), `conftest.py` (the process group, one `Buffer` and the streams per
-session), `kernels/_common.py` (pool layouts and a tile producer). Tests run
-at the production shape in `utils.py`.
+session), `kernels/_common.py` (pool layouts and a tile producer). Tests sweep
+several small shapes chosen to vary the code paths (hidden sizes, top-k,
+experts per rank, tokens per rank) rather than targeting one model's shape;
+keep them small enough that the suites stay fast.
 
 Rules for the distributed tests, which `conftest.py` cannot enforce:
 
@@ -128,8 +130,8 @@ Rules for the distributed tests, which `conftest.py` cannot enforce:
 Tolerances come from measurement or analysis, never from loosening until a
 test passes: exact equality where the operation copies data; bf16 ulp bounds
 derived from the rounding steps for reductions; and for GEMM outputs a
-per-row relative error set at about twice the worst row measured at the
-production shape, against a reference that models only the roundings the
+per-row relative error set at about twice the worst row measured across the
+test shapes and all ranks, against a reference that models only the roundings the
 kernels make by design. A known bug gets a `pytest.skip` whose reason names
 it, removed by the fix.
 
@@ -142,9 +144,8 @@ New functionality lands with tests: a new kernel gets a kernel test, a new
 dispatch / combine path or `Buffer` method a distributed one. Assert
 numerical contracts, not "did it run", and cover the edge cases the code
 handles (padding rows, empty experts and ranks, uneven token counts,
-`dispatch_seq` reuse across iterations). A test that fails at production shape
-but passes at a smaller config has not passed; find out why instead of
-shrinking the config.
+`dispatch_seq` reuse across iterations). A failure at one shape is a failure;
+find out why instead of dropping the shape.
 
 ## Forks and dependencies
 

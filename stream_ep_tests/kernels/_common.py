@@ -1,17 +1,20 @@
 """Shared setup for the single-GPU kernel tests: pool layouts, arrival signals,
 and a producer that streams pool tiles in the way dispatch does.
 
-Every kernel runs at the production hidden sizes; the layouts vary the number
-of experts and tiles. ``LAYOUTS["small"]`` has an empty expert, a partial tile
-and full tiles; ``LAYOUTS["production"]`` is a 32-expert rank at the
-production routing load (about 520 tiles) with two empty experts.
+Kernels run at each distinct (hidden, intermediate) pair of the test shapes.
+``LAYOUTS["small"]`` starts with an empty expert and has a partial tile and
+full tiles; ``LAYOUTS["many_tiles"]`` has 40 experts, several empty, and enough
+tiles that every CTA loops over many of them. Tile configs come from
+``default_tile_config`` for the shape (with the 2-CTA clusters stream_moe_func
+launches A and Y with) plus an alternate.
 """
 
 from dataclasses import dataclass
 
 import torch
 
-from stream_ep_tests.utils import DTYPE
+from stream_ep.stream_moe.stream_moe import default_tile_config
+from stream_ep_tests.utils import DTYPE, SHAPES
 
 TILE_M = 128
 
@@ -64,17 +67,32 @@ class PoolLayout:
         return torch.where(self.real(), tokens, -1)
 
 
-def _production_rows(num_experts=32, mean=2048, empty=(5, 17), seed=0) -> tuple[int, ...]:
+def _random_rows(num_experts=40, max_rows=700, empty=(0, 7, 23, 39), seed=0) -> tuple[int, ...]:
     g = torch.Generator().manual_seed(seed)
-    rows = (mean * (0.5 + torch.rand(num_experts, generator=g))).long()
+    rows = torch.randint(1, max_rows, (num_experts,), generator=g)
     rows[list(empty)] = 0
     return tuple(rows.tolist())
 
 
 LAYOUTS = {
-    "small": PoolLayout((200, 0, 129, 384)),
-    "production": PoolLayout(_production_rows()),
+    "small": PoolLayout((0, 200, 0, 129, 384)),
+    "many_tiles": PoolLayout(_random_rows()),
 }
+
+# (hidden, intermediate) pairs the kernel tests run at.
+KERNEL_SHAPES = {f"{s.hidden}x{s.intermediate}": (s.hidden, s.intermediate) for s in SHAPES.values()}
+
+
+def configs(kernel: str, hidden: int, intermediate: int) -> dict[str, dict]:
+    """``default`` is what stream_moe_func launches ``kernel`` with at this shape; ``alternate`` an unclustered 128-wide tile."""
+    cfg = default_tile_config(intermediate, hidden)
+    default = {
+        "a": {"tile_n": cfg.tile_n_a, "cluster_n": 2},
+        "y": {"tile_n": cfg.tile_n_y, "cluster_n": 2},
+        "a_bwd": {"tile_n": cfg.tile_n_a_bwd},
+        "y_bwd": {"tile_n": cfg.tile_n_y_bwd},
+    }[kernel]
+    return {"default": default, "alternate": {"tile_n": 128}}
 
 
 def randn(*shape, scale=1.0, seed=0) -> torch.Tensor:

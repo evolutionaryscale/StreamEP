@@ -1,16 +1,30 @@
 import os
+from dataclasses import dataclass
 
 import torch
 
-# The 82ba5b production MoE shape (82B total / 4.3B active): d_model H, per-expert
-# intermediate I, E experts, top-K routing, tokens per rank. Shared by the
-# production-shape tests and the stream_ep_bench harnesses.
-H = 3072
-I = 768
-NUM_EXPERTS = 256
-SEQ_LEN_PER_RANK = 8192
-TOPK = 8
 DTYPE = torch.bfloat16
+
+
+@dataclass(frozen=True)
+class Shape:
+    hidden: int
+    intermediate: int  # per expert
+    num_experts: int  # across all ranks
+    topk: int
+    tokens: int  # per rank
+
+
+# Small shapes that each vary a code path; tests sweep all of them.
+SHAPES = {
+    "small": Shape(hidden=512, intermediate=256, num_experts=64, topk=4, tokens=512),
+    # Non-power-of-2 top-k and expert counts, a 192-wide kernel A tile.
+    "odd_topk": Shape(hidden=1024, intermediate=384, num_experts=96, topk=6, tokens=256),
+    # 64 experts per rank at 8 ranks: the scheduler's second ballot slot.
+    "many_experts": Shape(hidden=768, intermediate=512, num_experts=512, topk=8, tokens=512),
+    # 2 experts per rank at 8 ranks, 1 at 16.
+    "few_experts": Shape(hidden=512, intermediate=256, num_experts=16, topk=2, tokens=512),
+}
 
 
 def report(name: str, ratio: float) -> None:

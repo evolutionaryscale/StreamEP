@@ -18,15 +18,15 @@ import torch
 
 from stream_ep_tests import routing
 from stream_ep_tests.reference import Global
-from stream_ep_tests.utils import DTYPE, H
+from stream_ep_tests.utils import DTYPE, SHAPES
 
 TILE_M = 128
 
 
-def dispatch(buffer, group, scenario, seed=0):
+def dispatch(buffer, group, shape, scenario, seed=0):
     device = torch.device("cuda", torch.cuda.current_device())
-    r = routing.SCENARIOS[scenario](group.rank(), group.size(), device, seed=seed)
-    x = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
+    r = routing.SCENARIOS[scenario](SHAPES[shape], group.rank(), group.size(), device, seed=seed)
+    x = torch.randn(r.num_tokens, SHAPES[shape].hidden, dtype=DTYPE, device=device)
     pool, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)
     torch.cuda.synchronize()
     return pool, handle, Global.gather(x, r, group)
@@ -68,19 +68,21 @@ def check_layout(pool, handle, inputs: Global):
 
 
 @pytest.mark.parametrize("scenario", routing.SCENARIOS)
-def test_layout(buffer, group, scenario):
-    check_layout(*dispatch(buffer, group, scenario))
+@pytest.mark.parametrize("shape", SHAPES)
+def test_layout(buffers, group, shape, scenario):
+    check_layout(*dispatch(buffers(shape), group, shape, scenario))
 
 
-def test_back_to_back_dispatches(buffer, group):
+@pytest.mark.parametrize("shape", SHAPES)
+def test_back_to_back_dispatches(buffers, group, shape):
     """Fresh routing each call on one Buffer: no state leaks between dispatches."""
     for seed in range(4):
-        check_layout(*dispatch(buffer, group, "sentinels", seed=seed))
+        check_layout(*dispatch(buffers(shape), group, shape, "sentinels", seed=seed))
 
 
-def test_placement_is_deterministic(buffer, group):
-    _, a, _ = dispatch(buffer, group, "power_law", seed=7)
-    _, b, _ = dispatch(buffer, group, "power_law", seed=7)
+def test_placement_is_deterministic(buffers, group):
+    _, a, _ = dispatch(buffers("odd_topk"), group, "odd_topk", "power_law", seed=7)
+    _, b, _ = dispatch(buffers("odd_topk"), group, "odd_topk", "power_law", seed=7)
     assert torch.equal(a.pool_recv_token, b.pool_recv_token)
     assert torch.equal(a.pool_k_slot, b.pool_k_slot)
     assert torch.equal(a.recv_token_to_slots, b.recv_token_to_slots)

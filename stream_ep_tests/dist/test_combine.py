@@ -12,7 +12,7 @@ import torch
 
 from stream_ep_tests import routing
 from stream_ep_tests.dist.test_dispatch import dispatch
-from stream_ep_tests.utils import assert_sums_close
+from stream_ep_tests.utils import SHAPES, assert_sums_close
 
 
 
@@ -27,8 +27,10 @@ def rounding_ulps(group) -> float:
 
 
 @pytest.mark.parametrize("scenario", routing.SCENARIOS)
-def test_combine(buffer, group, scenario):
-    _, handle, inputs = dispatch(buffer, group, scenario)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_combine(buffers, group, shape, scenario):
+    buffer = buffers(shape)
+    _, handle, inputs = dispatch(buffer, group, shape, scenario)
     handle.o.copy_(torch.randn_like(handle.o))
     handle.y_done_per_token.fill_(handle.dispatch_seq)
 
@@ -41,8 +43,10 @@ def test_combine(buffer, group, scenario):
 
 
 @pytest.mark.parametrize("scenario", routing.SCENARIOS)
-def test_combine_grads(buffer, group, scenario):
-    _, handle, inputs = dispatch(buffer, group, scenario)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_combine_grads(buffers, group, shape, scenario):
+    buffer = buffers(shape)
+    _, handle, inputs = dispatch(buffer, group, shape, scenario)
     dL_dx_per_r = torch.randn_like(handle.o)
     weight_grads = torch.randn(handle.TK_padded, dtype=torch.float32, device=handle.o.device)
 

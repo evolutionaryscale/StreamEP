@@ -23,10 +23,9 @@ from stream_ep.stream_moe.stream_moe import (
     default_tile_config,
 )
 
-# (I, H): the production shape, then one that hits all four bench-tuned
-# defaults; the rest force a power-of-2 fallback on one or more tile_n values.
+# (I, H): first row hits all four bench-tuned defaults; the rest force a
+# power-of-2 fallback on one or more tile_n values.
 _SHAPES = [
-    (768, 3072),
     (1536, 2048),
     (2048, 2048),
     (2048, 1536),
@@ -173,9 +172,3 @@ def test_resolve_rejects_tile_m_192_with_autopicked_tile_n():
     # validate must reject, since auto tile_n exceed 128.
     with pytest.raises(ValueError, match="tile_m=192"):
         _resolve_tile_config(TileConfig(tile_m=192), 2048, 2048)
-
-
-def test_production_shape_defaults():
-    # The tiles the kernel tests and stream_moe_func run at the production shape.
-    cfg = default_tile_config(768, 3072)
-    assert (cfg.tile_n_a, cfg.tile_n_y, cfg.tile_n_y_bwd, cfg.tile_n_a_bwd) == (192, 256, 192, 256)

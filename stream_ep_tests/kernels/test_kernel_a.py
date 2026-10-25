@@ -13,9 +13,11 @@ import torch
 
 from stream_ep.stream_moe.kernel_a import streaming_moe_a
 from stream_ep_tests.kernels._common import (
+    KERNEL_SHAPES,
     LAYOUTS,
     TILE_M,
     PoolLayout,
+    configs,
     expert_weights,
     fired,
     per_expert,
@@ -24,21 +26,19 @@ from stream_ep_tests.kernels._common import (
     warm_up_producer,
 )
 from stream_ep_tests.reference import swiglu
-from stream_ep_tests.utils import DTYPE, H, I, assert_rows_close
+from stream_ep_tests.utils import DTYPE, assert_rows_close
 
-# Production: tile_n_a=192 with 2-CTA clusters (stream_moe.py); the alternate covers the unclustered path.
-CONFIGS = {"production": {"tile_n": 192, "cluster_n": 2}, "alternate": {"tile_n": 128, "cluster_n": 1}}
 RTOL = 1e-2
 
 
-def inputs(layout):
+def inputs(layout, H, I):
     pool = randn(layout.num_slots, H, seed=1)
     pool[~layout.real()] = float("inf")
     return pool, expert_weights(layout, 2 * I, H, seed=2)
 
 
 def check(layout, pool, w1, postact, preact=None):
-    real = layout.real()
+    real, I = layout.real(), postact.shape[-1]
     preact_ref = per_expert(layout, pool, w1, lambda x, w: x @ w.T)
     # Kernel A rounds the pre-activation to bf16 before the activation, as the reference model does.
     assert_rows_close(postact.view(-1, I)[real], swiglu(preact_ref.to(DTYPE).float())[real], RTOL, "postact")
@@ -46,28 +46,33 @@ def check(layout, pool, w1, postact, preact=None):
         assert_rows_close(preact.view(-1, 2 * I)[real], preact_ref[real], RTOL, "preact")
 
 
-@pytest.mark.parametrize("num_sms", [None, 8])
-@pytest.mark.parametrize("config", CONFIGS)
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_kernel_a(layout, config, num_sms):
-    layout = LAYOUTS[layout]
-    pool, w1 = inputs(layout)
+def launch(layout, pool, w1, count, target, *, preact=None, **kwargs):
+    I = w1.shape[1] // 2
     postact = torch.full((layout.total_tiles, TILE_M, I), float("nan"), dtype=DTYPE, device="cuda")
+    streaming_moe_a(pool, w1, postact, layout.block_offset(), count, target, preact_a=preact, tile_m=TILE_M, **kwargs)
+    return postact
+
+
+@pytest.mark.parametrize("num_sms", [None, 8])
+@pytest.mark.parametrize("config", ["default", "alternate"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_a(shape, layout, config, num_sms):
+    (H, I), layout = KERNEL_SHAPES[shape], LAYOUTS[layout]
+    pool, w1 = inputs(layout, H, I)
     preact = torch.full((layout.total_tiles, TILE_M, 2 * I), float("nan"), dtype=DTYPE, device="cuda")
     target = layout.arrival_target()
-    streaming_moe_a(
-        pool, w1, postact, layout.block_offset(), fired(target), target, preact_a=preact, tile_m=TILE_M, num_sms=num_sms, **CONFIGS[config]
-    )
+    postact = launch(layout, pool, w1, fired(target), target, preact=preact, num_sms=num_sms, **configs("a", H, I)[config])
     torch.cuda.synchronize()
     check(layout, pool, w1, postact, preact)
 
 
-@pytest.mark.parametrize("config", CONFIGS)
-def test_kernel_a_streamed_pool(config):
-    layout = LAYOUTS["small"]
-    src, w1 = inputs(layout)
+@pytest.mark.parametrize("config", ["default", "alternate"])
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_a_streamed_pool(shape, config):
+    (H, I), layout = KERNEL_SHAPES[shape], LAYOUTS["small"]
+    src, w1 = inputs(layout, H, I)
     pool = torch.full_like(src, float("nan"))
-    postact = torch.full((layout.total_tiles, TILE_M, I), float("nan"), dtype=DTYPE, device="cuda")
     target = layout.arrival_target()
     count = torch.zeros_like(target)
 
@@ -75,7 +80,7 @@ def test_kernel_a_streamed_pool(config):
     compute, producer = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(compute):
         # Leave SMs free for the producer: a persistent grid on every SM would starve it.
-        streaming_moe_a(pool, w1, postact, layout.block_offset(), count, target, tile_m=TILE_M, num_sms=16, **CONFIGS[config])
+        postact = launch(layout, pool, w1, count, target, num_sms=16, **configs("a", H, I)[config])
     with torch.cuda.stream(producer):
         stream_tiles(pool, src, count, target)
     torch.cuda.synchronize()
@@ -90,10 +95,10 @@ def test_many_local_experts(num_experts):
         pytest.skip(
             "known bug: the scheduler's expert lookup covers at most 64 local experts while dispatch allows 1024; fix in a follow-up"
         )
+    H, I = KERNEL_SHAPES["512x256"]
     layout = PoolLayout(tuple(0 if e % 7 == 3 else 64 + 32 * (e % 5) for e in range(num_experts)))
-    pool, w1 = inputs(layout)
-    postact = torch.full((layout.total_tiles, TILE_M, I), float("nan"), dtype=DTYPE, device="cuda")
+    pool, w1 = inputs(layout, H, I)
     target = layout.arrival_target()
-    streaming_moe_a(pool, w1, postact, layout.block_offset(), fired(target), target, tile_m=TILE_M, num_sms=8, **CONFIGS["production"])
+    postact = launch(layout, pool, w1, fired(target), target, num_sms=8, **configs("a", H, I)["default"])
     torch.cuda.synchronize()
     check(layout, pool, w1, postact)

@@ -20,8 +20,8 @@ satisfied the kernel never spins, so default kernel replay works perfectly and
 you get full SM / tensor-core / memory / occupancy / roofline counters per
 kernel.
 
-Shape defaults to the **real 4-node 82ba5b** point so the GEMM tiles match
-production: world=32 -> E_local = 256/32 = 8 experts/rank; H=3072, I=768;
+Shape defaults to the profiling shape at a 4-node point so the GEMM tiles are
+realistic: world=32 -> E_local = 256/32 = 8 experts/rank; H=3072, I=768;
 uniform routing gives ~T*topk*world/E = 8192 tokens/expert -> ~64 tiles/expert
 at tile_m=128 -> total_tiles=512 (M_recv=65536). Override --world / --tiles /
 --hidden / --intermediate to profile a different operating point. tile_n per
@@ -60,9 +60,9 @@ from stream_ep.stream_moe.kernel_y import streaming_moe_y
 from stream_ep.stream_moe.kernel_y_bwd import streaming_moe_y_bwd
 from stream_ep.stream_moe.stream_moe import TileConfig, _resolve_tile_config
 
-from stream_ep_tests.utils import DTYPE, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
-from stream_ep_tests.utils import H as H_DEFAULT
-from stream_ep_tests.utils import I as I_DEFAULT
+from stream_ep_bench import DTYPE, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
+from stream_ep_bench import H as H_DEFAULT
+from stream_ep_bench import I as I_DEFAULT
 
 
 def _expert_pool_block_offset(total_tiles: int, E_local: int, device) -> torch.Tensor:
@@ -131,8 +131,8 @@ def build(kernel: str, s: dict, device):
     if kernel == "a":
         pool = (torch.randn(TK, H, dtype=DTYPE, device=device, generator=g) * 0.1).contiguous()
         postact_a = torch.empty(total_tiles, tile_m, I, dtype=DTYPE, device=device)
-        # ac_level 0 saves preact_a ([2I] mD store); ac_level >=1 (production
-        # 82ba5b default) sets preact_a=None -> store skipped, separate kernel.
+        # ac_level 0 saves preact_a ([2I] mD store); ac_level >=1 sets
+        # preact_a=None -> store skipped, separate kernel.
         preact_a = torch.empty(total_tiles, tile_m, two_I, dtype=DTYPE, device=device) if s["ac_level"] == 0 else None
         cnt, tgt = _fired_arrival(total_tiles, device)
 
@@ -261,8 +261,7 @@ def main():
         type=int,
         default=0,
         choices=[0, 1, 2],
-        help="kernel_a only: 0 = save preact_a (mD [2I] store); >=1 = skip it "
-        "(production 82ba5b uses moe_ac_level=1). No effect on other kernels.",
+        help="kernel_a only: 0 = save preact_a (mD [2I] store); >=1 = skip it No effect on other kernels.",
     )
     p.add_argument("--tile_m", type=int, default=None)
     p.add_argument("--tile_n_a", type=int, default=None)

@@ -21,7 +21,7 @@ import torch
 from stream_ep import Buffer
 from stream_ep_tests import routing
 from stream_ep_tests.reference import Global
-from stream_ep_tests.utils import DTYPE, H
+from stream_ep_tests.utils import DTYPE, SHAPES
 
 os.environ.setdefault("STREAMEP_DEBUG_PB_DELAY_US", "20000")
 
@@ -102,23 +102,19 @@ def check(handle, inputs: Global, internode: bool):
 
 
 @pytest.mark.parametrize("scenario", routing.SCENARIOS)
-@pytest.mark.parametrize("num_sms", [None, 64])
-def test_metadata(buffer, group, scenario, num_sms):
+@pytest.mark.parametrize("shape", SHAPES)
+def test_metadata(buffers, group, shape, scenario):
     """Back-to-back dispatches with fresh routing, checked after the last one."""
     device = torch.device("cuda", torch.cuda.current_device())
-    saved = Buffer.num_sms
-    Buffer.num_sms = num_sms or saved
-    try:
-        runs = []
-        for seed in range(4):
-            r = routing.SCENARIOS[scenario](group.rank(), group.size(), device, seed=seed)
-            x = torch.randn(r.num_tokens, H, dtype=DTYPE, device=device)
-            _, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)
-            runs.append((handle, x, r))
-        torch.cuda.synchronize()
-        # Gather everything before checking: a rank that fails a check must not skip a later gather.
-        gathered = [(handle, Global.gather(x, r, group)) for handle, x, r in runs]
-        for handle, inputs in gathered:
-            check(handle, inputs, buffer._is_internode())
-    finally:
-        Buffer.num_sms = saved
+    buffer = buffers(shape)
+    runs = []
+    for seed in range(4):
+        r = routing.SCENARIOS[scenario](SHAPES[shape], group.rank(), group.size(), device, seed=seed)
+        x = torch.randn(r.num_tokens, SHAPES[shape].hidden, dtype=DTYPE, device=device)
+        _, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)
+        runs.append((handle, x, r))
+    torch.cuda.synchronize()
+    # Gather everything before checking: a rank that fails a check must not skip a later gather.
+    gathered = [(handle, Global.gather(x, r, group)) for handle, x, r in runs]
+    for handle, inputs in gathered:
+        check(handle, inputs, buffer._is_internode())

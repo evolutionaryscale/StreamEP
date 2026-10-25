@@ -12,16 +12,20 @@ import pytest
 import torch
 
 from stream_ep.stream_moe.kernel_y import streaming_moe_y
-from stream_ep_tests.kernels._common import LAYOUTS, TILE_M, expert_weights, fired, per_expert, randn
-from stream_ep_tests.utils import DTYPE, H, I, assert_rows_close
+from stream_ep_tests.kernels._common import KERNEL_SHAPES, LAYOUTS, TILE_M, configs, expert_weights, fired, per_expert, randn
+from stream_ep_tests.utils import DTYPE, assert_rows_close
 
-# Production: tile_n_y=256 with 2-CTA clusters (stream_moe.py).
-CONFIGS = {"production": {"tile_n": 256, "cluster_n": 2}, "alternate": {"tile_n": 128, "cluster_n": 1}}
 RTOL = 1e-2
 SEQ = 7
 
 
-def run(layout, num_recv, config, num_sms=None):
+@pytest.mark.parametrize("num_sms", [None, 8])
+@pytest.mark.parametrize("config", ["default", "alternate"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_y(shape, layout, config, num_sms):
+    (H, I), layout = KERNEL_SHAPES[shape], LAYOUTS[layout]
+    num_recv = layout.num_slots // 3
     real = layout.real()
     postact = randn(layout.num_slots, I, seed=3)
     postact[~real] = float("nan")
@@ -35,7 +39,6 @@ def run(layout, num_recv, config, num_sms=None):
     remaining, done = k_local.clone(), torch.zeros(num_recv, dtype=torch.int64, device="cuda")
     target = layout.arrival_target()
     tiles = postact.view(layout.total_tiles, TILE_M, I)
-    block_offset = layout.block_offset()
     streaming_moe_y(
         tiles,
         w2,
@@ -44,13 +47,13 @@ def run(layout, num_recv, config, num_sms=None):
         weight,
         remaining,
         done,
-        block_offset,
+        layout.block_offset(),
         fired(target),
         target,
         combine_seq=SEQ,
         tile_m=TILE_M,
         num_sms=num_sms,
-        **CONFIGS[config],
+        **configs("y", H, I)[config],
     )
     torch.cuda.synchronize()
 
@@ -60,11 +63,3 @@ def run(layout, num_recv, config, num_sms=None):
     assert not guarded[0].any() and not guarded[-1].any(), "scatter wrote outside o"
     assert not remaining.any(), "a token's remaining count did not reach zero"
     assert torch.equal(done, torch.where(k_local > 0, SEQ, 0)), "done stamps differ from tokens with slots"
-
-
-@pytest.mark.parametrize("num_sms", [None, 8])
-@pytest.mark.parametrize("config", CONFIGS)
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_kernel_y(layout, config, num_sms):
-    layout = LAYOUTS[layout]
-    run(layout, num_recv=layout.num_slots // 3, config=config, num_sms=num_sms)

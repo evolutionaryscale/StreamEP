@@ -19,7 +19,7 @@ import torch.distributed as dist
 
 from stream_ep import Buffer
 from stream_ep.stream_moe.stream_moe import make_streams
-from stream_ep_tests.utils import DTYPE, H
+from stream_ep_tests.utils import DTYPE, SHAPES
 
 
 def _share_verdict(outcome) -> None:
@@ -63,10 +63,20 @@ def group():
 
 
 @pytest.fixture(scope="session")
-def buffer(group):
-    """One Buffer per session, sized for the production hidden size; tests with
-    smaller hidden sizes fit in it."""
-    return Buffer.sized_for(group, H * DTYPE.itemsize)
+def buffers(group):
+    """``buffers(shape)``: the session's Buffer for a test shape, created on first use.
+
+    A Buffer's internode rings carry slot positions across calls, and the slot
+    size follows the hidden size and top-k, so one Buffer must keep one
+    geometry: each shape gets its own."""
+    cache = {}
+
+    def get(shape: str) -> Buffer:
+        if shape not in cache:
+            cache[shape] = Buffer.sized_for(group, SHAPES[shape].hidden * DTYPE.itemsize)
+        return cache[shape]
+
+    return get
 
 
 @pytest.fixture(scope="session")

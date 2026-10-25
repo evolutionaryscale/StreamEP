@@ -18,21 +18,27 @@ import pytest
 import torch
 
 from stream_ep.stream_moe.kernel_y_bwd import streaming_moe_y_bwd
-from stream_ep_tests.kernels._common import LAYOUTS, TILE_M, expert_weights, fired, per_expert, randn, stream_tiles, warm_up_producer
+from stream_ep_tests.kernels._common import (
+    KERNEL_SHAPES,
+    LAYOUTS,
+    TILE_M,
+    configs,
+    expert_weights,
+    fired,
+    per_expert,
+    randn,
+    stream_tiles,
+    warm_up_producer,
+)
 from stream_ep_tests.reference import swiglu
-from stream_ep_tests.utils import DTYPE, H, I, assert_rows_close, report
+from stream_ep_tests.utils import DTYPE, assert_rows_close, report
 
-# Production: tile_n_y_bwd=192 without clusters (default_tile_config).
-CONFIGS = {"production": {"tile_n": 192}, "alternate": {"tile_n": 128}}
 RTOL = 1e-2
-# dL_dweight is an fp32 dot product over I terms of bf16 inputs: worst-case
-# accumulation error I * 2**-24 of the terms' magnitudes.
-DOT_RTOL = I * 2**-24
 
 
 class Case:
-    def __init__(self, layout):
-        self.layout = layout
+    def __init__(self, layout, H, I):
+        self.layout, self.I = layout, I
         self.real = layout.real()
         self.dL_do = randn(layout.num_slots, H, seed=7)
         self.dL_do[~self.real] = float("inf")
@@ -47,11 +53,24 @@ class Case:
 
     def launch(self, dL_do, count, **kwargs):
         t = self.layout.total_tiles
-        streaming_moe_y_bwd(dL_do, self.w2, self.dswiglu, self.postact, self.weight, self.recv, self.preact.view(t, TILE_M, 2 * I), self.dweight,
-                            self.layout.block_offset(), count, self.target, tile_m=TILE_M, **kwargs)  # fmt: skip
+        streaming_moe_y_bwd(
+            dL_do,
+            self.w2,
+            self.dswiglu,
+            self.postact,
+            self.weight,
+            self.recv,
+            self.preact.view(t, TILE_M, 2 * self.I),
+            self.dweight,
+            self.layout.block_offset(),
+            count,
+            self.target,
+            tile_m=TILE_M,
+            **kwargs,
+        )
 
     def check(self):
-        real = self.real
+        real, I = self.real, self.I
         g = per_expert(self.layout, self.dL_do, self.w2, lambda d, w: d @ w)[real]
         preact = self.preact[real].float().requires_grad_()
         a = swiglu(preact)
@@ -64,30 +83,35 @@ class Case:
         terms = (a * g).detach()
         dot_ratio = (self.dweight[real] - terms.sum(1)).abs() / terms.abs().sum(1)
         report("dL_dweight", dot_ratio.max().item())
-        assert dot_ratio.max() <= DOT_RTOL, f"dL_dweight: slot error {dot_ratio.max():.3e} of its terms' magnitude > {DOT_RTOL:.1e}"
+        # An fp32 dot product over I terms of bf16 inputs: worst-case accumulation error I * 2**-24.
+        assert dot_ratio.max() <= I * 2**-24, f"dL_dweight: slot error {dot_ratio.max():.3e} of its terms' magnitude > {I * 2**-24:.1e}"
         assert not self.dswiglu.view(-1, 2 * I)[~real].any(), "dL_dswiglu_in not zero at padding rows"
         assert not self.postact.view(-1, I)[~real].any(), "postact_a_for_dW2 not zero at padding rows"
 
 
 @pytest.mark.parametrize("num_sms", [None, 8])
-@pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.parametrize("config", ["default", "alternate"])
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_kernel_y_bwd(layout, config, num_sms):
-    case = Case(LAYOUTS[layout])
-    case.launch(case.dL_do, fired(case.target), num_sms=num_sms, **CONFIGS[config])
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_y_bwd(shape, layout, config, num_sms):
+    H, I = KERNEL_SHAPES[shape]
+    case = Case(LAYOUTS[layout], H, I)
+    case.launch(case.dL_do, fired(case.target), num_sms=num_sms, **configs("y_bwd", H, I)[config])
     torch.cuda.synchronize()
     case.check()
 
 
-def test_kernel_y_bwd_streamed_gradients():
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_y_bwd_streamed_gradients(shape):
     """dispatch_grads fills ``dL_do_pool`` while kernel_y_bwd runs, as in the backward pass."""
-    case = Case(LAYOUTS["small"])
+    H, I = KERNEL_SHAPES[shape]
+    case = Case(LAYOUTS["small"], H, I)
     dL_do = torch.full_like(case.dL_do, float("nan"))
     count = torch.zeros_like(case.target)
     warm_up_producer(dL_do, case.dL_do, count, case.target)
     compute, producer = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(compute):
-        case.launch(dL_do, count, num_sms=16, **CONFIGS["production"])
+        case.launch(dL_do, count, num_sms=16, **configs("y_bwd", H, I)["default"])
     with torch.cuda.stream(producer):
         stream_tiles(dL_do, case.dL_do, count, case.target)
     torch.cuda.synchronize()
@@ -97,11 +121,23 @@ def test_kernel_y_bwd_streamed_gradients():
 def test_oversized_tile_raises():
     """A tile too large for y_bwd's four-stage mainloop fails at compile time
     with an actionable message, not as an invalid launch."""
-    E, I_big, tiles = 1, 1024, 1
+    E, H, I, tiles = 1, 4096, 1024, 1  # 256-wide tiles over a large K
     slots = tiles * TILE_M
     z = lambda *s, dtype=DTYPE: torch.zeros(*s, dtype=dtype, device="cuda")  # noqa: E731
     target = torch.zeros(tiles, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="ab_stage=4.*shrink tile_n_y_bwd"):
-        streaming_moe_y_bwd(z(slots, H), z(E, H, I_big), z(tiles, TILE_M, 2 * I_big), z(tiles, TILE_M, I_big), z(slots, dtype=torch.float32),
-                            torch.full((slots,), -1, dtype=torch.int32, device="cuda"), z(tiles, TILE_M, 2 * I_big), z(slots, dtype=torch.float32),
-                            torch.tensor([0, tiles], dtype=torch.int32, device="cuda"), target, target, tile_m=TILE_M, tile_n=256)  # fmt: skip
+        streaming_moe_y_bwd(
+            z(slots, H),
+            z(E, H, I),
+            z(tiles, TILE_M, 2 * I),
+            z(tiles, TILE_M, I),
+            z(slots, dtype=torch.float32),
+            torch.full((slots,), -1, dtype=torch.int32, device="cuda"),
+            z(tiles, TILE_M, 2 * I),
+            z(slots, dtype=torch.float32),
+            torch.tensor([0, tiles], dtype=torch.int32, device="cuda"),
+            target,
+            target,
+            tile_m=TILE_M,
+            tile_n=256,
+        )

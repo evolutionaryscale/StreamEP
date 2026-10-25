@@ -10,20 +10,19 @@ import pytest
 import torch
 
 from stream_ep.stream_moe.kernel_a_bwd import streaming_moe_a_bwd
-from stream_ep_tests.kernels._common import LAYOUTS, TILE_M, expert_weights, fired, per_expert, randn
-from stream_ep_tests.utils import DTYPE, H, I, assert_rows_close
+from stream_ep_tests.kernels._common import KERNEL_SHAPES, LAYOUTS, TILE_M, configs, expert_weights, fired, per_expert, randn
+from stream_ep_tests.utils import DTYPE, assert_rows_close
 
-# Production: tile_n_a_bwd=256 without clusters (default_tile_config).
-CONFIGS = {"production": {"tile_n": 256}, "alternate": {"tile_n": 128}}
 RTOL = 1e-2
 SEQ = 9
 
 
 @pytest.mark.parametrize("num_sms", [None, 8])
-@pytest.mark.parametrize("config", CONFIGS)
+@pytest.mark.parametrize("config", ["default", "alternate"])
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_kernel_a_bwd(layout, config, num_sms):
-    layout = LAYOUTS[layout]
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_a_bwd(shape, layout, config, num_sms):
+    (H, I), layout = KERNEL_SHAPES[shape], LAYOUTS[layout]
     num_recv = layout.num_slots // 3
     real = layout.real()
     grad_in = randn(layout.num_slots, 2 * I, seed=5)
@@ -37,9 +36,20 @@ def test_kernel_a_bwd(layout, config, num_sms):
     remaining, done = k_local.clone(), torch.zeros(num_recv, dtype=torch.int64, device="cuda")
     target = layout.arrival_target()
     tiles = grad_in.view(layout.total_tiles, TILE_M, 2 * I)
-    block_offset = layout.block_offset()
     streaming_moe_a_bwd(
-        tiles, w1, dL_dx, recv, remaining, done, block_offset, fired(target), target, SEQ, tile_m=TILE_M, num_sms=num_sms, **CONFIGS[config]
+        tiles,
+        w1,
+        dL_dx,
+        recv,
+        remaining,
+        done,
+        layout.block_offset(),
+        fired(target),
+        target,
+        SEQ,
+        tile_m=TILE_M,
+        num_sms=num_sms,
+        **configs("a_bwd", H, I)[config],
     )
     torch.cuda.synchronize()
 
