@@ -112,8 +112,8 @@ All suites are pytest, run one session per file by `stream_ep_tests/run.py`
 
 Shared pieces: `routing.py` (the routing scenarios the distributed tests
 sweep), `reference.py` (torch references built from every rank's gathered
-inputs), `conftest.py` (the process group, one `Buffer` and the streams per
-session), `kernels/_common.py` (pool layouts and a tile producer). Tests sweep
+inputs), `conftest.py` (the process group, the streams, and one `Buffer` per
+test shape), `kernels/_common.py` (pool layouts and a tile producer). Tests sweep
 several small shapes chosen to vary the code paths (hidden sizes, top-k,
 experts per rank, tokens per rank) rather than targeting one model's shape;
 keep them small enough that the suites stay fast.
