@@ -113,6 +113,7 @@ from stream_ep.stream_moe.streaming_gemm_base import (
     StreamingGemmBase,
     StreamingTileSchedulerOptions,
 )
+from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +685,7 @@ def streaming_moe_y_bwd(
     I = two_I // 2
     H = dL_do_pool.shape[1]
     E_local = W2.shape[0]
+    assert E_local <= MAX_LOCAL_EXPERTS, f"{E_local} local experts exceed the scheduler's {MAX_LOCAL_EXPERTS}"
     assert W2.shape == (E_local, H, I), f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected {(E_local, H, I)}"
     # tile_n MUST divide the output N dim (= I, the moe_intermediate_size).
     # Non-divisible tile_n produces silently-wrong stores in the data-grad

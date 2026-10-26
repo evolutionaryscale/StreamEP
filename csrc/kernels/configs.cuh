@@ -3,7 +3,10 @@
 #define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
-#define NUM_MAX_LOCAL_EXPERTS 1024
+// Experts per rank. Dispatch tracks a warp's finished experts in 64-bit masks
+// and the streaming GEMM schedulers look experts up in 2 slots of 32 lanes;
+// raising this means widening both.
+#define NUM_MAX_LOCAL_EXPERTS 64
 #define NUM_BUFFER_ALIGNMENT_BYTES 128
 
 #define FINISHED_SUM_TAG 1024

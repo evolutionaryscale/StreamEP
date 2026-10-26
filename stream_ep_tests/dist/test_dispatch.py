@@ -13,9 +13,12 @@ exactly which token landed in which slot. Every routing scenario checks:
   buffers start at zero.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
+from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
 from stream_ep_tests import routing
 from stream_ep_tests.reference import Global
 from stream_ep_tests.utils import DTYPE, SHAPES
@@ -86,3 +89,12 @@ def test_placement_is_deterministic(buffers, group):
     assert torch.equal(a.pool_recv_token, b.pool_recv_token)
     assert torch.equal(a.pool_k_slot, b.pool_k_slot)
     assert torch.equal(a.recv_token_to_slots, b.recv_token_to_slots)
+
+
+def test_too_many_local_experts_raises(buffers, group):
+    shape = replace(SHAPES["small"], num_experts=(MAX_LOCAL_EXPERTS + 1) * group.size())
+    device = torch.device("cuda", torch.cuda.current_device())
+    r = routing.SCENARIOS["uniform"](shape, group.rank(), group.size(), device)
+    x = torch.randn(r.num_tokens, shape.hidden, dtype=DTYPE, device=device)
+    with pytest.raises(RuntimeError, match="num_local_experts <= NUM_MAX_LOCAL_EXPERTS"):
+        buffers("small").dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)

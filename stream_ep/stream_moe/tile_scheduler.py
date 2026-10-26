@@ -67,6 +67,10 @@ from quack.tile_scheduler import PersistenceMode, TileScheduler, WorkTileInfo
 
 from stream_ep.stream_moe.ptx_helpers import ld_acquire_gpu_global_i32
 
+# The expert lookup's reach: 32 lanes x 2 entries each. Matches csrc's
+# NUM_MAX_LOCAL_EXPERTS, which dispatch enforces.
+MAX_LOCAL_EXPERTS = 64
+
 
 @dataclass
 class StreamingTileSchedulerArguments:
@@ -320,10 +324,11 @@ class StreamingTileScheduler(TileScheduler):
             pid_n = cluster_pid_n * Int32(params.cluster_shape_mnk[1])
 
             # Warp-cooperative expert lookup. expert_pool_block_offset has length
-            # E_local + 1 (last entry = total_tiles); kNumExpertsPerLane=2 covers
-            # E_local up to 63. Out-of-range slots get INT_MAX so they never
+            # E_local + 1 (last entry = total_tiles); kNumExpertsPerLane entries per
+            # lane cover E_local up to MAX_LOCAL_EXPERTS (cum[E_local] itself is never
+            # needed). Out-of-range slots get INT_MAX so they never
             # match; cum[E_local]=total_tiles never matches since tile_id < it.
-            kNumExpertsPerLane = const_expr(2)
+            kNumExpertsPerLane = const_expr(MAX_LOCAL_EXPERTS // 32)
             num_local_experts = cute.size(params.expert_pool_block_offset, mode=[0]) - Int32(1)
             lane_idx = cute.arch.lane_idx()
             INF = Int32(0x7FFFFFFF)

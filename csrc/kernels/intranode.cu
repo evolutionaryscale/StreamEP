@@ -17,11 +17,9 @@ namespace intranode {
 constexpr int kReceiverChunkSize = 32;
 
 // Compile-time bounds for the streaming dispatch path. All three derive from
-// "must fit in a 32-lane warp": E_local indexes per-(c, src, e) SMEM slots that
-// lane 0 walks unrolled; topk and ranks both index lane masks (uint32 dst_mask
-// in the metadata kernel, lane-as-rank patterns in the dispatch / combine
-// kernels). Increase only if the kernel logic is widened correspondingly.
-constexpr int kMaxLocalExpertsPerRank = 64;
+// "must fit in a 32-lane warp": topk and ranks both index lane masks (uint32
+// dst_mask in the metadata kernel, lane-as-rank patterns in the dispatch /
+// combine kernels). Increase only if the kernel logic is widened correspondingly.
 constexpr int kMaxTopK = 32;
 constexpr int kMaxRanks = 32;
 
@@ -663,11 +661,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_main_kernel(DispatchP
 
     int num_experts_per_rank = shape.num_experts / kNumRanks;
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 and shape.num_topk > 0);
-    // Pool-layout SMEM scratch is sized by E_local at runtime; a compile-time
-    // upper bound keeps the receiver-block per-(chunk, k) slot computation
-    // unrolled. The 32-lane bound covers any practical MoE: even Mixtral-style
-    // routing has num_experts_per_rank well under 32 at world_size ≥ 8.
-    EP_DEVICE_ASSERT(num_experts_per_rank <= kMaxLocalExpertsPerRank);
+    EP_DEVICE_ASSERT(num_experts_per_rank <= NUM_MAX_LOCAL_EXPERTS);
     EP_DEVICE_ASSERT(shape.num_topk <= kMaxTopK);
     EP_DEVICE_ASSERT((inputs.topk_idx == nullptr) == (inputs.topk_weights == nullptr));
 
@@ -1214,7 +1208,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_grads_main_kernel(
 
     int num_experts_per_rank = shape.num_experts / kNumRanks;
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 and shape.num_topk > 0);
-    EP_DEVICE_ASSERT(num_experts_per_rank <= kMaxLocalExpertsPerRank);
+    EP_DEVICE_ASSERT(num_experts_per_rank <= NUM_MAX_LOCAL_EXPERTS);
     EP_DEVICE_ASSERT(shape.num_topk <= kMaxTopK);
 
     // Channel buffer pointers — same IPC slab layout as fwd dispatch (both

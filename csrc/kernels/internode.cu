@@ -2050,6 +2050,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         // 2D bookkeeping. Use kNumRDMARanks bitmasks of E_local bits each;
         // since NUM_MAX_LOCAL_EXPERTS = 64 and kNumRDMARanks ≤ 16, this is
         // a uint64_t[kNumRDMARanks] register array.
+        static_assert(NUM_MAX_LOCAL_EXPERTS <= 64, "completed_mask holds one bit per local expert");
         uint64_t completed_mask[kNumRDMARanks] = {0};
 
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
@@ -3325,6 +3326,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
         // Eager Pass 2 fire dedup mask, per-src_rdma_rank (see fwd dispatch
         // for the rationale comment).
+        static_assert(NUM_MAX_LOCAL_EXPERTS <= 64, "completed_mask holds one bit per local expert");
         uint64_t completed_mask[kNumRDMARanks] = {0};
 
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
