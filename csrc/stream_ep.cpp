@@ -2107,6 +2107,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens") = 256,
              py::arg("num_max_rdma_chunked_send_tokens") = 6,
              py::arg("num_max_rdma_chunked_recv_tokens") = 256)
+        .def_readonly("num_sms", &stream_ep::Config::num_sms)
+        .def_readonly("num_max_nvl_chunked_send_tokens", &stream_ep::Config::num_max_nvl_chunked_send_tokens)
+        .def_readonly("num_max_nvl_chunked_recv_tokens", &stream_ep::Config::num_max_nvl_chunked_recv_tokens)
+        .def_readonly("num_max_rdma_chunked_send_tokens", &stream_ep::Config::num_max_rdma_chunked_send_tokens)
+        .def_readonly("num_max_rdma_chunked_recv_tokens", &stream_ep::Config::num_max_rdma_chunked_recv_tokens)
         .def("get_nvl_buffer_size_hint", &stream_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &stream_ep::Config::get_rdma_buffer_size_hint);
 

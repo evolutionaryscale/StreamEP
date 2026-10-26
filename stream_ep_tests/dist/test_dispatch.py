@@ -23,11 +23,11 @@ from stream_ep_tests.utils import DTYPE, SHAPES
 TILE_M = 128
 
 
-def dispatch(buffer, group, shape, scenario, seed=0):
+def dispatch(buffer, group, shape, scenario, seed=0, config=None):
     device = torch.device("cuda", torch.cuda.current_device())
     r = routing.SCENARIOS[scenario](SHAPES[shape], group.rank(), group.size(), device, seed=seed)
     x = torch.randn(r.num_tokens, SHAPES[shape].hidden, dtype=DTYPE, device=device)
-    pool, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M)
+    pool, handle, _ = buffer.dispatch(x, *r.dispatch_args(), r.num_experts, tile_m=TILE_M, config=config)
     torch.cuda.synchronize()
     return pool, handle, Global.gather(x, r, group)
 

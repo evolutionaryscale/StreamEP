@@ -11,6 +11,14 @@ import stream_ep_cpp
 from stream_ep_cpp import Config, EventHandle
 from .utils import check_nvlink_connections
 
+_CONFIG_FIELDS = (
+    "num_sms",
+    "num_max_nvl_chunked_send_tokens",
+    "num_max_nvl_chunked_recv_tokens",
+    "num_max_rdma_chunked_send_tokens",
+    "num_max_rdma_chunked_recv_tokens",
+)
+
 
 @dataclass
 class StreamingHandle:
@@ -263,6 +271,7 @@ class Buffer:
         # dispatch when caller passes ``dispatch_seq=None``; explicit
         # override still supported for tests.
         self._next_seq = 0
+        self._layouts: dict[str, dict[str, int]] = {}
 
     def destroy(self):
         """
@@ -491,6 +500,25 @@ class Buffer:
         assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         return config_map[num_ranks]
 
+    def _check_layout(self, rings: str, x: torch.Tensor, num_topk: int, config: Config) -> None:
+        """Pin the token geometry, and the config of ``rings`` ("dispatch" or
+        "combine"), to their first call; raise if a later call changes either.
+
+        The internode rings keep cumulative head/tail cursors across calls at
+        offsets set by the bytes per token, ``num_topk`` and the config, and
+        each region is placed after the previous one by those same sizes. A
+        call that changed any of them would read old ring data as cursors, so a
+        Buffer serves one geometry.
+        """
+        layouts = {
+            "token geometry": {"hidden_bytes": x.shape[1] * x.element_size(), "num_topk": num_topk},
+            f"{rings} config": {field: getattr(config, field) for field in _CONFIG_FIELDS},
+        }
+        for name, layout in layouts.items():
+            first = self._layouts.setdefault(name, layout)
+            if layout != first:
+                raise ValueError(f"Buffer {name} changed from {first} to {layout}; use one Buffer per geometry")
+
     @classmethod
     def sized_for(cls, group: dist.ProcessGroup, hidden_bytes: int) -> "Buffer":
         """A Buffer whose NVL / RDMA regions fit dispatch and combine of
@@ -572,6 +600,7 @@ class Buffer:
                 against dispatch main.
         """
         config = self.get_dispatch_config(self.group_size) if config is None else config
+        self._check_layout("dispatch", x, topk_idx.shape[1], config)
 
         if dispatch_seq is None:
             self._next_seq += 1
@@ -661,6 +690,7 @@ class Buffer:
 
         TK_padded = handle.TK_padded  # was handle.pool.shape[0]; decoupled so pool can be dropped post-fwd
         num_topk = handle.recv_token_to_slots.shape[1]
+        self._check_layout("dispatch", dL_dy, num_topk, config)
         num_local_experts = handle.expert_frequency.shape[0]
         num_experts = num_local_experts * self.group_size
 
@@ -721,6 +751,7 @@ class Buffer:
         shared, gated by ``is_fwd``.
         """
         config = self.get_combine_config(self.group_size) if config is None else config
+        self._check_layout("combine", x, handle.recv_token_to_slots.shape[1], config)
         seq = handle.dispatch_seq if combine_seq is None else combine_seq
 
         if self._is_internode():
@@ -794,6 +825,7 @@ class Buffer:
                 dL_dtopk_weights: ``[num_tokens, num_topk]`` fp32
         """
         config = self.get_combine_config(self.group_size) if config is None else config
+        self._check_layout("combine", dL_dx_per_r, handle.recv_token_to_slots.shape[1], config)
         seq = handle.dispatch_seq if dispatch_seq is None else dispatch_seq
 
         if self._is_internode():
