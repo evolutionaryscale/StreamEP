@@ -3,15 +3,15 @@ per-kernel summary table parsed from the profiler's in-memory event
 aggregator.
 
 This is the source of truth for collective-kernel per-call timing
-(dispatch / dispatch_grads / combine / combine_grads): the collective ops
-need natural per-iter slack to satisfy the single-slot `rdma_channel_meta`
-protocol, which the full fwd+bwd pipeline provides but a rapid-fire bench
-loop does not. It also reports end-to-end overlap savings and peak memory.
+(dispatch / dispatch_grads / combine / combine_grads), measured inside the
+full fwd+bwd pipeline rather than a rapid-fire loop of one collective, so each
+call sees the slack and SM contention it has in training. It also reports
+end-to-end overlap savings and peak memory.
 
 What you should see in the resulting chrome trace
 -------------------------------------------------
-- `communicate stream`: dispatch_metadata → host poll → tile_arrays_init
-  → dispatch main → combine. Combine FIFOs after dispatch, but waits on
+- `communicate stream`: dispatch metadata → host poll → dispatch main →
+  combine. Combine FIFOs after dispatch, but waits on
   a torch.cuda.Event recorded on the compute stream so kernel Y wins the
   SM race.
 - `compute stream`: streaming_moe_a → streaming_moe_y. Same-stream FIFO
@@ -22,11 +22,11 @@ What you should see in the resulting chrome trace
 
 Launch
 ------
-    torchrun --nproc_per_node=2 \\
+    torchrun --nproc_per_node=8 \\
         -m stream_ep_bench.profile_pipeline \\
         [--profile_dir /path/to/profiles]
 
-Default --profile_dir is `/tmp/stream_moe_profile_<SLURM_JOB_ID-or-pid>/`.
+Default --profile_dir is `/tmp/stream_moe_profile_<YYYYmmdd_HHMMSS>/`.
 Trace files land per-rank in that directory. Open the .json with
 chrome://tracing or point TensorBoard at the dir.
 """
@@ -39,8 +39,8 @@ import torch
 import torch.distributed as torch_dist
 import torch.profiler
 from stream_ep import Buffer as StreamEPBuffer
-import stream_ep_tests.utils as test_utils
-from stream_ep_tests.utils import DTYPE, SEQ_LEN_PER_RANK, H
+import stream_ep_bench as defaults
+from stream_ep_bench import DTYPE, SEQ_LEN_PER_RANK, H
 
 from stream_ep.stream_moe.stream_moe import (
     TileConfig,
@@ -50,9 +50,7 @@ from stream_ep.stream_moe.stream_moe import (
 )
 
 
-# torchrun-driven distributed helpers. Kept here so smoke_pipeline /
-# validate_multi_iter can reuse them by importing from
-# profile_pipeline.
+# torchrun-driven distributed helpers, shared with nsys_pipeline.
 def init_distributed() -> torch.device:
     """Init NCCL process group from torchrun env vars; return the local cuda device."""
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -79,17 +77,6 @@ def rank_zero_print(*args, **kwargs) -> None:
     if torch_dist.is_initialized() and torch_dist.get_rank() != 0:
         return
     print(*args, **kwargs)
-
-
-def rank_zero_only(fn):
-    """Decorator: only rank 0 actually executes; other ranks return None."""
-
-    def wrapper(*args, **kwargs):
-        if torch_dist.is_initialized() and torch_dist.get_rank() != 0:
-            return None
-        return fn(*args, **kwargs)
-
-    return wrapper
 
 
 def make_uniform_topk_idx(n_tokens, topk, num_experts, rank, device):
@@ -177,18 +164,18 @@ def main():
     )
     p.add_argument("--num_sms", type=int, default=None, help="StreamEP num_sms override; default = Buffer auto-pick.")
     p.add_argument("--seq_len", type=int, default=SEQ_LEN_PER_RANK)
-    # MoE shape overrides — default to the 82ba5b prod shape (H=3072 I=768
-    # E=256 K=8), so the profile runs at the real GEMM size (2I·H) that
+    # MoE shape overrides — default to the stream_ep_bench profiling shape
+    # (H=3072 I=768 E=256 K=8), so the profile runs at a GEMM size (2I·H) that
     # determines whether the bwd preact_a recompute hides behind
     # dispatch_grads' comm. Pass flags for a different shape, e.g. the esm4
     # 18.6B: --hidden 2048 --intermediate 384 --num_experts 384 --topk 13.
-    # Defaults come via globals() because main() rebinds H/I/NUM_EXPERTS/TOPK
-    # as locals below — a bare `default=H` would be an UnboundLocalError on
-    # that soon-to-be-local name.
-    p.add_argument("--hidden", type=int, default=test_utils.H, help="d_model H (default: 82ba5b 3072)")
-    p.add_argument("--intermediate", type=int, default=test_utils.I, help="per-expert I (default: 82ba5b 768)")
-    p.add_argument("--num_experts", type=int, default=test_utils.NUM_EXPERTS, help="total experts E (default: 82ba5b 256)")
-    p.add_argument("--topk", type=int, default=test_utils.TOPK, help="top-k K (default: 82ba5b 8)")
+    # Defaults read through the module (defaults.H, ...) because main()
+    # rebinds H/I/NUM_EXPERTS/TOPK as locals below; a bare `default=H` would
+    # be an UnboundLocalError on that soon-to-be-local name.
+    p.add_argument("--hidden", type=int, default=defaults.H, help="d_model H")
+    p.add_argument("--intermediate", type=int, default=defaults.I, help="per-expert I")
+    p.add_argument("--num_experts", type=int, default=defaults.NUM_EXPERTS, help="total experts E")
+    p.add_argument("--topk", type=int, default=defaults.TOPK, help="top-k K")
     p.add_argument("--num_sms_a", type=int, default=None)
     p.add_argument("--num_sms_y", type=int, default=None)
     p.add_argument("--num_sms_a_bwd", type=int, default=None)
@@ -575,7 +562,7 @@ def main():
         print(f"  buffer.combine:                          {fwd_combine_us:7.1f} μs")
         print(f"    combine_main_kernel:                   {combine_kernel_us:7.1f} μs")
         print(f"  fwd serial sum of stages:                {fwd_serial_us:7.1f} μs")
-        print(f"  fwd e2e (4 streams, real overlap):       {fwd_e2e_us:7.1f} μs")
+        print(f"  fwd e2e (2 streams, real overlap):       {fwd_e2e_us:7.1f} μs")
         print(f"  fwd overlap saved:                       {pct_saved(fwd_serial_us, fwd_e2e_us)}")
         print()
         print(f"  buffer.dispatch_grads:                   {dispatch_grads_us:7.1f} μs")

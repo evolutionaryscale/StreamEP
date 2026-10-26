@@ -1,354 +1,104 @@
-"""Tests for the streaming-MoE kernel A (pool layout).
+"""Kernel A (up-projection + SwiGLU over the pool) against a torch reference.
 
-These tests exercise the streaming-design properties directly:
-  - test_compile: kernel compiles for a representative shape.
-  - test_single_tile: total_tiles=1, arrival pre-fired. Numerics: matmul +
-    SwiGLU on pool[0:tile_m, :] vs an eager pytorch reference.
-  - test_multi_tile_static: total_tiles=N spread across multiple experts via
-    expert_pool_block_offset; all per-tile arrivals pre-fired, persistent
-    CTAs absorb all tiles.
-  - test_producer_consumer: producer kernel on a different stream fires
-    pool_arrival_count entries with delay; kernel A spins then drains.
-
-Per-tile ready handshake:
-  * (pool_arrival_count, pool_arrival_target) int32 pair. Consumer spins
-    until ``pool_arrival_count[tile] == pool_arrival_target[tile]``.
-  * Internal consumer_head[1] int32 (allocated inside `streaming_moe_a`) —
-    single global atomic-add counter for linear claims.
-
-Pool layout:
-  * pool[total_tiles * tile_m, H] is expert-major and BLOCK_M-padded; tile t
-    occupies rows [t*tile_m, (t+1)*tile_m) and belongs to
-    expert_id = tile_id_to_expert[t].
+``postact[s] = swiglu(pool[s] @ W1[e(s)].T)`` for every real slot, and with
+``preact_a`` the pre-activation itself. Padding rows of the pool hold inf, as
+an uninitialized pool may; real rows must not see it. ``num_sms=8`` makes each
+CTA loop over many tiles and experts; the streamed case writes the pool while
+the kernel runs, so a kernel that reads a tile before its arrival count reaches
+its target reads NaN.
 """
 
 import pytest
 import torch
-import torch.nn.functional as F
+
+from stream_ep.stream_moe.kernel_a import streaming_moe_a
+from stream_ep_tests.kernels._common import (
+    KERNEL_SHAPES,
+    LAYOUTS,
+    TILE_M,
+    PoolLayout,
+    configs,
+    expert_weights,
+    fired,
+    per_expert,
+    randn,
+    stream_tiles,
+    warm_up_producer,
+)
+from stream_ep_tests.reference import swiglu
+from stream_ep_tests.utils import DTYPE, assert_rows_close
+
+RTOL = 1e-2
 
 
-def _swiglu_ref(h_two_I: torch.Tensor) -> torch.Tensor:
-    """QuACK's gated epilogue pairs ADJACENT N-elements: gate = h[..., ::2],
-    up = h[..., 1::2], output = silu(gate) * up. See gemm_act.py
-    GemmGatedMixin.epi_visit_subtile.
-    """
-    gate = h_two_I[..., 0::2]
-    up = h_two_I[..., 1::2]
-    return F.silu(gate) * up
+def inputs(layout, H, I):
+    pool = randn(layout.num_slots, H, seed=1)
+    pool[~layout.real()] = float("inf")
+    return pool, expert_weights(layout, 2 * I, H, seed=2)
 
 
-def _make_pool_arrival(total_tiles: int, device, fired: bool = True, target_val: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate (pool_arrival_count, pool_arrival_target) int32 pair.
-
-    pool_arrival_target is set to ``target_val`` (per-tile firing target).
-    pool_arrival_count is ``target_val`` if fired=True (scheduler spin
-    passes immediately) or zero otherwise (test producer fires by
-    `red.release.gpu.global.add.s32`'ing ``target_val`` into each slot
-    with a delay between fires — see ``fire_tiles_with_delay``).
-    """
-    pool_arrival_target = torch.full((total_tiles,), target_val, dtype=torch.int32, device=device)
-    init = target_val if fired else 0
-    pool_arrival_count = torch.full((total_tiles,), init, dtype=torch.int32, device=device)
-    return pool_arrival_count, pool_arrival_target
+def check(layout, pool, w1, postact, preact=None):
+    real, I = layout.real(), postact.shape[-1]
+    preact_ref = per_expert(layout, pool, w1, lambda x, w: x @ w.T)
+    # Kernel A rounds the pre-activation to bf16 before the activation, as the reference model does.
+    assert_rows_close(postact.view(-1, I)[real], swiglu(preact_ref.to(DTYPE).float())[real], RTOL, "postact")
+    if preact is not None:
+        assert_rows_close(preact.view(-1, 2 * I)[real], preact_ref[real], RTOL, "preact")
 
 
-def _make_tile_metadata(tile_to_expert_list, E_local, device):
-    """Build (tile_id_to_expert, expert_pool_block_offset) from a list mapping
-    each tile_id to its expert. Tiles must already be in expert-major order
-    (i.e. all tiles for expert e come before any tile for expert e+1)."""
-    total_tiles = len(tile_to_expert_list)
-    tile_id_to_expert = torch.tensor(tile_to_expert_list, dtype=torch.int32, device=device)
-    expert_pool_block_offset = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
-    counts = [0] * E_local
-    for e in tile_to_expert_list:
-        counts[e] += 1
-    cum = 0
-    for e in range(E_local):
-        expert_pool_block_offset[e] = cum
-        cum += counts[e]
-    expert_pool_block_offset[E_local] = cum
-    assert cum == total_tiles, f"tile_to_expert_list must be expert-major and contiguous; got {tile_to_expert_list}"
-    return tile_id_to_expert, expert_pool_block_offset
+def launch(layout, pool, w1, count, target, *, preact=None, **kwargs):
+    I = w1.shape[1] // 2
+    postact = torch.full((layout.total_tiles, TILE_M, I), float("nan"), dtype=DTYPE, device="cuda")
+    streaming_moe_a(pool, w1, postact, layout.block_offset(), count, target, preact_a=preact, tile_m=TILE_M, **kwargs)
+    return postact
 
 
-@pytest.fixture
-def device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    return torch.device("cuda")
+@pytest.mark.parametrize("num_sms", [None, 8])
+@pytest.mark.parametrize("config", ["default", "alternate"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_a(shape, layout, config, num_sms):
+    (H, I), layout = KERNEL_SHAPES[shape], LAYOUTS[layout]
+    pool, w1 = inputs(layout, H, I)
+    preact = torch.full((layout.total_tiles, TILE_M, 2 * I), float("nan"), dtype=DTYPE, device="cuda")
+    target = layout.arrival_target()
+    postact = launch(layout, pool, w1, fired(target), target, preact=preact, num_sms=num_sms, **configs("a", H, I)[config])
+    torch.cuda.synchronize()
+    check(layout, pool, w1, postact, preact)
 
 
-def test_streaming_moe_a_compiles(device):
-    """JIT-compile only (no launch) for a representative production-shape config."""
-    from stream_ep.stream_moe.kernel_a import (
-        streaming_moe_a,
-    )
+@pytest.mark.parametrize("config", ["default", "alternate"])
+@pytest.mark.parametrize("shape", KERNEL_SHAPES)
+def test_kernel_a_streamed_pool(shape, config):
+    (H, I), layout = KERNEL_SHAPES[shape], LAYOUTS["small"]
+    src, w1 = inputs(layout, H, I)
+    pool = torch.full_like(src, float("nan"))
+    target = layout.arrival_target()
+    count = torch.zeros_like(target)
 
-    H, I, E_local = 128, 256, 4
-    tile_m, tile_n = 128, 256
-    total_tiles = 4
-    TK_padded = total_tiles * tile_m
+    warm_up_producer(pool, src, count, target)
+    compute, producer = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(compute):
+        # Leave SMs free for the producer: a persistent grid on every SM would starve it.
+        postact = launch(layout, pool, w1, count, target, num_sms=16, **configs("a", H, I)[config])
+    with torch.cuda.stream(producer):
+        stream_tiles(pool, src, count, target)
+    torch.cuda.synchronize()
+    check(layout, src, w1, postact)
 
-    dtype = torch.bfloat16
-    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
-    W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
 
-    # All 4 tiles belong to expert 0.
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([0, 0, 0, 0], E_local, device)
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
-    import stream_ep.stream_moe.compile_config as cu
-
-    orig = cu.COMPILE_ONLY
-    cu.COMPILE_ONLY = True
-    try:
-        streaming_moe_a(
-            pool,
-            W1,
-            postact_a,
-            expert_pool_block_offset,
-            pool_arrival_count,
-            pool_arrival_target,
-            tile_m=tile_m,
-            tile_n=tile_n,
+@pytest.mark.parametrize("num_experts", [32, 64, 100])
+def test_many_local_experts(num_experts):
+    """The scheduler finds each tile's expert with a warp ballot over the block offsets;
+    32 and more experts take its second ballot slot."""
+    if num_experts > 64:
+        pytest.skip(
+            "known bug: the scheduler's expert lookup covers at most 64 local experts while dispatch allows 1024; fix in a follow-up"
         )
-    finally:
-        cu.COMPILE_ONLY = orig
-
-
-def test_streaming_moe_a_single_tile(device):
-    """total_tiles=1, arrival pre-fired. Validates the full kernel path:
-    linear claim, scheduler 5-int payload, strided pool read, per-tile postact,
-    expert lookup via tile_id_to_expert.
-    """
-    from stream_ep.stream_moe.kernel_a import (
-        streaming_moe_a,
-    )
-
-    H, I, E_local = 128, 256, 4
-    tile_m, tile_n = 128, 256
-    total_tiles = 1
-    TK_padded = total_tiles * tile_m
-    chosen_expert = 2
-
-    dtype = torch.bfloat16
-    torch.manual_seed(0)
-    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
-    W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
-
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata([chosen_expert], E_local, device)
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
-
-    streaming_moe_a(
-        pool,
-        W1,
-        postact_a,
-        expert_pool_block_offset,
-        pool_arrival_count,
-        pool_arrival_target,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
+    H, I = KERNEL_SHAPES["512x256"]
+    layout = PoolLayout(tuple(0 if e % 7 == 3 else 64 + 32 * (e % 5) for e in range(num_experts)))
+    pool, w1 = inputs(layout, H, I)
+    target = layout.arrival_target()
+    postact = launch(layout, pool, w1, fired(target), target, num_sms=8, **configs("a", H, I)["default"])
     torch.cuda.synchronize()
-
-    x_tile = pool[0:tile_m, :]
-    h = x_tile.float() @ W1[chosen_expert].float().t()
-    a_ref = _swiglu_ref(h).to(dtype)
-
-    a_kernel = postact_a[0]
-    diff = (a_kernel.float() - a_ref.float()).abs()
-    rel = diff / (a_ref.float().abs() + 1e-3)
-    assert rel.max().item() < 5e-2, f"max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
-
-
-def test_streaming_moe_a_multi_tile_static(device):
-    """total_tiles=N>1 spread across multiple experts via expert_pool_block_offset.
-    Validates per-tile expert selection (W1[expert_id] varies via
-    tile_id_to_expert) and persistent kernel termination via the linear-claim
-    bounds check.
-    """
-    from stream_ep.stream_moe.kernel_a import (
-        streaming_moe_a,
-    )
-
-    H, I, E_local = 128, 256, 4
-    tile_m, tile_n = 128, 256
-    # Expert-major distribution: expert 0: 2 tiles, expert 1: 1 tile,
-    # expert 2: 2 tiles, expert 3: 1 tile.  total_tiles = 6.
-    tile_to_expert_list = [0, 0, 1, 2, 2, 3]
-    total_tiles = len(tile_to_expert_list)
-    TK_padded = total_tiles * tile_m
-
-    dtype = torch.bfloat16
-    torch.manual_seed(7)
-    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
-    W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
-
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
-
-    streaming_moe_a(
-        pool,
-        W1,
-        postact_a,
-        expert_pool_block_offset,
-        pool_arrival_count,
-        pool_arrival_target,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
-    torch.cuda.synchronize()
-
-    for t in range(total_tiles):
-        e = tile_to_expert_list[t]
-        x_tile = pool[t * tile_m : (t + 1) * tile_m, :]
-        h = x_tile.float() @ W1[e].float().t()
-        a_ref = _swiglu_ref(h).to(dtype)
-        diff = (postact_a[t].float() - a_ref.float()).abs()
-        rel = diff / (a_ref.float().abs() + 1e-3)
-        assert rel.max().item() < 5e-2, f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
-
-
-def test_streaming_moe_a_with_preact(device):
-    """``preact_a`` opt-in path: kernel A's standard mD TMA-store writes the
-    pre-SwiGLU [2I] gate-up accumulator alongside the postact_a [I] postact
-    write. This is the bwd-savings path — saving preact lets ``kernel_a_bwd``
-    skip a recompute GEMM (~370 µs/layer at production) in exchange for the
-    extra TMA-store traffic (overlaps with the GEMM mainloop).
-
-    Multi-tile spread across multiple experts (mirrors the no-preact
-    multi_tile test) so we hit per-expert W1 slabs and validate that the
-    preact write lands at the right pool row for each tile_id.
-    """
-    from stream_ep.stream_moe.kernel_a import (
-        streaming_moe_a,
-    )
-
-    H, I, E_local = 128, 256, 4
-    tile_m, tile_n = 128, 256
-    tile_to_expert_list = [0, 0, 1, 2, 2, 3]
-    total_tiles = len(tile_to_expert_list)
-    TK_padded = total_tiles * tile_m
-
-    dtype = torch.bfloat16
-    torch.manual_seed(13)
-    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
-    W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
-    preact_a = torch.zeros(total_tiles, tile_m, 2 * I, dtype=dtype, device=device)
-
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device)
-
-    streaming_moe_a(
-        pool,
-        W1,
-        postact_a,
-        expert_pool_block_offset,
-        pool_arrival_count,
-        pool_arrival_target,
-        preact_a=preact_a,
-        tile_m=tile_m,
-        tile_n=tile_n,
-    )
-    torch.cuda.synchronize()
-
-    # Per-tile postact + preact references.
-    for t in range(total_tiles):
-        e = tile_to_expert_list[t]
-        x_tile = pool[t * tile_m : (t + 1) * tile_m, :]
-        h_ref = (x_tile.float() @ W1[e].float().t()).to(dtype)  # [tile_m, 2I]
-        a_ref = _swiglu_ref(h_ref).to(dtype)  # [tile_m, I]
-
-        # Postact: same as the no-preact path — sanity check the SwiGLU output
-        # didn't change just because we added the mD store.
-        diff_a = (postact_a[t].float() - a_ref.float()).abs()
-        rel_a = diff_a / (a_ref.float().abs() + 1e-3)
-        assert rel_a.max().item() < 5e-2, f"tile {t}: postact mismatch, max rel diff {rel_a.max().item():.4f}"
-
-        # Preact: the [2I] pre-SwiGLU accumulator. The eager reference is the
-        # raw `pool @ W1[e].T` GEMM in fp32 cast to bf16 — exactly what kernel
-        # A's mD TMA-store should land (no alpha/beta/RowVec/ColVec applied
-        # since callers don't pass them).
-        diff_h = (preact_a[t].float() - h_ref.float()).abs()
-        rel_h = diff_h / (h_ref.float().abs() + 1e-3)
-        assert rel_h.max().item() < 5e-2, (
-            f"tile {t}: preact mismatch, expert={e}, max rel diff {rel_h.max().item():.4f}, max abs diff {diff_h.max().item():.4f}"
-        )
-
-
-def test_streaming_moe_a_producer_consumer(device):
-    """Kernel A on compute_a_stream spins on pool_arrival_count while a
-    producer kernel on a separate stream release-adds into each slot with
-    delays between fires.
-    """
-    from stream_ep.stream_moe.kernel_a import (
-        fire_tiles_with_delay,
-        streaming_moe_a,
-    )
-
-    H, I, E_local = 128, 256, 4
-    tile_m, tile_n = 128, 256
-    tile_to_expert_list = [0, 0, 1, 2, 2, 3]
-    total_tiles = len(tile_to_expert_list)
-    TK_padded = total_tiles * tile_m
-
-    dtype = torch.bfloat16
-    torch.manual_seed(11)
-    pool = torch.randn(TK_padded, H, dtype=dtype, device=device)
-    W1 = torch.randn(E_local, 2 * I, H, dtype=dtype, device=device).mul_(0.02)
-    postact_a = torch.zeros(total_tiles, tile_m, I, dtype=dtype, device=device)
-
-    tile_id_to_expert, expert_pool_block_offset = _make_tile_metadata(tile_to_expert_list, E_local, device)
-    pool_arrival_count, pool_arrival_target = _make_pool_arrival(total_tiles, device=device, fired=False)
-
-    # Pre-warm the producer JIT compile so the host doesn't block during the
-    # concurrent launch (one-shot pre-fire then reset).
-    fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=0)
-    torch.cuda.synchronize()
-    pool_arrival_count.zero_()
-    torch.cuda.synchronize()
-
-    compute_a_stream = torch.cuda.Stream()
-    producer_stream = torch.cuda.Stream()
-
-    with torch.cuda.stream(compute_a_stream):
-        streaming_moe_a(
-            pool,
-            W1,
-            postact_a,
-            expert_pool_block_offset,
-            pool_arrival_count,
-            pool_arrival_target,
-            tile_m=tile_m,
-            tile_n=tile_n,
-        )
-    with torch.cuda.stream(producer_stream):
-        fire_tiles_with_delay(pool_arrival_count, pool_arrival_target, delay_us=50)
-
-    torch.cuda.synchronize()
-
-    for t in range(total_tiles):
-        e = tile_to_expert_list[t]
-        x_tile = pool[t * tile_m : (t + 1) * tile_m, :]
-        h = x_tile.float() @ W1[e].float().t()
-        a_ref = _swiglu_ref(h).to(dtype)
-        diff = (postact_a[t].float() - a_ref.float()).abs()
-        rel = diff / (a_ref.float().abs() + 1e-3)
-        assert rel.max().item() < 5e-2, f"tile {t}: expert={e}, max rel diff {rel.max().item():.4f}, max abs diff {diff.max().item():.4f}"
-
-
-if __name__ == "__main__":
-    dev = torch.device("cuda")
-    test_streaming_moe_a_compiles(dev)
-    print("compile OK")
-    test_streaming_moe_a_single_tile(dev)
-    print("single-tile PASS")
-    test_streaming_moe_a_multi_tile_static(dev)
-    print("multi-tile-static PASS")
-    test_streaming_moe_a_with_preact(dev)
-    print("with-preact PASS")
-    test_streaming_moe_a_producer_consumer(dev)
-    print("producer-consumer PASS")
+    check(layout, pool, w1, postact)

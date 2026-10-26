@@ -1,79 +1,72 @@
-import torch
-import torch.distributed as dist
-from typing import Optional
+import os
+from dataclasses import dataclass
 
-# The 82ba5b production MoE shape (82B total / 4.3B active): d_model H, per-expert
-# intermediate I, E experts, top-K routing, tokens per rank. Shared by the
-# production-shape tests and the stream_ep_bench harnesses.
-H = 3072
-I = 768
-NUM_EXPERTS = 256
-SEQ_LEN_PER_RANK = 8192
-TOPK = 8
+import torch
+
 DTYPE = torch.bfloat16
 
 
-def cleanup_dist():
-    # Sync all ranks then tear down so the TCPStore client closes in lockstep.
-    # Without the barrier, rank 0 exits first and the others' heartbeat monitor
-    # logs a (harmless but loud) "recvBytes ... Connection was likely closed".
-    if dist.is_initialized():
-        dist.barrier(device_ids=[torch.cuda.current_device()])
-        dist.destroy_process_group()
+@dataclass(frozen=True)
+class Shape:
+    hidden: int
+    intermediate: int  # per expert
+    num_experts: int  # across all ranks
+    topk: int
+    tokens: int  # per rank
 
 
-def make_inputs(
-    num_tokens: int,
-    hidden: int,
-    num_topk: int,
-    num_experts: int,
-    num_ranks: int,
-    rank: int,
-    device: torch.device,
-    *,
-    seed: int = 123,
-    x_kind: str = "rank_tag",
-    plant_sentinels: bool = False,
-    sentinel_p: float = 0.05,
-    plant_empty_expert: Optional[int] = None,
-):
-    """Standard per-rank dispatch/combine test inputs.
+# Small shapes that each vary a code path; tests sweep all of them.
+SHAPES = {
+    "small": Shape(hidden=512, intermediate=256, num_experts=64, topk=4, tokens=512),
+    # Non-power-of-2 top-k and expert counts, a 192-wide kernel A tile.
+    "odd_topk": Shape(hidden=1024, intermediate=384, num_experts=96, topk=6, tokens=256),
+    # 64 experts per rank at 8 ranks: the scheduler's second ballot slot.
+    "many_experts": Shape(hidden=768, intermediate=512, num_experts=512, topk=8, tokens=512),
+    # 2 experts per rank at 8 ranks, 1 at 16.
+    "few_experts": Shape(hidden=512, intermediate=256, num_experts=16, topk=2, tokens=512),
+}
 
-    ``x_kind``:
-      - ``"rank_tag"`` (default): ``x[t, :] = float(rank)`` — lets dispatch
-        and combine tests verify pool / reduced output in closed form.
-      - ``"randn"``: random normal — for gradient correctness tests where
-        the input distribution matters.
 
-    Sentinel plant (``plant_sentinels=True``, default p=5%) flips a random
-    ``topk_idx`` subset to ``-1`` to exercise the skip branch. The empty-
-    expert plant (``plant_empty_expert=e``) additionally rewrites every
-    ``topk_idx == e`` to ``-1`` so expert ``e`` receives zero tokens this
-    iter (exercises the empty-expert branch on receivers).
-    """
-    import stream_ep  # late import: the stream_ep_bench harnesses import this module before Buffer init
+def report(name: str, ratio: float) -> None:
+    """With ``REPORT_ERR=1`` (and ``pytest -s``), print each check's worst error
+    ratio: the data tolerances are calibrated from. Show every rank's output
+    (torchrun without ``--local-ranks-filter``) to see the worst over ranks."""
+    if os.environ.get("REPORT_ERR"):
+        print(f"ERRRATIO {name} {ratio:.3e}", flush=True)
 
-    g = torch.Generator(device=device).manual_seed(seed + rank)
-    if x_kind == "rank_tag":
-        x = torch.full((num_tokens, hidden), float(rank), dtype=torch.bfloat16, device=device)
-    elif x_kind == "randn":
-        x = torch.randn((num_tokens, hidden), generator=g, device=device, dtype=torch.bfloat16)
-    else:
-        raise ValueError(f"unknown x_kind {x_kind!r}")
 
-    idx = torch.randint(0, num_experts, (num_tokens, num_topk), generator=g, device=device, dtype=torch.int64)
-    if plant_sentinels:
-        sentinel = torch.rand((num_tokens, num_topk), generator=g, device=device) < sentinel_p
-        idx = torch.where(sentinel, torch.full_like(idx, -1), idx)
-    if plant_empty_expert is not None:
-        idx = torch.where(idx == plant_empty_expert, torch.full_like(idx, -1), idx)
-    topk_idx = idx.to(stream_ep.topk_idx_t)
+def assert_rows_close(actual: torch.Tensor, expected: torch.Tensor, rtol: float, name: str) -> None:
+    """Every row's error is small relative to that row: ``||a_r - e_r|| <= rtol * ||e_r||``.
 
-    topk_weights = torch.rand((num_tokens, num_topk), generator=g, device=device, dtype=torch.float32)
+    Rows are the first dimension (tokens, or experts for weight gradients).
+    Normalizing per row means one wrong token or expert fails even when its
+    values are small next to the rest of the tensor. A row whose expected value
+    is zero must come out (near) zero."""
+    assert actual.shape == expected.shape, f"{name}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    assert torch.isfinite(actual).all(), f"{name}: non-finite values"
+    a, e = actual.float().flatten(1), expected.float().flatten(1)
+    err = (a - e).norm(dim=1)
+    ref = e.norm(dim=1)
+    ratio = err / ref.clamp(min=1e-6 * ref.max().clamp(min=1e-30))
+    worst = int(ratio.argmax())
+    report(name, ratio[worst].item())
+    assert ratio[worst] <= rtol, f"{name}: row {worst} relative error {ratio[worst]:.3e} > {rtol} (row norm {ref[worst]:.3e})"
 
-    num_local_experts = num_experts // num_ranks
-    rank_idx = torch.where(topk_idx >= 0, topk_idx // num_local_experts, torch.full_like(topk_idx, -1))
-    is_token_in_rank = torch.zeros((num_tokens, num_ranks), dtype=torch.bool, device=device)
-    for r in range(num_ranks):
-        is_token_in_rank[:, r] = (rank_idx == r).any(dim=-1)
-    return x, topk_idx, topk_weights, is_token_in_rank
+
+def bf16_ulp(x: torch.Tensor) -> torch.Tensor:
+    """Spacing of bf16 values at magnitude ``|x|`` (0 where x is 0)."""
+    exponent = torch.floor(torch.log2(x.abs().clamp(min=torch.finfo(torch.float32).tiny)))
+    return torch.where(x == 0, 0.0, torch.exp2(exponent - 7))
+
+
+def assert_sums_close(actual: torch.Tensor, expected: torch.Tensor, abs_sum: torch.Tensor, ulps: float, name: str) -> None:
+    """A bf16 reduction against its fp32 sum: each element within ``ulps`` bf16
+    ulps of the sum of the absolute values of its terms, which bounds every
+    partial sum the reduction may round."""
+    assert actual.shape == expected.shape, f"{name}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    err = (actual.float() - expected.float()).abs()
+    bound = ulps * bf16_ulp(abs_sum.float())
+    excess = torch.where(bound > 0, err / bound.clamp(min=1e-30), torch.where(err > 0, torch.inf, 0.0))
+    report(name, excess.max().item() * ulps)
+    bad = (err > bound).nonzero()
+    assert bad.numel() == 0, f"{name}: {bad.shape[0]} elements off by more than {ulps} ulp, first at {bad[0].tolist()}"

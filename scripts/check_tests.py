@@ -1,13 +1,15 @@
 """Check the test layout stream_ep_tests.run relies on (no GPU needed).
 
 - every test_*.py lives in stream_ep_tests/{kernels,dist,internode}/;
-- dist/ and internode/ scripts are torchrun entry points: a __main__ guard
-  and cleanup_dist(), so the runner can trust their exit code;
-- internode/ scripts guard world_size > 8, and dist/ scripts don't, because
-  dist/ runs at every world size;
-- kernels/ tests stay single-process (no init_process_group);
-- imports are package-qualified (stream_ep_tests....): the runner launches
-  modules from the repo root, so bare `from utils` / `from test_x` fail.
+- dist/ and internode/ tests run under torchrun on every rank and take the
+  process group from the ``group`` fixture: they never initialize it
+  themselves or define a ``__main__`` entry point;
+- internode/ modules skip below two nodes (``pytestmark =
+  pytest.mark.usefixtures("internode_only")``), and dist/ modules don't,
+  because dist/ runs at every world size;
+- kernels/ tests stay single-process (no process group);
+- imports are package-qualified (stream_ep_tests....): tests run from the
+  repo root, so bare `from utils` / `from test_x` fail.
 
     python scripts/check_tests.py
 """
@@ -18,8 +20,8 @@ import sys
 from pathlib import Path
 
 SUITES = ("kernels", "dist", "internode")
-INTERNODE_GUARD = re.compile(r"world_size\s*>\s*8")
-BARE_IMPORT = re.compile(r"^\s*(from|import)\s+(utils|test_\w+)\b", re.M)
+INTERNODE_MARK = 'pytestmark = pytest.mark.usefixtures("internode_only")'
+BARE_IMPORT = re.compile(r"^\s*(from|import)\s+(utils|test_\w+|_common)\b", re.M)
 
 
 def problems() -> list[str]:
@@ -32,17 +34,18 @@ def problems() -> list[str]:
         suite, src = path.parts[1], path.read_text()
         if BARE_IMPORT.search(src):
             found.append(f"{path}: import test helpers as stream_ep_tests.<...>, not by bare module name")
-        if suite == "kernels":
-            if "init_process_group" in src:
-                found.append(f"{path}: kernels/ tests are single-process")
-            continue
-        if 'if __name__ == "__main__":' not in src or "cleanup_dist()" not in src:
-            found.append(f"{path}: torchrun scripts need a __main__ guard and cleanup_dist()")
-        guarded = any(INTERNODE_GUARD.search(line) for line in src.splitlines() if line.lstrip().startswith("assert"))
-        if suite == "internode" and not guarded:
-            found.append(f"{path}: internode/ scripts must assert world_size > 8")
-        if suite == "dist" and guarded:
-            found.append(f"{path}: dist/ scripts run at every world size; move internode-only tests to internode/")
+        if "init_process_group" in src:
+            found.append(
+                f"{path}: take the process group from the `group` fixture"
+                if suite != "kernels"
+                else f"{path}: kernels/ tests are single-process"
+            )
+        if 'if __name__ == "__main__":' in src:
+            found.append(f"{path}: tests run through pytest; drop the __main__ entry point")
+        if suite == "internode" and INTERNODE_MARK not in src:
+            found.append(f"{path}: internode/ modules must declare `{INTERNODE_MARK}`")
+        if suite == "dist" and INTERNODE_MARK in src:
+            found.append(f"{path}: dist/ tests run at every world size; move internode-only tests to internode/")
     return found
 
 

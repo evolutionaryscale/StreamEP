@@ -36,8 +36,8 @@ GEMM tiles and SM counts are picked from the weight shapes and world size; `Tile
 
 - `stream_ep/` — the `Buffer` class over the `stream_ep_cpp` extension built from `csrc/`.
 - `stream_ep/stream_moe/` — the MoE layer and its kernels. The package docstring is the code map.
-- `stream_ep_tests/` — tests: `kernels/` (pytest, 1 GPU), `dist/` (torchrun, any world size), `internode/` (two or more nodes).
-- `stream_ep_bench/` — profiling and multi-iteration validation harnesses (`profile_pipeline`, `validate_multi_iter`, `ncu_microbench`, ...).
+- `stream_ep_tests/` — pytest suites: `kernels/` (single process, 1 GPU), `dist/` (under torchrun, any world size), `internode/` (two or more nodes).
+- `stream_ep_bench/` — profiling harnesses (`profile_pipeline`, `nsys_pipeline`, `ncu_microbench`).
 - `scripts/` — release wheel build and checks, and the test-layout check.
 
 Only `stream_ep/` and the extension ship in the wheel.
@@ -53,12 +53,12 @@ Only `stream_ep/` and the extension ship in the wheel.
 ```bash
 pixi run -e test build-ext          # in-place build after .cu / .cpp / .cuh edits
 pixi run -e test test-kernels       # kernel pytest, 1 GPU
-pixi run -e test test-dist          # every dist/ script on this node, 8 GPUs
+pixi run -e test test-dist          # every dist/ file on this node, 8 GPUs
 srun -N2 --ntasks-per-node=1 pixi run -e test test-internode   # dist/ + internode/ across nodes
 pixi run -e lint lint               # pre-commit hooks; `pixi run -e lint pre-commit install` to run them on commit
 ```
 
-The suites are discovered from the directories (`python -m stream_ep_tests.run <suite> --list` shows what would run). One script: `pixi run -e test torchrun --standalone --nproc-per-node=8 -m stream_ep_tests.dist.test_dispatch`.
+The suites are discovered from the directories (`python -m stream_ep_tests.run <suite> --list` shows what would run), and each file runs as its own pytest session. One file: `pixi run -e test torchrun --standalone --nproc-per-node=8 --local-ranks-filter 0 -m pytest stream_ep_tests/dist/test_dispatch.py`.
 
 ## Release
 

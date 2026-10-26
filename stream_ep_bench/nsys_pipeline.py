@@ -1,4 +1,4 @@
-"""nsys target: the full streaming MoE pipeline (fwd+bwd) at the 82ba5b shape,
+"""nsys target: the full streaming MoE pipeline (fwd+bwd) at the profiling shape,
 with warmup OUTSIDE a cudaProfilerStart/Stop fence so an nsys run with
 `--capture-range=cudaProfilerApi` captures only a handful of steady iterations
 (no JIT/warmup bloat).
@@ -10,7 +10,7 @@ compute overlap geometry, exposed comm, and per-rank/per-node imbalance. Run
 the FULL pipeline (not isolated kernels) because overlap only exists across the
 2 concurrent streams (the communicate stream + the compute stream).
 
-Shape defaults to the 82ba5b prod MoE (inherited from profile_pipeline globals:
+Shape defaults to the profiling shape in ``stream_ep_bench`` (
 H=3072, I=768, E=256, K=8, T=8192/rank). World size = however many ranks
 torchrun launches (8 = 1 node intranode/NVL; 16/32 = 2/4 nodes internode/RDMA).
 
@@ -30,7 +30,7 @@ import argparse
 import torch
 import torch.distributed as torch_dist
 
-from stream_ep_tests.utils import DTYPE, H, I, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
+from stream_ep_bench import DTYPE, H, I, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
 from stream_ep_bench.profile_pipeline import (
     barrier,
     get_global_rank,

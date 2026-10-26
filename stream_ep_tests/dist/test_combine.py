@@ -1,179 +1,64 @@
-"""``Buffer.combine`` against an analytical reference.
+"""``Buffer.combine`` and ``Buffer.combine_grads`` against a gathered reference.
 
-Kernel Y is not run: ``handle.o`` is filled with rank-tagged sentinels and
-``y_done_per_token`` with ``combine_seq``, so the per-token gate is open and
-the test checks only the cross-rank reduction into ``recv_x``.
-
-  1. Single dispatch + combine: each output token equals the sum of the
-     sentinels of the ranks it was sent to.
-  2. Three dispatches with different routing seeds: each combine reads only
-     its own dispatch's state.
+Kernel Y and kernel_a_bwd are not run: their outputs (``handle.o``,
+``dL_dx_per_r``, the per-slot weight gradients) are filled with random rows and
+their per-token release stamps are pre-set, so only the reduction back to the
+source ranks is checked. Random rows make every contribution distinguishable,
+so a row read from the wrong receive slot or rank shows up as a mismatch.
 """
 
-import os
-
+import pytest
 import torch
-import torch.distributed as dist
-from stream_ep import Buffer
-from stream_ep_tests.utils import cleanup_dist, make_inputs
+
+from stream_ep_tests import routing
+from stream_ep_tests.dist.test_dispatch import dispatch
+from stream_ep_tests.utils import SHAPES, assert_sums_close
 
 
 
-def expected_combine_output(is_token_in_rank, num_tokens, hidden, num_ranks, dtype, device):
-    """Analytical reference: each output[t] = sum over ranks R that hold any of
-    t's K experts, of R's per-rank sentinel (= float(R)). With our token data
-    set to ``x[r] = rank`` everywhere, the combine receiver atomic-adds these
-    values across contributing ranks.
-
-    is_token_in_rank: this rank's [num_tokens, num_ranks] bool routing matrix.
-    Returns: [num_tokens, hidden] expected output.
-    """
-    # is_token_in_rank[t, r] for THIS rank's source tokens t. Reduce across r:
-    # output[t] = sum over r where is_token_in_rank[t, r] is True, of r.
-    contrib = torch.arange(num_ranks, dtype=torch.float32, device=device).unsqueeze(0)  # [1, R]
-    out_per_token = (is_token_in_rank.float() * contrib).sum(dim=-1, keepdim=True)  # [T, 1]
-    return out_per_token.expand(num_tokens, hidden).to(dtype).contiguous()
+def rounding_ulps(group) -> float:
+    """Combine sums each token's rows in fp32 and rounds once to bf16. Internode,
+    each node's forwarder first rounds its partial sum, so the receiver adds one
+    rounding per node. Each rounding is at most half an ulp of a partial sum,
+    which the sum of absolute values bounds. A row taken from the wrong slot or
+    rank is off by O(1), hundreds of ulps."""
+    num_nodes = (group.size() + 7) // 8
+    return 0.5 if num_nodes == 1 else 0.5 * (num_nodes + 1)
 
 
-def populate_handle_o_with_rank_tag(handle, rank, num_recv_tokens, hidden, dtype):
-    """Set handle.o[r, :] = rank for all valid r. Padding slots stay zero (won't
-    be touched by combine sender because they don't exist in [0, T_recv))."""
-    handle.o.fill_(float(rank))
+@pytest.mark.parametrize("scenario", routing.SCENARIOS)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_combine(buffers, group, shape, scenario):
+    buffer = buffers(shape)
+    _, handle, inputs = dispatch(buffer, group, shape, scenario)
+    handle.o.copy_(torch.randn_like(handle.o))
+    handle.y_done_per_token.fill_(handle.dispatch_seq)
 
-
-def run_one_dispatch_combine(
-    buf, x, topk_idx, topk_weights, is_token_in_rank, num_experts, num_topk, hidden, num_ranks, rank, tile_m, dispatch_seq, dtype, device
-):
-    """One dispatch + manual o/y_done_per_token fill + combine + check."""
-    pool, handle, _event = buf.dispatch(
-        x,
-        topk_idx,
-        topk_weights,
-        is_token_in_rank,
-        num_experts,
-        tile_m=tile_m,
-        dispatch_seq=dispatch_seq,
-    )
+    out, weights_out = buffer.combine(handle.o, handle)
     torch.cuda.synchronize()
 
-    # Manually populate handle.o with this rank's tag (kernel Y replacement).
-    T_recv = handle.o.shape[0]
-    populate_handle_o_with_rank_tag(handle, rank, T_recv, hidden, dtype)
+    expected, abs_sum = inputs.to_sources(handle.o), inputs.to_sources(handle.o.abs())
+    assert weights_out is None
+    assert_sums_close(out, expected, abs_sum, rounding_ulps(group), "out")
 
-    # Manually fire the per-token gate (kernel Y release-store replacement).
-    handle.y_done_per_token.fill_(dispatch_seq)
 
-    # Run combine. Use the same int as combine_seq for symmetry with the
-    # production layer wrapper.
-    out, _recv_topk = buf.combine(
-        handle.o,
-        handle,
-        combine_seq=dispatch_seq,
-    )
+@pytest.mark.parametrize("scenario", routing.SCENARIOS)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_combine_grads(buffers, group, shape, scenario):
+    buffer = buffers(shape)
+    _, handle, inputs = dispatch(buffer, group, shape, scenario)
+    dL_dx_per_r = torch.randn_like(handle.o)
+    weight_grads = torch.randn(handle.TK_padded, dtype=torch.float32, device=handle.o.device)
+
+    done = torch.full((handle.o.shape[0],), handle.dispatch_seq, dtype=torch.int64, device=handle.o.device)
+
+    dL_dx, dL_dtopk = buffer.combine_grads(dL_dx_per_r, handle, weight_grads, done)
     torch.cuda.synchronize()
 
-    # Reference: each output[t, :] = sum over ranks R that hold any of t's experts of R.
-    expected = expected_combine_output(is_token_in_rank, x.shape[0], hidden, num_ranks, dtype, device)
-    actual = out
+    # Each (token, k) lives on exactly one rank, which sends its slot's gradient.
+    slots = handle.recv_token_to_slots.long()
+    expected_dtopk = inputs.to_sources(torch.where(slots >= 0, weight_grads[slots.clamp(min=0)], 0.0))
+    expected, abs_sum = inputs.to_sources(dL_dx_per_r), inputs.to_sources(dL_dx_per_r.abs())
 
-    # Compare valid-shape rows. bf16 atol roomy enough for sums up to 64.
-    diff = (actual.float() - expected.float()).abs().max().item()
-    assert diff < 1e-2, (
-        f"combine output mismatch (max abs diff = {diff:.4e})\n"
-        f"  expected[0:4, 0]: {expected[:4, 0].cpu().tolist()}\n"
-        f"  actual[0:4, 0]:   {actual[:4, 0].cpu().tolist()}\n"
-        f"  rank={rank} dispatch_seq={dispatch_seq}"
-    )
-    return T_recv
-
-
-def main():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    device = torch.device("cuda")
-
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    group = dist.group.WORLD
-
-    num_experts = 64
-    num_topk = 4
-    num_tokens = 256
-    hidden = 256
-    tile_m = 32
-    dtype = torch.bfloat16
-    hidden_bytes = hidden * 2
-
-    buf = Buffer.sized_for(group, hidden_bytes)
-
-    # ─── Test 1: basic combine. Single dispatch + populated o + combine.
-    x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-        num_tokens,
-        hidden,
-        num_topk,
-        num_experts,
-        world_size,
-        rank,
-        device,
-        seed=123,
-    )
-    T_recv = run_one_dispatch_combine(
-        buf,
-        x,
-        topk_idx,
-        topk_weights,
-        is_token_in_rank,
-        num_experts,
-        num_topk,
-        hidden,
-        world_size,
-        rank,
-        tile_m,
-        dispatch_seq=1,
-        dtype=dtype,
-        device=device,
-    )
-    if rank == 0:
-        print(f"PASS test_basic_combine: world={world_size} T_recv={T_recv}")
-
-    # ─── Test 2: multi-dispatch combine. Three back-to-back dispatches with
-    # different routing seeds; each combine should produce its own dispatch's
-    # expected output (no cross-dispatch contamination).
-    for seq, seed in enumerate([456, 789, 1011], start=2):
-        x, topk_idx, topk_weights, is_token_in_rank = make_inputs(
-            num_tokens,
-            hidden,
-            num_topk,
-            num_experts,
-            world_size,
-            rank,
-            device,
-            seed=seed,
-        )
-        T_recv = run_one_dispatch_combine(
-            buf,
-            x,
-            topk_idx,
-            topk_weights,
-            is_token_in_rank,
-            num_experts,
-            num_topk,
-            hidden,
-            world_size,
-            rank,
-            tile_m,
-            dispatch_seq=seq,
-            dtype=dtype,
-            device=device,
-        )
-        if rank == 0:
-            print(f"PASS test_multi_dispatch_combine #{seq - 1} (seed={seed}): T_recv={T_recv}")
-
-    if rank == 0:
-        print(f"PASS: all combine validations on rank 0 (world={world_size})")
-
-    cleanup_dist()
-
-
-if __name__ == "__main__":
-    main()
+    assert_sums_close(dL_dx, expected, abs_sum, rounding_ulps(group), "dL_dx")
+    assert torch.equal(dL_dtopk, expected_dtopk)

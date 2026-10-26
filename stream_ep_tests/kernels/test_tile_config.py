@@ -3,15 +3,14 @@
 Covers the three pieces that make up the ``tile_config`` API:
   - ``default_tile_config(I, H)`` — the bench-tuned resolved baseline, including
     the power-of-2 divisibility fallback when a default tile_n doesn't divide.
-  - ``TileConfig.validate(I, H)`` — the four StreamEP-specific output-tile_n
-    divisibility constraints (None fields skipped).
+  - ``TileConfig.validate(I, H)`` — the StreamEP-specific output-tile_n
+    divisibility and tile_m constraints (None fields skipped).
   - ``_resolve_tile_config`` — overlay a caller's non-None overrides onto the
     baseline. The load-bearing property: pinning ONE knob must NOT freeze the
     others at a hardcoded default — they stay auto-picked for the shape.
 
-Pure tile-math (no kernels launch), but the import pulls ``stream_ep`` (CUDA
-extension), so this collects on a GPU node like the other stream_moe pytest
-modules.
+Pure tile math (no kernels launch), but importing ``stream_ep`` loads the CUDA
+extension, so it runs on a GPU node like the other kernel tests.
 """
 
 from dataclasses import replace

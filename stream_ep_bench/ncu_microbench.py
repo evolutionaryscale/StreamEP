@@ -20,8 +20,8 @@ satisfied the kernel never spins, so default kernel replay works perfectly and
 you get full SM / tensor-core / memory / occupancy / roofline counters per
 kernel.
 
-Shape defaults to the **real 4-node 82ba5b** point so the GEMM tiles match
-production: world=32 -> E_local = 256/32 = 8 experts/rank; H=3072, I=768;
+Shape defaults to the profiling shape at a 4-node point so the GEMM tiles are
+realistic: world=32 -> E_local = 256/32 = 8 experts/rank; H=3072, I=768;
 uniform routing gives ~T*topk*world/E = 8192 tokens/expert -> ~64 tiles/expert
 at tile_m=128 -> total_tiles=512 (M_recv=65536). Override --world / --tiles /
 --hidden / --intermediate to profile a different operating point. tile_n per
@@ -54,16 +54,15 @@ import argparse
 
 import torch
 
+from stream_ep.stream_moe.kernel_a import streaming_moe_a
+from stream_ep.stream_moe.kernel_a_bwd import streaming_moe_a_bwd
+from stream_ep.stream_moe.kernel_y import streaming_moe_y
+from stream_ep.stream_moe.kernel_y_bwd import streaming_moe_y_bwd
 from stream_ep.stream_moe.stream_moe import TileConfig, _resolve_tile_config
 
-# Module-level default shape = 82ba5b prod MoE (per-expert), same as
-# profile_pipeline's globals.
-H_DEFAULT = 3072
-I_DEFAULT = 768
-NUM_EXPERTS = 256
-TOPK = 8
-SEQ_LEN_PER_RANK = 8192
-DTYPE = torch.bfloat16
+from stream_ep_bench import DTYPE, NUM_EXPERTS, SEQ_LEN_PER_RANK, TOPK
+from stream_ep_bench import H as H_DEFAULT
+from stream_ep_bench import I as I_DEFAULT
 
 
 def _expert_pool_block_offset(total_tiles: int, E_local: int, device) -> torch.Tensor:
@@ -130,12 +129,10 @@ def build(kernel: str, s: dict, device):
     W2 = (torch.randn(E_local, H, I, dtype=DTYPE, device=device, generator=g) * 0.02).contiguous()
 
     if kernel == "a":
-        from stream_ep.stream_moe.kernel_a import streaming_moe_a
-
         pool = (torch.randn(TK, H, dtype=DTYPE, device=device, generator=g) * 0.1).contiguous()
         postact_a = torch.empty(total_tiles, tile_m, I, dtype=DTYPE, device=device)
-        # ac_level 0 saves preact_a ([2I] mD store); ac_level >=1 (production
-        # 82ba5b default) sets preact_a=None -> store skipped, separate kernel.
+        # ac_level 0 saves preact_a ([2I] mD store); ac_level >=1 sets
+        # preact_a=None -> store skipped, separate kernel.
         preact_a = torch.empty(total_tiles, tile_m, two_I, dtype=DTYPE, device=device) if s["ac_level"] == 0 else None
         cnt, tgt = _fired_arrival(total_tiles, device)
 
@@ -160,8 +157,6 @@ def build(kernel: str, s: dict, device):
         )
 
     if kernel == "y":
-        from stream_ep.stream_moe.kernel_y import streaming_moe_y
-
         T_recv = TK
         postact_a = (torch.randn(total_tiles, tile_m, I, dtype=DTYPE, device=device, generator=g) * 0.1).contiguous()
         o = torch.zeros(T_recv, H, dtype=DTYPE, device=device)
@@ -172,6 +167,9 @@ def build(kernel: str, s: dict, device):
         cnt, tgt = _fired_arrival(total_tiles, device)
 
         def fn():
+            # Every launch decrements each token to zero and stamps it; restore the
+            # counts so repeated launches run the same per-token release path.
+            k_local_remaining.fill_(1)
             streaming_moe_y(
                 postact_a,
                 W2,
@@ -192,8 +190,6 @@ def build(kernel: str, s: dict, device):
         return fn, f"kernel_y  GEMM (TK={TK},I={I})@W2(H={H}) tile_m={tile_m} tile_n_y={cfg.tile_n_y}"
 
     if kernel == "a_bwd":
-        from stream_ep.stream_moe.kernel_a_bwd import streaming_moe_a_bwd
-
         T_recv = TK
         dL_dswiglu_in = (torch.randn(total_tiles, tile_m, two_I, dtype=DTYPE, device=device, generator=g) * 0.1).contiguous()
         dL_dx_per_r = torch.zeros(T_recv, H, dtype=DTYPE, device=device)
@@ -203,6 +199,7 @@ def build(kernel: str, s: dict, device):
         cnt, tgt = _fired_arrival(total_tiles, device)
 
         def fn():
+            bwd_k_local_remaining.fill_(1)  # see kernel Y: keep the per-token release path in every launch
             streaming_moe_a_bwd(
                 dL_dswiglu_in,
                 W1,
@@ -221,8 +218,6 @@ def build(kernel: str, s: dict, device):
         return fn, f"kernel_a_bwd  NN GEMM (TK={TK},2I={two_I})@W1(H={H}) tile_m={tile_m} tile_n_a_bwd={cfg.tile_n_a_bwd}"
 
     if kernel == "y_bwd":
-        from stream_ep.stream_moe.kernel_y_bwd import streaming_moe_y_bwd
-
         dL_do_pool = (torch.randn(TK, H, dtype=DTYPE, device=device, generator=g) * 0.1).contiguous()
         dL_dswiglu_in = torch.empty(total_tiles, tile_m, two_I, dtype=DTYPE, device=device)
         postact_a_for_dW2 = torch.empty(total_tiles, tile_m, I, dtype=DTYPE, device=device)
@@ -266,8 +261,7 @@ def main():
         type=int,
         default=0,
         choices=[0, 1, 2],
-        help="kernel_a only: 0 = save preact_a (mD [2I] store); >=1 = skip it "
-        "(production 82ba5b uses moe_ac_level=1). No effect on other kernels.",
+        help="kernel_a only: 0 = save preact_a (mD [2I] store); >=1 = skip it No effect on other kernels.",
     )
     p.add_argument("--tile_m", type=int, default=None)
     p.add_argument("--tile_n_a", type=int, default=None)
