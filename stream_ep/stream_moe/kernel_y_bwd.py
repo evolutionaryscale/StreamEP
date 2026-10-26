@@ -87,7 +87,6 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from quack.activation import dswiglu
 from quack.cache import jit_cache
-from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -114,6 +113,7 @@ from stream_ep.stream_moe.streaming_gemm_base import (
     StreamingGemmBase,
     StreamingTileSchedulerOptions,
 )
+from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +685,7 @@ def streaming_moe_y_bwd(
     I = two_I // 2
     H = dL_do_pool.shape[1]
     E_local = W2.shape[0]
+    assert E_local <= MAX_LOCAL_EXPERTS, f"{E_local} local experts exceed the scheduler's {MAX_LOCAL_EXPERTS}"
     assert W2.shape == (E_local, H, I), f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected {(E_local, H, I)}"
     # tile_n MUST divide the output N dim (= I, the moe_intermediate_size).
     # Non-divisible tile_n produces silently-wrong stores in the data-grad
@@ -784,9 +785,6 @@ def streaming_moe_y_bwd(
         device_capacity=device_capacity,
         dropout_p=dropout_p,
     )
-
-    if compile_config.COMPILE_ONLY:
-        return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:

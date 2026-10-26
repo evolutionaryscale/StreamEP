@@ -48,7 +48,6 @@ def test_round_trip(case):
     assert not expanded[~real].any(), "re-expanded padding slots not zero"
 
 
-@pytest.mark.skip(reason="known bug: reexpand zeroes padding by multiplying row 0 by 0, so inf in x_recv[0] gives NaN; fix in a follow-up")
 def test_padding_zero_with_inf_in_x_recv():
     pool, recv, x_recv = broadcast_pool(*CASES["duplicates_and_padding"])
     x_recv[0] = float("inf")

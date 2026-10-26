@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from stream_ep.stream_moe.kernel_a import streaming_moe_a
+from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
 from stream_ep_tests.kernels._common import (
     KERNEL_SHAPES,
     LAYOUTS,
@@ -87,18 +88,27 @@ def test_kernel_a_streamed_pool(shape, config):
     check(layout, src, w1, postact)
 
 
-@pytest.mark.parametrize("num_experts", [32, 64, 100])
+def many_experts_layout(num_experts: int) -> PoolLayout:
+    return PoolLayout(tuple(0 if e % 7 == 3 else 64 + 32 * (e % 5) for e in range(num_experts)))
+
+
+@pytest.mark.parametrize("num_experts", [32, 64])
 def test_many_local_experts(num_experts):
     """The scheduler finds each tile's expert with a warp ballot over the block offsets;
-    32 and more experts take its second ballot slot."""
-    if num_experts > 64:
-        pytest.skip(
-            "known bug: the scheduler's expert lookup covers at most 64 local experts while dispatch allows 1024; fix in a follow-up"
-        )
+    32 and more experts take its second ballot slot, and 64 fill it."""
     H, I = KERNEL_SHAPES["512x256"]
-    layout = PoolLayout(tuple(0 if e % 7 == 3 else 64 + 32 * (e % 5) for e in range(num_experts)))
+    layout = many_experts_layout(num_experts)
     pool, w1 = inputs(layout, H, I)
     target = layout.arrival_target()
     postact = launch(layout, pool, w1, fired(target), target, num_sms=8, **configs("a", H, I)["default"])
     torch.cuda.synchronize()
     check(layout, pool, w1, postact)
+
+
+def test_too_many_local_experts_raises():
+    H, I = KERNEL_SHAPES["512x256"]
+    layout = many_experts_layout(MAX_LOCAL_EXPERTS + 1)
+    pool, w1 = inputs(layout, H, I)
+    target = layout.arrival_target()
+    with pytest.raises(AssertionError, match="local experts exceed"):
+        launch(layout, pool, w1, fired(target), target, **configs("a", H, I)["default"])

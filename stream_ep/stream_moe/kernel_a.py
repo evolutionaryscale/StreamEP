@@ -44,7 +44,6 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from quack.activation import gate_fn_map
 from quack.cache import jit_cache
-from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -69,6 +68,7 @@ from stream_ep.stream_moe.streaming_gemm_base import (
     StreamingGemmBase,
     StreamingTileSchedulerOptions,
 )
+from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +442,7 @@ def streaming_moe_a(
     assert pool_arrival_target.shape == (total_tiles,) and pool_arrival_target.dtype == torch.int32
     H = pool.shape[1]
     E_local = W1.shape[0]
+    assert E_local <= MAX_LOCAL_EXPERTS, f"{E_local} local experts exceed the scheduler's {MAX_LOCAL_EXPERTS}"
     assert expert_pool_block_offset.shape == (E_local + 1,)
     assert W1.shape[1] == 2 * I, f"W1 dim 1 must be 2*I = {2 * I}; got W1.shape={tuple(W1.shape)}"
     assert W1.shape[2] == H, f"W1 dim 2 (H) must match pool dim 1; got W1.shape={tuple(W1.shape)}, H={H}"
@@ -500,9 +501,6 @@ def streaming_moe_a(
         store_preact=preact_a is not None,
         dropout_p=dropout_p,
     )
-
-    if compile_config.COMPILE_ONLY:
-        return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:

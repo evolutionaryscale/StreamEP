@@ -58,7 +58,6 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
 from quack.cache import jit_cache
-from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     get_device_capacity,
@@ -75,6 +74,7 @@ from stream_ep.stream_moe.kernel_y import (
     StreamingScatterBase,
 )
 from stream_ep.stream_moe.streaming_gemm_base import StreamingTileSchedulerOptions
+from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +310,7 @@ def streaming_moe_a_bwd(
     assert in_tile_m == tile_m, f"dL_dswiglu_in middle dim must equal tile_m={tile_m}; got {in_tile_m}"
     T_recv, H = dL_dx_per_r.shape
     E_local = W1.shape[0]
+    assert E_local <= MAX_LOCAL_EXPERTS, f"{E_local} local experts exceed the scheduler's {MAX_LOCAL_EXPERTS}"
     assert W1.shape == (
         E_local,
         two_I,
@@ -365,9 +366,6 @@ def streaming_moe_a_bwd(
         cluster_n=cluster_n,
         device_capacity=device_capacity,
     )
-
-    if compile_config.COMPILE_ONLY:
-        return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:
