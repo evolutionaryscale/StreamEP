@@ -41,10 +41,9 @@ def _index_copy_rows(
     hmask = h < H
     tok = tl.load(idx_ptr + row)  # int32 slot -> recv-token, -1 = pad
     valid = tok >= 0
-    tokc = tl.maximum(tok, 0)  # clamp pad to row 0 (masked/zeroed out)
+    tokc = tl.maximum(tok, 0)  # clamp pad to row 0 (its load/store is masked off)
     if GATHER:  # expand: out[row] = in[tok], pad -> 0
-        v = tl.load(in_ptr + tokc * H + h, mask=hmask, other=0.0)
-        v = v * valid.to(v.dtype)  # pad row -> 0 (1.0/0.0 multiply, exact)
+        v = tl.load(in_ptr + tokc * H + h, mask=hmask & valid, other=0.0)
         tl.store(out_ptr + row * H + h, v, mask=hmask)
     else:  # compact: out[tok] = in[row], skip pad
         v = tl.load(in_ptr + row * H + h, mask=hmask)
