@@ -44,7 +44,6 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from quack.activation import gate_fn_map
 from quack.cache import jit_cache
-from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -500,9 +499,6 @@ def streaming_moe_a(
         store_preact=preact_a is not None,
         dropout_p=dropout_p,
     )
-
-    if compile_config.COMPILE_ONLY:
-        return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:

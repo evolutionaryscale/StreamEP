@@ -58,7 +58,6 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
 from quack.cache import jit_cache
-from stream_ep.stream_moe import compile_config
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     get_device_capacity,
@@ -365,9 +364,6 @@ def streaming_moe_a_bwd(
         cluster_n=cluster_n,
         device_capacity=device_capacity,
     )
-
-    if compile_config.COMPILE_ONLY:
-        return
 
     max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
     if num_sms is not None:
