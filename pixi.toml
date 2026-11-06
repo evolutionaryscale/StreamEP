@@ -1,0 +1,39 @@
+[workspace]
+name = "stream-ep"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[system-requirements]
+libc = "2.28"
+
+[dependencies]
+python = "3.12.*"
+cxx-compiler = "*"
+gxx_linux-64 = "14.3.*"
+cuda-version = "13.3.*"
+cuda-compiler = "13.3.*"
+cuda-cudart-dev = "13.3.*"
+cuda-driver-dev = "13.3.*"
+cuda-nvtx-dev = "13.3.*"
+libcublas-dev = "*"
+libcusolver-dev = "*"
+libcusparse-dev = "*"
+rdma-core = "*"
+ninja = "*"
+patchelf = "*"
+pip = "*"
+setuptools = ">=77,<82"
+wheel = "*"
+
+[pypi-dependencies]
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+nvidia-nvshmem-cu13 = "==3.4.5"
+
+[activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+TORCH_CUDA_ARCH_LIST = "9.0"
+NVSHMEM_HCA_PREFIX = "ibp"
+
+[tasks.build-ext]
+cmd = "python setup.py build_ext --inplace"
+description = "Build the v0.1.14 native extension against torch 2.11 and CUDA 13"
