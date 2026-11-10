@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stream-ep"
-version = "0.1.14"
+version = "0.1.15"
 # The compiled extension is ABI-bound to the torch it was built against and
 # statically links NVSHMEM's device library, so both are pinned to the exact
 # versions in pixi.toml's build env: a consumer env with different versions
