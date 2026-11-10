@@ -1041,13 +1041,8 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 // message header from the forwarder) avoids cross-NVL-peer `base_pool` IPC
 // plumbing, keeps the receiver symmetric with intranode (same single-writer
 // proof: each (channel, src_nvl_rank) warp uniquely owns the
-// `(c, src_world, e_local)` tuple), and keeps the forwarder lean (it is the
-// internode bottleneck).
+// `(c, src_world, e_local)` tuple), and keeps the forwarder lean.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Per-warp lane-0-resident scratch for Pass A's K-loop slot mapping.
-// num_topk ≤ 32 is asserted at kernel entry.
-constexpr int kMaxTopK = 32;
 
 // SMEM bytes for the NVL receiver's per-warp `seen[src_rdma][e_local]` slab,
 // sized at runtime by E_local. Total receiver-side SMEM:
@@ -1056,6 +1051,39 @@ constexpr int kMaxTopK = 32;
 // blocks share the same SMEM allocation but leave the slab unused.
 __host__ __device__ inline int receiver_seen_smem_bytes(int num_rdma_ranks, int E_local) {
     return NUM_MAX_NVL_PEERS * num_rdma_ranks * E_local * static_cast<int>(sizeof(int));
+}
+
+// All lanes fence their scalar writes and drained TMA stores before lane 0 publishes completion to the local consumer.
+__device__ __forceinline__ void receiver_eager_fire(int e_local,
+                                                    bool is_e_leader,
+                                                    uint64_t& completed_mask_for_src,
+                                                    const int* seen_for_src,
+                                                    const int* seen_expected_for_src_world,
+                                                    const int* base_pool_for_src_world,
+                                                    int E_local,
+                                                    int tile_m,
+                                                    int* arrival_count,
+                                                    int lane_id) {
+    const uint64_t done_mask = completed_mask_for_src;
+    uint64_t bit = 0;
+    if (e_local >= 0 and is_e_leader and not((done_mask >> e_local) & 1ull)) {
+        if (seen_for_src[e_local] == ld_nc_global(seen_expected_for_src_world + e_local))
+            bit = 1ull << e_local;
+    }
+    const uint64_t newly_complete = (static_cast<uint64_t>(__reduce_or_sync(0xffffffff, static_cast<unsigned>(bit >> 32))) << 32) |
+        __reduce_or_sync(0xffffffff, static_cast<unsigned>(bit));
+    if (newly_complete == 0)
+        return;
+    completed_mask_for_src = done_mask | newly_complete;
+    __threadfence();
+    __syncwarp();
+    if (lane_id == 0) {
+        for (int e = 0; e < E_local; ++e) {
+            if ((newly_complete >> e) & 1)
+                fire_pool_blocks(base_pool_for_src_world[e], seen_for_src[e], tile_m, arrival_count);
+        }
+    }
+    __syncwarp();
 }
 
 template <int kNumRDMARanks,
@@ -1969,22 +1997,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         // ── kNVLReceivers: pool-layout streaming receiver ───────────────────
         // One warp per src_nvl_rank (= target_rank). Each warp drains its
         // (channel, src_nvl_rank) NVL ring stream and:
-        //   Pass A: lane-0 K-loop computes slot = base_pool[c, src_world,
-        //           e_local] + warp_local_seen[src_rdma_rank][e_local]++.
-        //           Single-writer per (c, src_world, e_local) tuple — no atomic.
-        //   Pass B: TMA-load message data; K-fanout TMA-store to pool[slot] for
-        //           each local k; lane-0 writes per-pool-slot scalars
-        //           (pool_topk_weight, pool_recv_token, pool_k_slot) and
-        //           per-recv-token reverse-map (recv_token_to_slots[r, :K],
-        //           k_local_remaining[r], k_local_total[r]); lane-0 writes
-        //           recv_src_meta (combine plumbing).
-        //   Pass 2 fire (substream-end): per-warp `__threadfence()` (.gpu) +
-        //           cross-NVL-receiver-warp `bar.sync 2` (for device-scope
-        //           visibility of other warps' writes contributing to the same
-        //           tile via base_pool stacking) → lane-0 expert-major walk
-        //           over (e, src_rdma_rank); `red.release.gpu.global.add.s32`
-        //           into pool_arrival_count[block_id]. Kernel A's scheduler
-        //           spins until count == pool_arrival_target[block_id].
+        // Lane k owns topk entry k. Matching-expert lanes allocate slots in
+        // k order, with one leader updating each warp-local expert counter.
+        // Each local-k lane stores its pool copy and scalars, then all lanes
+        // fence before lane 0 release-adds completed substream contributions.
         const int src_nvl_rank = target_rank;
 
         int total_offset = 0;
@@ -2024,8 +2040,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
         // ── Per-warp Pass A counter table: warp_local_seen[src_rdma][e_local].
         // Stored in SMEM (sized at runtime by E_local; per-warp slab indexed
-        // by `target_rank` ∈ [0, NUM_MAX_NVL_PEERS)). Lane 0 reads/writes it;
-        // lane 0 walks Pass 2 fire over the same slab.
+        // by `target_rank` ∈ [0, NUM_MAX_NVL_PEERS)). Each expert's leader
+        // updates its counter; lane 0 walks Pass 2 fire over the same slab.
         // Slab placement: right after the NUM_MAX_NVL_PEERS TMA buffer slabs.
         int* warp_local_seen = reinterpret_cast<int*>(smem_tma_buffer + NUM_MAX_NVL_PEERS * kNumTMABytesPerWarp +
                                                       target_rank * kNumRDMARanks * E_local * static_cast<int>(sizeof(int)));
@@ -2038,7 +2054,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         const int* base_pool_for_channel = tile_signal.base_pool + channel_id * num_world_ranks * E_local;
         const int* seen_for_channel = tile_signal.seen_per_substream + channel_id * num_world_ranks * E_local;
 
-        // Eager Pass 2 fire bookkeeping: lane-0 register bitmask of `e_local`s
+        // Eager Pass 2 fire bookkeeping: warp-replicated bitmask of `e_local`s
         // this warp has already fired pool_arrival_count for (across all
         // src_rdma_rank src_worlds). Each warp's substream binding is to a specific
         // src_nvl_rank — `e_local` alone identifies the (src_world, e) tuple
@@ -2144,43 +2160,30 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 auto topk_weights_in_msg =
                     reinterpret_cast<const float*>(shifted + hidden_bytes + sizeof(SourceMeta) + shape.num_topk * sizeof(int));
 
-                // ── Pass A: lane-0 K-loop, slot allocation. Reads topk_idx
-                //    from the global NVL ring (independent of TMA). Also
-                //    records `e_local_row[k]` for the per-iter eager-fire
-                //    check below. ──
-                int slot_row[kMaxTopK];
-                int e_local_row[kMaxTopK];
-                if (lane_id == 0) {
-                    int* base_pool_substream = const_cast<int*>(base_pool_for_channel + src_world * E_local);
-                    int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
-                    for (int k = 0; k < shape.num_topk; ++k) {
-                        // ld_nc_global (= ld.volatile.global with DISABLE_AGGRESSIVE_PTX_INSTRS)
-                        // bypasses the read-only data cache, which is NOT
-                        // invalidated by ld.acquire.sys on a different address.
-                        // __ldg here would let a stale cached topk_idx escape
-                        // the release-acquire ordering on nvl_channel_tail.
-                        int e_global = static_cast<int>(ld_nc_global(topk_idx_in_msg + k));
-                        int e_local = (e_global >= local_expert_begin and e_global < local_expert_end) ? e_global - local_expert_begin : -1;
-                        e_local_row[k] = e_local;
-                        if (e_local >= 0) {
-                            int slot = base_pool_substream[e_local] + seen_for_src[e_local];
-                            seen_for_src[e_local] += 1;
-                            slot_row[k] = slot;
-                        } else {
-                            slot_row[k] = -1;
-                        }
-                    }
+                // ld_nc_global bypasses the read-only cache: acquire on nvl_channel_tail does not invalidate cached ring data.
+                const bool is_k_lane = lane_id < shape.num_topk;
+                int e_local = -1;
+                float topk_weight = 0.f;
+                if (is_k_lane) {
+                    int e_global = static_cast<int>(ld_nc_global(topk_idx_in_msg + lane_id));
+                    e_local = (e_global >= local_expert_begin and e_global < local_expert_end) ? e_global - local_expert_begin : -1;
+                    topk_weight = ld_nc_global(topk_weights_in_msg + lane_id);
                 }
-                // No need to broadcast: only lane 0 issues the K-fanout TMA stores
-                // and per-pool-slot scalar writes. Other lanes participate in the
-                // TMA load below via the warp's shared mbarrier.
+                int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
+                const unsigned same_e_lanes = __match_any_sync(0xffffffff, e_local);
+                const int rank_in_e = __popc(same_e_lanes & ((1u << lane_id) - 1u));
+                int slot = -1;
+                if (e_local >= 0)
+                    slot = base_pool_for_channel[src_world * E_local + e_local] + seen_for_src[e_local] + rank_in_e;
+                // Every matching lane must read the old counter before its leader updates it.
+                __syncwarp();
+                if (e_local >= 0 and rank_in_e == 0)
+                    seen_for_src[e_local] += __popc(same_e_lanes);
+                __syncwarp();
 
-                // ── Pass B: wait this iter's load, prefetch next, K-fanout store. ──
                 mbarrier_wait(tma_mbarrier(s), tma_phase[s]);
 
-                // Prefetch next iter's load (overlaps with the K-fanout below).
-                // The prior iter's `tma_store_wait<0>` drained the stores reading
-                // from `tma_buffer(ns)` two iters ago, so the buffer is free.
+                // Every storing lane drained the previous stores reading tma_buffer(ns), so the next load can reuse it.
                 if (chunk_idx + 1 < num_recv_tokens) {
                     int next_buf = cached_channel_head_idx % env.num_max_nvl_chunked_recv_tokens;
                     auto next_shifted = nvl_channel_x.buffer() + next_buf * num_bytes_per_token;
@@ -2191,97 +2194,39 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     __syncwarp();
                 }
 
-                if (lane_id == 0) {
-                    for (int k = 0; k < shape.num_topk; ++k) {
-                        int slot = slot_row[k];
-                        if (slot < 0)
-                            continue;
-                        tma_store_1d(tma_buffer(s), pool_out.pool + static_cast<int64_t>(slot) * shape.hidden_int4, hidden_bytes, false);
-                    }
-                }
-                __syncwarp();
+                if (slot >= 0)
+                    tma_store_1d(tma_buffer(s), pool_out.pool + static_cast<int64_t>(slot) * shape.hidden_int4, hidden_bytes, false);
 
-                // ── Pass B (continued): per-pool-slot scalars + per-recv-token scalars. ──
-                if (lane_id == 0) {
-                    int k_local_total_val = 0;
-                    for (int k = 0; k < shape.num_topk; ++k) {
-                        int slot = slot_row[k];
-                        per_token_out.recv_token_to_slots[recv_token_idx * shape.num_topk + k] = slot;
-                        if (slot < 0)
-                            continue;
-                        pool_out.pool_topk_weight[slot] = ld_nc_global(topk_weights_in_msg + k);
-                        pool_out.pool_recv_token[slot] = recv_token_idx;
-                        pool_out.pool_k_slot[slot] = k;
-                        ++k_local_total_val;
-                    }
-                    if (k_local_total_val > 0) {
-                        per_token_out.k_local_remaining[recv_token_idx] = k_local_total_val;
-                        per_token_out.k_local_total[recv_token_idx] = k_local_total_val;
-                    }
+                if (is_k_lane)
+                    per_token_out.recv_token_to_slots[recv_token_idx * shape.num_topk + lane_id] = slot;
+                if (slot >= 0) {
+                    pool_out.pool_topk_weight[slot] = topk_weight;
+                    pool_out.pool_recv_token[slot] = recv_token_idx;
+                    pool_out.pool_k_slot[slot] = lane_id;
+                }
+                const int k_local_total_val = __popc(__ballot_sync(0xffffffff, slot >= 0));
+                if (lane_id == 0 and k_local_total_val > 0) {
+                    per_token_out.k_local_remaining[recv_token_idx] = k_local_total_val;
+                    per_token_out.k_local_total[recv_token_idx] = k_local_total_val;
                 }
 
                 // Combine plumbing: recv_src_meta per recv_token.
                 if (elect_one_sync())
                     st_na_global(reinterpret_cast<SourceMeta*>(per_token_out.recv_src_meta) + recv_token_idx, meta);
 
-                // Drain this iter's K-fanout stores before stage `s` is reused
-                // (two iters from now) by the next prefetch's load — and before
-                // the eager-fire check below issues atomicAdds whose target
-                // ordering depends on the pool writes being sys-visible.
+                // Drain every lane's bulk group before stage reuse and the release-add to the local pool consumer.
                 tma_store_wait<0>();
                 __syncwarp();
-
-                // ── Eager Pass 2 fire.
-                // For each unique `e_local` this iter touched on this src_world
-                // (= src_rdma × NUM_MAX_NVL_PEERS + src_nvl), check whether
-                // `warp_local_seen[src_rdma][e_local]` just hit the metadata-
-                // kernel-computed `seen_per_substream[c, src_world, e_local]`.
-                // If yes, this warp has finished its contribution to expert
-                // `e_local` in this substream: fence + `red.release.gpu.global.add.s32`
-                // the writes-in-block count into pool_arrival_count[block].
-                //
-                // Visibility: each warp's `__threadfence()` before its own
-                // release-add orders this warp's pool writes (K-fanout TMA
-                // stores + per-pool-slot scalars) GPU-visible before the
-                // add lands. The release semantics of `red.release.gpu.global.add`
-                // then chain with kernel A's acquire-load on the same address;
-                // by the time count reaches pool_arrival_target[block] on the
-                // consumer side, every contributor's fenced pool writes are
-                // observable. ``.gpu`` scope suffices — the forwarder writes
-                // into LOCAL pool (its own GPU) and the consumer (kernel A)
-                // runs on the same GPU; the cross-rank NVL channel head is
-                // a separate explicit ``st.relaxed.sys`` store, not covered
-                // by this fence. Mirrors intranode's single-fusion pattern
-                // without the cross-warp `bar.sync 2` — each warp's own
-                // fence-before-release-add carries the invariant.
-                if (lane_id == 0) {
-                    uint64_t newly_complete = 0;
-                    for (int k = 0; k < shape.num_topk; ++k) {
-                        int e_local = e_local_row[k];
-                        if (e_local < 0)
-                            continue;
-                        uint64_t bit = 1ULL << e_local;
-                        if ((completed_mask[src_rdma_rank] | newly_complete) & bit)
-                            continue;
-                        int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
-                        int expected = ld_nc_global(seen_for_channel + src_world * E_local + e_local);
-                        if (my_seen == expected)
-                            newly_complete |= bit;
-                    }
-
-                    if (newly_complete != 0) {
-                        completed_mask[src_rdma_rank] |= newly_complete;
-                        __threadfence();
-                        for (int e_local = 0; e_local < E_local; ++e_local) {
-                            if (!((newly_complete >> e_local) & 1))
-                                continue;
-                            int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
-                            int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
-                            fire_pool_blocks(slot_start_e, my_seen, shape.tile_m, tile_signal.pool_arrival_count);
-                        }
-                    }
-                }
-                __syncwarp();
+                receiver_eager_fire(e_local,
+                                    rank_in_e == 0,
+                                    completed_mask[src_rdma_rank],
+                                    seen_for_src,
+                                    seen_for_channel + src_world * E_local,
+                                    base_pool_for_channel + src_world * E_local,
+                                    E_local,
+                                    shape.tile_m,
+                                    tile_signal.pool_arrival_count,
+                                    lane_id);
             }
 
             if (elect_one_sync())
@@ -3317,7 +3262,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
         // Per-warp Pass-A-equivalent counter table for eager-fire bookkeeping,
         // mirrors fwd `warp_local_seen`. Placed in SMEM right after the
-        // NUM_MAX_NVL_PEERS TMA stage slabs. Lane 0 reads/writes it.
+        // NUM_MAX_NVL_PEERS TMA stage slabs. Each expert's leader updates it.
         int* warp_local_seen = reinterpret_cast<int*>(smem_tma_buffer + NUM_MAX_NVL_PEERS * kNumTMABytesPerWarp +
                                                       target_rank * kNumRDMARanks * E_local * static_cast<int>(sizeof(int)));
         for (int i = lane_id; i < kNumRDMARanks * E_local; i += 32)
@@ -3419,69 +3364,35 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     __syncwarp();
                 }
 
-                // Bwd Pass A equivalent: per K, derive (slot, e_local) and
-                // increment the per-warp `warp_local_seen[src_rdma][e_local]`
-                // counter. e_local comes from `tile_id_to_expert[slot/tile_m]`
-                // (the metadata kernel built it; small and L2-resident).
-                int e_local_row[kMaxTopK];
-                if (lane_id == 0) {
-                    int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
-                    for (int k = 0; k < shape.num_topk; ++k) {
-                        int slot = routing.recv_token_to_slots[recv_token_idx * shape.num_topk + k];
-                        if (slot < 0) {
-                            e_local_row[k] = -1;
-                            continue;
-                        }
-                        int tile_id = slot / shape.tile_m;
-                        int e_local = __ldg(routing.tile_id_to_expert + tile_id);
-                        e_local_row[k] = e_local;
-                        seen_for_src[e_local] += 1;
-                        tma_store_1d(tma_buffer(s), io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4, hidden_bytes, false);
-                    }
+                int e_local = -1;
+                int slot = -1;
+                if (lane_id < shape.num_topk) {
+                    slot = routing.recv_token_to_slots[recv_token_idx * shape.num_topk + lane_id];
+                    if (slot >= 0)
+                        e_local = __ldg(routing.tile_id_to_expert + slot / shape.tile_m);
                 }
+                int* seen_for_src = warp_local_seen + src_rdma_rank * E_local;
+                const unsigned same_e_lanes = __match_any_sync(0xffffffff, e_local);
+                const int rank_in_e = __popc(same_e_lanes & ((1u << lane_id) - 1u));
+                if (e_local >= 0 and rank_in_e == 0)
+                    seen_for_src[e_local] += __popc(same_e_lanes);
+                if (slot >= 0)
+                    tma_store_1d(tma_buffer(s), io.dL_do_pool + static_cast<int64_t>(slot) * shape.hidden_int4, hidden_bytes, false);
                 __syncwarp();
                 tma_store_wait<0>();
                 __syncwarp();
 
-                // ── Eager Pass 2 fire (bwd).
-                // Same shape as fwd's eager fire (see dispatch_main_kernel for
-                // the visibility argument). Release-adds into
-                // `bwd_dispatch_arrival_count[block]` when this substream's
-                // contribution to expert `e_local` is complete;
-                // `seen_per_substream` is the metadata-kernel-computed expected
-                // count, matching fwd's count.
-                if (lane_id == 0) {
-                    uint64_t newly_complete = 0;
-                    for (int k = 0; k < shape.num_topk; ++k) {
-                        int e_local = e_local_row[k];
-                        if (e_local < 0)
-                            continue;
-                        uint64_t bit = 1ULL << e_local;
-                        if ((completed_mask[src_rdma_rank] | newly_complete) & bit)
-                            continue;
-                        int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
-                        int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
-                        int expected = ld_nc_global(seen_for_channel + src_world * E_local + e_local);
-                        if (my_seen == expected)
-                            newly_complete |= bit;
-                    }
-
-                    if (newly_complete != 0) {
-                        completed_mask[src_rdma_rank] |= newly_complete;
-                        // Device-scope fence: dL_do_pool is local and
-                        // consumed by kernel_y_bwd on the same GPU.
-                        __threadfence();
-                        int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
-                        for (int e_local = 0; e_local < E_local; ++e_local) {
-                            if (!((newly_complete >> e_local) & 1))
-                                continue;
-                            int my_seen = warp_local_seen[src_rdma_rank * E_local + e_local];
-                            int slot_start_e = base_pool_for_channel[src_world * E_local + e_local];
-                            fire_pool_blocks(slot_start_e, my_seen, shape.tile_m, tile_signal.bwd_dispatch_arrival_count);
-                        }
-                    }
-                }
-                __syncwarp();
+                const int src_world = src_rdma_rank * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                receiver_eager_fire(e_local,
+                                    rank_in_e == 0,
+                                    completed_mask[src_rdma_rank],
+                                    seen_for_src,
+                                    seen_for_channel + src_world * E_local,
+                                    base_pool_for_channel + src_world * E_local,
+                                    E_local,
+                                    shape.tile_m,
+                                    tile_signal.bwd_dispatch_arrival_count,
+                                    lane_id);
             }
 
             if (elect_one_sync())
