@@ -391,8 +391,8 @@ def make_streams(
     )
 
 
-# Optional callable(side) invoked after a layer's pipeline is launched and before
-# the caller stream joins it (side is "fwd" or "bwd"). None disables it.
+# Optional callable invoked after a layer's pipeline is launched and before the
+# caller stream joins it, in both forward and backward. None disables it.
 overlap_yield = None
 
 # NVTX call counters — used to label fwd/bwd nsys ranges with a per-rank
@@ -673,9 +673,13 @@ class StreamMoEFunc(torch.autograd.Function):
             # on the streams while this side is parked.
             communicate_done = streams.communicate.record_event()
             compute_done = streams.compute.record_event()
-            overlap_yield("fwd")
-            caller_stream.wait_event(communicate_done)
-            caller_stream.wait_event(compute_done)
+            try:
+                overlap_yield()
+            finally:
+                # Join even if the hook raises: the locals freed on unwind are
+                # still in use by the pipeline.
+                caller_stream.wait_event(communicate_done)
+                caller_stream.wait_event(compute_done)
         else:
             caller_stream.wait_stream(streams.communicate)
             caller_stream.wait_stream(streams.compute)
@@ -1135,9 +1139,13 @@ class StreamMoEFunc(torch.autograd.Function):
         if overlap_yield is not None:
             communicate_done = streams.communicate.record_event()
             compute_done = streams.compute.record_event()
-            overlap_yield("bwd")
-            caller_stream.wait_event(communicate_done)
-            caller_stream.wait_event(compute_done)
+            try:
+                overlap_yield()
+            finally:
+                # Join even if the hook raises: the locals freed on unwind are
+                # still in use by the pipeline.
+                caller_stream.wait_event(communicate_done)
+                caller_stream.wait_event(compute_done)
         else:
             caller_stream.wait_stream(streams.communicate)
             caller_stream.wait_stream(streams.compute)
