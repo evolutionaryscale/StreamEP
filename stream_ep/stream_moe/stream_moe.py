@@ -391,6 +391,10 @@ def make_streams(
     )
 
 
+# Optional callable invoked after a layer's pipeline is launched and before the
+# caller stream joins it, in both forward and backward. None disables it.
+overlap_yield = None
+
 # NVTX call counters — used to label fwd/bwd nsys ranges with a per-rank
 # monotonic id. Set STREAM_EP_NVTX=1 in the env to enable. Off by default
 # so we don't pay the nvtx push/pop overhead in production runs.
@@ -662,10 +666,23 @@ class StreamMoEFunc(torch.autograd.Function):
                 handle._dispatch_out.release_pool()
             pool = None
 
-        # Layer-end back-edges. caller_stream waits on both streams so the
-        # layer-as-barrier invariant holds across layers.
-        caller_stream.wait_stream(streams.communicate)
-        caller_stream.wait_stream(streams.compute)
+        # Overlap hook: the pipeline is launched and every local is still alive;
+        # another microbatch may enqueue caller-stream work before the joins below.
+        if overlap_yield is not None:
+            # Join this layer's own tail, not whatever the other side launches
+            # on the streams while this side is parked.
+            communicate_done = streams.communicate.record_event()
+            compute_done = streams.compute.record_event()
+            try:
+                overlap_yield()
+            finally:
+                # Join even if the hook raises: the locals freed on unwind are
+                # still in use by the pipeline.
+                caller_stream.wait_event(communicate_done)
+                caller_stream.wait_event(compute_done)
+        else:
+            caller_stream.wait_stream(streams.communicate)
+            caller_stream.wait_stream(streams.compute)
 
         # Release o from the saved state, AFTER the back-edges. o is forward-only
         # — kernel Y's atomic-scatter target, consumed by combine above, never
@@ -1119,8 +1136,19 @@ class StreamMoEFunc(torch.autograd.Function):
                 dW2_local.zero_()
 
         # ── Exit chain back to caller_stream ───────────────────────────────
-        caller_stream.wait_stream(streams.communicate)
-        caller_stream.wait_stream(streams.compute)
+        if overlap_yield is not None:
+            communicate_done = streams.communicate.record_event()
+            compute_done = streams.compute.record_event()
+            try:
+                overlap_yield()
+            finally:
+                # Join even if the hook raises: the locals freed on unwind are
+                # still in use by the pipeline.
+                caller_stream.wait_event(communicate_done)
+                caller_stream.wait_event(compute_done)
+        else:
+            caller_stream.wait_stream(streams.communicate)
+            caller_stream.wait_stream(streams.compute)
 
         # Outputs of combine_grads were allocated on streams.communicate;
         # dW1 / dW2 on streams.compute. Record them on caller_stream so
