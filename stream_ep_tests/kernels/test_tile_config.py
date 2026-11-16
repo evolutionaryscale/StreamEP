@@ -4,7 +4,7 @@ Covers the three pieces that make up the ``tile_config`` API:
   - ``default_tile_config(I, H)`` — the bench-tuned resolved baseline, including
     the power-of-2 divisibility fallback when a default tile_n doesn't divide.
   - ``TileConfig.validate(I, H)`` — the StreamEP-specific output-tile_n
-    divisibility and tile_m constraints (None fields skipped).
+    divisibility, kernel Y cluster, and tile_m constraints (None fields skipped).
   - ``_resolve_tile_config`` — overlay a caller's non-None overrides onto the
     baseline. The load-bearing property: pinning ONE knob must NOT freeze the
     others at a hardcoded default — they stay auto-picked for the shape.
@@ -44,7 +44,7 @@ def test_default_config_self_consistent(I, H):
     cfg.validate(I, H)
     # Restate the four constraints independently of validate().
     assert (2 * I) % cfg.tile_n_a == 0 and I % cfg.tile_n_a == 0
-    assert H % cfg.tile_n_y == 0
+    assert H % cfg.tile_n_y == 0 and (H // cfg.tile_n_y) % cfg.cluster_n_y == 0
     assert I % cfg.tile_n_y_bwd == 0
     assert H % cfg.tile_n_a_bwd == 0
     assert cfg.tile_m == 128
@@ -80,6 +80,33 @@ def test_validate_rejects_bad_tile_n(field):
     cfg = TileConfig(**{field: 7})
     with pytest.raises(ValueError, match=field):
         cfg.validate(1536, 2048)
+
+
+@pytest.mark.parametrize(
+    "H, tile_n_y, cluster_n_y",
+    [(2048, 256, 2), (1536, 256, 2), (768, 256, 1), (1280, 256, 1), (384, 128, 1)],
+)
+def test_cluster_n_y_follows_stripe_count(H, tile_n_y, cluster_n_y):
+    # A 2-CTA cluster over an odd stripe count would launch a stripe past H.
+    cfg = default_tile_config(1536, H)
+    assert (cfg.tile_n_y, cfg.cluster_n_y) == (tile_n_y, cluster_n_y)
+
+
+def test_validate_rejects_cluster_with_odd_stripe_count():
+    with pytest.raises(ValueError, match="cluster_n_y=2"):
+        TileConfig(tile_n_y=256, cluster_n_y=2).validate(1536, 768)
+
+
+@pytest.mark.parametrize("tile_n_y, cluster_n_y", [(128, 2), (192, 2), (256, 1)])
+def test_resolve_tile_n_y_override_repicks_cluster(tile_n_y, cluster_n_y):
+    # The cluster is picked for the resolved tile_n_y, not the baseline's.
+    resolved = _resolve_tile_config(TileConfig(tile_n_y=tile_n_y), 1536, 768)
+    assert (resolved.tile_n_y, resolved.cluster_n_y) == (tile_n_y, cluster_n_y)
+
+
+def test_resolve_rejects_cluster_override_with_odd_stripe_count():
+    with pytest.raises(ValueError, match="cluster_n_y"):
+        _resolve_tile_config(TileConfig(cluster_n_y=2), 1536, 768)
 
 
 def test_validate_skips_none_fields():

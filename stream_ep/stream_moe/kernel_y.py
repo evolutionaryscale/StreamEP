@@ -99,7 +99,22 @@ class ScatterParams(NamedTuple):
     expert_pool_block_offset: cute.Tensor  # [E_local + 1]      int32 — pool-block prefix-sum (for tile_id reconstruct)
     T_recv: Int32  # row count == mO.shape[0]
     combine_seq: Int64  # value to release-store on hit-zero
-    num_pid_n: Int32  # N-stripe count per tile (= ceil(H / tile_N))
+    num_pid_n: Int32  # N-stripe count per tile (= H / tile_N)
+
+
+def scatter_num_pid_n(H: int, tile_n: int, cluster_n: int) -> int:
+    """N-stripe count of a scatter kernel (kernel Y, kernel A bwd).
+
+    The scatter has no column bound, so every launched stripe must lie inside
+    ``H``. A cluster-N launch rounds the stripe count up to a multiple of
+    ``cluster_n``, so ``cluster_n`` must divide it as well as ``tile_n``
+    dividing ``H``: an extra stripe would atomic-add past the end of each row
+    and count toward the per-tile stripe gate.
+    """
+    assert H % tile_n == 0, f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
+    num_pid_n = H // tile_n
+    assert num_pid_n % cluster_n == 0, f"cluster_n ({cluster_n}) must divide the stripe count H // tile_n = {num_pid_n}"
+    return num_pid_n
 
 
 # ---------------------------------------------------------------------------
@@ -838,10 +853,7 @@ def streaming_moe_y(
     E_local = W2.shape[0]
     assert E_local <= MAX_LOCAL_EXPERTS, f"{E_local} local experts exceed the scheduler's {MAX_LOCAL_EXPERTS}"
     assert W2.shape == (E_local, H, I), f"W2 must be (E_local, H, I); got {tuple(W2.shape)}, expected {(E_local, H, I)}"
-    # tile_n MUST divide the output N dim (= H). Non-divisible tile_n produces
-    # partial-tile stores that silently corrupt adjacent memory in the
-    # atomic-scatter epilogue.
-    assert H % tile_n == 0, f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
+    num_pid_n = scatter_num_pid_n(H, tile_n, cluster_n)
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
     assert pool_topk_weight.shape == (total_tiles * tile_m,)
@@ -900,7 +912,6 @@ def streaming_moe_y(
     # tile_n_stripes_done gates per-tile bookkeeping when num_pid_n > 1: the
     # CTA whose atomic-add returns `num_pid_n - 1` is the last N-stripe and
     # does the per-row decrement + compute_done release.
-    num_pid_n = (H + tile_n - 1) // tile_n
     tile_n_stripes_done = torch.zeros(total_tiles, dtype=torch.int32, device=postact_a.device)
 
     scatter = ScatterParams(

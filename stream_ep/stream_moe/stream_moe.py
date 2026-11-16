@@ -168,6 +168,9 @@ class TileConfig:
     tile_n_a: int | None = None
     # fwd kernel Y output N = H; must divide H.
     tile_n_y: int | None = None
+    # fwd kernel Y CTAs per cluster along N; must divide the stripe count
+    # H // tile_n_y. Auto-picked as 2 when the stripe count is even, else 1.
+    cluster_n_y: int | None = None
     # bwd kernel Y output N = I; must divide I.
     tile_n_y_bwd: int | None = None
     # bwd kernel A output N = H; must divide H.
@@ -260,12 +263,22 @@ class TileConfig:
             )
         if self.tile_n_y is not None and H % self.tile_n_y != 0:
             errs.append(f"tile_n_y={self.tile_n_y} must divide H={H} (fwd kernel Y out N=H)")
+        elif self.tile_n_y is not None and self.cluster_n_y is not None and (H // self.tile_n_y) % self.cluster_n_y != 0:
+            errs.append(
+                f"cluster_n_y={self.cluster_n_y} must divide the kernel Y stripe count "
+                f"H // tile_n_y = {H // self.tile_n_y} (H={H}, tile_n_y={self.tile_n_y})"
+            )
         if self.tile_n_y_bwd is not None and I % self.tile_n_y_bwd != 0:
             errs.append(f"tile_n_y_bwd={self.tile_n_y_bwd} must divide I={I} (bwd kernel Y out N=I)")
         if self.tile_n_a_bwd is not None and H % self.tile_n_a_bwd != 0:
             errs.append(f"tile_n_a_bwd={self.tile_n_a_bwd} must divide H={H} (bwd kernel A out N=H)")
         if errs:
             raise ValueError(f"TileConfig invalid for (I={I}, H={H}): " + "; ".join(errs))
+
+
+def _default_cluster_n_y(H: int, tile_n_y: int) -> int:
+    """2-CTA clusters when kernel Y's stripe count is even, otherwise unclustered."""
+    return 2 if (H // tile_n_y) % 2 == 0 else 1
 
 
 def default_tile_config(I: int, H: int) -> TileConfig:
@@ -290,10 +303,13 @@ def default_tile_config(I: int, H: int) -> TileConfig:
     if I % tile_n_a != 0:
         tile_n_a = _largest_pow2_divisor(I, cap=256)
 
+    tile_n_y = pick(256, H)
+
     return TileConfig(
         tile_m=128,
         tile_n_a=tile_n_a,
-        tile_n_y=pick(256, H),
+        tile_n_y=tile_n_y,
+        cluster_n_y=_default_cluster_n_y(H, tile_n_y),
         # y_bwd forces ab_stage=4 (deep W2/A mainloop prefetch — its scoreboard
         # stall is the long-K mainloop load; see StreamingMoeYBwd._compute_stages).
         # tile_n_y_bwd must stay small enough to leave SMEM for that 4th AB
@@ -341,6 +357,8 @@ def _resolve_tile_config(tile_config: TileConfig | None, I: int, H: int) -> Tile
     cfg = default_tile_config(I, H)
     if tile_config is not None:
         overrides = {f.name: getattr(tile_config, f.name) for f in fields(tile_config) if getattr(tile_config, f.name) is not None}
+        if "tile_n_y" in overrides and "cluster_n_y" not in overrides and H % overrides["tile_n_y"] == 0:
+            overrides["cluster_n_y"] = _default_cluster_n_y(H, overrides["tile_n_y"])
         if overrides:
             cfg = replace(cfg, **overrides)
     cfg.validate(I, H)
@@ -456,6 +474,7 @@ class StreamMoEFunc(torch.autograd.Function):
         tile_m = cfg.tile_m
         tile_n_a = cfg.tile_n_a
         tile_n_y = cfg.tile_n_y
+        cluster_n_y = cfg.cluster_n_y
         num_sms_a = cfg.num_sms_a
         num_sms_y = cfg.num_sms_y
 
@@ -611,7 +630,7 @@ class StreamMoEFunc(torch.autograd.Function):
                     started_flag=buffer.kernel_y_started_flag_view(),
                     tile_m=tile_m,
                     tile_n=tile_n_y,
-                    cluster_n=2,
+                    cluster_n=cluster_n_y,
                     num_sms=num_sms_y,
                 )
         _nvtx_pop()  # fwd_compute
