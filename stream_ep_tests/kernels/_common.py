@@ -5,7 +5,7 @@ Kernels run at each distinct (hidden, intermediate) pair of the test shapes.
 ``LAYOUTS["small"]`` starts with an empty expert and has a partial tile and
 full tiles; ``LAYOUTS["many_tiles"]`` has 40 experts, several empty, and enough
 tiles that every CTA loops over many of them. Tile configs come from
-``default_tile_config`` for the shape (with the 2-CTA clusters stream_moe_func
+``default_tile_config`` for the shape (with the clusters stream_moe_func
 launches A and Y with) plus an alternate.
 """
 
@@ -88,7 +88,7 @@ def configs(kernel: str, hidden: int, intermediate: int) -> dict[str, dict]:
     cfg = default_tile_config(intermediate, hidden)
     default = {
         "a": {"tile_n": cfg.tile_n_a, "cluster_n": 2},
-        "y": {"tile_n": cfg.tile_n_y, "cluster_n": 2},
+        "y": {"tile_n": cfg.tile_n_y, "cluster_n": cfg.cluster_n_y},
         "a_bwd": {"tile_n": cfg.tile_n_a_bwd},
         "y_bwd": {"tile_n": cfg.tile_n_y_bwd},
     }[kernel]
@@ -119,6 +119,23 @@ def per_expert(layout: PoolLayout, rows: torch.Tensor, weights: torch.Tensor, fn
             out = y.new_zeros(layout.num_slots, *y.shape[1:])
         out[idx] = y
     return out
+
+
+def guarded_output(num_rows: int, H: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A zeroed ``[num_rows, H]`` scatter target with one guard row on each side.
+
+    Returns ``(guarded, output)``. The guard rows hold -0.0, which any atomic
+    add turns into +0.0, so even a stray add of zeros shows up in
+    :func:`assert_guards_untouched`."""
+    guarded = torch.full((num_rows + 2, H), -0.0, dtype=DTYPE, device="cuda")
+    output = guarded[1:-1]
+    output.zero_()
+    return guarded, output
+
+
+def assert_guards_untouched(guarded: torch.Tensor, name: str) -> None:
+    guards = guarded[[0, -1]].view(torch.int16)
+    assert torch.equal(guards, torch.full_like(guarded[[0, -1]], -0.0).view(torch.int16)), f"scatter wrote outside {name}"
 
 
 def fired(target: torch.Tensor) -> torch.Tensor:

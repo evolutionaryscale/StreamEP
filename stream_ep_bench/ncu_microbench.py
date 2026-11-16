@@ -97,6 +97,7 @@ def _shape(args) -> dict:
             tile_m=args.tile_m,
             tile_n_a=args.tile_n_a,
             tile_n_y=args.tile_n_y,
+            cluster_n_y=args.cluster_n_y,
             tile_n_a_bwd=args.tile_n_a_bwd,
             tile_n_y_bwd=args.tile_n_y_bwd,
         ),
@@ -147,7 +148,7 @@ def build(kernel: str, s: dict, device):
                 preact_a=preact_a,
                 tile_m=tile_m,
                 tile_n=cfg.tile_n_a,
-                cluster_n=2,  # match production (stream_moe.py launches fwd A/Y at cluster_n=2)
+                cluster_n=2,  # match production (stream_moe.py launches fwd A at cluster_n=2)
             )
 
         store = "preact" if s["ac_level"] == 0 else "no-preact"
@@ -184,10 +185,10 @@ def build(kernel: str, s: dict, device):
                 combine_seq=1,
                 tile_m=tile_m,
                 tile_n=cfg.tile_n_y,
-                cluster_n=2,  # match production (a_bwd/y_bwd stay at wrapper default cluster_n=1)
+                cluster_n=cfg.cluster_n_y,
             )
 
-        return fn, f"kernel_y  GEMM (TK={TK},I={I})@W2(H={H}) tile_m={tile_m} tile_n_y={cfg.tile_n_y}"
+        return fn, f"kernel_y  GEMM (TK={TK},I={I})@W2(H={H}) tile_m={tile_m} tile_n_y={cfg.tile_n_y} cluster_n_y={cfg.cluster_n_y}"
 
     if kernel == "a_bwd":
         T_recv = TK
@@ -266,6 +267,7 @@ def main():
     p.add_argument("--tile_m", type=int, default=None)
     p.add_argument("--tile_n_a", type=int, default=None)
     p.add_argument("--tile_n_y", type=int, default=None)
+    p.add_argument("--cluster_n_y", type=int, default=None)
     p.add_argument("--tile_n_a_bwd", type=int, default=None)
     p.add_argument("--tile_n_y_bwd", type=int, default=None)
     p.add_argument("--warmup", type=int, default=5, help="warmup launches before the profiled one (JIT + cache)")

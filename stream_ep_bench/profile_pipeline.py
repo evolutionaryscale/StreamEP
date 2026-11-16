@@ -131,6 +131,7 @@ def _tile_config_from_args(args) -> TileConfig:
         tile_m=args.tile_m,
         tile_n_a=args.tile_n_a,
         tile_n_y=args.tile_n_y,
+        cluster_n_y=args.cluster_n_y,
         tile_n_y_bwd=args.tile_n_y_bwd,
         tile_n_a_bwd=args.tile_n_a_bwd,
         tile_m_dW1=args.tile_m_dW1,
@@ -207,6 +208,7 @@ def main():
     p.add_argument("--tile_m", type=int, default=None)
     p.add_argument("--tile_n_a", type=int, default=None)
     p.add_argument("--tile_n_y", type=int, default=None)
+    p.add_argument("--cluster_n_y", type=int, default=None)
     p.add_argument("--tile_n_a_bwd", type=int, default=None)
     p.add_argument("--tile_n_y_bwd", type=int, default=None)
     p.add_argument("--tile_m_dW1", type=int, default=None)
@@ -307,7 +309,7 @@ def main():
             f"config: world={world_size} num_sms={StreamEPBuffer.num_sms} "
             f"H={H} I={I} E={NUM_EXPERTS} K={TOPK} T={args.seq_len} "
             f"tile_m={resolved_cfg.tile_m} tile_n_a={resolved_cfg.tile_n_a} "
-            f"tile_n_y={resolved_cfg.tile_n_y} tile_n_y_bwd={resolved_cfg.tile_n_y_bwd} "
+            f"tile_n_y={resolved_cfg.tile_n_y} cluster_n_y={resolved_cfg.cluster_n_y} tile_n_y_bwd={resolved_cfg.tile_n_y_bwd} "
             f"tile_n_a_bwd={resolved_cfg.tile_n_a_bwd} "
             f"num_sms_a={resolved_cfg.num_sms_a} num_sms_y={resolved_cfg.num_sms_y} "
             f"act_ckpt_level={act_ckpt_level}",

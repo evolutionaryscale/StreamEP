@@ -72,6 +72,7 @@ from stream_ep.stream_moe.kernel_y import (
     AtomicScatterStore,
     ScatterParams,
     StreamingScatterBase,
+    scatter_num_pid_n,
 )
 from stream_ep.stream_moe.streaming_gemm_base import StreamingTileSchedulerOptions
 from stream_ep.stream_moe.tile_scheduler import MAX_LOCAL_EXPERTS
@@ -316,10 +317,7 @@ def streaming_moe_a_bwd(
         two_I,
         H,
     ), f"W1 must be (E_local, 2*I, H) = {(E_local, two_I, H)}; got {tuple(W1.shape)}"
-    # tile_n MUST divide the output N dim (= H). Non-divisible tile_n produces
-    # silently-wrong stores in the data-grad GEMM's partial-tile path (the
-    # bug that bit production at H=2048 with tile_n=192).
-    assert H % tile_n == 0, f"tile_n ({tile_n}) must divide H ({H}); H % tile_n = {H % tile_n}"
+    num_pid_n = scatter_num_pid_n(H, tile_n, cluster_n)
     assert pool_recv_token.shape == (total_tiles * tile_m,)
     assert pool_recv_token.dtype == torch.int32
     assert bwd_k_local_remaining.shape == (T_recv,)
@@ -379,7 +377,6 @@ def streaming_moe_a_bwd(
     # `num_pid_n - 1` is the last N-stripe to complete for its tile_id and
     # owns the per-row bookkeeping (atomicSub bwd_k_local_remaining +
     # hit-zero release-store on bwd_a_done_per_token).
-    num_pid_n = (H + tile_n - 1) // tile_n
     tile_n_stripes_done = torch.zeros(total_tiles, dtype=torch.int32, device=dL_dswiglu_in.device)
 
     scatter = ScatterParams(
