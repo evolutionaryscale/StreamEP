@@ -297,6 +297,14 @@ class AtomicScatterStore(EpiOp):
         on `tile_n_stripes_done[tile_id]` returning `num_pid_n - 1`) does the
         decrement. Atomic-add provides acq_rel ordering, so the last CTA sees
         all prior N-stripes' atomic-scatters.
+
+        A cluster-N launch rounds the stripe count up to a multiple of
+        ``cluster_n``, so when ``num_pid_n`` is not a multiple of it the last
+        cluster carries phantom stripes (``pid_n >= num_pid_n``) that lie
+        wholly past ``H``. They scatter nothing (see ``_scatter_store``) and
+        must not count toward the gate: counted, a phantom could be one of the
+        first ``num_pid_n`` arrivals and release the tile's tokens before a
+        real stripe has landed.
         """
         if const_expr(param is None):
             return
@@ -329,7 +337,11 @@ class AtomicScatterStore(EpiOp):
         # old serialized 128-row chain on thread 0 that was the dominant
         # cost of the kernel-Y epilogue (bisected: ~700 µs of structural
         # tail).
-        if is_thread0:
+        is_real_stripe = tile_coord_mnkl[1] < param.num_pid_n
+        is_phantom_stripe = tile_coord_mnkl[1] >= param.num_pid_n
+        if is_thread0 & is_phantom_stripe:
+            is_last_t[0] = Int32(0)
+        if is_thread0 & is_real_stripe:
             stripes_ptr = utils.elem_pointer(param.tile_n_stripes_done, (tile_id,))
             prev_stripes = cute.arch.atomic_add(stripes_ptr, Int32(1))
             is_last_stripe = prev_stripes == (param.num_pid_n - Int32(1))
@@ -565,6 +577,11 @@ class StreamingScatterBase(StreamingGemmBase):
         work_iters_per_warp = const_expr((work_per_warp + 32 - 1) // 32)
 
         T_recv = scatter.T_recv
+        # Columns past H belong to a phantom cluster-N stripe (see
+        # ``AtomicScatterStore.end``); skipping them keeps every atomic inside
+        # row r. H and the chunk start are multiples of 8, so a v4 chunk is
+        # either wholly inside the row or wholly past it.
+        H = cute.size(scatter.mO, mode=[1])
 
         for w in cutlass.range_constexpr(work_iters_per_warp):
             work_idx = Int32(w) * Int32(32) + Int32(lane_idx)
@@ -591,14 +608,16 @@ class StreamingScatterBase(StreamingGemmBase):
             # PTX-level @%p on the v4 atomic skips the instruction entirely
             # at issue time — no HBM op, no atomic side-effect — so the
             # address can be any clamped in-bounds pointer.
-            atomic_pred = (r_raw >= Int32(0)) & (r_raw < T_recv) & row_in_range
+            bf16_base = v4_chunk * Int32(8)
+            n_global = n_origin + bf16_base
+            atomic_pred = (r_raw >= Int32(0)) & (r_raw < T_recv) & row_in_range & (n_global < H)
             r_safe = r_raw if atomic_pred else Int32(0)
+            n_safe = n_global if atomic_pred else Int32(0)
 
             # 8 adjacent bf16 starting at bf16-idx (v4_chunk * 8) = 4 int32.
             # Recast THIS ROW (stride-1 contiguous in N on the un-swizzled
             # padded staging) to Int32: bf16 pair [2k, 2k+1] → int32 k. The v4
             # chunk's 8 bf16 = int32 [4*v4_chunk .. 4*v4_chunk+3].
-            bf16_base = v4_chunk * Int32(8)
             stage_row_i32 = cute.recast_tensor(stage_view[m_safe, None], Int32)
             i32_base = v4_chunk * Int32(4)
             p0 = stage_row_i32[i32_base + Int32(0)]
@@ -608,10 +627,9 @@ class StreamingScatterBase(StreamingGemmBase):
             # v4 needs 16-byte alignment (8 bf16). bf16_base is multiple
             # of 8 by construction; n_origin is multiple of epi_tile_N
             # (≥ 8 by config); together address is 16-byte aligned.
-            n_global = n_origin + bf16_base
             o_row = scatter.mO[r_safe, None]
             o_row_as_i32 = cute.recast_tensor(o_row, Int32)
-            target_ptr = utils.elem_pointer(o_row_as_i32, (n_global // Int32(2),))
+            target_ptr = utils.elem_pointer(o_row_as_i32, (n_safe // Int32(2),))
             red_add_bf16x2_v4_pred(target_ptr, p0, p1, p2, p3, Int32(atomic_pred))
 
         # 5. WAR barrier: order all warps' scatter READS of the staging before

@@ -5,7 +5,10 @@ Each receive token gets several slots, and once a token's last slot lands the
 kernel stamps ``y_done_per_token[r] = combine_seq`` for combine. Padding rows
 of ``postact`` hold NaN with weight 0, as an uninitialized pool would; the
 predicated scatter must skip them rather than add ``0 * NaN``. Guard rows
-around ``o`` catch a scatter to ``r = -1`` or ``r = T_recv``.
+around ``o`` catch a scatter to ``r = -1`` or ``r = T_recv``, and a scatter past
+column ``H`` of the last row (from a phantom cluster-N stripe when the stripe
+count is odd). They hold -0.0, which even an atomic add of +0.0 turns into
++0.0, so a stray add of zeros is caught too.
 """
 
 import pytest
@@ -33,8 +36,9 @@ def test_kernel_y(shape, layout, config, num_sms):
     recv = layout.recv_tokens(num_recv)
     weight = torch.where(real, torch.rand(layout.num_slots, device="cuda"), 0.0)
 
-    guarded = torch.zeros(num_recv + 2, H, dtype=DTYPE, device="cuda")
+    guarded = torch.full((num_recv + 2, H), -0.0, dtype=DTYPE, device="cuda")
     o = guarded[1:-1]
+    o.zero_()
     k_local = torch.bincount(recv[real].long(), minlength=num_recv).to(torch.int32)
     remaining, done = k_local.clone(), torch.zeros(num_recv, dtype=torch.int64, device="cuda")
     target = layout.arrival_target()
@@ -60,6 +64,7 @@ def test_kernel_y(shape, layout, config, num_sms):
     y = per_expert(layout, postact, w2, lambda a, w: a @ w.T)
     expected = torch.zeros(num_recv, H, device="cuda").index_add_(0, recv[real].long(), weight[real, None] * y[real])
     assert_rows_close(o, expected, RTOL, "o")
-    assert not guarded[0].any() and not guarded[-1].any(), "scatter wrote outside o"
+    neg_zero = torch.full((2, H), -0.0, dtype=DTYPE, device="cuda").view(torch.int16)
+    assert torch.equal(guarded[[0, -1]].view(torch.int16), neg_zero), "scatter wrote outside o"
     assert not remaining.any(), "a token's remaining count did not reach zero"
     assert torch.equal(done, torch.where(k_local > 0, SEQ, 0)), "done stamps differ from tokens with slots"
