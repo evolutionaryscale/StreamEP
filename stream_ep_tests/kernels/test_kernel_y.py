@@ -8,7 +8,8 @@ predicated scatter must skip them rather than add ``0 * NaN``. Guard rows
 around ``o`` catch a scatter to ``r = -1`` or ``r = T_recv``, and a scatter past
 column ``H`` of the last row (from a phantom cluster-N stripe when the stripe
 count is odd). They hold -0.0, which even an atomic add of +0.0 turns into
-+0.0, so a stray add of zeros is caught too.
++0.0, so a stray add of zeros is caught too (regression for
+https://github.com/evolutionaryscale/StreamEP/pull/33).
 """
 
 import pytest
